@@ -23,8 +23,7 @@ members = ["crates/mlx-ffi"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-# TODO(W1): replace OWNER once the public repo exists
-repository = "https://github.com/OWNER/alloy"
+repository = "https://github.com/LayerDynamics/alloy"
 
 [workspace.dependencies]
 # bindgen is pinned EXACTLY ("="), not caret-ranged. Its generated code

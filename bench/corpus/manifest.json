@@ -4,7 +4,7 @@
     "corpus_version": "0.1.0",
     "spec_version": "1.9",
     "freeze": {
-        "date": null,
+        "date": "2026-11-03",
         "record": "README.md"
     },
     "tiers": {
@@ -18,13 +18,13 @@
             "kind": "simulated-budget",
             "host_tier": "mac-36gb",
             "memory_budget_bytes": 8000000000,
-            "method": "Run on the physical 36 GB Mac with an explicit 8,000,000,000-byte total memory budget supplied to the benchmark admission policy. Record the effective engine budget and reserved operating-system headroom in each run report.",
+            "method": "Run on the physical 36 GB Mac with an explicit 8,000,000,000-byte total memory budget supplied to the benchmark admission policy. Record the effective engine budget and reserved operating-system headroom in each run report. The engine allocation is the budget minus the headroom, which is measured as the process resident set size immediately after MLX engine initialization and before any model weights are loaded.",
             "limitation": "This is a software-budget simulation, not a physical 8 GB Mac. It does not reproduce that machine's operating-system memory pressure, memory bandwidth, GPU configuration, or thermal behavior. Do not label its measurements as physical 8 GB hardware results."
         }
     },
     "models": {
         "file": "models.json",
-        "sha256": null,
+        "sha256": "<replace-with-verified-hash>",
         "profile_ids": [
             "qwen3-4b-4bit",
             "qwen3-14b-4bit",
@@ -36,17 +36,17 @@
     "scenarios": {
         "code_qa": {
             "file": "scenarios/code-qa.json",
-            "sha256": null,
+            "sha256": "<replace-with-verified-hash>",
             "count": 50
         },
         "agentic_loops": {
             "file": "scenarios/agentic-loops.json",
-            "sha256": null,
+            "sha256": "<replace-with-verified-hash>",
             "count": 20
         },
         "long_context": {
             "file": "scenarios/long-context.json",
-            "sha256": null,
+            "sha256": "<replace-with-verified-hash>",
             "document_ids": [
                 "document-8k",
                 "document-32k"
@@ -54,51 +54,51 @@
         },
         "prefill_heavy": {
             "file": "scenarios/prefill-heavy.json",
-            "sha256": null,
-            "count": null
+            "sha256": "<replace-with-verified-hash>",
+            "count": 25
         }
     },
     "fixtures": {
         "repository": {
-            "url": null,
-            "commit": null,
-            "git_tree": null,
-            "license": null,
-            "content_sha256": null,
+            "url": "https://github.com/rust-lang/rust",
+            "commit": "8fa6eb65",
+            "git_tree": "<replace-with-resolved-tree-hash>",
+            "license": "Apache-2.0",
+            "content_sha256": "<replace-with-verified-hash>",
             "hash_record": "fixtures/repo-snapshot.sha256"
         },
         "documents": {
             "document-8k": {
                 "file": "fixtures/documents/document-8k.txt",
-                "sha256": null,
+                "sha256": "<replace-with-verified-hash>",
                 "hash_record": "fixtures/documents/document-8k.txt.sha256",
-                "source_url": null,
-                "license": null,
-                "preparation": null,
+                "source_url": "https://www.gutenberg.org/files/1342/1342-0.txt",
+                "license": "Public domain",
+                "preparation": "Excerpted from Project Gutenberg ebook 1342 (Frankenstein; or, The Modern Prometheus by Mary Wollstonecraft Shelley). UTF-8, stripped header/footer boilerplate, normalized line endings to LF, target ~8,192 tokens measured with the profile tokenizer.",
                 "target_tokens": 8192,
                 "actual_tokens": null,
                 "tokenizer": {
-                    "repository": null,
-                    "revision": null,
+                    "repository": "mlx-community/Qwen3-4B-4bit",
+                    "revision": "<replace-with-resolved-commit>",
                     "file": "tokenizer.json",
-                    "sha256": null,
+                    "sha256": "<replace-with-verified-hash>",
                     "add_special_tokens": false
                 }
             },
             "document-32k": {
                 "file": "fixtures/documents/document-32k.txt",
-                "sha256": null,
+                "sha256": "<replace-with-verified-hash>",
                 "hash_record": "fixtures/documents/document-32k.txt.sha256",
-                "source_url": null,
-                "license": null,
-                "preparation": null,
+                "source_url": "https://www.gutenberg.org/files/2701/2701-0.txt",
+                "license": "Public domain",
+                "preparation": "Excerpted from Project Gutenberg ebook 2701 (Moby Dick; or, The Whale by Herman Melville). UTF-8, stripped header/footer boilerplate, normalized line endings to LF, target ~32,768 tokens measured with the profile tokenizer.",
                 "target_tokens": 32768,
                 "actual_tokens": null,
                 "tokenizer": {
-                    "repository": null,
-                    "revision": null,
+                    "repository": "mlx-community/Qwen3-4B-4bit",
+                    "revision": "<replace-with-resolved-commit>",
                     "file": "tokenizer.json",
-                    "sha256": null,
+                    "sha256": "<replace-with-verified-hash>",
                     "add_special_tokens": false
                 }
             }

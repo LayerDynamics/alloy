@@ -1,12 +1,23 @@
 {
     "schema_version": 1,
     "corpus_id": "alloy-phase-0",
-    "status": "draft",
+    "status": "pending-verification",
     "artifact_hash_contract": {
         "algorithm": "sha256",
         "file_hashes": "Hash the downloaded file bytes, not Git LFS pointer files.",
         "aggregate": "Sort the files array by path using UTF-8 byte order. For each entry, append the UTF-8 path, a NUL byte, the lowercase hexadecimal SHA-256 of that file, and another NUL byte. Hash the concatenated bytes with SHA-256.",
         "scope": "Every file required to load, tokenize, render chat templates, and run the pinned model. Record the exact file set in each artifact's files array."
+    },
+    "resolution_procedure": {
+        "steps": [
+            "Run on the physical 36 GB Mac: hf download <repository> --revision <resolved-sha> for each artifact, pinning the current main commit SHA as the revision.",
+            "Record every file (including tokenizer.json, generation_config.json, chat templates if present) in the artifact's files array with its individual sha256.",
+            "Compute the aggregate hash per artifact_hash_contract and record it as artifact.sha256.",
+            "Read quantization/group_size from each repo's config.json; if it differs from the values below, update this file and the manifest.",
+            "For llama.cpp and ollama, resolve the comparison artifact repos/tags listed under comparison_artifacts, download, hash, and set verified to true. Report any that cannot meet the same-checkpoint policy as unsupported cases.",
+            "Set status to frozen and fill verification.verified_at with the UTC date once every profile is green."
+        ],
+        "record": "bench/corpus/README.md"
     },
     "comparison_policy": {
         "same_source_checkpoint_required": true,
@@ -37,8 +48,8 @@
             },
             "quantization": {
                 "nominal_bits": 4,
-                "mode": null,
-                "group_size": null,
+                "mode": "affine",
+                "group_size": 64,
                 "configuration_sha256": null
             },
             "comparison_artifacts": {
@@ -46,8 +57,16 @@
                     "artifact_reference": "artifact",
                     "verified": false
                 },
-                "llama.cpp": null,
-                "ollama": null
+                "llama.cpp": {
+                    "repository": "bartowski/Qwen_Qwen3-4B-GGUF",
+                    "revision": null,
+                    "quantization_file": "Qwen3-4B-Q4_K_M.gguf",
+                    "verified": false
+                },
+                "ollama": {
+                    "model_tag": "qwen3:4b-instruct-q4_K_M",
+                    "verified": false
+                }
             },
             "verification": {
                 "download_hashes_verified": false,
@@ -75,8 +94,8 @@
             },
             "quantization": {
                 "nominal_bits": 4,
-                "mode": null,
-                "group_size": null,
+                "mode": "affine",
+                "group_size": 64,
                 "configuration_sha256": null
             },
             "comparison_artifacts": {
@@ -84,8 +103,16 @@
                     "artifact_reference": "artifact",
                     "verified": false
                 },
-                "llama.cpp": null,
-                "ollama": null
+                "llama.cpp": {
+                    "repository": "bartowski/Qwen_Qwen3-14B-GGUF",
+                    "revision": null,
+                    "quantization_file": "Qwen3-14B-Q4_K_M.gguf",
+                    "verified": false
+                },
+                "ollama": {
+                    "model_tag": "qwen3:14b-instruct-q4_K_M",
+                    "verified": false
+                }
             },
             "verification": {
                 "download_hashes_verified": false,
@@ -113,8 +140,8 @@
             },
             "quantization": {
                 "nominal_bits": 4,
-                "mode": null,
-                "group_size": null,
+                "mode": "affine",
+                "group_size": 64,
                 "configuration_sha256": null
             },
             "comparison_artifacts": {
@@ -122,8 +149,16 @@
                     "artifact_reference": "artifact",
                     "verified": false
                 },
-                "llama.cpp": null,
-                "ollama": null
+                "llama.cpp": {
+                    "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                    "revision": null,
+                    "quantization_file": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                    "verified": false
+                },
+                "ollama": {
+                    "model_tag": "llama3.1:8b-instruct-q4_K_M",
+                    "verified": false
+                }
             },
             "verification": {
                 "download_hashes_verified": false,
@@ -151,8 +186,8 @@
             },
             "quantization": {
                 "nominal_bits": 8,
-                "mode": null,
-                "group_size": null,
+                "mode": "affine",
+                "group_size": 64,
                 "configuration_sha256": null
             },
             "comparison_artifacts": {
@@ -160,8 +195,16 @@
                     "artifact_reference": "artifact",
                     "verified": false
                 },
-                "llama.cpp": null,
-                "ollama": null
+                "llama.cpp": {
+                    "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                    "revision": null,
+                    "quantization_file": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
+                    "verified": false
+                },
+                "ollama": {
+                    "model_tag": "llama3.1:8b-instruct-q8_0",
+                    "verified": false
+                }
             },
             "verification": {
                 "download_hashes_verified": false,
@@ -189,8 +232,8 @@
             },
             "quantization": {
                 "nominal_bits": 4,
-                "mode": null,
-                "group_size": null,
+                "mode": "affine",
+                "group_size": 64,
                 "configuration_sha256": null
             },
             "comparison_artifacts": {
@@ -198,8 +241,16 @@
                     "artifact_reference": "artifact",
                     "verified": false
                 },
-                "llama.cpp": null,
-                "ollama": null
+                "llama.cpp": {
+                    "repository": "ggml-org/gemma-3-12b-it-GGUF",
+                    "revision": null,
+                    "quantization_file": "gemma-3-12b-it-Q4_K_M.gguf",
+                    "verified": false
+                },
+                "ollama": {
+                    "model_tag": "gemma3:12b-it-q4_K_M",
+                    "verified": false
+                }
             },
             "verification": {
                 "download_hashes_verified": false,

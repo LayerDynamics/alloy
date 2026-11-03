@@ -1,0 +1,518 @@
+{
+    "schema_version": 1,
+    "scenario": "code-qa",
+    "description": "50 questions about the alloy repository snapshot, grounded in its source files and symbols.",
+    "repository": "LayerDynamics/alloy",
+    "commit": "8fa6eb65",
+    "question_count": 50,
+    "questions": [
+        {
+            "id": "cq-001",
+            "question": "What is the pinned Rust toolchain channel in rust-toolchain.toml?",
+            "expected_answer": "1.99.1",
+            "supporting_files": [
+                "rust-toolchain.toml"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-002",
+            "question": "What is the crate name defined in crates/mlx-ffi/Cargo.toml?",
+            "expected_answer": "mlx-ffi",
+            "supporting_files": [
+                "crates/mlx-ffi/Cargo.toml"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-003",
+            "question": "Which bindgen crate version is pinned exactly in the root Cargo.toml workspace dependencies?",
+            "expected_answer": "0.73.2",
+            "supporting_files": [
+                "Cargo.toml"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-004",
+            "question": "Which function in build.rs links the static mlxc and mlx libraries?",
+            "expected_answer": "build_and_link",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "build_and_link"
+            ]
+        },
+        {
+            "id": "cq-005",
+            "question": "What is the vendored mlx-c ref recorded in PINS.md?",
+            "expected_answer": "v0.8.0",
+            "supporting_files": [
+                "PINS.md"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-006",
+            "question": "Which MLX core commit is derived from mlx-c's CMakeLists.txt in PINS.md?",
+            "expected_answer": "36969c094354086e15d2a327a9c50feb20b9cf11",
+            "supporting_files": [
+                "PINS.md"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-007",
+            "question": "What is the content digest algorithm used for vendored tree verification in scripts/vendor.sh?",
+            "expected_answer": "sha256",
+            "supporting_files": [
+                "scripts/vendor.sh"
+            ],
+            "supporting_symbols": [
+                "dir_hash"
+            ]
+        },
+        {
+            "id": "cq-008",
+            "question": "Which environment variable enables bindgen regeneration in build.rs?",
+            "expected_answer": "MLX_FFI_REGENERATE",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "MLX_FFI_REGENERATE"
+            ]
+        },
+        {
+            "id": "cq-009",
+            "question": "What is the struct that wraps an mlx_array handle in lib.rs?",
+            "expected_answer": "Array",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Array"
+            ]
+        },
+        {
+            "id": "cq-010",
+            "question": "Which test file contains the closure_smoke named test?",
+            "expected_answer": "tests/raii.rs",
+            "supporting_files": [
+                "crates/mlx-ffi/tests/raii.rs"
+            ],
+            "supporting_symbols": [
+                "closure_smoke"
+            ]
+        },
+        {
+            "id": "cq-011",
+            "question": "What is the umbrella header included by wrapper.h?",
+            "expected_answer": "mlx/c/mlx.h",
+            "supporting_files": [
+                "crates/mlx-ffi/wrapper.h"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-012",
+            "question": "Which FetchContent source directory override is used for JSON in build.rs?",
+            "expected_answer": "FETCHCONTENT_SOURCE_DIR_JSON",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "FETCHCONTENT_SOURCE_DIR_JSON"
+            ]
+        },
+        {
+            "id": "cq-013",
+            "question": "What is the name of the coverage inventory output file checked into the crate?",
+            "expected_answer": "coverage/inventory.txt",
+            "supporting_files": [
+                "crates/mlx-ffi/coverage/inventory.txt"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-014",
+            "question": "Which script regenerates the coverage inventory and runs the drift gate?",
+            "expected_answer": "scripts/coverage_inventory.sh",
+            "supporting_files": [
+                "scripts/coverage_inventory.sh"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-015",
+            "question": "What is the name of the pinned builder image used by bindgen_check.sh?",
+            "expected_answer": "alloy-builder:phase0",
+            "supporting_files": [
+                "scripts/bindgen_check.sh"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-016",
+            "question": "Which Docker platform does bindgen_check.sh require for its Clang flags?",
+            "expected_answer": "linux/arm64",
+            "supporting_files": [
+                "scripts/bindgen_check.sh"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-017",
+            "question": "What is the escape hatch for unvendored FetchContent dependencies in build.rs?",
+            "expected_answer": "FETCHCONTENT_FULLY_DISCONNECTED",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "FETCHCONTENT_FULLY_DISCONNECTED"
+            ]
+        },
+        {
+            "id": "cq-018",
+            "question": "Which struct represents an owned MLX device in lib.rs?",
+            "expected_answer": "Device",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Device"
+            ]
+        },
+        {
+            "id": "cq-019",
+            "question": "Which struct represents an owned MLX stream in lib.rs?",
+            "expected_answer": "Stream",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Stream"
+            ]
+        },
+        {
+            "id": "cq-020",
+            "question": "Which struct represents an owned MLX closure in lib.rs?",
+            "expected_answer": "Closure",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Closure"
+            ]
+        },
+        {
+            "id": "cq-021",
+            "question": "Which struct represents an MLX vector-of-arrays argument type in lib.rs?",
+            "expected_answer": "VectorArray",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "VectorArray"
+            ]
+        },
+        {
+            "id": "cq-022",
+            "question": "What is the compile-time assertion pattern used to guard mlxdtype discriminant renumbering?",
+            "expected_answer": "const _: () = assert!(sys::mlxdtypeMLXBOOL as u32 == DType::Bool as u32)",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "DType",
+                "mlxdtypeMLXBOOL"
+            ]
+        },
+        {
+            "id": "cq-023",
+            "question": "Which test in tests/ops.rs exercises the quantized-matmul op surface?",
+            "expected_answer": "quantized_matmul_smoke",
+            "supporting_files": [
+                "crates/mlx-ffi/tests/ops.rs"
+            ],
+            "supporting_symbols": [
+                "quantized_matmul_smoke"
+            ]
+        },
+        {
+            "id": "cq-024",
+            "question": "Which test in tests/unified.rs exercises CPU/GPU zero-copy aliasing?",
+            "expected_answer": "cpu_gpu_views_alias_memory",
+            "supporting_files": [
+                "crates/mlx-ffi/tests/unified.rs"
+            ],
+            "supporting_symbols": [
+                "cpu_gpu_views_alias_memory"
+            ]
+        },
+        {
+            "id": "cq-025",
+            "question": "What is the platform gate applied to tests/unified.rs?",
+            "expected_answer": "cfg(target_os = \"macos\")",
+            "supporting_files": [
+                "crates/mlx-ffi/tests/unified.rs"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-026",
+            "question": "Which Dockerfile builds the bindgen/libclang container image?",
+            "expected_answer": "scripts/docker/Dockerfile",
+            "supporting_files": [
+                "scripts/docker/Dockerfile"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-027",
+            "question": "Which Dockerfile builds the native reproducibility container image?",
+            "expected_answer": "scripts/docker/Dockerfile.repro",
+            "supporting_files": [
+                "scripts/docker/Dockerfile.repro"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-028",
+            "question": "What is the MLX build option disabled on Linux in build.rs?",
+            "expected_answer": "MLX_BUILD_METAL",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "MLX_BUILD_METAL"
+            ]
+        },
+        {
+            "id": "cq-029",
+            "question": "Which macOS frameworks does build.rs link on the Mac lane?",
+            "expected_answer": "Metal, Foundation, QuartzCore, Accelerate",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-030",
+            "question": "Which Linux system libraries does build.rs link for the MLX CPU backend?",
+            "expected_answer": "dl, pthread, blas, lapack, stdc++",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-031",
+            "question": "What is the deploy target pinned for macOS builds in build.rs?",
+            "expected_answer": "14.0",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "CMAKE_OSX_DEPLOYMENT_TARGET"
+            ]
+        },
+        {
+            "id": "cq-032",
+            "question": "Which bindgen formatter is used to normalize generated bindings output?",
+            "expected_answer": "Rustfmt",
+            "supporting_files": [
+                "crates/mlx-ffi/build.rs"
+            ],
+            "supporting_symbols": [
+                "bindgen::Formatter::Rustfmt"
+            ]
+        },
+        {
+            "id": "cq-033",
+            "question": "What is the namespaced type used for FFI bindings in lib.rs?",
+            "expected_answer": "sys",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "sys"
+            ]
+        },
+        {
+            "id": "cq-034",
+            "question": "Which function in lib.rs wraps mlx_array_new_from_slice?",
+            "expected_answer": "Array::from_f32_slice",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Array::from_f32_slice"
+            ]
+        },
+        {
+            "id": "cq-035",
+            "question": "Which method materializes a lazy MLX array in lib.rs?",
+            "expected_answer": "Array::eval",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Array::eval"
+            ]
+        },
+        {
+            "id": "cq-036",
+            "question": "Which method adopts an owned raw mlx_array handle in lib.rs?",
+            "expected_answer": "Array::from_raw",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Array::from_raw"
+            ]
+        },
+        {
+            "id": "cq-037",
+            "question": "Which closure constructor takes a Rust FnMut and a payload destructor?",
+            "expected_answer": "Closure::wrap_fn",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Closure::wrap_fn"
+            ]
+        },
+        {
+            "id": "cq-038",
+            "question": "Which closure method invokes the MLX closure and returns an owned result vector?",
+            "expected_answer": "Closure::apply",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Closure::apply"
+            ]
+        },
+        {
+            "id": "cq-039",
+            "question": "Which closure method compiles the closure with mlx_compile?",
+            "expected_answer": "Closure::compile",
+            "supporting_files": [
+                "crates/mlx-ffi/src/lib.rs"
+            ],
+            "supporting_symbols": [
+                "Closure::compile"
+            ]
+        },
+        {
+            "id": "cq-040",
+            "question": "What is the default device selection function exposed by the mlx-c FFI?",
+            "expected_answer": "mlx_get_default_device",
+            "supporting_files": [
+                "crates/mlx-ffi/src/bindings.rs"
+            ],
+            "supporting_symbols": [
+                "mlx_get_default_device"
+            ]
+        },
+        {
+            "id": "cq-041",
+            "question": "Which function frees an mlx_stream handle in the bindings?",
+            "expected_answer": "mlx_stream_free",
+            "supporting_files": [
+                "crates/mlx-ffi/src/bindings.rs"
+            ],
+            "supporting_symbols": [
+                "mlx_stream_free"
+            ]
+        },
+        {
+            "id": "cq-042",
+            "question": "Which function synchronizes the default stream in the bindings?",
+            "expected_answer": "mlx_synchronize_default",
+            "supporting_files": [
+                "crates/mlx-ffi/src/bindings.rs"
+            ],
+            "supporting_symbols": [
+                "mlx_synchronize_default"
+            ]
+        },
+        {
+            "id": "cq-043",
+            "question": "Which script verifies vendored tree digests against PINS.md?",
+            "expected_answer": "scripts/pins_check.sh",
+            "supporting_files": [
+                "scripts/pins_check.sh"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-044",
+            "question": "Which script performs two clean builds and compares library hashes for test 11?",
+            "expected_answer": "scripts/repro_check.sh",
+            "supporting_files": [
+                "scripts/repro_check.sh"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-045",
+            "question": "What is the license of the alloy project as recorded in LICENSE?",
+            "expected_answer": "Apache-2.0",
+            "supporting_files": [
+                "LICENSE"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-046",
+            "question": "Which directory contains vendored sources tracked in git per .gitignore?",
+            "expected_answer": "vendor/",
+            "supporting_files": [
+                ".gitignore"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-047",
+            "question": "What is the config directory documented in README.md?",
+            "expected_answer": "~/.alloy/",
+            "supporting_files": [
+                "README.md"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-048",
+            "question": "Which spec version is referenced in the manifest and schema?",
+            "expected_answer": "1.9",
+            "supporting_files": [
+                "bench/corpus/manifest.json",
+                "bench/corpus/manifest.schema.json"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-049",
+            "question": "What is the corpus_id used in the benchmark manifest?",
+            "expected_answer": "alloy-phase-0",
+            "supporting_files": [
+                "bench/corpus/manifest.json"
+            ],
+            "supporting_symbols": []
+        },
+        {
+            "id": "cq-050",
+            "question": "Which work item reserves crates.io alloyd, npm alloyml, PyPI alloy-convert, and Homebrew alloy tap names?",
+            "expected_answer": "W1",
+            "supporting_files": [
+                "docs/specs/Phase 0 Execution Plan.md"
+            ],
+            "supporting_symbols": [
+                "W1"
+            ]
+        }
+    ]
+}

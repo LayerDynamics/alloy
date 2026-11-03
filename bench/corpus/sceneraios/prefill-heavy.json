@@ -1,0 +1,158 @@
+{
+    "schema_version": 1,
+    "scenario": "prefill-heavy",
+    "description": "Large-prompt prefill scenarios measuring TTFT and memory under heavy input load.",
+    "prompt_count": 25,
+    "prompts": [
+        {
+            "id": "ph-001",
+            "kind": "code-review",
+            "approximate_tokens": 4096,
+            "description": "Review a 4096-token Rust source diff for safety and correctness issues."
+        },
+        {
+            "id": "ph-002",
+            "kind": "code-review",
+            "approximate_tokens": 8192,
+            "description": "Review an 8192-token multi-file Rust refactor for API consistency."
+        },
+        {
+            "id": "ph-003",
+            "kind": "document-qa",
+            "approximate_tokens": 4096,
+            "description": "Answer questions about a 4096-token technical specification excerpt."
+        },
+        {
+            "id": "ph-004",
+            "kind": "document-qa",
+            "approximate_tokens": 8192,
+            "description": "Answer questions about an 8192-token architecture document."
+        },
+        {
+            "id": "ph-005",
+            "kind": "log-analysis",
+            "approximate_tokens": 4096,
+            "description": "Analyze 4096 tokens of daemon logs for error patterns and root causes."
+        },
+        {
+            "id": "ph-006",
+            "kind": "log-analysis",
+            "approximate_tokens": 8192,
+            "description": "Analyze 8192 tokens of distributed traces for latency anomalies."
+        },
+        {
+            "id": "ph-007",
+            "kind": "spec-compliance",
+            "approximate_tokens": 4096,
+            "description": "Check a 4096-token feature implementation against its SPEC section."
+        },
+        {
+            "id": "ph-008",
+            "kind": "spec-compliance",
+            "approximate_tokens": 8192,
+            "description": "Check an 8192-token feature implementation against its SPEC section."
+        },
+        {
+            "id": "ph-009",
+            "kind": "chat-summary",
+            "approximate_tokens": 4096,
+            "description": "Summarize a 4096-token multi-turn conversation history."
+        },
+        {
+            "id": "ph-010",
+            "kind": "chat-summary",
+            "approximate_tokens": 8192,
+            "description": "Summarize an 8192-token multi-turn conversation history."
+        },
+        {
+            "id": "ph-011",
+            "kind": "token-budget",
+            "approximate_tokens": 4096,
+            "description": "Apply a 4096-token compaction policy to a session context window."
+        },
+        {
+            "id": "ph-012",
+            "kind": "token-budget",
+            "approximate_tokens": 8192,
+            "description": "Apply an 8192-token compaction policy to a session context window."
+        },
+        {
+            "id": "ph-013",
+            "kind": "prefix-cache",
+            "approximate_tokens": 4096,
+            "description": "Measure prefix-cache hit rate on a 4096-token shared system prompt."
+        },
+        {
+            "id": "ph-014",
+            "kind": "prefix-cache",
+            "approximate_tokens": 8192,
+            "description": "Measure prefix-cache hit rate on an 8192-token shared system prompt."
+        },
+        {
+            "id": "ph-015",
+            "kind": "in-context-learning",
+            "approximate_tokens": 4096,
+            "description": "Run few-shot inference with 4096 tokens of example input-output pairs."
+        },
+        {
+            "id": "ph-016",
+            "kind": "in-context-learning",
+            "approximate_tokens": 8192,
+            "description": "Run few-shot inference with 8192 tokens of example input-output pairs."
+        },
+        {
+            "id": "ph-017",
+            "kind": "long-context-prefix",
+            "approximate_tokens": 4096,
+            "description": "Query a 4096-token prefix of the 32k document for early-document facts."
+        },
+        {
+            "id": "ph-018",
+            "kind": "long-context-prefix",
+            "approximate_tokens": 8192,
+            "description": "Query an 8192-token prefix of the 32k document for mid-document facts."
+        },
+        {
+            "id": "ph-019",
+            "kind": "mixed-workload",
+            "approximate_tokens": 4096,
+            "description": "Interleave code, document, and log queries totaling 4096 tokens."
+        },
+        {
+            "id": "ph-020",
+            "kind": "mixed-workload",
+            "approximate_tokens": 8192,
+            "description": "Interleave code, document, and log queries totaling 8192 tokens."
+        },
+        {
+            "id": "ph-021",
+            "kind": "stress-prefill",
+            "approximate_tokens": 12288,
+            "description": "Sustain a 12,288-token prefill to measure peak memory and TTFT tail latency."
+        },
+        {
+            "id": "ph-022",
+            "kind": "stress-prefill",
+            "approximate_tokens": 16384,
+            "description": "Sustain a 16,384-token prefill to measure peak memory and TTFT tail latency."
+        },
+        {
+            "id": "ph-023",
+            "kind": "stress-prefill",
+            "approximate_tokens": 24576,
+            "description": "Sustain a 24,576-token prefill to measure peak memory and TTFT tail latency."
+        },
+        {
+            "id": "ph-024",
+            "kind": "stress-prefill",
+            "approximate_tokens": 32768,
+            "description": "Sustain a 32,768-token prefill to measure peak memory and TTFT tail latency."
+        },
+        {
+            "id": "ph-025",
+            "kind": "stress-prefill",
+            "approximate_tokens": 49152,
+            "description": "Sustain a 49,152-token prefill to measure peak memory and TTFT tail latency at the upper bound of the context window."
+        }
+    ]
+}

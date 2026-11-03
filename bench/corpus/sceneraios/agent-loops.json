@@ -1,0 +1,278 @@
+{
+    "schema_version": 1,
+    "scenario": "agentic-loops",
+    "description": "20 multi-turn agentic tool-loop tasks with tool fixtures and success criteria.",
+    "task_count": 20,
+    "tasks": [
+        {
+            "id": "al-001",
+            "title": "Read and summarize a source file",
+            "turns": 3,
+            "tools": [
+                "read_file",
+                "summarize"
+            ],
+            "success_criteria": [
+                "Returns a faithful summary of the target file's purpose",
+                "Cites at least two key symbols from the file"
+            ]
+        },
+        {
+            "id": "al-002",
+            "title": "Search for a symbol across the crate",
+            "turns": 2,
+            "tools": [
+                "search_code",
+                "grep"
+            ],
+            "success_criteria": [
+                "Locates all definitions of the queried symbol",
+                "Reports file paths and line numbers"
+            ]
+        },
+        {
+            "id": "al-003",
+            "title": "Add a new FFI wrapper method",
+            "turns": 4,
+            "tools": [
+                "read_file",
+                "edit_file",
+                "cargo_build",
+                "cargo_test"
+            ],
+            "success_criteria": [
+                "Method compiles without warnings",
+                "Existing tests still pass",
+                "New method is covered by a unit test"
+            ]
+        },
+        {
+            "id": "al-004",
+            "title": "Update vendored MLX pin",
+            "turns": 5,
+            "tools": [
+                "scripts/vendor.sh",
+                "git_diff",
+                "cargo_test"
+            ],
+            "success_criteria": [
+                "PINS.md updated with new commit and digest",
+                "bindings.rs regenerated if API surface changed",
+                "Coverage inventory still green"
+            ]
+        },
+        {
+            "id": "al-005",
+            "title": "Run the coverage inventory gate",
+            "turns": 2,
+            "tools": [
+                "scripts/coverage_inventory.sh",
+                "cargo_test"
+            ],
+            "success_criteria": [
+                "--check passes with zero missing or stale symbols",
+                "--test rejects a mutated symbol"
+            ]
+        },
+        {
+            "id": "al-006",
+            "title": "Regenerate bindings in the pinned container",
+            "turns": 3,
+            "tools": [
+                "scripts/bindgen_check.sh",
+                "docker"
+            ],
+            "success_criteria": [
+                "Container regeneration completes without Clang errors",
+                "Checked-in bindings match container output byte-for-byte"
+            ]
+        },
+        {
+            "id": "al-007",
+            "title": "Run the reproducibility check",
+            "turns": 4,
+            "tools": [
+                "scripts/repro_check.sh",
+                "docker"
+            ],
+            "success_criteria": [
+                "Two clean builds produce identical library hashes",
+                "Hashes recorded in DR-0001"
+            ]
+        },
+        {
+            "id": "al-008",
+            "title": "Verify pinned vendor tree digests",
+            "turns": 2,
+            "tools": [
+                "scripts/pins_check.sh"
+            ],
+            "success_criteria": [
+                "All five trees match PINS.md and .sha256 mirrors",
+                "Tampering with any tree is rejected"
+            ]
+        },
+        {
+            "id": "al-009",
+            "title": "Add a new benchmark scenario",
+            "turns": 4,
+            "tools": [
+                "edit_file",
+                "validate.sh",
+                "cargo_test"
+            ],
+            "success_criteria": [
+                "Scenario JSON validates against manifest.schema.json",
+                "Scenario count matches manifest declaration",
+                "validate.sh passes"
+            ]
+        },
+        {
+            "id": "al-010",
+            "title": "Resolve and record a model artifact hash",
+            "turns": 3,
+            "tools": [
+                "curl",
+                "sha256sum",
+                "edit_file"
+            ],
+            "success_criteria": [
+                "Model file downloaded and hashed",
+                "models.json updated with verified sha256",
+                "manifest.json models.sha256 updated"
+            ]
+        },
+        {
+            "id": "al-011",
+            "title": "Create a GitHub release tag",
+            "turns": 3,
+            "tools": [
+                "git_tag",
+                "git_push",
+                "gh_release"
+            ],
+            "success_criteria": [
+                "Tag points to a clean main commit",
+                "Release notes summarize Phase 0 status"
+            ]
+        },
+        {
+            "id": "al-012",
+            "title": "Reserve crate name alloyd on crates.io",
+            "turns": 2,
+            "tools": [
+                "cargo_publish"
+            ],
+            "success_criteria": [
+                "Placeholder 0.0.0 publication succeeds",
+                "Name reserved for future alloyd releases"
+            ]
+        },
+        {
+            "id": "al-013",
+            "title": "Reserve package name alloyml on npm",
+            "turns": 2,
+            "tools": [
+                "npm_publish"
+            ],
+            "success_criteria": [
+                "Placeholder 0.0.0 publication succeeds",
+                "Name reserved for future alloyml releases"
+            ]
+        },
+        {
+            "id": "al-014",
+            "title": "Reserve package name alloy-convert on PyPI",
+            "turns": 2,
+            "tools": [
+                "twine_upload"
+            ],
+            "success_criteria": [
+                "Placeholder 0.0.0 publication succeeds",
+                "Name reserved for future alloy-convert releases"
+            ]
+        },
+        {
+            "id": "al-015",
+            "title": "Create the homebrew-alloy tap",
+            "turns": 3,
+            "tools": [
+                "git_create_repo",
+                "edit_file"
+            ],
+            "success_criteria": [
+                "Tap repo contains Formula/alloy.rb stub",
+                "Tap is installable via brew tap"
+            ]
+        },
+        {
+            "id": "al-016",
+            "title": "Write the Phase 1 execution plan",
+            "turns": 4,
+            "tools": [
+                "edit_file",
+                "read_file"
+            ],
+            "success_criteria": [
+                "PHASE-1-EXECUTION-PLAN.md contains exact file set and named tests",
+                "Plan reviewed against Phase 1 exit criteria"
+            ]
+        },
+        {
+            "id": "al-017",
+            "title": "Add CI workflow for Linux and Mac lanes",
+            "turns": 5,
+            "tools": [
+                "edit_file",
+                "gh_workflow"
+            ],
+            "success_criteria": [
+                "Linux lane runs on every PR",
+                "Mac lane runs on merge-to-main and release tags",
+                "Tests 8, 9, 12 pass in CI"
+            ]
+        },
+        {
+            "id": "al-018",
+            "title": "Document the fallback decision for mlx-c binding layer",
+            "turns": 3,
+            "tools": [
+                "edit_file",
+                "read_file"
+            ],
+            "success_criteria": [
+                "DR-0001 records own-layer vs mlx-c-rust outcome",
+                "Decision boundary documented for infra-crate API"
+            ]
+        },
+        {
+            "id": "al-019",
+            "title": "Run the full Phase 0 named test suite locally",
+            "turns": 6,
+            "tools": [
+                "cargo_test",
+                "scripts/coverage_inventory.sh",
+                "scripts/pins_check.sh"
+            ],
+            "success_criteria": [
+                "Tests 1-7 pass on macOS",
+                "Tests 8, 9, 12 pass",
+                "Test 6 skips cleanly on hosts without Metal"
+            ]
+        },
+        {
+            "id": "al-020",
+            "title": "Freeze the benchmark corpus",
+            "turns": 4,
+            "tools": [
+                "validate.sh",
+                "edit_file"
+            ],
+            "success_criteria": [
+                "All scenario files populated with exact counts",
+                "All fixture hashes recorded",
+                "freeze.date set in manifest.json"
+            ]
+        }
+    ]
+}

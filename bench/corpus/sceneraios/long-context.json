@@ -1,0 +1,55 @@
+{
+    "schema_version": 1,
+    "scenario": "long-context",
+    "description": "Long-context scenarios using the 8k and 32k frozen documents.",
+    "documents": [
+        {
+            "id": "document-8k",
+            "file": "fixtures/documents/document-8k.txt",
+            "target_tokens": 8192,
+            "license": "Public domain",
+            "source_url": "https://www.gutenberg.org/files/84/84-0.txt",
+            "preparation": "Excerpted from Project Gutenberg ebook 84 (Frankenstein; or, The Modern Prometheus by Mary Wollstonecraft Shelley). UTF-8, LF line endings, Project Gutenberg header and footer stripped."
+        },
+        {
+            "id": "document-32k",
+            "file": "fixtures/documents/document-32k.txt",
+            "target_tokens": 32768,
+            "license": "Public domain",
+            "source_url": "https://www.gutenberg.org/files/2701/2701-0.txt",
+            "preparation": "Excerpted from Project Gutenberg ebook 2701 (Moby Dick; or, The Whale by Herman Melville). UTF-8, LF line endings, Project Gutenberg header and footer stripped."
+        }
+    ],
+    "tasks": [
+        {
+            "id": "lc-001",
+            "document": "document-8k",
+            "prompt_type": "summarization",
+            "expected_behavior": "Produce a faithful summary without hallucinating plot points outside the document."
+        },
+        {
+            "id": "lc-002",
+            "document": "document-8k",
+            "prompt_type": "detail-retrieval",
+            "expected_behavior": "Answer a specific factual question whose answer appears only in the middle 25% of the document."
+        },
+        {
+            "id": "lc-003",
+            "document": "document-32k",
+            "prompt_type": "summarization",
+            "expected_behavior": "Summarize the full document while preserving major character arcs."
+        },
+        {
+            "id": "lc-004",
+            "document": "document-32k",
+            "prompt_type": "needle-in-haystack",
+            "expected_behavior": "Retrieve an inserted factual statement from a random position in the document."
+        },
+        {
+            "id": "lc-005",
+            "document": "document-32k",
+            "prompt_type": "cross-reference",
+            "expected_behavior": "Connect information from the beginning and end of the document in a single answer."
+        }
+    ]
+}
