@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1
+
+# scripts/docker/Dockerfile.repro
+#
+# Native Linux arm64 builder for vendored_build_reproducible.
+#
+# Keep this separate from the Bookworm/libclang-14 bindgen image.
+# The native build needs a newer libstdc++ for std::format.
+#
+# Build:
+#   docker build --platform linux/arm64 \
+#     -t alloy-native-builder:phase0 \
+#     -f scripts/docker/Dockerfile.repro scripts/docker
+#
+# Optional overrides:
+#   RUST_IMAGE: Rust toolchain source image, preferably digest-pinned
+#   DEBIAN_IMAGE: native build environment, preferably digest-pinned
+
+ARG RUST_IMAGE=rust:1.99.1-bookworm
+ARG DEBIAN_IMAGE=debian:trixie-slim
+
+FROM ${RUST_IMAGE} AS rust_toolchain
+
+FROM ${DEBIAN_IMAGE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      pkg-config \
+      cmake \
+      make \
+      binutils \
+      gcc-14 \
+      g++-14 \
+      libc6-dev \
+      libblas-dev \
+      liblapack-dev \
+      liblapacke-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Supply conventional compiler names for Rust and native build tools.
+# /usr/local/bin takes precedence over /usr/bin in the configured PATH.
+RUN ln -s /usr/bin/gcc-14 /usr/local/bin/cc \
+ && ln -s /usr/bin/g++-14 /usr/local/bin/c++ \
+ && ln -s /usr/bin/gcc-14 /usr/local/bin/gcc \
+ && ln -s /usr/bin/g++-14 /usr/local/bin/g++
+
+# Copy the Rust toolchain from the selected Rust image.
+COPY --from=rust_toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=rust_toolchain /usr/local/cargo /usr/local/cargo
+
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:/usr/local/bin:${PATH}
+
+ENV CC=gcc-14
+ENV CXX=g++-14
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=gcc-14
+ENV CARGO_TERM_COLOR=never
+
+# Verify both conventional compiler commands exist.
+RUN cc --version \
+ && c++ --version
+
+# Verify the selected C++ standard library supports std::format.
+RUN printf '%s\n' \
+      '#include <format>' \
+      '#include <string>' \
+      'int main() {' \
+      '    return std::format("value={}", 42) == "value=42" ? 0 : 1;' \
+      '}' \
+      > /tmp/format-check.cpp \
+ && c++ -std=c++20 /tmp/format-check.cpp -o /tmp/format-check \
+ && /tmp/format-check \
+ && rm -f /tmp/format-check.cpp /tmp/format-check
+
+# Verify Rust can link and execute a basic native binary.
+# Use the toolchain already present in the image.
+RUN printf '%s\n' \
+      'fn main() { println!("Rust linker check passed"); }' \
+      > /tmp/rust-link-check.rs \
+ && rustc /tmp/rust-link-check.rs -o /tmp/rust-link-check \
+ && /tmp/rust-link-check \
+ && rm -f /tmp/rust-link-check.rs /tmp/rust-link-check
+
+WORKDIR /work
