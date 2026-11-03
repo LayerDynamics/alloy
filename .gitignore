@@ -1,0 +1,26 @@
+# --- Rust ---
+/target
+
+# Cargo.lock is COMMITTED, deliberately: tests 10 and 11
+# (bindgen_output_stable, vendored_build_reproducible) depend on
+# dependency versions being pinned across machines and CI.
+# Do not add Cargo.lock here.
+
+# --- Vendored sources ---
+# vendor/ is tracked (vendored mlx-c + MLX core, per PINS.md).
+# build.rs runs all CMake builds inside OUT_DIR under target/,
+# so no vendor-local build directories ever need ignoring.
+# Never configure CMake manually inside vendor/.
+
+# --- Corpus ---
+# One-time local model-resolution runs (recorded in bench/corpus/README.md)
+bench/corpus/.local/
+
+# --- macOS ---
+.DS_Store
+
+# --- Editors / scratch ---
+.idea/
+.vscode/
+*.swp
+*.log

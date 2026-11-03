@@ -1,0 +1,57 @@
+# Root Cargo.toml — alloy workspace
+#
+# This manifest is a Phase 0 file-set amendment, recorded in
+# docs/decisions/DR-0001: the execution plan's file list places the first
+# crate under crates/mlx-ffi/ but defines no workspace root, and no cargo
+# command works from the repo root without one. Phase 1's infra and model
+# family crates join `members` here — nothing else about this file should
+# need to change when they do.
+
+[workspace]
+# Resolver 3 = resolver 2 semantics plus MSRV-aware dependency selection,
+# matching the edition 2024 members. Explicit because this is a virtual
+# manifest (no [package] here), where cargo would otherwise default to
+# the legacy resolver.
+resolver = "3"
+members = ["crates/mlx-ffi"]
+
+[workspace.package]
+# Shared metadata inherited by member crates via `workspace = true`.
+# The crates.io name reservation for `alloyd` (W1, placeholder 0.0.0
+# publication) is a separate account action — this workspace's crates are
+# not published in Phase 0.
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+# TODO(W1): replace OWNER once the public repo exists
+repository = "https://github.com/OWNER/alloy"
+
+[workspace.dependencies]
+# bindgen is pinned EXACTLY ("="), not caret-ranged. Its generated code
+# must be byte-identical across regenerations for named test
+# `bindgen_output_stable` (test 10); a caret range would silently admit
+# patch releases with different codegen. Bumps are deliberate events:
+# update the pin, regenerate crates/mlx-ffi/src/bindings.rs via
+# scripts/bindgen_check.sh, and record the change in DR-0001.
+# The other half of the determinism contract is the pinned libclang in
+# scripts/docker/Dockerfile.
+bindgen = "=0.73.2"
+
+# Build-time CMake driver for build.rs. Version-pinned through the
+# committed Cargo.lock; exact-pinning is reserved for dependencies whose
+# output artifacts are themselves checked in (bindgen only, for now).
+cmake = "0.1"
+
+[workspace.lints.rust]
+# mlx-ffi is an unsafe-heavy crate by design; keep the unsafe surface
+# auditable from the first commit. Member crates opt in via
+# [lints] workspace = true.
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+# Defaults are fine for Phase 0. Byte-level reproducibility for named test
+# `vendored_build_reproducible` (test 11) comes from environment
+# normalization in scripts/repro_check.sh, not from profile tuning.
