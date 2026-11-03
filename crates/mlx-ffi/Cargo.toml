@@ -1,0 +1,24 @@
+[package]
+name = "mlx-ffi"
+description = "RAII bindgen layer over vendored mlx-c (Phase 0 FFI spike)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+build = "build.rs"
+# Declares the native library this crate links; cargo enforces that the
+# build script emits link directives for it and prevents two crates in a
+# dependency graph from both linking mlxc independently.
+links = "mlxc"
+
+[lints]
+workspace = true
+
+# Phase 0: lib.rs and the named tests are std-only by design — the FFI
+# layer must stay dependency-free so the infra/family crates above it
+# (Phase 1+) own every choice. No [dependencies] until there is a reason.
+
+[build-dependencies]
+bindgen.workspace = true
+cmake.workspace = true
