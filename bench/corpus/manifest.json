@@ -1,0 +1,141 @@
+{
+    "schema_version": 1,
+    "corpus_id": "alloy-phase-0",
+    "corpus_version": "0.1.0",
+    "spec_version": "1.9",
+    "freeze": {
+        "date": null,
+        "record": "README.md"
+    },
+    "tiers": {
+        "mac-36gb": {
+            "kind": "physical",
+            "platform": "macos",
+            "architecture": "arm64",
+            "installed_memory_gb": 36
+        },
+        "simulated-8gb": {
+            "kind": "simulated-budget",
+            "host_tier": "mac-36gb",
+            "memory_budget_bytes": 8000000000,
+            "method": "Run on the physical 36 GB Mac with an explicit 8,000,000,000-byte total memory budget supplied to the benchmark admission policy. Record the effective engine budget and reserved operating-system headroom in each run report.",
+            "limitation": "This is a software-budget simulation, not a physical 8 GB Mac. It does not reproduce that machine's operating-system memory pressure, memory bandwidth, GPU configuration, or thermal behavior. Do not label its measurements as physical 8 GB hardware results."
+        }
+    },
+    "models": {
+        "file": "models.json",
+        "sha256": null,
+        "profile_ids": [
+            "qwen3-4b-4bit",
+            "qwen3-14b-4bit",
+            "llama-3.1-8b-4bit",
+            "llama-3.1-8b-8bit",
+            "gemma-3-12b-4bit"
+        ]
+    },
+    "scenarios": {
+        "code_qa": {
+            "file": "scenarios/code-qa.json",
+            "sha256": null,
+            "count": 50
+        },
+        "agentic_loops": {
+            "file": "scenarios/agentic-loops.json",
+            "sha256": null,
+            "count": 20
+        },
+        "long_context": {
+            "file": "scenarios/long-context.json",
+            "sha256": null,
+            "document_ids": [
+                "document-8k",
+                "document-32k"
+            ]
+        },
+        "prefill_heavy": {
+            "file": "scenarios/prefill-heavy.json",
+            "sha256": null,
+            "count": null
+        }
+    },
+    "fixtures": {
+        "repository": {
+            "url": null,
+            "commit": null,
+            "git_tree": null,
+            "license": null,
+            "content_sha256": null,
+            "hash_record": "fixtures/repo-snapshot.sha256"
+        },
+        "documents": {
+            "document-8k": {
+                "file": "fixtures/documents/document-8k.txt",
+                "sha256": null,
+                "hash_record": "fixtures/documents/document-8k.txt.sha256",
+                "source_url": null,
+                "license": null,
+                "preparation": null,
+                "target_tokens": 8192,
+                "actual_tokens": null,
+                "tokenizer": {
+                    "repository": null,
+                    "revision": null,
+                    "file": "tokenizer.json",
+                    "sha256": null,
+                    "add_special_tokens": false
+                }
+            },
+            "document-32k": {
+                "file": "fixtures/documents/document-32k.txt",
+                "sha256": null,
+                "hash_record": "fixtures/documents/document-32k.txt.sha256",
+                "source_url": null,
+                "license": null,
+                "preparation": null,
+                "target_tokens": 32768,
+                "actual_tokens": null,
+                "tokenizer": {
+                    "repository": null,
+                    "revision": null,
+                    "file": "tokenizer.json",
+                    "sha256": null,
+                    "add_special_tokens": false
+                }
+            }
+        }
+    },
+    "metrics": {
+        "decode_tokens_per_second": {
+            "unit": "tokens/s",
+            "direction": "higher-is-better"
+        },
+        "ttft_p50_ms": {
+            "unit": "ms",
+            "direction": "lower-is-better"
+        },
+        "ttft_p95_ms": {
+            "unit": "ms",
+            "direction": "lower-is-better"
+        },
+        "peak_memory_bytes": {
+            "unit": "bytes",
+            "direction": "lower-is-better"
+        },
+        "agent_loop_overhead_ms": {
+            "unit": "ms",
+            "direction": "lower-is-better"
+        }
+    },
+    "comparison": {
+        "backends": [
+            "alloy",
+            "llama.cpp",
+            "ollama",
+            "omlx"
+        ],
+        "same_model_required": true,
+        "same_quantization_required": true,
+        "same_hardware_required": true,
+        "report_unsupported_cases": true
+    }
+}

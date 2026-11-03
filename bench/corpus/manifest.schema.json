@@ -1,0 +1,527 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "Alloy benchmark corpus manifest",
+    "description": "The Phase 0 frozen benchmark corpus. All local paths are relative to bench/corpus/.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "schema_version",
+        "corpus_id",
+        "corpus_version",
+        "spec_version",
+        "freeze",
+        "tiers",
+        "models",
+        "scenarios",
+        "fixtures",
+        "metrics",
+        "comparison"
+    ],
+    "properties": {
+        "schema_version": {
+            "const": 1
+        },
+        "corpus_id": {
+            "const": "alloy-phase-0"
+        },
+        "corpus_version": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "spec_version": {
+            "const": "1.9"
+        },
+        "freeze": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "date",
+                "record"
+            ],
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+                },
+                "record": {
+                    "const": "README.md"
+                }
+            }
+        },
+        "tiers": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "mac-36gb",
+                "simulated-8gb"
+            ],
+            "properties": {
+                "mac-36gb": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "kind",
+                        "platform",
+                        "architecture",
+                        "installed_memory_gb"
+                    ],
+                    "properties": {
+                        "kind": {
+                            "const": "physical"
+                        },
+                        "platform": {
+                            "const": "macos"
+                        },
+                        "architecture": {
+                            "const": "arm64"
+                        },
+                        "installed_memory_gb": {
+                            "const": 36
+                        }
+                    }
+                },
+                "simulated-8gb": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "kind",
+                        "host_tier",
+                        "memory_budget_bytes",
+                        "method",
+                        "limitation"
+                    ],
+                    "properties": {
+                        "kind": {
+                            "const": "simulated-budget"
+                        },
+                        "host_tier": {
+                            "const": "mac-36gb"
+                        },
+                        "memory_budget_bytes": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "method": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "limitation": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    }
+                }
+            }
+        },
+        "models": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "file",
+                "sha256",
+                "profile_ids"
+            ],
+            "properties": {
+                "file": {
+                    "const": "models.json"
+                },
+                "sha256": {
+                    "$ref": "#/$defs/sha256"
+                },
+                "profile_ids": {
+                    "type": "array",
+                    "minItems": 5,
+                    "maxItems": 5,
+                    "uniqueItems": true,
+                    "items": {
+                        "enum": [
+                            "qwen3-4b-4bit",
+                            "qwen3-14b-4bit",
+                            "llama-3.1-8b-4bit",
+                            "llama-3.1-8b-8bit",
+                            "gemma-3-12b-4bit"
+                        ]
+                    }
+                }
+            }
+        },
+        "scenarios": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "code_qa",
+                "agentic_loops",
+                "long_context",
+                "prefill_heavy"
+            ],
+            "properties": {
+                "code_qa": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "file",
+                        "sha256",
+                        "count"
+                    ],
+                    "properties": {
+                        "file": {
+                            "const": "scenarios/code-qa.json"
+                        },
+                        "sha256": {
+                            "$ref": "#/$defs/sha256"
+                        },
+                        "count": {
+                            "const": 50
+                        }
+                    }
+                },
+                "agentic_loops": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "file",
+                        "sha256",
+                        "count"
+                    ],
+                    "properties": {
+                        "file": {
+                            "const": "scenarios/agentic-loops.json"
+                        },
+                        "sha256": {
+                            "$ref": "#/$defs/sha256"
+                        },
+                        "count": {
+                            "const": 20
+                        }
+                    }
+                },
+                "long_context": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "file",
+                        "sha256",
+                        "document_ids"
+                    ],
+                    "properties": {
+                        "file": {
+                            "const": "scenarios/long-context.json"
+                        },
+                        "sha256": {
+                            "$ref": "#/$defs/sha256"
+                        },
+                        "document_ids": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "uniqueItems": true,
+                            "items": {
+                                "enum": [
+                                    "document-8k",
+                                    "document-32k"
+                                ]
+                            }
+                        }
+                    }
+                },
+                "prefill_heavy": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "file",
+                        "sha256",
+                        "count"
+                    ],
+                    "properties": {
+                        "file": {
+                            "const": "scenarios/prefill-heavy.json"
+                        },
+                        "sha256": {
+                            "$ref": "#/$defs/sha256"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    }
+                }
+            }
+        },
+        "fixtures": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "repository",
+                "documents"
+            ],
+            "properties": {
+                "repository": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "url",
+                        "commit",
+                        "git_tree",
+                        "license",
+                        "content_sha256",
+                        "hash_record"
+                    ],
+                    "properties": {
+                        "url": {
+                            "$ref": "#/$defs/httpsUrl"
+                        },
+                        "commit": {
+                            "$ref": "#/$defs/gitObjectId"
+                        },
+                        "git_tree": {
+                            "$ref": "#/$defs/gitObjectId"
+                        },
+                        "license": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "content_sha256": {
+                            "$ref": "#/$defs/sha256"
+                        },
+                        "hash_record": {
+                            "const": "fixtures/repo-snapshot.sha256"
+                        }
+                    }
+                },
+                "documents": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                        "document-8k",
+                        "document-32k"
+                    ],
+                    "properties": {
+                        "document-8k": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/$defs/document"
+                                },
+                                {
+                                    "properties": {
+                                        "target_tokens": {
+                                            "const": 8192
+                                        }
+                                    }
+                                }
+                            ]
+                        },
+                        "document-32k": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/$defs/document"
+                                },
+                                {
+                                    "properties": {
+                                        "target_tokens": {
+                                            "const": 32768
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "metrics": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "decode_tokens_per_second",
+                "ttft_p50_ms",
+                "ttft_p95_ms",
+                "peak_memory_bytes",
+                "agent_loop_overhead_ms"
+            ],
+            "properties": {
+                "decode_tokens_per_second": {
+                    "const": {
+                        "unit": "tokens/s",
+                        "direction": "higher-is-better"
+                    }
+                },
+                "ttft_p50_ms": {
+                    "const": {
+                        "unit": "ms",
+                        "direction": "lower-is-better"
+                    }
+                },
+                "ttft_p95_ms": {
+                    "const": {
+                        "unit": "ms",
+                        "direction": "lower-is-better"
+                    }
+                },
+                "peak_memory_bytes": {
+                    "const": {
+                        "unit": "bytes",
+                        "direction": "lower-is-better"
+                    }
+                },
+                "agent_loop_overhead_ms": {
+                    "const": {
+                        "unit": "ms",
+                        "direction": "lower-is-better"
+                    }
+                }
+            }
+        },
+        "comparison": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "backends",
+                "same_model_required",
+                "same_quantization_required",
+                "same_hardware_required",
+                "report_unsupported_cases"
+            ],
+            "properties": {
+                "backends": {
+                    "type": "array",
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "uniqueItems": true,
+                    "items": {
+                        "enum": [
+                            "alloy",
+                            "llama.cpp",
+                            "ollama",
+                            "omlx"
+                        ]
+                    }
+                },
+                "same_model_required": {
+                    "const": true
+                },
+                "same_quantization_required": {
+                    "const": true
+                },
+                "same_hardware_required": {
+                    "const": true
+                },
+                "report_unsupported_cases": {
+                    "const": true
+                }
+            }
+        }
+    },
+    "$defs": {
+        "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+        },
+        "gitObjectId": {
+            "description": "Full SHA-1 Git object ID, not an abbreviated hash.",
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+        },
+        "httpsUrl": {
+            "type": "string",
+            "pattern": "^https://[^\\s]+$"
+        },
+        "localPath": {
+            "description": "A corpus-relative path without absolute paths, parent traversal, dot components, or backslashes.",
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\s]+$"
+        },
+        "tokenizer": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "repository",
+                "revision",
+                "file",
+                "sha256",
+                "add_special_tokens"
+            ],
+            "properties": {
+                "repository": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+                },
+                "revision": {
+                    "$ref": "#/$defs/gitObjectId"
+                },
+                "file": {
+                    "const": "tokenizer.json"
+                },
+                "sha256": {
+                    "$ref": "#/$defs/sha256"
+                },
+                "add_special_tokens": {
+                    "const": false
+                }
+            }
+        },
+        "document": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "file",
+                "sha256",
+                "hash_record",
+                "source_url",
+                "license",
+                "preparation",
+                "target_tokens",
+                "actual_tokens",
+                "tokenizer"
+            ],
+            "properties": {
+                "file": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/localPath"
+                        },
+                        {
+                            "pattern": "^fixtures/documents/.+\\.txt$"
+                        }
+                    ]
+                },
+                "sha256": {
+                    "$ref": "#/$defs/sha256"
+                },
+                "hash_record": {
+                    "allOf": [
+                        {
+                            "$ref": "#/$defs/localPath"
+                        },
+                        {
+                            "pattern": "^fixtures/documents/.+\\.sha256$"
+                        }
+                    ]
+                },
+                "source_url": {
+                    "$ref": "#/$defs/httpsUrl"
+                },
+                "license": {
+                    "type": "string",
+                    "minLength": 1
+                },
+                "preparation": {
+                    "description": "How the source was normalized and excerpted into this frozen UTF-8 document.",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "target_tokens": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "actual_tokens": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "tokenizer": {
+                    "$ref": "#/$defs/tokenizer"
+                }
+            }
+        }
+    }
+}

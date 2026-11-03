@@ -1,0 +1,211 @@
+{
+    "schema_version": 1,
+    "corpus_id": "alloy-phase-0",
+    "status": "draft",
+    "artifact_hash_contract": {
+        "algorithm": "sha256",
+        "file_hashes": "Hash the downloaded file bytes, not Git LFS pointer files.",
+        "aggregate": "Sort the files array by path using UTF-8 byte order. For each entry, append the UTF-8 path, a NUL byte, the lowercase hexadecimal SHA-256 of that file, and another NUL byte. Hash the concatenated bytes with SHA-256.",
+        "scope": "Every file required to load, tokenize, render chat templates, and run the pinned model. Record the exact file set in each artifact's files array."
+    },
+    "comparison_policy": {
+        "same_source_checkpoint_required": true,
+        "same_nominal_bit_width_required": true,
+        "quantization_recipe_must_be_recorded": true,
+        "nominal_bit_width_alone_proves_equivalence": false,
+        "backend_artifacts_must_be_pinned": true,
+        "unavailable_comparisons_must_be_reported": true
+    },
+    "profiles": [
+        {
+            "id": "qwen3-4b-4bit",
+            "family": "qwen3",
+            "variant": "Qwen3-4B",
+            "modalities": [
+                "text"
+            ],
+            "source": {
+                "repository": "Qwen/Qwen3-4B",
+                "revision": null
+            },
+            "artifact": {
+                "repository": "mlx-community/Qwen3-4B-4bit",
+                "revision": null,
+                "format": "mlx-safetensors",
+                "sha256": null,
+                "files": null
+            },
+            "quantization": {
+                "nominal_bits": 4,
+                "mode": null,
+                "group_size": null,
+                "configuration_sha256": null
+            },
+            "comparison_artifacts": {
+                "omlx": {
+                    "artifact_reference": "artifact",
+                    "verified": false
+                },
+                "llama.cpp": null,
+                "ollama": null
+            },
+            "verification": {
+                "download_hashes_verified": false,
+                "verified_at": null,
+                "record": "README.md"
+            }
+        },
+        {
+            "id": "qwen3-14b-4bit",
+            "family": "qwen3",
+            "variant": "Qwen3-14B",
+            "modalities": [
+                "text"
+            ],
+            "source": {
+                "repository": "Qwen/Qwen3-14B",
+                "revision": null
+            },
+            "artifact": {
+                "repository": "mlx-community/Qwen3-14B-4bit",
+                "revision": null,
+                "format": "mlx-safetensors",
+                "sha256": null,
+                "files": null
+            },
+            "quantization": {
+                "nominal_bits": 4,
+                "mode": null,
+                "group_size": null,
+                "configuration_sha256": null
+            },
+            "comparison_artifacts": {
+                "omlx": {
+                    "artifact_reference": "artifact",
+                    "verified": false
+                },
+                "llama.cpp": null,
+                "ollama": null
+            },
+            "verification": {
+                "download_hashes_verified": false,
+                "verified_at": null,
+                "record": "README.md"
+            }
+        },
+        {
+            "id": "llama-3.1-8b-4bit",
+            "family": "llama3",
+            "variant": "Llama-3.1-8B-Instruct",
+            "modalities": [
+                "text"
+            ],
+            "source": {
+                "repository": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "revision": null
+            },
+            "artifact": {
+                "repository": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+                "revision": null,
+                "format": "mlx-safetensors",
+                "sha256": null,
+                "files": null
+            },
+            "quantization": {
+                "nominal_bits": 4,
+                "mode": null,
+                "group_size": null,
+                "configuration_sha256": null
+            },
+            "comparison_artifacts": {
+                "omlx": {
+                    "artifact_reference": "artifact",
+                    "verified": false
+                },
+                "llama.cpp": null,
+                "ollama": null
+            },
+            "verification": {
+                "download_hashes_verified": false,
+                "verified_at": null,
+                "record": "README.md"
+            }
+        },
+        {
+            "id": "llama-3.1-8b-8bit",
+            "family": "llama3",
+            "variant": "Llama-3.1-8B-Instruct",
+            "modalities": [
+                "text"
+            ],
+            "source": {
+                "repository": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "revision": null
+            },
+            "artifact": {
+                "repository": "mlx-community/Meta-Llama-3.1-8B-Instruct-8bit",
+                "revision": null,
+                "format": "mlx-safetensors",
+                "sha256": null,
+                "files": null
+            },
+            "quantization": {
+                "nominal_bits": 8,
+                "mode": null,
+                "group_size": null,
+                "configuration_sha256": null
+            },
+            "comparison_artifacts": {
+                "omlx": {
+                    "artifact_reference": "artifact",
+                    "verified": false
+                },
+                "llama.cpp": null,
+                "ollama": null
+            },
+            "verification": {
+                "download_hashes_verified": false,
+                "verified_at": null,
+                "record": "README.md"
+            }
+        },
+        {
+            "id": "gemma-3-12b-4bit",
+            "family": "gemma3",
+            "variant": "Gemma-3-12B-IT",
+            "modalities": [
+                "text"
+            ],
+            "source": {
+                "repository": "google/gemma-3-12b-it",
+                "revision": null
+            },
+            "artifact": {
+                "repository": "mlx-community/gemma-3-text-12b-it-4bit",
+                "revision": null,
+                "format": "mlx-safetensors",
+                "sha256": null,
+                "files": null
+            },
+            "quantization": {
+                "nominal_bits": 4,
+                "mode": null,
+                "group_size": null,
+                "configuration_sha256": null
+            },
+            "comparison_artifacts": {
+                "omlx": {
+                    "artifact_reference": "artifact",
+                    "verified": false
+                },
+                "llama.cpp": null,
+                "ollama": null
+            },
+            "verification": {
+                "download_hashes_verified": false,
+                "verified_at": null,
+                "record": "README.md"
+            }
+        }
+    ]
+}
