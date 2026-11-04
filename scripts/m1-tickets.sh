@@ -84,7 +84,7 @@ ticket() {
   gh api --method POST "repos/$REPO/issues" --input "$WORK/new-issue.json" --jq .html_url
 }
 
-ticket "epic,phase-1" "Epic: Phase 1 vertical slice" 'Tracks tests 1-15 and the five Phase 1 exit criteria from docs/specs/PHASE-1-EXECUTION-PLAN.md. Closes only on the exit-review ticket. Sub-tickets: inference-infra, Qwen3 family crate, engine core, harness-core, alloyd daemon, ts/cli, CI lanes, exit review, minijinja pin.'
+ticket "epic,phase-1" "Epic: Phase 1 vertical slice" 'Tracks tests 1-15 and the five Phase 1 exit criteria from docs/specs/PHASE-1-EXECUTION-PLAN.md. Closes only on the exit-review ticket. Sub-tickets: inference-infra, Qwen3 family crate, engine core, harness-core, alloyd daemon, ts/cli, CI lanes, and exit review. The shared minijinja workspace pin is already implemented; see DR-0001 and issue #10.'
 
 ticket "phase-1,engine" "inference-infra crate: KV cache, RoPE, attention, sampling" 'W1, 3 days. Blocks the family crate and engine core.
 
@@ -102,7 +102,7 @@ Build crates/engine: async render_and_count / estimate_memory / generate / cance
 
 ticket "phase-1,harness" "harness-core: context builder, session store, telemetry client" 'W4, 4 days. Blocks the daemon. Depends on engine core.
 
-Build crates/harness-core: render_and_count over HF tokenizers plus minijinja (FR-9), B.4 event log schema v1 in SQLite, FR-35 telemetry client (in-memory counts, TLS flush, offline drop). Acceptance: token_count_exact, events_appendonly, session_resume_restart, telemetry_schema_conforms against docs/events/telemetry-v1.json, telemetry_offline_drop.'
+Build crates/harness-core: render_and_count over HF tokenizers plus the already-pinned workspace minijinja dependency (FR-9), B.4 event log schema v1 in SQLite, FR-35 telemetry client (in-memory counts, TLS flush, offline drop). Acceptance: token_count_exact, events_appendonly, session_resume_restart, telemetry_schema_conforms against docs/events/telemetry-v1.json, telemetry_offline_drop.'
 
 ticket "phase-1,daemon" "alloyd daemon: UDS JSON-RPC server, B.6 subset" 'W5, 3 days. Blocks ts/cli and the end-to-end test. Depends on engine core and harness-core.
 
@@ -120,8 +120,8 @@ ticket "phase-1,closeout" "Exit review and Phase 2 plan" 'W8, 1 day. Closes the 
 
 Run the five exit criteria: alloy chat end-to-end on the pinned corpus artifact (test 13), session survives restart with the real model (test 14), engine traits documented and versioned (test 15), vendored-build reproducibility verified twice (two green CI runs post-corpus-freeze), telemetry emits per schema (tests 9-10). Then draft PHASE-2-EXECUTION-PLAN.md in the same file-set/named-tests format.'
 
-ticket "phase-1,pin" "Pin minijinja and amend DR-0001" 'No blockers; lands with harness-core.
-
-When harness-core takes the minijinja dependency, pin the exact version in the root Cargo.toml and record it in a DR-0001 amendment with the locked version. Closes the last W2 pin item from Phase 0.'
+# The shared minijinja pin was implemented with Qwen3.
+# Issue #10 tracks its DR-0001 closeout; do not recreate it as pending work.
+# Harness-core inherits the existing workspace dependency when implemented.
 
 echo "Done. Milestone: $MS_TITLE"
