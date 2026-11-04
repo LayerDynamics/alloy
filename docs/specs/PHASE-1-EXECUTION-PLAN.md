@@ -107,7 +107,7 @@ fully — Phase 1 only proves the estimate exists and is honest for one model.
 | W1 | `inference-infra` crate, test 1 | 3 d |
 | W2 | Qwen3 family crate + tiny fixture + tests 2–3 | 5 d |
 | W3 | Engine core: B.1 trait, registry, scheduler (single session), admission estimate, cache stub | 4 d |
-| W4 | `harness-core`: context builder (render_and_count), session store, telemetry client + schema | 4 d |
+| W4 | `harness-core`: context builder (render_and_count; inherit the existing minijinja workspace pin), session store, telemetry client + schema | 4 d |
 | W5 | `alloyd`: UDS JSON-RPC server, B.6 subset, tests 5–10 | 3 d |
 | W6 | `ts/cli`: `alloy chat` + internal RPC client | 2 d |
 | W7 | CI extension: unit/mocked lanes for the new crates; Mac integration tests 13–14 | 2 d |
@@ -123,9 +123,13 @@ the item most likely to absorb it, per risk R3/R4 in the spec.
   (corpus profile `qwen3-4b-4bit`) runs only on the Mac lane. Reference
   logit vectors are captured from eager-mode execution and committed with
   the fixture, per FR-8.
-- minijinja gets pinned in the root `Cargo.toml` the moment
-  `harness-core` depends on it; the pin lands in a DR-0001 amendment with
-  the locked version, closing the last W2-item-3 pin from Phase 0.
+- Completed dependency prerequisite: minijinja is exact-pinned to
+  `=2.12.0` in the root `Cargo.toml`, with version `2.12.0` recorded in
+  `Cargo.lock`. Qwen3 was the first consumer; DR-0001 records the decision
+  under issue #10. This is not pending harness-core work.
+  When harness-core adopts the renderer, inherit it with
+  `minijinja = { workspace = true }`; do not introduce another version
+  or repeat the pinning task.
 - The privacy policy is published before the first tagged 0.x pre-release
   that emits — it is not required for Phase 1 merge, but the schema
   (`docs/events/telemetry-v1.json`) is, and it must contain the anonymity

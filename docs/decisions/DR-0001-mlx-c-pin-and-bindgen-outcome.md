@@ -159,9 +159,18 @@ golden-render regression tests.
 
 ### Change policy
 
-Renderer upgrades are deliberate changes: update the workspace pin and
-lockfile together, run the rendering and template-identity tests, review
-any output differences, and record the rationale in a decision amendment.
+Renderer upgrades are deliberate changes. For each upgrade:
+
+1. Update the exact workspace dependency pin and `Cargo.lock` together.
+2. Update this document's current minijinja entry in the **Pins** table
+   to match the manifest constraint and resolved lockfile version.
+3. Run the rendering and template-identity tests and review any output
+   differences.
+4. Record the previous and new versions, rationale, and validation
+   evidence in a dated decision amendment.
+5. Update any other documentation that explicitly describes the current
+   renderer version. Preserve dated historical decisions as history.
+
 Do not rewrite golden fixtures merely to make an unexpected change pass.
 
 This amendment records the existing merged pin. It does not claim full
