@@ -24,3 +24,4 @@ bench/corpus/.local/
 .vscode/
 *.swp
 *.log
+bench/corpus/.venv

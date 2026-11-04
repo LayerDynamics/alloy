@@ -18,13 +18,13 @@
             "kind": "simulated-budget",
             "host_tier": "mac-36gb",
             "memory_budget_bytes": 8000000000,
-            "method": "Run on the physical 36 GB Mac with an explicit 8,000,000,000-byte total memory budget supplied to the benchmark admission policy. Record the effective engine budget and reserved operating-system headroom in each run report. The engine allocation is the budget minus the headroom, which is measured as the process resident set size immediately after MLX engine initialization and before any model weights are loaded.",
+            "method": "Run on the physical 36 GB Mac with an explicit 8,000,000,000-byte total memory budget supplied to the benchmark admission policy. The engine allocation is that budget minus headroom, measured as resident set size immediately after MLX initialization and before model weights load. Record both numbers in each run report.",
             "limitation": "This is a software-budget simulation, not a physical 8 GB Mac. It does not reproduce that machine's operating-system memory pressure, memory bandwidth, GPU configuration, or thermal behavior. Do not label its measurements as physical 8 GB hardware results."
         }
     },
     "models": {
         "file": "models.json",
-        "sha256": "<replace-with-verified-hash>",
+        "sha256": "2ab97ec45c36ffa7ad5f7c05f00fc46527e311a85cfad876d2446ebdda2fff3a",
         "profile_ids": [
             "qwen3-4b-4bit",
             "qwen3-14b-4bit",
@@ -36,17 +36,17 @@
     "scenarios": {
         "code_qa": {
             "file": "scenarios/code-qa.json",
-            "sha256": "<replace-with-verified-hash>",
+            "sha256": "093eee083578b067a01da47e09f34fa67865ed34cf187208f27098bea6f89dc8",
             "count": 50
         },
         "agentic_loops": {
             "file": "scenarios/agentic-loops.json",
-            "sha256": "<replace-with-verified-hash>",
+            "sha256": "850dc33a8d0c5fe96716a89a36f3425e8cfb297263d0a573a8c7c3037e916633",
             "count": 20
         },
         "long_context": {
             "file": "scenarios/long-context.json",
-            "sha256": "<replace-with-verified-hash>",
+            "sha256": "44e842968be1d96bb52a0dd36d1da5c0bdfceec530d978a43bc84b3ddd89b8a5",
             "document_ids": [
                 "document-8k",
                 "document-32k"
@@ -54,51 +54,52 @@
         },
         "prefill_heavy": {
             "file": "scenarios/prefill-heavy.json",
-            "sha256": "<replace-with-verified-hash>",
+            "sha256": "6f6f63c7be101fabdda981ae88ec10e126ebb9ffa36801a7e4dc965c3a157858",
             "count": 25
         }
     },
     "fixtures": {
         "repository": {
-            "url": "https://github.com/rust-lang/rust",
-            "commit": "8fa6eb65",
-            "git_tree": "<replace-with-resolved-tree-hash>",
+            "url": "https://github.com/LayerDynamics/alloy",
+            "commit": "290d95d8b602106b635eb464eaa45f87f285d7ae",
+            "git_tree": "55a1276b32ab8f21f3220c8c2716da12f2bbfb7a",
             "license": "Apache-2.0",
-            "content_sha256": "<replace-with-verified-hash>",
-            "hash_record": "fixtures/repo-snapshot.sha256"
+            "content_sha256": "d6d6cdd50d520a3b67767dee43b79cb91e08a845d067f2d3b493fd86847d2bb1",
+            "hash_record": "fixtures/repo-snapshot.sha256",
+            "archive": "fixtures/repo-snapshot.tar.gz"
         },
         "documents": {
             "document-8k": {
                 "file": "fixtures/documents/document-8k.txt",
-                "sha256": "<replace-with-verified-hash>",
+                "sha256": "f8902cc4b05c38e7f10b3866b3d9557862e555f3ed276eeabf6a79bf1a85ae99",
                 "hash_record": "fixtures/documents/document-8k.txt.sha256",
-                "source_url": "https://www.gutenberg.org/files/1342/1342-0.txt",
+                "source_url": "https://www.gutenberg.org/cache/epub/84/pg84.txt",
                 "license": "Public domain",
-                "preparation": "Excerpted from Project Gutenberg ebook 1342 (Frankenstein; or, The Modern Prometheus by Mary Wollstonecraft Shelley). UTF-8, stripped header/footer boilerplate, normalized line endings to LF, target ~8,192 tokens measured with the profile tokenizer.",
+                "preparation": "Excerpted from Project Gutenberg ebook 84, Frankenstein; or, The Modern Prometheus by Mary Wollstonecraft Shelley. Gutenberg header and footer removed, line endings normalized to LF, then truncated to at most 8192 tokens.",
                 "target_tokens": 8192,
-                "actual_tokens": null,
+                "actual_tokens": 8192,
                 "tokenizer": {
                     "repository": "mlx-community/Qwen3-4B-4bit",
-                    "revision": "<replace-with-resolved-commit>",
+                    "revision": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
                     "file": "tokenizer.json",
-                    "sha256": "<replace-with-verified-hash>",
+                    "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
                     "add_special_tokens": false
                 }
             },
             "document-32k": {
                 "file": "fixtures/documents/document-32k.txt",
-                "sha256": "<replace-with-verified-hash>",
+                "sha256": "393bc22d01056d7e6f5fbba865071725867679aa00521f84780802c660cb0c75",
                 "hash_record": "fixtures/documents/document-32k.txt.sha256",
                 "source_url": "https://www.gutenberg.org/files/2701/2701-0.txt",
                 "license": "Public domain",
-                "preparation": "Excerpted from Project Gutenberg ebook 2701 (Moby Dick; or, The Whale by Herman Melville). UTF-8, stripped header/footer boilerplate, normalized line endings to LF, target ~32,768 tokens measured with the profile tokenizer.",
+                "preparation": "Excerpted from Project Gutenberg ebook 2701, Moby-Dick; or, The Whale by Herman Melville. Gutenberg header and footer removed, line endings normalized to LF, then truncated to at most 32768 tokens.",
                 "target_tokens": 32768,
-                "actual_tokens": null,
+                "actual_tokens": 32768,
                 "tokenizer": {
                     "repository": "mlx-community/Qwen3-4B-4bit",
-                    "revision": "<replace-with-resolved-commit>",
+                    "revision": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
                     "file": "tokenizer.json",
-                    "sha256": "<replace-with-verified-hash>",
+                    "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
                     "add_special_tokens": false
                 }
             }

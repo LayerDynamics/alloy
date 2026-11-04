@@ -259,12 +259,13 @@
                     "type": "object",
                     "additionalProperties": false,
                     "required": [
-                        "url",
+                        "archive",
                         "commit",
-                        "git_tree",
-                        "license",
                         "content_sha256",
-                        "hash_record"
+                        "git_tree",
+                        "hash_record",
+                        "license",
+                        "url"
                     ],
                     "properties": {
                         "url": {
@@ -285,6 +286,9 @@
                         },
                         "hash_record": {
                             "const": "fixtures/repo-snapshot.sha256"
+                        },
+                        "archive": {
+                            "const": "fixtures/repo-snapshot.tar.gz"
                         }
                     }
                 },
