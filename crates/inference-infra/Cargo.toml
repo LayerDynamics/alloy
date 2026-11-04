@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mlx-ffi = { path = "../mlx-ffi" }
 
 [lints]
 workspace = true

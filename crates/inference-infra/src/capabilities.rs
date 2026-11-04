@@ -1,3 +1,5 @@
+use mlx_ffi::{Device, DeviceType};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend { Cpu, Metal }
 
@@ -17,18 +19,24 @@ pub struct BackendCapabilities {
 }
 
 impl BackendCapabilities {
-    pub fn detect() -> Self {
-        // TODO(#2): query the vendored mlx-ffi for the active device when the
-        // bindings are wired. These are the honest values for the CPU kernels
-        // implemented in `ops` today; flip flags only as real backends land.
-        BackendCapabilities {
-            backend: Backend::Cpu,
+    /// Query the process-wide default MLX device and map its type, so a
+    /// Metal device is never reported as CPU (review comment 7).
+    pub fn detect() -> Result<Self, mlx_ffi::Error> {
+        let device = Device::get_default()?;
+        let backend = match device.kind()? {
+            DeviceType::Cpu => Backend::Cpu,
+            DeviceType::Gpu => Backend::Metal,
+        };
+        Ok(BackendCapabilities {
+            backend,
+            // Honest values for the kernels implemented in `ops` today;
+            // flip flags only as real backends land.
             supports_rope: true,
             supports_attention: true,
             supports_kv_cache: true,
             supports_sampling: true,
             quantization_modes: vec![QuantMode::Fp32],
             max_context_len: 32_768,
-        }
+        })
     }
 }
