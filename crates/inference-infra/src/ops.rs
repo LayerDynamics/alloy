@@ -6,9 +6,15 @@ use crate::tensor::Tensor;
 /// `position + t`; the low half of each head rotates against the high half.
 pub fn apply_rope(x: &Tensor, position: usize, theta_base: f32) -> Result<Tensor, KernelError> {
     let shape = x.shape();
-    assert!(shape.len() == 3, "expected [tokens, heads, head_dim], got {shape:?}");
+    assert!(
+        shape.len() == 3,
+        "expected [tokens, heads, head_dim], got {shape:?}"
+    );
     let (tokens, heads, head_dim) = (shape[0], shape[1], shape[2]);
-    assert!(head_dim > 0 && head_dim % 2 == 0, "head_dim must be even, got {head_dim}");
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "head_dim must be even, got {head_dim}"
+    );
     let half = head_dim / 2;
 
     let data = x.data()?;
@@ -65,9 +71,21 @@ pub fn attention(
 ) -> Result<Tensor, KernelError> {
     let qs = q.shape();
     let ks = k.shape();
-    assert_eq!(qs.len(), 3, "q must be [tokens, q_heads, head_dim], got {qs:?}");
-    assert_eq!(ks.len(), 3, "k must be [kv_len, kv_heads, head_dim], got {ks:?}");
-    assert_eq!(ks, v.shape(), "v must match k: [kv_len, kv_heads, head_dim]");
+    assert_eq!(
+        qs.len(),
+        3,
+        "q must be [tokens, q_heads, head_dim], got {qs:?}"
+    );
+    assert_eq!(
+        ks.len(),
+        3,
+        "k must be [kv_len, kv_heads, head_dim], got {ks:?}"
+    );
+    assert_eq!(
+        ks,
+        v.shape(),
+        "v must match k: [kv_len, kv_heads, head_dim]"
+    );
     let (tokens, q_heads, d) = (qs[0], qs[1], qs[2]);
     let (kv_len, kv_heads, _) = (ks[0], ks[1], ks[2]);
     assert!(
@@ -83,7 +101,12 @@ pub fn attention(
     let qd = q.data()?;
     let kd = k.data()?;
     let vd = v.data()?;
-    if qd.iter().chain(kd.iter()).chain(vd.iter()).any(|x| !x.is_finite()) {
+    if qd
+        .iter()
+        .chain(kd.iter())
+        .chain(vd.iter())
+        .any(|x| !x.is_finite())
+    {
         return Err(KernelError::NonFinite);
     }
 
@@ -241,14 +264,24 @@ impl KvCache {
             .map_err(|_| KernelError::AllocationFailed { elements: slots })?;
         values_data.resize(slots, 0.0);
 
-        Ok(KvCache { head_dim, max_len, len: 0, keys_data, values_data })
+        Ok(KvCache {
+            head_dim,
+            max_len,
+            len: 0,
+            keys_data,
+            values_data,
+        })
     }
 
     /// Appends one token's k and v, each `[1, head_dim]`.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(), KernelError> {
         assert_eq!(k.shape(), &[1, self.head_dim], "k must be [1, head_dim]");
         assert_eq!(v.shape(), &[1, self.head_dim], "v must be [1, head_dim]");
-        assert!(self.len < self.max_len, "KV cache full ({} slots)", self.max_len);
+        assert!(
+            self.len < self.max_len,
+            "KV cache full ({} slots)",
+            self.max_len
+        );
 
         let kd = k.data()?;
         let vd = v.data()?;
@@ -272,8 +305,14 @@ impl KvCache {
         }
         let len = self.len;
         Ok((
-            Tensor::new(&[len, self.head_dim], self.keys_data[..len * self.head_dim].to_vec())?,
-            Tensor::new(&[len, self.head_dim], self.values_data[..len * self.head_dim].to_vec())?,
+            Tensor::new(
+                &[len, self.head_dim],
+                self.keys_data[..len * self.head_dim].to_vec(),
+            )?,
+            Tensor::new(
+                &[len, self.head_dim],
+                self.values_data[..len * self.head_dim].to_vec(),
+            )?,
         ))
     }
 
@@ -282,7 +321,10 @@ impl KvCache {
         if self.len == 0 {
             return Err(KernelError::Empty);
         }
-        Tensor::new(&[self.len, self.head_dim], self.keys_data[..self.len * self.head_dim].to_vec())
+        Tensor::new(
+            &[self.len, self.head_dim],
+            self.keys_data[..self.len * self.head_dim].to_vec(),
+        )
     }
 
     /// Single-tensor read, for inspection only. Prefer [`KvCache::k_v`].
@@ -290,7 +332,10 @@ impl KvCache {
         if self.len == 0 {
             return Err(KernelError::Empty);
         }
-        Tensor::new(&[self.len, self.head_dim], self.values_data[..self.len * self.head_dim].to_vec())
+        Tensor::new(
+            &[self.len, self.head_dim],
+            self.values_data[..self.len * self.head_dim].to_vec(),
+        )
     }
 
     pub fn len(&self) -> usize {

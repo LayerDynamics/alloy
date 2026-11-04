@@ -81,7 +81,11 @@ fn quantized_matmul_smoke() {
     };
     assert_eq!(status, 0, "mlx_quantize failed");
     let quantized = VectorArray::from_raw(q_raw).expect("adopt quantize result");
-    assert_eq!(quantized.len(), 3, "affine quantize returns (w_q, scales, biases)");
+    assert_eq!(
+        quantized.len(),
+        3,
+        "affine quantize returns (w_q, scales, biases)"
+    );
 
     let w_q = quantized.get(0).expect("w_q");
     let scales = quantized.get(1).expect("scales");

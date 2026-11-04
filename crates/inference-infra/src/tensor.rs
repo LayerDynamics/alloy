@@ -17,12 +17,18 @@ impl Tensor {
     pub fn new(shape: &[usize], data: Vec<f32>) -> Result<Self, KernelError> {
         let expected: usize = shape.iter().product();
         if expected != data.len() {
-            return Err(KernelError::ShapeMismatch { expected, got: data.len() });
+            return Err(KernelError::ShapeMismatch {
+                expected,
+                got: data.len(),
+            });
         }
         let dims: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let array = Array::from_f32_slice(&data, &dims).map_err(KernelError::Mlx)?;
         array.eval().map_err(KernelError::Mlx)?;
-        Ok(Tensor { shape: shape.to_vec(), array })
+        Ok(Tensor {
+            shape: shape.to_vec(),
+            array,
+        })
     }
 
     /// Row-major shape, fixed at construction.

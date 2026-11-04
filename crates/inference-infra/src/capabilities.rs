@@ -1,10 +1,16 @@
 use mlx_ffi::{Device, DeviceType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Backend { Cpu, Metal }
+pub enum Backend {
+    Cpu,
+    Metal,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QuantMode { Fp32, I4 }
+pub enum QuantMode {
+    Fp32,
+    I4,
+}
 
 /// What the family crate (B.5 `capabilities`) reads at registration time.
 #[derive(Clone, Debug)]

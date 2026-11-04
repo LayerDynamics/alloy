@@ -26,16 +26,14 @@ fn mlx_compile_smoke() {
     };
     // SAFETY: `res` is a valid out-target; `a`, `b`, `stream` are owned
     // handles with correct lifetimes for this call.
-    let status =
-        unsafe { sys::mlx_add(&mut res, a.as_raw(), b.as_raw(), stream.as_raw()) };
+    let status = unsafe { sys::mlx_add(&mut res, a.as_raw(), b.as_raw(), stream.as_raw()) };
     assert_eq!(status, 0, "mlx_add failed");
     let lazy = Array::from_raw(res).expect("adopt lazy add result");
 
     // Wrap a trivial identity closure and compile it with shape
     // specialization.
-    let identity = Closure::wrap_fn(|inputs: &[Array]| {
-        inputs.iter().map(|a| a.clone()).collect()
-    }).expect("wrap identity closure");
+    let identity = Closure::wrap_fn(|inputs: &[Array]| inputs.iter().map(|a| a.clone()).collect())
+        .expect("wrap identity closure");
 
     let compiled = identity.compile(false).expect("compile closure");
 

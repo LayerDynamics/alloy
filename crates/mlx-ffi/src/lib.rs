@@ -58,7 +58,7 @@ pub mod bindings;
 use std::fmt;
 use std::mem;
 use std::os::raw::{c_int, c_void};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
 
 use bindings as sys;
