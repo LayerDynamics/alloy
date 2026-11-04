@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pins and corpus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
+          bash scripts/pinscheck.sh
+          bash bench/corpus/validate.sh
+
+      - name: bindgen image and test 10
+        run: |
+          docker build --platform linux/arm64 \
+            -t alloy-builder:phase0 \
+            -f scripts/docker/Dockerfile \
+            scripts/docker
+          bash scripts/bindgencheck.sh --test
+
+      - name: inventory gate
+        run: bash scripts/coverageinventory.sh --test
+
+      - name: native image, FFI tests, and test 11
+        run: |
+          docker build --platform linux/arm64 \
+            -t alloy-native-builder:phase0 \
+            -f scripts/docker/Dockerfile.repro \
+            scripts/docker
+          ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
+            bash scripts/reprocheck.sh --test
+          # CPU FFI tests 1-5 and 7. Test 6 stays on the Mac lane.
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src:ro \
+            -e CARGO_TERM_COLOR=never \
+            alloy-native-builder:phase0 \
+            bash -lc 'tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf - && cd /work && cargo test --locked -p mlx-ffi --test raii --test compile --test ops -- --test-threads=1'
+
+  mac:
+    name: mac-metal
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Metal and unified tests
+        run: cargo test --locked -p mlx-ffi --no-fail-fast -- --test-threads=1
