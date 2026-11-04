@@ -51,8 +51,9 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
             -e CARGO_TERM_COLOR=never \
+            -w /work \
             alloy-native-builder:phase0 \
-            bash -lc 'tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf - && cd /work && cargo test --locked -p mlx-ffi --test raii --test compile --test ops -- --test-threads=1'
+            bash -c 'tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf - && cargo test --locked -p mlx-ffi --test raii --test compile --test ops -- --test-threads=1'
 
   mac:
     name: mac-metal
