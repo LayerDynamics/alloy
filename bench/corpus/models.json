@@ -1,7 +1,7 @@
 {
     "schema_version": 1,
     "corpus_id": "alloy-phase-0",
-    "status": "pending-verification",
+    "status": "frozen",
     "artifact_hash_contract": {
         "algorithm": "sha256",
         "file_hashes": "Hash the downloaded file bytes, not Git LFS pointer files.",
@@ -100,17 +100,43 @@
             "comparison_artifacts": {
                 "omlx": {
                     "artifact_reference": "artifact",
-                    "verified": false
+                    "verified": true,
+                    "omlx_version": "0.7.3",
+                    "model_id": "alloy-qwen3-4b-4bit",
+                    "bytes_verified": "files re-hashed from disk and aggregate digest re-verified before the load; oMLX served that exact directory",
+                    "completion": {
+                        "finish_reason": "length",
+                        "text_field": "reasoning_content",
+                        "text": "Okay, the user wants me to reply with the single word \"ready\". Let me make sure "
+                    },
+                    "verified_at": "2026-11-04"
                 },
                 "llama.cpp": {
                     "repository": "bartowski/Qwen_Qwen3-4B-GGUF",
-                    "revision": null,
-                    "quantization_file": "Qwen3-4B-Q4_K_M.gguf",
-                    "verified": false
+                    "revision": "cb76885dc66d50759b207c5a48c4e78dfa00c638",
+                    "quantization_file": "Qwen_Qwen3-4B-Q4_K_M.gguf",
+                    "verified": true,
+                    "sha256": "fbe1d5edd4ce802ae3ae7c7e4ab7d09789d697fdac1fc7929f8df4ca3c41bae3",
+                    "file_size_bytes": 2497280960,
+                    "source_metadata": {},
+                    "checkpoint_match": "Model card names Qwen/Qwen3-4B as the original model. The converter did not embed the source commit in the GGUF metadata, so the match is repository-level, not commit-level.",
+                    "checkpoint_evidence_url": "https://huggingface.co/bartowski/Qwen_Qwen3-4B-GGUF",
+                    "quantization_recipe": "llama.cpp release b5200, imatrix calibration"
                 },
                 "ollama": {
-                    "model_tag": "qwen3:4b-instruct-q4_K_M",
-                    "verified": false
+                    "model_tag": "qwen3:4b-q4_K_M",
+                    "verified": true,
+                    "manifest_sha256": "2bfd38a7daaf4b1037efe517ccb73d1a3bbd4822cf89f1a82be1569050a114e0",
+                    "config_digest": "sha256:5efd52d6d9f24db4a33df0d706ee6037edf026027281bb9568bb066ebc5a4f31",
+                    "layer_digests": [
+                        "sha256:163553aea1b1de62de7c5eb2ef5afb756b4b3133308d9ae7e42e951d8d696ef5",
+                        "sha256:ae370d884f108d16e7cc8fd5259ebc5773a0afa6e078b11f4ed7e39a27e0dfc4",
+                        "sha256:d18a5cc71b84bc4af394a31116bd3932b42241de70c77d2b76d69a314ec8aa12",
+                        "sha256:cff3f395ef3756ab63e58b0ad1b32bb6f802905cae1472e6a12034e4246fbbdb"
+                    ],
+                    "size_bytes": 2620787773,
+                    "checkpoint_match": "Ollama does not publish the HF source commit. The non-suffixed 40K-context tags are the original Qwen3 hybrid checkpoints; the 2507-suffixed tags are the July-2025 Instruct/Thinking refreshes and are different checkpoints, deliberately avoided.",
+                    "verification_method": "registry manifest pinned by SHA-256; layer digests recorded from the manifest; weights not downloaded"
                 }
             },
             "verification": {
@@ -195,17 +221,43 @@
             "comparison_artifacts": {
                 "omlx": {
                     "artifact_reference": "artifact",
-                    "verified": false
+                    "verified": true,
+                    "omlx_version": "0.7.3",
+                    "model_id": "alloy-qwen3-14b-4bit",
+                    "bytes_verified": "files re-hashed from disk and aggregate digest re-verified before the load; oMLX served that exact directory",
+                    "completion": {
+                        "finish_reason": "length",
+                        "text_field": "reasoning_content",
+                        "text": "Okay, the user wants me to reply with the single word \"ready\". Let me make sure "
+                    },
+                    "verified_at": "2026-11-04"
                 },
                 "llama.cpp": {
                     "repository": "bartowski/Qwen_Qwen3-14B-GGUF",
-                    "revision": null,
-                    "quantization_file": "Qwen3-14B-Q4_K_M.gguf",
-                    "verified": false
+                    "revision": "bd080f768a6401c2d5a7fa53a2e50cd8218a9ce2",
+                    "quantization_file": "Qwen_Qwen3-14B-Q4_K_M.gguf",
+                    "verified": true,
+                    "sha256": "915913e22399475dbe6c968ac014d9f1fbe08975e489279aede9d5c7b2c98eb6",
+                    "file_size_bytes": 9001753632,
+                    "source_metadata": {},
+                    "checkpoint_match": "Model card names Qwen/Qwen3-14B as the original model. The converter did not embed the source commit in the GGUF metadata, so the match is repository-level, not commit-level.",
+                    "checkpoint_evidence_url": "https://huggingface.co/bartowski/Qwen_Qwen3-14B-GGUF",
+                    "quantization_recipe": "llama.cpp release b5200, imatrix calibration"
                 },
                 "ollama": {
-                    "model_tag": "qwen3:14b-instruct-q4_K_M",
-                    "verified": false
+                    "model_tag": "qwen3:14b-q4_K_M",
+                    "verified": true,
+                    "manifest_sha256": "bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8",
+                    "config_digest": "sha256:78b3b822087d5199783c8203553a5a92ce5eb7b683a5a81003f8efea9b399d74",
+                    "layer_digests": [
+                        "sha256:a8cc1361f3145dc01f6d77c6c82c9116b9ffe3c97b34716fe20418455876c40e",
+                        "sha256:ae370d884f108d16e7cc8fd5259ebc5773a0afa6e078b11f4ed7e39a27e0dfc4",
+                        "sha256:d18a5cc71b84bc4af394a31116bd3932b42241de70c77d2b76d69a314ec8aa12",
+                        "sha256:cff3f395ef3756ab63e58b0ad1b32bb6f802905cae1472e6a12034e4246fbbdb"
+                    ],
+                    "size_bytes": 9276198077,
+                    "checkpoint_match": "Ollama does not publish the HF source commit. The non-suffixed 40K-context tags are the original Qwen3 hybrid checkpoints; the 2507-suffixed tags are the July-2025 refreshes, deliberately avoided.",
+                    "verification_method": "registry manifest pinned by SHA-256; layer digests recorded from the manifest; weights not downloaded"
                 }
             },
             "verification": {
@@ -274,17 +326,43 @@
             "comparison_artifacts": {
                 "omlx": {
                     "artifact_reference": "artifact",
-                    "verified": false
+                    "verified": true,
+                    "omlx_version": "0.7.3",
+                    "model_id": "alloy-llama-3.1-8b-4bit",
+                    "bytes_verified": "files re-hashed from disk and aggregate digest re-verified before the load; oMLX served that exact directory",
+                    "completion": {
+                        "finish_reason": "stop",
+                        "text_field": "content",
+                        "text": "ready"
+                    },
+                    "verified_at": "2026-11-04"
                 },
                 "llama.cpp": {
                     "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-                    "revision": null,
+                    "revision": "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
                     "quantization_file": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-                    "verified": false
+                    "verified": true,
+                    "sha256": "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c",
+                    "file_size_bytes": 4920739232,
+                    "source_metadata": {},
+                    "checkpoint_match": "Model card names meta-llama/Meta-Llama-3.1-8B-Instruct as the original model. The converter did not embed the source commit in the GGUF metadata, so the match is repository-level, not commit-level.",
+                    "checkpoint_evidence_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                    "quantization_recipe": "llama.cpp release b3472, imatrix calibration"
                 },
                 "ollama": {
                     "model_tag": "llama3.1:8b-instruct-q4_K_M",
-                    "verified": false
+                    "verified": true,
+                    "manifest_sha256": "46e0c10c039e019119339687c3c1757cc81b9da49709a3b3924863ba87ca666e",
+                    "config_digest": "sha256:455f34728c9b5dd3376378bfb809ee166c145b0b4c1f1a6feca069055066ef9a",
+                    "layer_digests": [
+                        "sha256:667b0c1932bc6ffc593ed1d03f895bf2dc8dc6df21db3042284a6f4416b06a29",
+                        "sha256:948af2743fc78a328dcb3b0f5a31b3d75f415840fdb699e8b1235978392ecf85",
+                        "sha256:0ba8f0e314b4264dfd19df045cde9d4c394a52474bf92ed6a3de22a4ca31a177",
+                        "sha256:56bb8bd477a519ffa694fc449c2413c6f0e1d3b1c88fa7e3c9d88d3ae49d4dcb"
+                    ],
+                    "size_bytes": 4920752841,
+                    "checkpoint_match": "Ollama library page describes Llama 3.1 from Meta, 8B size; repository-level match, no source commit published.",
+                    "verification_method": "registry manifest pinned by SHA-256; layer digests recorded from the manifest; weights not downloaded"
                 }
             },
             "verification": {
@@ -357,17 +435,43 @@
             "comparison_artifacts": {
                 "omlx": {
                     "artifact_reference": "artifact",
-                    "verified": false
+                    "verified": true,
+                    "omlx_version": "0.7.3",
+                    "model_id": "alloy-llama-3.1-8b-8bit",
+                    "bytes_verified": "files re-hashed from disk and aggregate digest re-verified before the load; oMLX served that exact directory",
+                    "completion": {
+                        "finish_reason": "stop",
+                        "text_field": "content",
+                        "text": "Ready"
+                    },
+                    "verified_at": "2026-11-04"
                 },
                 "llama.cpp": {
                     "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-                    "revision": null,
+                    "revision": "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
                     "quantization_file": "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
-                    "verified": false
+                    "verified": true,
+                    "sha256": "9da71c45c90a821809821244d4971e5e5dfad7eb091f0b8ff0546392393b6283",
+                    "file_size_bytes": 8540775840,
+                    "source_metadata": {},
+                    "checkpoint_match": "Model card names meta-llama/Meta-Llama-3.1-8B-Instruct as the original model. The converter did not embed the source commit in the GGUF metadata, so the match is repository-level, not commit-level.",
+                    "checkpoint_evidence_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+                    "quantization_recipe": "llama.cpp release b3472, imatrix calibration"
                 },
                 "ollama": {
                     "model_tag": "llama3.1:8b-instruct-q8_0",
-                    "verified": false
+                    "verified": true,
+                    "manifest_sha256": "b158ded76fa05be6bce8a682099ce5df8c5571340a04cf63a2923464679db576",
+                    "config_digest": "sha256:4a4a958ae5504a5ff0e265d985f398cb95d1f63c6a9c199f94f2d2e112112dfc",
+                    "layer_digests": [
+                        "sha256:cc04e85e1f866a5ba87dd66b5260f0cb32354e2c66505e86a7ac3c0092272b7d",
+                        "sha256:948af2743fc78a328dcb3b0f5a31b3d75f415840fdb699e8b1235978392ecf85",
+                        "sha256:0ba8f0e314b4264dfd19df045cde9d4c394a52474bf92ed6a3de22a4ca31a177",
+                        "sha256:56bb8bd477a519ffa694fc449c2413c6f0e1d3b1c88fa7e3c9d88d3ae49d4dcb"
+                    ],
+                    "size_bytes": 8540789449,
+                    "checkpoint_match": "Ollama library page describes Llama 3.1 from Meta, 8B size; repository-level match, no source commit published.",
+                    "verification_method": "registry manifest pinned by SHA-256; layer digests recorded from the manifest; weights not downloaded"
                 }
             },
             "verification": {
@@ -448,17 +552,44 @@
             "comparison_artifacts": {
                 "omlx": {
                     "artifact_reference": "artifact",
-                    "verified": false
+                    "verified": true,
+                    "omlx_version": "0.7.3",
+                    "model_id": "alloy-gemma-3-12b-4bit",
+                    "bytes_verified": "files re-hashed from disk and aggregate digest re-verified before the load; oMLX served that exact directory",
+                    "completion": {
+                        "finish_reason": "stop",
+                        "text_field": "content",
+                        "text": "ready"
+                    },
+                    "verified_at": "2026-11-04"
                 },
                 "llama.cpp": {
                     "repository": "ggml-org/gemma-3-12b-it-GGUF",
-                    "revision": null,
+                    "revision": "ec0cbabd8dbff316f659876a50202295c3c4a314",
                     "quantization_file": "gemma-3-12b-it-Q4_K_M.gguf",
-                    "verified": false
+                    "verified": true,
+                    "sha256": "7bb69bff3f48a7b642355d64a90e481182a7794707b3133890646b1efa778ff5",
+                    "file_size_bytes": 7300574976,
+                    "source_metadata": {},
+                    "checkpoint_match": "Model card names google/gemma-3-12b-it as the original model. The converter did not embed the source commit in the GGUF metadata, so the match is repository-level, not commit-level.",
+                    "checkpoint_evidence_url": "https://huggingface.co/ggml-org/gemma-3-12b-it-GGUF",
+                    "quantization_recipe": "official ggml-org conversion; recipe not stated on the model card"
                 },
                 "ollama": {
                     "model_tag": "gemma3:12b-it-q4_K_M",
-                    "verified": false
+                    "verified": true,
+                    "manifest_sha256": "b92b218582c521ba287f38f1d6057dcd3c6cbff036f13cac97b5d861f5e58ec3",
+                    "config_digest": "sha256:fe25b92561cfd1b4fcc523d5f151f86c64254733bd4b8847b8252d15a0366262",
+                    "layer_digests": [
+                        "sha256:13576eb6dd8d9d04b4da04d015ff343968628d3c2984195569d9d3585651d4f1",
+                        "sha256:4abe4caf8e680a2d508f929edbacb5b6985b988f9d89d05b196a809f62d8fa67",
+                        "sha256:e0a42594d802e5d31cdc786deb4823edb8adff66094d49de8fffe976d753e348",
+                        "sha256:dd084c7d92a3c1c14cc09ae77153b903fd2024b64a100a0cc8ec9316063d2dbc",
+                        "sha256:3116c52250752e00dd06b16382e952bd33c34fd79fc4fe3a5d2c77cf7de1b14b"
+                    ],
+                    "size_bytes": 8164039587,
+                    "checkpoint_match": "Ollama library page describes Google's Gemma 3 12B; repository-level match, no source commit published. Multimodal build (Text+Image).",
+                    "verification_method": "registry manifest pinned by SHA-256; layer digests recorded from the manifest; weights not downloaded"
                 }
             },
             "verification": {

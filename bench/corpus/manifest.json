@@ -24,7 +24,7 @@
     },
     "models": {
         "file": "models.json",
-        "sha256": "2ab97ec45c36ffa7ad5f7c05f00fc46527e311a85cfad876d2446ebdda2fff3a",
+        "sha256": "dc2eac48c5522fa53360855950eba4527dc6c21dc943f1d1c9282bd8535b2534",
         "profile_ids": [
             "qwen3-4b-4bit",
             "qwen3-14b-4bit",
