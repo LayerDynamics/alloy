@@ -29,6 +29,26 @@ pub enum ModelError {
     NonFiniteWeight { tensor: &'static str, index: usize },
     /// A computation produced NaN or infinity.
     NonFiniteActivation(&'static str),
+    /// A configured resource budget would be exceeded.
+    MemoryLimit { required: usize, limit: usize },
+    /// A fallible allocation failed.
+    AllocationFailed,
+    /// A checkpoint could not be read or validated.
+    Checkpoint(String),
+    /// I/O failure, classified without parsing an error message.
+    CheckpointIo {
+        operation: &'static str,
+        path: std::path::PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// Malformed JSON or safetensors representation.
+    CheckpointFormat {
+        format: &'static str,
+        message: String,
+    },
+    /// Well-formed checkpoint data violates the supported model contract.
+    CheckpointValidation(String),
 }
 
 impl fmt::Display for ModelError {
@@ -65,6 +85,30 @@ impl fmt::Display for ModelError {
             Self::NonFiniteWeight { tensor, index } => {
                 write!(f, "{tensor}: non-finite weight at index {index}")
             }
+            Self::MemoryLimit { required, limit } => write!(
+                f,
+                "memory budget exceeded: {required} bytes required, limit {limit}"
+            ),
+            Self::AllocationFailed => write!(f, "allocation failed"),
+            Self::Checkpoint(message) => write!(f, "checkpoint error: {message}"),
+            Self::CheckpointIo {
+                operation,
+                path,
+                kind,
+                message,
+            } => {
+                write!(
+                    f,
+                    "checkpoint I/O ({operation}, {}, {kind:?}): {message}",
+                    path.display()
+                )
+            }
+            Self::CheckpointFormat { format, message } => {
+                write!(f, "checkpoint {format} parse error: {message}")
+            }
+            Self::CheckpointValidation(message) => {
+                write!(f, "checkpoint validation error: {message}")
+            }
             Self::NonFiniteActivation(stage) => {
                 write!(f, "non-finite activation during {stage}")
             }
@@ -81,6 +125,7 @@ impl std::error::Error for ModelError {}
 pub struct Qwen3Model {
     config: Qwen3Config,
     weights: Qwen3Weights,
+    cache_owner: std::sync::Arc<()>,
 }
 
 impl Qwen3Model {
@@ -89,8 +134,27 @@ impl Qwen3Model {
     /// Q/K normalization scales have shape `[head_dim]` and are shared
     /// across their corresponding attention heads.
     ///
-    /// Only tied input/output embeddings are currently supported.
-    pub fn load(config: Qwen3Config, weights: Qwen3Weights) -> Result<Self, ModelError> {
+    /// Paths load bounded safetensors; in-memory weights remain accepted.
+    pub fn load<S: crate::loader::ModelWeightSource>(
+        config: Qwen3Config,
+        source: S,
+    ) -> Result<Self, ModelError> {
+        let weights = source.into_weights(&config)?;
+        Self::from_weights(config, weights)
+    }
+
+    /// Load safetensors with explicitly chosen raw-file and decoded-weight limits.
+    pub fn load_safetensors(
+        config: Qwen3Config,
+        path: &std::path::Path,
+        options: crate::loader::LoadOptions,
+    ) -> Result<Self, ModelError> {
+        let weights = crate::loader::load_weights(&config, path, options)?;
+        Self::from_weights(config, weights)
+    }
+
+    /// Validate in-memory weights. Supports tied and separate output projections.
+    pub fn from_weights(config: Qwen3Config, weights: Qwen3Weights) -> Result<Self, ModelError> {
         let c = &config;
 
         if c.hidden_size == 0
@@ -125,10 +189,22 @@ impl Qwen3Model {
             ));
         }
 
-        if !c.tie_embeddings {
+        if c.tie_embeddings && weights.lm_head.is_some() {
             return Err(ModelError::InvalidConfig(
-                "untied output embeddings are not implemented",
+                "tied embeddings must not supply lm_head",
             ));
+        }
+        if !c.tie_embeddings && weights.lm_head.is_none() {
+            return Err(ModelError::InvalidConfig(
+                "untied embeddings require lm_head",
+            ));
+        }
+        if let Some(head) = &weights.lm_head {
+            check_tensor(
+                "lm_head",
+                checked_product(c.vocab_size, c.hidden_size, "lm_head")?,
+                head,
+            )?;
         }
 
         let q_dim = checked_product(c.q_heads, c.head_dim, "q_dim")?;
@@ -196,7 +272,11 @@ impl Qwen3Model {
 
         check_tensor("final_layernorm", c.hidden_size, &weights.final_layernorm)?;
 
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            cache_owner: std::sync::Arc::new(()),
+        })
     }
 
     /// Compute prefill logits for every input position.
@@ -205,11 +285,22 @@ impl Qwen3Model {
     ///
     /// Implements input RMSNorm, Q/K/V projections, per-head Q/K
     /// RMSNorm, split-half RoPE, grouped-query causal attention,
-    /// attention and MLP residuals, final RMSNorm, and tied output
+    /// attention and MLP residuals, final RMSNorm, and configured output
     /// projection.
     ///
     /// Positions start at zero. This method does not use a KV cache.
     pub fn forward(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.forward_with_output_limit(tokens, DEFAULT_MAX_LOGITS_BYTES)
+    }
+
+    /// Full-logits prefill with an explicit peak output-memory budget.
+    /// The budget covers result storage, row headers, and one f64 projection row;
+    /// it is not a process-wide budget for weights and hidden activations.
+    pub fn forward_with_output_limit(
+        &self,
+        tokens: &[u32],
+        max_output_bytes: usize,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
         let c = &self.config;
 
         if tokens.is_empty() {
@@ -224,6 +315,7 @@ impl Qwen3Model {
         }
 
         let token_count = tokens.len();
+        check_output_budget(token_count, c.vocab_size, max_output_bytes)?;
         let q_dim = c.q_heads * c.head_dim;
         let kv_dim = c.kv_heads * c.head_dim;
 
@@ -325,30 +417,36 @@ impl Qwen3Model {
 
         let normalized = rmsnorm_rows(&hidden, c.hidden_size, &self.weights.final_layernorm);
 
-        let logits = linear(
-            &normalized,
-            c.hidden_size,
-            &self.weights.embed_tokens,
-            c.vocab_size,
-        );
-
-        ensure_finite(&logits, "output projection")?;
-
-        logits
-            .chunks_exact(c.vocab_size)
-            .map(|row| {
-                row.iter()
-                    .map(|&value| {
-                        let value = value as f32;
-                        if value.is_finite() {
-                            Ok(value)
-                        } else {
-                            Err(ModelError::NonFiniteActivation("f32 logit conversion"))
-                        }
-                    })
-                    .collect::<Result<Vec<f32>, ModelError>>()
-            })
-            .collect()
+        let head = if c.tie_embeddings {
+            &self.weights.embed_tokens
+        } else {
+            self.weights
+                .lm_head
+                .as_ref()
+                .ok_or(ModelError::InvalidConfig("missing lm_head"))?
+        };
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(token_count)
+            .map_err(|_| ModelError::AllocationFailed)?;
+        // Project one row at a time: never retain the full f64 logits matrix.
+        for row in normalized.chunks_exact(c.hidden_size) {
+            let logits = linear(row, c.hidden_size, head, c.vocab_size);
+            ensure_finite(&logits, "output projection")?;
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(c.vocab_size)
+                .map_err(|_| ModelError::AllocationFailed)?;
+            for value in logits {
+                let value = value as f32;
+                if !value.is_finite() {
+                    return Err(ModelError::NonFiniteActivation("f32 logit conversion"));
+                }
+                output.push(value);
+            }
+            result.push(output);
+        }
+        Ok(result)
     }
 }
 
@@ -518,3 +616,31 @@ fn silu(value: f64) -> f64 {
         value * exponential / (1.0 + exponential)
     }
 }
+
+/// Default full-logits output limit: 64 MiB, excluding model/hidden storage.
+pub const DEFAULT_MAX_LOGITS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Result rows, row headers, and one temporary f64 projection row.
+pub fn full_logits_bytes(tokens: usize, vocabulary: usize) -> Result<usize, ModelError> {
+    let output = checked_product(
+        checked_product(tokens, vocabulary, "logit elements")?,
+        std::mem::size_of::<f32>(),
+        "f32 output bytes",
+    )?;
+    let temporary = checked_product(vocabulary, std::mem::size_of::<f64>(), "f64 row bytes")?;
+    let headers = checked_product(tokens, std::mem::size_of::<Vec<f32>>(), "row headers")?;
+    output
+        .checked_add(temporary)
+        .and_then(|v| v.checked_add(headers))
+        .ok_or(ModelError::DimensionOverflow("logit memory"))
+}
+fn check_output_budget(tokens: usize, vocabulary: usize, limit: usize) -> Result<(), ModelError> {
+    let required = full_logits_bytes(tokens, vocabulary)?;
+    if required > limit {
+        Err(ModelError::MemoryLimit { required, limit })
+    } else {
+        Ok(())
+    }
+}
+
+include!("decode_impl.rs");

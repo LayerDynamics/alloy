@@ -56,11 +56,13 @@ pub struct Qwen3Weights {
     pub layers: Vec<LayerWeights>,
     /// `[hidden]`
     pub final_layernorm: Vec<f32>,
+    /// Separate [vocab, hidden] output weights for untied configurations.
+    pub lm_head: Option<Vec<f32>>,
 }
 
 /// Deterministic fixture weights. Canonical generation order — MUST match
 /// gen_reference.py: `embed_tokens`, then per layer (`input_layernorm`,
-/// `q_proj`, `k_proj`, `v_proj`, `o_proj`, `post_attention_layernorm`,
+/// `q_proj`, `k_proj`, `v_proj`, `q_norm`, `k_norm`, `o_proj`, `post_attention_layernorm`,
 /// `gate_proj`, `up_proj`, `down_proj`), then `final_layernorm`.
 pub fn generate_fixture(config: &Qwen3Config) -> Qwen3Weights {
     let c = config;
@@ -84,10 +86,17 @@ pub fn generate_fixture(config: &Qwen3Config) -> Qwen3Weights {
         });
     }
     let final_layernorm = fill(&mut rng, c.hidden_size);
+    // Append only for untied fixtures: tied reference RNG ordering is unchanged.
+    let lm_head = if c.tie_embeddings {
+        None
+    } else {
+        Some(fill(&mut rng, c.vocab_size * c.hidden_size))
+    };
 
     Qwen3Weights {
         embed_tokens,
         layers,
         final_layernorm,
+        lm_head,
     }
 }

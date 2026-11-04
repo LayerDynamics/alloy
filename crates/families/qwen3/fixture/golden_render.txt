@@ -1,1 +1,9 @@
-PLACEHOLDER
+<|im_start|>system
+You are Alloy's test assistant.<|im_end|>
+<|im_start|>user
+Say exactly: ok<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
