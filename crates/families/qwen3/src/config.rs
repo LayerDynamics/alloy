@@ -32,8 +32,9 @@ impl Qwen3Config {
         }
     }
 
-    /// The qwen3-4b-4bit profile. Verify every field against the corpus
-    /// artifact's config.json before relying on these for the real model.
+    /// Qwen3-4B architecture with a conservative 32K runtime context limit.
+    /// The published source config declares tied embeddings. Check the exact
+    /// artifact config before loading; untied variants use a separate lm_head.
     pub fn qwen3_4b() -> Self {
         Qwen3Config {
             hidden_size: 2560,
