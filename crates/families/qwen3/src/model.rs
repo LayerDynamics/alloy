@@ -35,6 +35,20 @@ pub enum ModelError {
     AllocationFailed,
     /// A checkpoint could not be read or validated.
     Checkpoint(String),
+    /// I/O failure, classified without parsing an error message.
+    CheckpointIo {
+        operation: &'static str,
+        path: std::path::PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// Malformed JSON or safetensors representation.
+    CheckpointFormat {
+        format: &'static str,
+        message: String,
+    },
+    /// Well-formed checkpoint data violates the supported model contract.
+    CheckpointValidation(String),
 }
 
 impl fmt::Display for ModelError {
@@ -77,6 +91,24 @@ impl fmt::Display for ModelError {
             ),
             Self::AllocationFailed => write!(f, "allocation failed"),
             Self::Checkpoint(message) => write!(f, "checkpoint error: {message}"),
+            Self::CheckpointIo {
+                operation,
+                path,
+                kind,
+                message,
+            } => {
+                write!(
+                    f,
+                    "checkpoint I/O ({operation}, {}, {kind:?}): {message}",
+                    path.display()
+                )
+            }
+            Self::CheckpointFormat { format, message } => {
+                write!(f, "checkpoint {format} parse error: {message}")
+            }
+            Self::CheckpointValidation(message) => {
+                write!(f, "checkpoint validation error: {message}")
+            }
             Self::NonFiniteActivation(stage) => {
                 write!(f, "non-finite activation during {stage}")
             }
@@ -157,6 +189,11 @@ impl Qwen3Model {
             ));
         }
 
+        if c.tie_embeddings && weights.lm_head.is_some() {
+            return Err(ModelError::InvalidConfig(
+                "tied embeddings must not supply lm_head",
+            ));
+        }
         if !c.tie_embeddings && weights.lm_head.is_none() {
             return Err(ModelError::InvalidConfig(
                 "untied embeddings require lm_head",

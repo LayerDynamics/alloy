@@ -1,4 +1,4 @@
-//! Bounded safetensors loading with explicit dtype and shape validation.
+//! Safetensors loading with typed failures and bounded cumulative byte accounting.
 use crate::{
     config::Qwen3Config,
     fixture::{LayerWeights, Qwen3Weights},
@@ -11,7 +11,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Resource limits for raw checkpoint bytes and decoded f32 weights separately.
+/// Limits for one loading operation, not a guarantee about process RSS.
+/// max_file_bytes counts all config, index, and safetensors bytes read cumulatively.
+/// max_weight_bytes limits decoded f32 tensor storage retained in the model.
+/// Defaults allow at most 16 MiB of each representation. JSON objects, names,
+/// allocator overhead, and other application memory are additional costs.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadOptions {
     pub max_file_bytes: usize,
@@ -20,13 +24,11 @@ pub struct LoadOptions {
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
-            max_file_bytes: 512 * 1024 * 1024,
-            max_weight_bytes: 512 * 1024 * 1024,
+            max_file_bytes: 16 * 1024 * 1024,
+            max_weight_bytes: 16 * 1024 * 1024,
         }
     }
 }
-
-/// Input accepted by Qwen3Model::load. Paths use bounded safetensors loading.
 pub trait ModelWeightSource {
     fn into_weights(self, config: &Qwen3Config) -> Result<Qwen3Weights, ModelError>;
 }
@@ -38,6 +40,11 @@ impl ModelWeightSource for Qwen3Weights {
 impl ModelWeightSource for &Path {
     fn into_weights(self, c: &Qwen3Config) -> Result<Qwen3Weights, ModelError> {
         load_weights(c, self, LoadOptions::default())
+    }
+}
+impl ModelWeightSource for &PathBuf {
+    fn into_weights(self, c: &Qwen3Config) -> Result<Qwen3Weights, ModelError> {
+        self.as_path().into_weights(c)
     }
 }
 impl ModelWeightSource for PathBuf {
@@ -55,48 +62,206 @@ impl ModelWeightSource for String {
         Path::new(&self).into_weights(c)
     }
 }
-fn error(message: impl ToString) -> ModelError {
-    ModelError::Checkpoint(message.to_string())
+fn invalid(message: impl ToString) -> ModelError {
+    ModelError::CheckpointValidation(message.to_string())
+}
+fn io_error(operation: &'static str, path: &Path, error: std::io::Error) -> ModelError {
+    ModelError::CheckpointIo {
+        operation,
+        path: path.to_path_buf(),
+        kind: error.kind(),
+        message: error.to_string(),
+    }
+}
+fn json_error(error: serde_json::Error) -> ModelError {
+    ModelError::CheckpointFormat {
+        format: "json",
+        message: error.to_string(),
+    }
+}
+fn tensor_error(error: safetensors::SafeTensorError) -> ModelError {
+    ModelError::CheckpointFormat {
+        format: "safetensors",
+        message: error.to_string(),
+    }
 }
 fn product(a: usize, b: usize) -> Result<usize, ModelError> {
     a.checked_mul(b)
         .ok_or(ModelError::DimensionOverflow("checkpoint tensor"))
 }
-fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ModelError> {
-    let file = std::fs::File::open(path).map_err(error)?;
-    let size = usize::try_from(file.metadata().map_err(error)?.len()).map_err(error)?;
-    if size > limit {
-        return Err(ModelError::MemoryLimit {
-            required: size,
-            limit,
-        });
+
+/// Canonicalize the actual supplied path first: never substitute a sibling artifact.
+/// This also makes bare relative filenames independent of empty parent semantics.
+fn resolve_source(path: &Path) -> Result<(PathBuf, PathBuf, bool), ModelError> {
+    let supplied = path
+        .canonicalize()
+        .map_err(|e| io_error("canonicalize checkpoint", path, e))?;
+    let metadata =
+        std::fs::metadata(&supplied).map_err(|e| io_error("stat checkpoint", &supplied, e))?;
+    if metadata.is_dir() {
+        return Ok((supplied.clone(), supplied, true));
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(size)
-        .map_err(|_| ModelError::AllocationFailed)?;
-    file.take((limit as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(error)?;
-    if bytes.len() > limit {
-        return Err(ModelError::MemoryLimit {
-            required: bytes.len(),
-            limit,
-        });
+    if !metadata.is_file() {
+        return Err(invalid("checkpoint must be a regular file or directory"));
     }
-    Ok(bytes)
+    let root = supplied
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    Ok((supplied, root, false))
+}
+fn optional_file(path: &Path) -> Result<bool, ModelError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(invalid(format!(
+            "not a regular metadata file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("stat metadata", path, error)),
+    }
+}
+struct RawBudget {
+    used: usize,
+    limit: usize,
+}
+impl RawBudget {
+    /// Metadata and shards share this accounting; fixed metadata caps are additional.
+    fn read(&mut self, path: &Path, per_file_limit: usize) -> Result<Vec<u8>, ModelError> {
+        let mut file =
+            std::fs::File::open(path).map_err(|e| io_error("open checkpoint", path, e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| io_error("stat open checkpoint", path, e))?;
+        if !metadata.is_file() {
+            return Err(invalid("checkpoint component is not a regular file"));
+        }
+        let size = usize::try_from(metadata.len())
+            .map_err(|_| ModelError::DimensionOverflow("file length"))?;
+        let required = self
+            .used
+            .checked_add(size)
+            .ok_or(ModelError::DimensionOverflow("raw checkpoint bytes"))?;
+        if required > self.limit {
+            return Err(ModelError::MemoryLimit {
+                required,
+                limit: self.limit,
+            });
+        }
+        if size > per_file_limit {
+            return Err(ModelError::MemoryLimit {
+                required: size,
+                limit: per_file_limit,
+            });
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| ModelError::AllocationFailed)?;
+        bytes.resize(size, 0);
+        file.read_exact(&mut bytes)
+            .map_err(|e| io_error("read checkpoint", path, e))?;
+        let mut probe = [0u8; 1];
+        if file
+            .read(&mut probe)
+            .map_err(|e| io_error("check checkpoint length", path, e))?
+            != 0
+        {
+            return Err(invalid("checkpoint changed length while loading"));
+        }
+        self.used = required;
+        Ok(bytes)
+    }
+}
+fn validate_config(c: &Qwen3Config, data: &serde_json::Value) -> Result<Option<usize>, ModelError> {
+    if !data.is_object() {
+        return Err(invalid("config must be a JSON object"));
+    }
+    for (name, expected) in [
+        ("hidden_size", c.hidden_size),
+        ("num_hidden_layers", c.num_layers),
+        ("num_attention_heads", c.q_heads),
+        ("num_key_value_heads", c.kv_heads),
+        ("head_dim", c.head_dim),
+        ("intermediate_size", c.intermediate_size),
+        ("vocab_size", c.vocab_size),
+    ] {
+        if data.get(name).and_then(|v| v.as_u64()) != Some(expected as u64) {
+            return Err(invalid(format!("config mismatch: {name}")));
+        }
+    }
+    if data.get("tie_word_embeddings").and_then(|v| v.as_bool()) != Some(c.tie_embeddings) {
+        return Err(invalid("config mismatch: tie_word_embeddings"));
+    }
+    if let Some(value) = data.get("hidden_act") {
+        if value.as_str() != Some("silu") {
+            return Err(invalid("only hidden_act=silu is supported"));
+        }
+    }
+    if let Some(value) = data.get("rms_norm_eps") {
+        let value = value
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| invalid("rms_norm_eps must be a finite number"))?;
+        if (value - 1e-6).abs() > 1e-12 {
+            return Err(invalid("unsupported rms_norm_eps"));
+        }
+    }
+    if let Some(value) = data.get("rope_theta") {
+        let value = value
+            .as_f64()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .ok_or_else(|| invalid("rope_theta must be a positive finite number"))?;
+        if value as f32 != c.rope_theta {
+            return Err(invalid("config mismatch: rope_theta"));
+        }
+    }
+    if data.get("rope_scaling").is_some_and(|v| !v.is_null()) {
+        return Err(invalid("rope scaling is unsupported"));
+    }
+    if let Some(value) = data.get("attention_bias") {
+        if value.as_bool() != Some(false) {
+            return Err(invalid("attention_bias must be false"));
+        }
+    }
+    let first = data.get("quantization").filter(|v| !v.is_null());
+    let second = data.get("quantization_config").filter(|v| !v.is_null());
+    if let (Some(a), Some(b)) = (first, second) {
+        if a != b {
+            return Err(invalid("conflicting quantization metadata"));
+        }
+    }
+    if let Some(quant) = first.or(second) {
+        if !quant.is_object() || quant.get("bits").and_then(|v| v.as_u64()) != Some(4) {
+            return Err(invalid("only affine four-bit quantization is supported"));
+        }
+        if let Some(mode) = quant.get("mode") {
+            if mode.as_str() != Some("affine") {
+                return Err(invalid("unsupported quantization mode"));
+            }
+        }
+        let group = quant
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .ok_or_else(|| invalid("group_size must be a positive integer"))?;
+        return Ok(Some(group));
+    }
+    Ok(None)
 }
 
-/// Load a single file or a directory containing a single file/sharded index.
-/// Supports F32/F16/BF16 and MLX affine 4-bit U32 matrices with scales/biases.
-/// Large checkpoints require explicit resource-limit opt-in.
+/// Load a single file or a directory, with exact index-to-shard inventory matching.
+/// Supports F32/F16/BF16 and MLX affine U32-packed four-bit matrices.
+/// Absent quantization metadata, infer each matrix's group size from validated
+/// scale/bias shapes; declared metadata must agree with those shapes.
 pub fn load_weights(
     c: &Qwen3Config,
     path: &Path,
     options: LoadOptions,
 ) -> Result<Qwen3Weights, ModelError> {
-    let q_dim = product(c.q_heads, c.head_dim)?;
-    let kv_dim = product(c.kv_heads, c.head_dim)?;
+    let (supplied, root, is_directory) = resolve_source(path)?;
     if [
         c.hidden_size,
         c.num_layers,
@@ -105,107 +270,63 @@ pub fn load_weights(
         c.head_dim,
         c.intermediate_size,
         c.vocab_size,
+        c.max_context,
     ]
     .contains(&0)
     {
-        return Err(error("zero checkpoint dimension"));
+        return Err(invalid("zero checkpoint dimension"));
     }
-    let root = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(Path::new("."))
+    if c.q_heads % c.kv_heads != 0
+        || c.head_dim % 2 != 0
+        || !c.rope_theta.is_finite()
+        || c.rope_theta <= 0.0
+    {
+        return Err(invalid("invalid attention configuration"));
+    }
+    let q_dim = product(c.q_heads, c.head_dim)?;
+    let kv_dim = product(c.kv_heads, c.head_dim)?;
+    let mut budget = RawBudget {
+        used: 0,
+        limit: options.max_file_bytes,
     };
-    let root = root.canonicalize().map_err(error)?;
-    let mut group_size = 64;
     let config_path = root.join("config.json");
-    if config_path.exists() {
-        let data: serde_json::Value =
-            serde_json::from_slice(&read_bounded(&config_path, 1024 * 1024)?).map_err(error)?;
-        for (name, expected) in [
-            ("hidden_size", c.hidden_size),
-            ("num_hidden_layers", c.num_layers),
-            ("num_attention_heads", c.q_heads),
-            ("num_key_value_heads", c.kv_heads),
-            ("head_dim", c.head_dim),
-            ("intermediate_size", c.intermediate_size),
-            ("vocab_size", c.vocab_size),
-        ] {
-            if data.get(name).and_then(|v| v.as_u64()) != Some(expected as u64) {
-                return Err(error(format!("config mismatch: {name}")));
-            }
-        }
-        if data.get("tie_word_embeddings").and_then(|v| v.as_bool()) != Some(c.tie_embeddings) {
-            return Err(error("config mismatch: tie_word_embeddings"));
-        }
-        if data
-            .get("rms_norm_eps")
-            .and_then(|v| v.as_f64())
-            .is_some_and(|v| (v - 1e-6).abs() > 1e-12)
-        {
-            return Err(error("unsupported rms_norm_eps"));
-        }
-        if data
-            .get("rope_theta")
-            .and_then(|v| v.as_f64())
-            .is_some_and(|v| v as f32 != c.rope_theta)
-        {
-            return Err(error("config mismatch: rope_theta"));
-        }
-        if data.get("rope_scaling").is_some_and(|v| !v.is_null())
-            || data.get("attention_bias").and_then(|v| v.as_bool()) == Some(true)
-        {
-            return Err(error("rope scaling and attention bias are unsupported"));
-        }
-        if let Some(quant) = data
-            .get("quantization")
-            .filter(|v| !v.is_null())
-            .or_else(|| data.get("quantization_config").filter(|v| !v.is_null()))
-        {
-            if quant.get("bits").and_then(|v| v.as_u64()) != Some(4)
-                || quant
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| v != "affine")
-            {
-                return Err(error("only MLX affine 4-bit quantization is supported"));
-            }
-            group_size = quant
-                .get("group_size")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| usize::try_from(v).ok())
-                .ok_or_else(|| error("missing quantization group_size"))?;
-            if group_size == 0 {
-                return Err(error("zero quantization group_size"));
-            }
-        }
-    }
+    let group_size = if optional_file(&config_path)? {
+        let bytes = budget.read(&config_path, 1024 * 1024)?;
+        let data = serde_json::from_slice(&bytes).map_err(json_error)?;
+        validate_config(c, &data)?
+    } else {
+        None
+    };
     let mut paths = BTreeSet::new();
     let mut index_map = BTreeMap::new();
-    if path.is_file() {
-        paths.insert(path.canonicalize().map_err(error)?);
-    } else if root.join("model.safetensors.index.json").exists() {
-        let index: serde_json::Value = serde_json::from_slice(&read_bounded(
-            &root.join("model.safetensors.index.json"),
-            16 * 1024 * 1024,
-        )?)
-        .map_err(error)?;
+    let index_path = root.join("model.safetensors.index.json");
+    let indexed = is_directory && optional_file(&index_path)?;
+    if !is_directory {
+        paths.insert(supplied);
+    } else if indexed {
+        let bytes = budget.read(&index_path, 16 * 1024 * 1024)?;
+        let index: serde_json::Value = serde_json::from_slice(&bytes).map_err(json_error)?;
         let map = index
             .get("weight_map")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| error("missing weight_map"))?;
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| invalid("missing or empty weight_map"))?;
         for (name, file) in map {
-            let file = file
+            let filename = file
                 .as_str()
-                .ok_or_else(|| error("invalid shard filename"))?;
-            let child = Path::new(file);
+                .ok_or_else(|| invalid("invalid shard filename"))?;
+            let child = Path::new(filename);
             if child.components().count() != 1
                 || child.extension().and_then(|v| v.to_str()) != Some("safetensors")
             {
-                return Err(error("unsafe shard filename"));
+                return Err(invalid("unsafe shard filename"));
             }
-            let resolved = root.join(child).canonicalize().map_err(error)?;
+            let candidate = root.join(child);
+            let resolved = candidate
+                .canonicalize()
+                .map_err(|e| io_error("canonicalize shard", &candidate, e))?;
             if resolved.parent() != Some(root.as_path()) {
-                return Err(error("shard escapes checkpoint directory"));
+                return Err(invalid("shard escapes checkpoint directory"));
             }
             index_map.insert(name.clone(), resolved.clone());
             paths.insert(resolved);
@@ -214,29 +335,31 @@ pub fn load_weights(
         paths.insert(root.join("model.safetensors"));
     }
     let mut buffers = BTreeMap::new();
-    let mut raw_bytes = 0usize;
     for path in paths {
-        let bytes = read_bounded(&path, options.max_file_bytes.saturating_sub(raw_bytes))?;
-        raw_bytes = raw_bytes
-            .checked_add(bytes.len())
-            .ok_or(ModelError::DimensionOverflow("checkpoint bytes"))?;
+        let bytes = budget.read(&path, options.max_file_bytes)?;
         buffers.insert(path, bytes);
     }
     let mut shards = BTreeMap::new();
     let mut names = BTreeMap::new();
     for (path, bytes) in &buffers {
-        let tensors = SafeTensors::deserialize(bytes).map_err(error)?;
+        let tensors = SafeTensors::deserialize(bytes).map_err(tensor_error)?;
         for name in tensors.names() {
             if names.insert(name.to_string(), path.clone()).is_some() {
-                return Err(error(format!("duplicate tensor: {name}")));
+                return Err(invalid(format!("duplicate tensor: {name}")));
             }
         }
         shards.insert(path.clone(), tensors);
     }
-    for (name, path) in index_map {
-        if names.get(&name) != Some(&path) {
-            return Err(error(format!("index mismatch for {name}")));
-        }
+    if indexed && names != index_map {
+        return Err(invalid(
+            "shard inventory must exactly match weight_map (names and files)",
+        ));
+    }
+    // A declared head in a tied checkpoint is never silently retained or ignored.
+    if c.tie_embeddings && names.contains_key("lm_head.weight") {
+        return Err(invalid(
+            "tied checkpoint must not supply a separate lm_head",
+        ));
     }
     let mut reader = Reader {
         shards,
@@ -310,19 +433,19 @@ struct Reader<'a> {
     names: BTreeMap<String, PathBuf>,
     used: usize,
     limit: usize,
-    group_size: usize,
+    group_size: Option<usize>,
 }
 impl Reader<'_> {
     fn view(&self, name: &str) -> Result<safetensors::tensor::TensorView<'_>, ModelError> {
         let path = self
             .names
             .get(name)
-            .ok_or_else(|| error(format!("missing tensor: {name}")))?;
+            .ok_or_else(|| invalid(format!("missing tensor: {name}")))?;
         self.shards
             .get(path)
-            .ok_or_else(|| error("missing shard"))?
+            .ok_or_else(|| invalid("missing shard"))?
             .tensor(name)
-            .map_err(error)
+            .map_err(tensor_error)
     }
     fn tensor(&mut self, name: &str, shape: &[usize]) -> Result<Vec<f32>, ModelError> {
         let count = shape.iter().try_fold(1usize, |a, &b| product(a, b))?;
@@ -341,18 +464,32 @@ impl Reader<'_> {
         let output = if view.dtype() == Dtype::U32 && shape.len() == 2 {
             let rows = shape[0];
             let width = shape[1];
-            let group = self.group_size;
-            if width % 8 != 0 || width % group != 0 || view.shape() != [rows, width / 8] {
-                return Err(error(format!("invalid packed shape: {name}")));
+            if rows == 0 || width == 0 || width % 8 != 0 || view.shape() != [rows, width / 8] {
+                return Err(invalid(format!("invalid packed shape: {name}")));
             }
             let base = name
                 .strip_suffix(".weight")
-                .ok_or_else(|| error("invalid matrix name"))?;
+                .ok_or_else(|| invalid("invalid matrix name"))?;
             let scales = self.view(&format!("{base}.scales"))?;
             let biases = self.view(&format!("{base}.biases"))?;
-            if scales.shape() != [rows, width / group] || biases.shape() != scales.shape() {
-                return Err(error("invalid quantization parameter shape"));
+            if scales.shape().len() != 2
+                || scales.shape()[0] != rows
+                || biases.shape() != scales.shape()
+            {
+                return Err(invalid("invalid quantization parameter shape"));
             }
+            let groups = scales.shape()[1];
+            if groups == 0 || width % groups != 0 {
+                return Err(invalid("quantization groups do not divide matrix width"));
+            }
+            let group = width / groups;
+            if self.group_size.is_some_and(|declared| declared != group) {
+                return Err(invalid(
+                    "quantization group_size disagrees with tensor shapes",
+                ));
+            }
+            validate_float_dtype(scales.dtype())?;
+            validate_float_dtype(biases.dtype())?;
             let mut output = Vec::new();
             output
                 .try_reserve_exact(count)
@@ -363,10 +500,10 @@ impl Reader<'_> {
                     let data = &view.data()[word_index * 4..word_index * 4 + 4];
                     let word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                     let code = ((word >> ((col % 8) * 4)) & 15) as f32;
-                    let param = row * (width / group) + col / group;
+                    let param = row * groups + col / group;
                     let value = code * float_at(&scales, param)? + float_at(&biases, param)?;
                     if !value.is_finite() {
-                        return Err(error("non-finite dequantized weight"));
+                        return Err(invalid("non-finite dequantized weight"));
                     }
                     output.push(value);
                 }
@@ -374,11 +511,9 @@ impl Reader<'_> {
             output
         } else {
             if view.shape() != shape {
-                return Err(error(format!(
-                    "wrong tensor shape: {name}: {:?} vs {shape:?}",
-                    view.shape()
-                )));
+                return Err(invalid(format!("wrong tensor shape: {name}")));
             }
+            validate_float_dtype(view.dtype())?;
             let mut output = Vec::new();
             output
                 .try_reserve_exact(count)
@@ -392,44 +527,63 @@ impl Reader<'_> {
         Ok(output)
     }
 }
+fn validate_float_dtype(dtype: Dtype) -> Result<(), ModelError> {
+    if matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+        Ok(())
+    } else {
+        Err(invalid(format!("unsupported float dtype: {dtype:?}")))
+    }
+}
 fn float_at(view: &safetensors::tensor::TensorView<'_>, index: usize) -> Result<f32, ModelError> {
     let bytes = view.data();
     let value = match view.dtype() {
         Dtype::F32 => {
             let start = product(index, 4)?;
-            let data = bytes
-                .get(start..start + 4)
-                .ok_or_else(|| error("truncated float"))?;
-            f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+            let end = start
+                .checked_add(4)
+                .ok_or(ModelError::DimensionOverflow("float offset"))?;
+            let d = bytes
+                .get(start..end)
+                .ok_or_else(|| invalid("truncated float"))?;
+            f32::from_le_bytes([d[0], d[1], d[2], d[3]])
         }
         Dtype::F16 | Dtype::BF16 => {
             let start = product(index, 2)?;
-            let data = bytes
-                .get(start..start + 2)
-                .ok_or_else(|| error("truncated half"))?;
-            let bits = u16::from_le_bytes([data[0], data[1]]);
+            let end = start
+                .checked_add(2)
+                .ok_or(ModelError::DimensionOverflow("half offset"))?;
+            let d = bytes
+                .get(start..end)
+                .ok_or_else(|| invalid("truncated half"))?;
+            let bits = u16::from_le_bytes([d[0], d[1]]);
             if view.dtype() == Dtype::F16 {
                 half::f16::from_bits(bits).to_f32()
             } else {
                 half::bf16::from_bits(bits).to_f32()
             }
         }
-        dtype => return Err(error(format!("unsupported float dtype: {dtype:?}"))),
+        dtype => return Err(invalid(format!("unsupported float dtype: {dtype:?}"))),
     };
     if !value.is_finite() {
-        return Err(error("non-finite checkpoint value"));
+        return Err(invalid("non-finite checkpoint value"));
     }
     Ok(value)
 }
 
 #[cfg(test)]
-mod tests {
+mod hardening_unit_tests {
     use super::*;
     #[test]
-    fn affine_four_bit_unpacking_and_half_types() {
+    fn inferred_groups_and_half_parameters_preserve_values() {
         let packed = 0x7654_3210u32.to_le_bytes();
-        let scale = half::f16::from_f32(0.5).to_bits().to_le_bytes();
-        let bias = half::bf16::from_f32(-1.0).to_bits().to_le_bytes();
+        let scale: Vec<u8> = [0.5f32, 2.0]
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let bias: Vec<u8> = [-1f32, 3.0]
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
         let views = vec![
             (
                 "test.weight",
@@ -438,34 +592,44 @@ mod tests {
             ),
             (
                 "test.scales",
-                safetensors::tensor::TensorView::new(Dtype::F16, vec![1, 1], &scale)
-                    .expect("scale"),
+                safetensors::tensor::TensorView::new(Dtype::F16, vec![1, 2], &scale)
+                    .expect("scales"),
             ),
             (
                 "test.biases",
-                safetensors::tensor::TensorView::new(Dtype::BF16, vec![1, 1], &bias).expect("bias"),
+                safetensors::tensor::TensorView::new(Dtype::BF16, vec![1, 2], &bias)
+                    .expect("biases"),
             ),
         ];
         let bytes = safetensors::tensor::serialize(views, &None).expect("serialize");
-        let tensors = SafeTensors::deserialize(&bytes).expect("deserialize");
-        let path = PathBuf::from("test");
+        let tensors = SafeTensors::deserialize(&bytes).expect("tensors");
+        let path = PathBuf::from("shard");
         let names = tensors
             .names()
             .into_iter()
-            .map(|name| (name.to_string(), path.clone()))
+            .map(|n| (n.to_string(), path.clone()))
             .collect();
         let mut reader = Reader {
             shards: BTreeMap::from([(path, tensors)]),
             names,
             used: 0,
-            limit: 32,
-            group_size: 8,
+            limit: 64,
+            group_size: None,
         };
-        let values = reader.tensor("test.weight", &[1, 8]).expect("dequantize");
         assert_eq!(
-            values,
-            (0..8).map(|v| v as f32 * 0.5 - 1.0).collect::<Vec<_>>()
+            reader.tensor("test.weight", &[1, 8]).expect("inferred"),
+            vec![-1.0, -0.5, 0.0, 0.5, 11.0, 13.0, 15.0, 17.0]
         );
-        assert!(reader.tensor("test.weight", &[1, 8]).is_err());
+        reader.group_size = Some(64);
+        assert!(matches!(
+            reader.tensor("test.weight", &[1, 8]),
+            Err(ModelError::CheckpointValidation(_))
+        ));
+        reader.group_size = None;
+        reader.limit = 1;
+        assert!(matches!(
+            reader.tensor("test.weight", &[1, 8]),
+            Err(ModelError::MemoryLimit { .. })
+        ));
     }
 }
