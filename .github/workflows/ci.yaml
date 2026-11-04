@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-jsonschema
-          bash scripts/pinscheck.sh
+          bash scripts/pins_check.sh --test
           bash bench/corpus/validate.sh
 
       - name: bindgen image and test 10
@@ -35,10 +35,10 @@ jobs:
             -t alloy-builder:phase0 \
             -f scripts/docker/Dockerfile \
             scripts/docker
-          bash scripts/bindgencheck.sh --test
+          bash scripts/bindgen_check.sh --test
 
       - name: inventory gate
-        run: bash scripts/coverageinventory.sh --test
+        run: bash scripts/coverage_inventory.sh --test
 
       - name: native image, FFI tests, and test 11
         run: |
@@ -47,7 +47,7 @@ jobs:
             -f scripts/docker/Dockerfile.repro \
             scripts/docker
           ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
-            bash scripts/reprocheck.sh --test
+            bash scripts/repro_check.sh --test
           # CPU FFI tests 1-5 and 7. Test 6 stays on the Mac lane.
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
