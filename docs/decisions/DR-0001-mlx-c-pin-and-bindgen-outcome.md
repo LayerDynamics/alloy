@@ -29,13 +29,16 @@ do not retype them from memory.
 | metal-cpp | vendored, macOS only | `PINS.md` |
 | gguflib | not vendored | `MLX_BUILD_GGUF=OFF` |
 | Node.js | 26.13.0, Active LTS, promoted 2026-10-28 | nodejs.org release |
-| minijinja | intentionally unpinned | not yet a workspace dependency |
+| minijinja | `=2.12.0`; locked version `2.12.0` | root `Cargo.toml`; `Cargo.lock`; Qwen3 workspace inheritance |
 
-Node is the Active LTS line for the TypeScript client. minijinja is pinned
-in the root `Cargo.toml` only when a crate depends on it; pin the version
-`cargo update -p minijinja --precise` locks at that time. The bindgen pin
-is exact because its generated code must be byte-identical across
-regenerations (named test 10).
+Node is the Active LTS line for the TypeScript client. minijinja is now
+exact-pinned at workspace scope to `=2.12.0`, with version `2.12.0`
+recorded in `Cargo.lock`. Qwen3 inherits this dependency for chat-template
+rendering. Future consumers, including harness-core, should inherit the
+same workspace dependency rather than declare an independent version.
+
+The bindgen pin is exact because its generated code must be byte-identical
+across regenerations (named test 10).
 
 ## Builders
 
@@ -125,3 +128,41 @@ All reserved, 2026-11-04, as 0.0.0 placeholders:
 
 The fallback was never triggered; it was not removed from the spec. DR-0001
 records only the pin and the own-layer outcome.
+
+## Amendment: minijinja renderer pin — 2026-11-04
+
+Issue: #10 — Pin minijinja and amend DR-0001.
+
+### Decision
+
+Use minijinja `2.12.0`, exact-pinned as `=2.12.0` in the root
+`[workspace.dependencies]` table. Commit `Cargo.lock` with the resolved
+version. Consumers inherit the dependency using
+`minijinja = { workspace = true }`.
+
+The first consumer is the Qwen3 family crate. This brings the pin forward
+from the original issue's planned harness-core integration; no additional
+dependency introduction is required when harness-core adopts it.
+
+### Evidence
+
+- Root `Cargo.toml` declares `minijinja = "=2.12.0"`.
+- `crates/families/qwen3/Cargo.toml` inherits the workspace dependency.
+- `Cargo.lock` records minijinja version `2.12.0`.
+- Qwen3's rendering tests cover the committed golden rendering and
+  SHA-256 identity of the embedded template bytes.
+
+The renderer-version pin and template hash identify different inputs:
+the pin fixes the rendering implementation version, while the hash
+identifies the exact template source bytes. Neither substitutes for
+golden-render regression tests.
+
+### Change policy
+
+Renderer upgrades are deliberate changes: update the workspace pin and
+lockfile together, run the rendering and template-identity tests, review
+any output differences, and record the rationale in a decision amendment.
+Do not rewrite golden fixtures merely to make an unexpected change pass.
+
+This amendment records the existing merged pin. It does not claim full
+upstream Qwen template compatibility or real-checkpoint conformance.
