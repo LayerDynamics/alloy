@@ -3,7 +3,7 @@
 #[repr(C)]
 #[derive(Debug)]
 pub struct FILE {
-    _private: [u8; 0],
+_private: [u8; 0],
 }
 
 #[derive(PartialEq, Copy, Clone, Hash, Debug, Default)]
