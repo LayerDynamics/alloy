@@ -10,9 +10,9 @@ fn t(shape: &[usize], data: Vec<f32>) -> Tensor {
     Tensor::new(shape, data).expect("tensor construction")
 }
 
-/// Comment 7: detect() must report the actual active device. On the Linux
-/// lane that is CPU; on a Metal host it is Metal. Consistency, not a
-/// hardcoded value, is the contract.
+/// Comment 7 (first review): detect() must report the actual active device.
+/// On the Linux lane that is CPU; on a Metal host it is Metal. Consistency,
+/// not a hardcoded value, is the contract.
 #[test]
 fn capabilities_report_active_device() {
     let caps = BackendCapabilities::detect().expect("device query");
@@ -43,7 +43,6 @@ fn rope_rotates_by_expected_angle() {
 
 #[test]
 fn attention_single_head_matches_hand_computation() {
-    // Degenerate GQA case: 1 query head, 1 KV head, one query token.
     let q = t(&[1, 1, 2], vec![1.0, 0.0]);
     let k = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
     let v = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
@@ -56,8 +55,6 @@ fn attention_single_head_matches_hand_computation() {
 
 #[test]
 fn attention_gqa_causal_matches_hand_computation() {
-    // 2 query heads over 1 KV head (group of 2), 2 tokens, head_dim 2.
-    // k0 = v0 = [1,0]; k1 = v1 = [0,1].
     let q = t(&[2, 2, 2], vec![
         1.0, 0.0, // token 0, head 0
         0.0, 1.0, // token 0, head 1
@@ -70,21 +67,15 @@ fn attention_gqa_causal_matches_hand_computation() {
     assert_eq!(out.shape(), &[2, 2, 2]);
     let d = out.data().expect("data");
 
-    // Token 0 sees only k0: both heads output v0 = [1, 0].
     assert!((d[0] - 1.0).abs() < TOL && d[1].abs() < TOL);
     assert!((d[2] - 1.0).abs() < TOL && d[3].abs() < TOL);
 
-    // Token 1 sees both keys:
-    // head 0 (q=[1,0]): scores (1, 0) -> weights (0.73106, 0.26894)
     assert!((d[4] - 0.73106).abs() < TOL && (d[5] - 0.26894).abs() < TOL);
-    // head 1 (q=[0,1]): scores (0, 1) -> weights (0.26894, 0.73106)
     assert!((d[6] - 0.26894).abs() < TOL && (d[7] - 0.73106).abs() < TOL);
 }
 
 #[test]
 fn attention_causal_offset_continues_cached_prefix() {
-    // Same queries, but token 0 is already cached: offset 1 means the
-    // first (and only) query token attends to both keys.
     let q = t(&[1, 1, 2], vec![1.0, 0.0]);
     let kv = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
     let out = attention(&q, &kv, &kv, 1.0, AttentionMask::Causal { offset: 1 }).expect("attention");
@@ -119,9 +110,6 @@ fn sampling_is_deterministic_for_seed() {
     assert_eq!(greedy_token(&logits).expect("greedy"), 2);
 }
 
-/// Comment 10: determinism alone would pass a constant sampler.
-/// softmax([0, 1, 2]) is roughly [0.0900, 0.2447, 0.6652]; over 1000
-/// seeded draws the empirical frequency must track that distribution.
 #[test]
 fn sampling_follows_logit_distribution() {
     let logits = [0.0, 1.0, 2.0];
@@ -147,7 +135,6 @@ fn sampling_rejects_invalid_logits() {
 #[test]
 fn greedy_rejects_invalid_logits() {
     assert_eq!(greedy_token(&[]), Err(KernelError::Empty));
-    // Comment 9: NaN at index 0 must fail even when later logits are finite.
     assert_eq!(greedy_token(&[f32::NAN, 1.0, 2.0]), Err(KernelError::NonFinite));
     assert_eq!(greedy_token(&[f32::NEG_INFINITY; 3]), Err(KernelError::NoFiniteLogits));
 }
@@ -159,20 +146,32 @@ fn kv_cache_append_equals_concatenated() {
     let k2 = t(&[1, 2], vec![0.0, 1.0]);
     let v2 = t(&[1, 2], vec![1.0, 0.0]);
 
-    let mut cache = KvCache::new(2, 8);
+    let mut cache = KvCache::new(2, 8).expect("cache construction");
     cache.append(&k1, &v1).expect("append 1");
     cache.append(&k2, &v2).expect("append 2");
 
     assert_eq!(cache.len(), 2);
-    let keys = cache.keys().expect("keys");
+
+    // Coherent snapshot: one call, one length, both tensors.
+    let (keys, values) = cache.k_v().expect("k_v snapshot");
+    assert_eq!(keys.shape(), values.shape(), "snapshot tensors must share one prefix length");
+
     assert_eq!(keys.shape(), &[2, 2]);
     let kd = keys.data().expect("data");
     assert!((kd[0] - 1.0).abs() < TOL && kd[1].abs() < TOL);
     assert!(kd[2].abs() < TOL && (kd[3] - 1.0).abs() < TOL);
 
-    let values = cache.values().expect("values");
-    assert_eq!(values.shape(), &[2, 2]);
     let vd = values.data().expect("data");
     assert!(vd[0].abs() < TOL && (vd[1] - 1.0).abs() < TOL);
     assert!((vd[2] - 1.0).abs() < TOL && vd[3].abs() < TOL);
+
+    // Single-tensor accessors still work for inspection.
+    assert_eq!(cache.keys().expect("keys").shape(), &[2, 2]);
+}
+
+/// Review comment 3: capacity overflow is an error, not an abort.
+#[test]
+fn kv_cache_rejects_overflowing_capacity() {
+    let err = KvCache::new(2, usize::MAX).expect_err("capacity must overflow");
+    assert_eq!(err, KernelError::CapacityTooLarge { max_len: usize::MAX, head_dim: 2 });
 }

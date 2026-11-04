@@ -11,6 +11,10 @@ pub enum KernelError {
     NoFiniteLogits,
     /// Constructed shape implies a different element count than the data.
     ShapeMismatch { expected: usize, got: usize },
+    /// The requested cache capacity (max_len * head_dim) overflows usize.
+    CapacityTooLarge { max_len: usize, head_dim: usize },
+    /// Reserving a cache buffer failed (allocation would exhaust memory).
+    AllocationFailed { elements: usize },
     /// An mlx-c call failed.
     Mlx(mlx_ffi::Error),
 }
@@ -23,6 +27,12 @@ impl fmt::Display for KernelError {
             KernelError::NoFiniteLogits => write!(f, "logits contain no finite value"),
             KernelError::ShapeMismatch { expected, got } => {
                 write!(f, "shape implies {expected} elements, got {got}")
+            }
+            KernelError::CapacityTooLarge { max_len, head_dim } => {
+                write!(f, "cache capacity {max_len} x {head_dim} overflows usize")
+            }
+            KernelError::AllocationFailed { elements } => {
+                write!(f, "failed to reserve {elements} f32 elements")
             }
             KernelError::Mlx(e) => write!(f, "mlx-c failure: {e}"),
         }
