@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Mirror of the mac-metal CI lane. Runs before every push so a red Mac
+# test never reaches GitHub. Skip once with: SKIP_HOOKS=1 git push
+set -euo pipefail
+
+if [ -n "${SKIP_HOOKS:-}" ]; then
+  exit 0
+fi
+
+# Git passes pushed refs on stdin; drain it so the pipe never blocks.
+cat >/dev/null
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "==> pre-push: mac-lane tests on ${BRANCH}"
+
+cargo test --locked -p mlx-ffi --no-fail-fast -- --test-threads=1
+cargo test --locked -p inference-infra --test infra_cpu_ops
+
+echo "==> pre-push: green"
