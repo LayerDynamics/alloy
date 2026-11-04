@@ -58,7 +58,7 @@ fn attention_rejects_empty_kv() {
     let q = t(&[1, 2], vec![1.0, 0.0]);
     let k = t(&[0, 2], vec![]);
     let v = t(&[0, 2], vec![]);
-    assert_eq!(attention(&q, &k, &v, 1.0), Err(KernelError::Empty));
+    assert_eq!(attention(&q, &k, &v, 1.0).unwrap_err(), KernelError::Empty);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn attention_rejects_non_finite_inputs() {
     let q = t(&[1, 2], vec![f32::NAN, 0.0]);
     let k = t(&[1, 2], vec![1.0, 0.0]);
     let v = t(&[1, 2], vec![0.0, 1.0]);
-    assert_eq!(attention(&q, &k, &v, 1.0), Err(KernelError::NonFinite));
+    assert_eq!(attention(&q, &k, &v, 1.0).unwrap_err(), KernelError::NonFinite);
 }
 
 #[test]
