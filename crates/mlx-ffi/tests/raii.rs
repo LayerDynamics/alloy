@@ -47,7 +47,10 @@ fn array_raii_roundtrip() {
     let c = b.clone();
     assert_eq!(c.data_f32().expect("clone data"), data.as_slice());
     drop(b);
-    assert_eq!(c.data_f32().expect("clone survives source drop"), data.as_slice());
+    assert_eq!(
+        c.data_f32().expect("clone survives source drop"),
+        data.as_slice()
+    );
     drop(c);
 
     // Create/dispose churn: 1000 scalar arrays, each cloned and read,
@@ -86,7 +89,9 @@ fn device_and_stream_lifecycle() {
     stream.synchronize().expect("stream synchronize");
 
     let default_stream = Stream::get_default(&cpu).expect("default stream");
-    default_stream.synchronize().expect("default stream synchronize");
+    default_stream
+        .synchronize()
+        .expect("default stream synchronize");
     mlx_ffi::synchronize_default_stream().expect("global default sync");
 
     // GPU: exercised on the Mac lane, skipped on the Linux CPU lane.
@@ -159,8 +164,7 @@ fn lazy_eval_and_synchronize() {
         ctx: std::ptr::null_mut(),
     };
     // SAFETY: `res` is a valid out-target; inputs and stream are valid.
-    let status =
-        unsafe { sys::mlx_add(&mut res, a.as_raw(), b.as_raw(), stream.as_raw()) };
+    let status = unsafe { sys::mlx_add(&mut res, a.as_raw(), b.as_raw(), stream.as_raw()) };
     assert_eq!(status, 0, "mlx_add failed");
     let c = Array::from_raw(res).expect("adopt lazy result");
 

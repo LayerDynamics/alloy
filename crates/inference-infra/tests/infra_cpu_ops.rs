@@ -1,6 +1,8 @@
 use inference_infra::capabilities::{Backend, BackendCapabilities};
 use inference_infra::error::KernelError;
-use inference_infra::ops::{apply_rope, attention, greedy_token, sample_token, AttentionMask, KvCache};
+use inference_infra::ops::{
+    AttentionMask, KvCache, apply_rope, attention, greedy_token, sample_token,
+};
 use inference_infra::tensor::Tensor;
 use mlx_ffi::{Device, DeviceType};
 
@@ -16,12 +18,24 @@ fn t(shape: &[usize], data: Vec<f32>) -> Tensor {
 #[test]
 fn capabilities_report_active_device() {
     let caps = BackendCapabilities::detect().expect("device query");
-    let expected = match Device::get_default().expect("default device").kind().expect("kind") {
+    let expected = match Device::get_default()
+        .expect("default device")
+        .kind()
+        .expect("kind")
+    {
         DeviceType::Cpu => Backend::Cpu,
         DeviceType::Gpu => Backend::Metal,
     };
-    assert_eq!(caps.backend, expected, "detect() must report the active MLX device");
-    assert!(caps.supports_rope && caps.supports_attention && caps.supports_kv_cache && caps.supports_sampling);
+    assert_eq!(
+        caps.backend, expected,
+        "detect() must report the active MLX device"
+    );
+    assert!(
+        caps.supports_rope
+            && caps.supports_attention
+            && caps.supports_kv_cache
+            && caps.supports_sampling
+    );
     assert!(caps.max_context_len >= 4096);
 }
 
@@ -55,12 +69,15 @@ fn attention_single_head_matches_hand_computation() {
 
 #[test]
 fn attention_gqa_causal_matches_hand_computation() {
-    let q = t(&[2, 2, 2], vec![
-        1.0, 0.0, // token 0, head 0
-        0.0, 1.0, // token 0, head 1
-        1.0, 0.0, // token 1, head 0
-        0.0, 1.0, // token 1, head 1
-    ]);
+    let q = t(
+        &[2, 2, 2],
+        vec![
+            1.0, 0.0, // token 0, head 0
+            0.0, 1.0, // token 0, head 1
+            1.0, 0.0, // token 1, head 0
+            0.0, 1.0, // token 1, head 1
+        ],
+    );
     let kv = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
 
     let out = attention(&q, &kv, &kv, 1.0, AttentionMask::Causal { offset: 0 }).expect("attention");
@@ -89,7 +106,10 @@ fn attention_rejects_empty_kv() {
     let q = t(&[1, 1, 2], vec![1.0, 0.0]);
     let k = t(&[0, 1, 2], vec![]);
     let v = t(&[0, 1, 2], vec![]);
-    assert_eq!(attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(), KernelError::Empty);
+    assert_eq!(
+        attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(),
+        KernelError::Empty
+    );
 }
 
 #[test]
@@ -97,7 +117,10 @@ fn attention_rejects_non_finite_inputs() {
     let q = t(&[1, 1, 2], vec![f32::NAN, 0.0]);
     let k = t(&[1, 1, 2], vec![1.0, 0.0]);
     let v = t(&[1, 1, 2], vec![0.0, 1.0]);
-    assert_eq!(attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(), KernelError::NonFinite);
+    assert_eq!(
+        attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(),
+        KernelError::NonFinite
+    );
 }
 
 #[test]
@@ -121,22 +144,40 @@ fn sampling_follows_logit_distribution() {
     assert_eq!(counts.iter().sum::<usize>(), 1000);
     let frac2 = counts[2] as f64 / 1000.0;
     assert!((frac2 - 0.6652).abs() < 0.05, "token-2 frequency {frac2}");
-    assert!(counts[0] > 0 && counts[1] > 0, "unreachable tokens: {counts:?}");
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "unreachable tokens: {counts:?}"
+    );
 }
 
 #[test]
 fn sampling_rejects_invalid_logits() {
     assert_eq!(sample_token(&[], 42), Err(KernelError::Empty));
-    assert_eq!(sample_token(&[f32::NEG_INFINITY; 3], 42), Err(KernelError::NoFiniteLogits));
-    assert_eq!(sample_token(&[f32::NAN, 1.0, 2.0], 42), Err(KernelError::NonFinite));
-    assert_eq!(sample_token(&[f32::INFINITY, 1.0, 2.0], 42), Err(KernelError::NonFinite));
+    assert_eq!(
+        sample_token(&[f32::NEG_INFINITY; 3], 42),
+        Err(KernelError::NoFiniteLogits)
+    );
+    assert_eq!(
+        sample_token(&[f32::NAN, 1.0, 2.0], 42),
+        Err(KernelError::NonFinite)
+    );
+    assert_eq!(
+        sample_token(&[f32::INFINITY, 1.0, 2.0], 42),
+        Err(KernelError::NonFinite)
+    );
 }
 
 #[test]
 fn greedy_rejects_invalid_logits() {
     assert_eq!(greedy_token(&[]), Err(KernelError::Empty));
-    assert_eq!(greedy_token(&[f32::NAN, 1.0, 2.0]), Err(KernelError::NonFinite));
-    assert_eq!(greedy_token(&[f32::NEG_INFINITY; 3]), Err(KernelError::NoFiniteLogits));
+    assert_eq!(
+        greedy_token(&[f32::NAN, 1.0, 2.0]),
+        Err(KernelError::NonFinite)
+    );
+    assert_eq!(
+        greedy_token(&[f32::NEG_INFINITY; 3]),
+        Err(KernelError::NoFiniteLogits)
+    );
 }
 
 #[test]
@@ -154,7 +195,11 @@ fn kv_cache_append_equals_concatenated() {
 
     // Coherent snapshot: one call, one length, both tensors.
     let (keys, values) = cache.k_v().expect("k_v snapshot");
-    assert_eq!(keys.shape(), values.shape(), "snapshot tensors must share one prefix length");
+    assert_eq!(
+        keys.shape(),
+        values.shape(),
+        "snapshot tensors must share one prefix length"
+    );
 
     assert_eq!(keys.shape(), &[2, 2]);
     let kd = keys.data().expect("data");
@@ -173,5 +218,11 @@ fn kv_cache_append_equals_concatenated() {
 #[test]
 fn kv_cache_rejects_overflowing_capacity() {
     let err = KvCache::new(2, usize::MAX).expect_err("capacity must overflow");
-    assert_eq!(err, KernelError::CapacityTooLarge { max_len: usize::MAX, head_dim: 2 });
+    assert_eq!(
+        err,
+        KernelError::CapacityTooLarge {
+            max_len: usize::MAX,
+            head_dim: 2
+        }
+    );
 }

@@ -37,6 +37,12 @@ pub struct LayerWeights {
     pub q_proj: Vec<f32>,
     pub k_proj: Vec<f32>,
     pub v_proj: Vec<f32>,
+    /// Learned RMSNorm scale over each query head's last dimension.
+    /// Shape: [head_dim], shared across query heads.
+    pub q_norm: Vec<f32>,
+    /// Learned RMSNorm scale over each key head's last dimension.
+    /// Shape: [head_dim], shared across key heads.
+    pub k_norm: Vec<f32>,
     pub o_proj: Vec<f32>,
     pub post_attention_layernorm: Vec<f32>,
     pub gate_proj: Vec<f32>,
@@ -68,6 +74,8 @@ pub fn generate_fixture(config: &Qwen3Config) -> Qwen3Weights {
             q_proj: fill(&mut rng, c.q_dim() * c.hidden_size),
             k_proj: fill(&mut rng, c.kv_dim() * c.hidden_size),
             v_proj: fill(&mut rng, c.kv_dim() * c.hidden_size),
+            q_norm: fill(&mut rng, c.head_dim),
+            k_norm: fill(&mut rng, c.head_dim),
             o_proj: fill(&mut rng, c.hidden_size * c.q_dim()),
             post_attention_layernorm: fill(&mut rng, c.hidden_size),
             gate_proj: fill(&mut rng, c.intermediate_size * c.hidden_size),
@@ -77,5 +85,9 @@ pub fn generate_fixture(config: &Qwen3Config) -> Qwen3Weights {
     }
     let final_layernorm = fill(&mut rng, c.hidden_size);
 
-    Qwen3Weights { embed_tokens, layers, final_layernorm }
+    Qwen3Weights {
+        embed_tokens,
+        layers,
+        final_layernorm,
+    }
 }
