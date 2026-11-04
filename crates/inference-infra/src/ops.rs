@@ -34,18 +34,49 @@ pub fn apply_rope(x: &Tensor, position: usize, theta_base: f32) -> Result<Tensor
     Tensor::new(shape, out)
 }
 
-/// Single-head scaled dot-product attention over full K/V.
-/// q: [1, d], k: [n, d], v: [n, d] -> [1, d]
-pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor, KernelError> {
-    assert_eq!(q.shape().len(), 2, "q must be [1, d]");
-    assert_eq!(q.shape()[0], 1, "q must be [1, d]");
-    let d = q.shape()[1];
-    let n = k.shape()[0];
-    assert_eq!(k.shape(), &[n, d], "k must be [n, d]");
-    assert_eq!(v.shape(), &[n, d], "v must be [n, d]");
+/// Which keys each query token may attend to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionMask {
+    /// Every query attends to every key (decode: the cache already holds
+    /// exactly the allowed prefix).
+    Full,
+    /// Query token `i` attends to keys `<= offset + i`. `offset: 0` is a
+    /// fresh prefill chunk; `offset = cached_len` continues a cached prefix.
+    Causal { offset: usize },
+}
 
-    // Comment 1: no K/V rows means no defined attention output.
-    if n == 0 {
+/// Grouped-query attention over full K/V.
+///
+/// q: [tokens, q_heads, d]
+/// k: [kv_len, kv_heads, d]
+/// v: [kv_len, kv_heads, d]
+/// -> [tokens, q_heads, d]
+///
+/// `q_heads` must be a multiple of `kv_heads` (the GQA group size);
+/// query head `h` reads KV head `h / (q_heads / kv_heads)`. The former
+/// single-head kernel is the degenerate case `q_heads == kv_heads == 1`
+/// with [`AttentionMask::Full`].
+pub fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: AttentionMask,
+) -> Result<Tensor, KernelError> {
+    let qs = q.shape();
+    let ks = k.shape();
+    assert_eq!(qs.len(), 3, "q must be [tokens, q_heads, head_dim], got {qs:?}");
+    assert_eq!(ks.len(), 3, "k must be [kv_len, kv_heads, head_dim], got {ks:?}");
+    assert_eq!(ks, v.shape(), "v must match k: [kv_len, kv_heads, head_dim]");
+    let (tokens, q_heads, d) = (qs[0], qs[1], qs[2]);
+    let (kv_len, kv_heads, _) = (ks[0], ks[1], ks[2]);
+    assert!(
+        q_heads % kv_heads == 0,
+        "q_heads ({q_heads}) must be a multiple of kv_heads ({kv_heads})"
+    );
+    let group = q_heads / kv_heads;
+
+    if tokens == 0 || kv_len == 0 {
         return Err(KernelError::Empty);
     }
 
@@ -56,29 +87,48 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tenso
         return Err(KernelError::NonFinite);
     }
 
-    // Comment 2: f64 accumulation — finite f32 inputs cannot overflow the
-    // dot product or the softmax at realistic dims.
-    let mut scores = vec![0.0_f64; n];
-    for i in 0..n {
-        let mut dot = 0.0_f64;
-        for j in 0..d {
-            dot += (qd[j] * kd[i * d + j]) as f64;
-        }
-        scores[i] = dot * scale as f64;
-    }
-    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-    let z: f64 = exps.iter().sum();
+    let mut out = vec![0.0_f64; tokens * q_heads * d];
+    for t in 0..tokens {
+        // Last key position this token may attend to. Masking by loop bound,
+        // not -inf injection: a causal row always keeps at least one allowed
+        // key, so the softmax can never see an all-masked (NaN) row.
+        let limit = match mask {
+            AttentionMask::Full => kv_len - 1,
+            AttentionMask::Causal { offset } => (offset + t).min(kv_len - 1),
+        };
+        for h in 0..q_heads {
+            let kv_h = h / group;
+            let q_base = (t * q_heads + h) * d;
 
-    let mut out = vec![0.0_f64; d];
-    for i in 0..n {
-        let w = exps[i] / z;
-        for j in 0..d {
-            out[j] += w * vd[i * d + j] as f64;
+            // Scores over the allowed prefix, f64 accumulation.
+            let mut scores = Vec::with_capacity(limit + 1);
+            for s in 0..=limit {
+                let k_base = (s * kv_heads + kv_h) * d;
+                let mut dot = 0.0_f64;
+                for j in 0..d {
+                    dot += (qd[q_base + j] * kd[k_base + j]) as f64;
+                }
+                scores.push(dot * scale as f64);
+            }
+
+            // Stable softmax over the allowed prefix only.
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let z: f64 = exps.iter().sum();
+
+            let out_base = (t * q_heads + h) * d;
+            for (s, e) in exps.iter().enumerate() {
+                let w = e / z;
+                let v_base = (s * kv_heads + kv_h) * d;
+                for j in 0..d {
+                    out[out_base + j] += w * vd[v_base + j] as f64;
+                }
+            }
         }
     }
+
     let out: Vec<f32> = out.into_iter().map(|x| x as f32).collect();
-    Tensor::new(&[1, d], out)
+    Tensor::new(&[tokens, q_heads, d], out)
 }
 
 /// SplitMix64 — deterministic, dependency-free PRNG for seeded sampling.
@@ -96,7 +146,7 @@ impl SplitMix64 {
 
 /// Multinomial sample from softmax-normalized logits, seeded.
 pub fn sample_token(logits: &[f32], seed: u64) -> Result<usize, KernelError> {
-    // Comment 9: validate before decoding; never return an arbitrary token.
+    // Validate before decoding; never return an arbitrary token.
     if logits.is_empty() {
         return Err(KernelError::Empty);
     }
@@ -112,8 +162,8 @@ pub fn sample_token(logits: &[f32], seed: u64) -> Result<usize, KernelError> {
         return Err(KernelError::NoFiniteLogits);
     }
 
-    // Comment 4: draw and cumulative probabilities in f64 — the 53-bit draw
-    // is exactly representable and cannot round to 1.0.
+    // Draw and cumulative probabilities in f64 — the 53-bit draw is
+    // exactly representable and cannot round to 1.0.
     let exps: Vec<f64> = logits
         .iter()
         .map(|l| ((*l as f64) - (max as f64)).exp())

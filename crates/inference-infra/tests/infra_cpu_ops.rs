@@ -1,6 +1,6 @@
 use inference_infra::capabilities::{Backend, BackendCapabilities};
 use inference_infra::error::KernelError;
-use inference_infra::ops::{apply_rope, attention, greedy_token, sample_token, KvCache};
+use inference_infra::ops::{apply_rope, attention, greedy_token, sample_token, AttentionMask, KvCache};
 use inference_infra::tensor::Tensor;
 use mlx_ffi::{Device, DeviceType};
 
@@ -43,11 +43,51 @@ fn rope_rotates_by_expected_angle() {
 
 #[test]
 fn attention_single_head_matches_hand_computation() {
-    let q = t(&[1, 2], vec![1.0, 0.0]);
-    let k = t(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
-    let v = t(&[2, 2], vec![1.0, 0.0, 0.0, 1.0]);
-    let out = attention(&q, &k, &v, 1.0).expect("attention");
-    assert_eq!(out.shape(), &[1, 2]);
+    // Degenerate GQA case: 1 query head, 1 KV head, one query token.
+    let q = t(&[1, 1, 2], vec![1.0, 0.0]);
+    let k = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let v = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let out = attention(&q, &k, &v, 1.0, AttentionMask::Full).expect("attention");
+    assert_eq!(out.shape(), &[1, 1, 2]);
+    let d = out.data().expect("data");
+    assert!((d[0] - 0.73106).abs() < TOL, "got {}", d[0]);
+    assert!((d[1] - 0.26894).abs() < TOL, "got {}", d[1]);
+}
+
+#[test]
+fn attention_gqa_causal_matches_hand_computation() {
+    // 2 query heads over 1 KV head (group of 2), 2 tokens, head_dim 2.
+    // k0 = v0 = [1,0]; k1 = v1 = [0,1].
+    let q = t(&[2, 2, 2], vec![
+        1.0, 0.0, // token 0, head 0
+        0.0, 1.0, // token 0, head 1
+        1.0, 0.0, // token 1, head 0
+        0.0, 1.0, // token 1, head 1
+    ]);
+    let kv = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
+
+    let out = attention(&q, &kv, &kv, 1.0, AttentionMask::Causal { offset: 0 }).expect("attention");
+    assert_eq!(out.shape(), &[2, 2, 2]);
+    let d = out.data().expect("data");
+
+    // Token 0 sees only k0: both heads output v0 = [1, 0].
+    assert!((d[0] - 1.0).abs() < TOL && d[1].abs() < TOL);
+    assert!((d[2] - 1.0).abs() < TOL && d[3].abs() < TOL);
+
+    // Token 1 sees both keys:
+    // head 0 (q=[1,0]): scores (1, 0) -> weights (0.73106, 0.26894)
+    assert!((d[4] - 0.73106).abs() < TOL && (d[5] - 0.26894).abs() < TOL);
+    // head 1 (q=[0,1]): scores (0, 1) -> weights (0.26894, 0.73106)
+    assert!((d[6] - 0.26894).abs() < TOL && (d[7] - 0.73106).abs() < TOL);
+}
+
+#[test]
+fn attention_causal_offset_continues_cached_prefix() {
+    // Same queries, but token 0 is already cached: offset 1 means the
+    // first (and only) query token attends to both keys.
+    let q = t(&[1, 1, 2], vec![1.0, 0.0]);
+    let kv = t(&[2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let out = attention(&q, &kv, &kv, 1.0, AttentionMask::Causal { offset: 1 }).expect("attention");
     let d = out.data().expect("data");
     assert!((d[0] - 0.73106).abs() < TOL, "got {}", d[0]);
     assert!((d[1] - 0.26894).abs() < TOL, "got {}", d[1]);
@@ -55,18 +95,18 @@ fn attention_single_head_matches_hand_computation() {
 
 #[test]
 fn attention_rejects_empty_kv() {
-    let q = t(&[1, 2], vec![1.0, 0.0]);
-    let k = t(&[0, 2], vec![]);
-    let v = t(&[0, 2], vec![]);
-    assert_eq!(attention(&q, &k, &v, 1.0).unwrap_err(), KernelError::Empty);
+    let q = t(&[1, 1, 2], vec![1.0, 0.0]);
+    let k = t(&[0, 1, 2], vec![]);
+    let v = t(&[0, 1, 2], vec![]);
+    assert_eq!(attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(), KernelError::Empty);
 }
 
 #[test]
 fn attention_rejects_non_finite_inputs() {
-    let q = t(&[1, 2], vec![f32::NAN, 0.0]);
-    let k = t(&[1, 2], vec![1.0, 0.0]);
-    let v = t(&[1, 2], vec![0.0, 1.0]);
-    assert_eq!(attention(&q, &k, &v, 1.0).unwrap_err(), KernelError::NonFinite);
+    let q = t(&[1, 1, 2], vec![f32::NAN, 0.0]);
+    let k = t(&[1, 1, 2], vec![1.0, 0.0]);
+    let v = t(&[1, 1, 2], vec![0.0, 1.0]);
+    assert_eq!(attention(&q, &k, &v, 1.0, AttentionMask::Full).unwrap_err(), KernelError::NonFinite);
 }
 
 #[test]
