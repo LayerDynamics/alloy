@@ -1572,3 +1572,6 @@ fn discard_policy_cannot_report_reuse_for_matching_executed_history() {
     assert_eq!(environment.cache_allocations(), 2);
     environment.wait_unreserved();
 }
+
+#[path = "support/runtime_policies.rs"]
+mod runtime_policies;
