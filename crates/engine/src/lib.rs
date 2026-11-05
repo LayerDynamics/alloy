@@ -20,10 +20,10 @@ pub mod family;
 pub mod generation;
 /// Unified CPU/Metal memory discovery and shared budgeting.
 pub mod platform;
+/// Bounded unified-memory pressure and reclamation decisions.
+pub mod pressure;
 pub mod registry;
 pub mod rendering;
 pub mod runtime;
 pub mod scheduler;
 pub mod types;
-/// Bounded unified-memory pressure and reclamation decisions.
-pub mod pressure;

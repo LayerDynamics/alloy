@@ -380,52 +380,84 @@ impl ReservationGrant {
         self.remaining_bytes == 0
     }
 
-    /// Transfer part of the grant to the resource that will own it.
+        /// Transfer part of the grant to the resource that will own it.
     ///
-    /// Shared reservation accounting is unchanged: this operation only
-    /// transfers ownership of bytes already admitted by reserve_grant.
+    /// Total reserved bytes remain unchanged.
     ///
-    /// On an invalid size or poisoned accounting lock, the grant is
-    /// unchanged. A zero-byte reservation is not created.
+    /// A partial transfer creates one additional independently owned
+    /// reservation. A complete transfer replaces the grant's accounting
+    /// entry with the returned reservation.
+    ///
+    /// A zero-byte request returns None without changing ownership.
+    ///
+    /// On failure, the grant and shared accounting remain unchanged.
     pub fn take(
         &mut self,
         operation: &'static str,
         bytes: u64,
     ) -> Result<Option<MemoryReservation>, EngineError> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+
         if !self.active {
             return Err(internal_error(
                 "cannot partition an inactive reservation grant",
             ));
         }
 
-        if bytes == 0 {
-            return Ok(None);
-        }
-
-        if bytes > self.remaining_bytes {
-            return Err(EngineError::invalid_request(
-                "grant_partition",
-                "requested bytes exceed the remaining startup grant",
-            ));
-        }
-
-        // Fail closed before changing grant ownership if accounting is
-        // poisoned. No accounting mutation is performed under this guard.
-        {
-            let _state = self.shared.lock_state()?;
-        }
-
-        self.remaining_bytes = self
+        let remaining_bytes = self
             .remaining_bytes
             .checked_sub(bytes)
-            .ok_or_else(|| internal_error("startup grant partition underflow"))?;
+            .ok_or_else(|| {
+                EngineError::invalid_request(
+                    "grant_partition",
+                    "requested bytes exceed the remaining startup grant",
+                )
+            })?;
 
-        if self.remaining_bytes == 0 {
-            self.active = false;
+        let shared = Arc::clone(&self.shared);
+
+        {
+            let mut state = self.shared.lock_state()?;
+
+            if state.reserved_bytes > state.budget_bytes {
+                return Err(internal_error(
+                    "admission reservations exceed the configured budget",
+                ));
+            }
+
+            if self.remaining_bytes > state.reserved_bytes
+                || state.active_reservations == 0
+            {
+                return Err(internal_error(
+                    "startup grant exceeds shared reservation accounting",
+                ));
+            }
+
+            let active_reservations = if remaining_bytes == 0 {
+                // The returned reservation replaces the grant's entry.
+                state.active_reservations
+            } else {
+                // Both the remainder and returned reservation own bytes.
+                state
+                    .active_reservations
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        internal_error(
+                            "admission reservation-count arithmetic overflow",
+                        )
+                    })?
+            };
+
+            // All fallible checks completed. Reserved bytes do not change.
+            state.active_reservations = active_reservations;
+            self.remaining_bytes = remaining_bytes;
+            self.active = remaining_bytes != 0;
         }
 
         Ok(Some(MemoryReservation {
-            shared: Arc::clone(&self.shared),
+            shared,
             operation,
             bytes,
             active: true,
