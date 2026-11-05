@@ -88,7 +88,7 @@ impl ContextBuilder {
         engine: &E,
         snapshot: ContextSnapshot,
     ) -> HarnessResult<RenderedContext> {
-        block_on(engine.render_and_count(snapshot))
+        block_on(engine.render_and_count(snapshot))?
             .map_err(|error| HarnessError::Engine(error.to_string()))
     }
 }
@@ -105,7 +105,7 @@ impl Wake for Notify {
     }
 }
 
-fn block_on<T>(future: impl Future<Output = T>) -> T {
+fn block_on<T>(future: impl Future<Output = T>) -> Result<T, HarnessError> {
     let mut future = Box::pin(future);
     let (sender, receiver) = std::sync::mpsc::channel();
     let waker = Waker::from(Arc::new(Notify(sender)));
@@ -114,11 +114,13 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 
     loop {
         match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
+            Poll::Ready(value) => return Ok(value),
             Poll::Pending => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    panic!("timed out waiting for engine future");
+                    return Err(HarnessError::Engine(
+                        "timed out waiting for engine future".into(),
+                    ));
                 }
                 match receiver.recv_timeout(remaining) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

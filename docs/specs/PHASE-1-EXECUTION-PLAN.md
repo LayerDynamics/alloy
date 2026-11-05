@@ -24,8 +24,9 @@ tokens in-process from an mlx-community artifact.
   user-message → render-and-count → generate → stream; no tools, no policy,
   no skills, no MCP (Phase 2+).
 - SQLite session store: B.4 event log schema v1, append-only.
-- Daemon `alloyd`: UDS JSON-RPC server exposing the B.6 subset Phase 1
-  needs (`sessions.*`, chat streaming), with apiversion negotiation.
+- Daemon `alloyd`: UDS JSON-RPC server exposing the B.6 Phase-1 chat/session
+  streaming subset with verbatim B.6 method names (`session.*`,
+  `sessions.resume`) and `api_version` negotiation.
 - Prefix-cache **stub only** — the interface, not the implementation; the
   real single-session prefix cache lands in Phase 3 with its tests.
 - Telemetry client (FR-35): in-memory anonymous-count collection, HTTPS/TLS
@@ -70,17 +71,34 @@ B.4 sessions table DDL (pinned here; SPEC B.4 deferred the pin to this plan):
   );
 W4 `session_resume_restart` proves durable history by dropping and reopening
 the SQLite store at the same path (daemon process restart remains W5 / test 14).
-crates/alloyd/ daemon binary
-src/{main.rs,rpc.rs}
-tests/rpc_surface.rs
+crates/alloyd/ daemon binary + lib
+src/{main.rs,lib.rs,boot.rs,rpc.rs,server.rs,service.rs}
+tests/rpc_surface.rs (`rpc_surface_v1`, `stream_events_order`)
+B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_version):
+  Framing: Unix domain socket; newline-delimited JSON-RPC 2.0 (one object/line).
+  Default socket: ~/.alloy/alloyd.sock (mode 0600); default DB: ~/.alloy/sessions.sqlite.
+  Every request MUST include api_version; Phase 1 accepts only api_version=1.
+  Implemented methods: session.create, session.send (streams session.event
+  notifications then a final response), session.pause (cancels in-flight
+  generation first), session.resume (paused→active only), sessions.resume
+  (historical reload after store/daemon reopen), daemon.status (sessions_active
+  from store; models_resident/memory_reserved from boot).
+  Production `alloyd` requires `--artifact` for local corpus profile
+  `qwen3-4b-4bit`; protocol tests use FixtureEngine only.
+  Stream notify shape: {"jsonrpc":"2.0","method":"session.event",
+  "params":{"session_id","event","body"}} where event is text_delta |
+  tool_call_delta | runtime_warning | generation_completed | request_failed.
+  JSON-RPC codes: -32600/-32601/-32602/-32603; application -32000 with
+  error.data.kind in {unsupported_api_version, session_not_found,
+  session_not_active, invalid_params, engine_failed, unsupported_in_phase1}.
+  Informal plan prose that said sessions.* meant the B.6 session.* surface;
+  wire names follow Appendix B.6 verbatim.
 ts/cli/ TypeScript CLI, Node LTS pin from DR-0001
 src/{main.ts,chat.ts,rpc-client.ts}
 package.json
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document
 docs/events/telemetry-v1.json initial event schema
 .github/workflows/ci.yaml extend: unit + mocked lanes
-
-text
 
 ## Named tests
 
@@ -93,7 +111,7 @@ text
 | 5 | `events_append_only` | B.4 schema v1: gapless per-session seq, monotonic ids, events survive reopen | Linux CI |
 | 6 | `session_resume_restart` | a session appends, store handle drops, same DB reopens, history intact (W4); full `alloyd` process restart is W5 / Mac test 14 | Linux CI |
 | 7 | `rpc_surface_v1` | B.6 subset: apiversion negotiation, method dispatch, error kinds on bad requests | Linux CI |
-| 8 | `stream_events_order` | mocked engine: text_delta stream ordering, generation_completed, cancel | Linux CI |
+| 8 | `stream_events_order` | mocked/fixture engine over UDS: text_delta ordering, pause-cancel → request_failed | Linux CI |
 | 9 | `telemetry_schema_conforms` | emitted events validate against docs/events/telemetry-v1.json; anonymity invariants hold (no prompts, paths, or model identifiers) | Linux CI |
 | 10 | `telemetry_offline_drop` | unreachable endpoint drops counts, never queues, never affects sessions | Linux CI |
 | 11 | `admission_estimate` | estimate_memory within 20% of measured for the synthetic model | Linux CI |
