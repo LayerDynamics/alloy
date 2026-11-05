@@ -56,7 +56,7 @@ tests include named W3 acceptance coverage (`stream_events_order`,
 `engine_traits_documented`)
 crates/harness-core/ supervisor skeleton, context, session store
 src/{supervisor.rs,context.rs,store.rs,telemetry.rs}
-tests/{events.rs,resume.rs,telemetry.rs,token_count.rs}
+tests/{events.rs,resume.rs,pause_resume.rs,supervisor_turn.rs,telemetry.rs,token_count.rs}
 B.4 sessions table DDL (pinned here; SPEC B.4 deferred the pin to this plan):
   CREATE TABLE sessions (
     session_id  TEXT PRIMARY KEY,
@@ -98,7 +98,7 @@ src/{main.ts,chat.ts,rpc-client.ts}
 package.json
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document
 docs/events/telemetry-v1.json initial event schema
-.github/workflows/ci.yaml extend: unit + mocked lanes
+.github/workflows/ci.yaml Linux + Mac lanes run `harness-core` and `alloyd` (`--all-targets` / `--doc`); Mac E2E tests 13–14 remain workflow_dispatch / W7
 
 ## Named tests
 
