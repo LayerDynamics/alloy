@@ -30,13 +30,12 @@
 use crate::{
     error::EngineError,
     types::{
-        ArtifactId, ContextSnapshot, ModelProfileId, RenderedContext,
-        RendererIdentity, TokenizerId,
+        ArtifactId, ContextSnapshot, ModelProfileId, RenderedContext, RendererIdentity, TokenizerId,
     },
 };
 use minijinja::{
-    AutoEscape, Environment, Error as TemplateError,
-    ErrorKind as TemplateErrorKind, UndefinedBehavior,
+    AutoEscape, Environment, Error as TemplateError, ErrorKind as TemplateErrorKind,
+    UndefinedBehavior,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -249,19 +248,16 @@ impl PinnedTokenizer {
         if observed != expected_sha256 {
             return Err(EngineError::ArtifactValidationFailed {
                 artifact_id: None,
-                message:
-                    "tokenizer source SHA-256 does not match its trusted pin"
-                        .to_owned(),
+                message: "tokenizer source SHA-256 does not match its trusted pin".to_owned(),
             });
         }
 
-        let tokenizer = Tokenizer::from_bytes(source).map_err(|source| {
-            EngineError::CheckpointFormat {
+        let tokenizer =
+            Tokenizer::from_bytes(source).map_err(|source| EngineError::CheckpointFormat {
                 format: "tokenizer.json",
                 path: None,
                 source,
-            }
-        })?;
+            })?;
 
         if tokenizer.get_truncation().is_some() {
             return Err(EngineError::unsupported(
@@ -282,10 +278,7 @@ impl PinnedTokenizer {
         hash.update(TOKENIZER_LIBRARY_VERSION.as_bytes());
         hash.update(observed);
 
-        let identity = TokenizerId::new(format!(
-            "sha256:{:x}",
-            hash.finalize(),
-        ))?;
+        let identity = TokenizerId::new(format!("sha256:{:x}", hash.finalize(),))?;
 
         Ok(Self {
             tokenizer,
@@ -353,20 +346,14 @@ pub fn render_chat(
             Value::String(message.role.as_str().to_owned()),
         );
 
-        value.insert(
-            "content".to_owned(),
-            Value::String(message.content.clone()),
-        );
+        value.insert("content".to_owned(), Value::String(message.content.clone()));
 
         messages.push(Value::Object(value));
     }
 
     let mut variables = Map::new();
 
-    variables.insert(
-        "messages".to_owned(),
-        Value::Array(messages),
-    );
+    variables.insert("messages".to_owned(), Value::Array(messages));
 
     variables.insert(
         "add_generation_prompt".to_owned(),
@@ -374,25 +361,16 @@ pub fn render_chat(
     );
 
     if let Some(enabled) = options.enable_thinking {
-        variables.insert(
-            "enable_thinking".to_owned(),
-            Value::Bool(enabled),
-        );
+        variables.insert("enable_thinking".to_owned(), Value::Bool(enabled));
     }
 
     let mut environment = Environment::new();
 
-    environment.set_undefined_behavior(
-        UndefinedBehavior::Strict,
-    );
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
 
-    environment.set_auto_escape_callback(|_| {
-        AutoEscape::None
-    });
+    environment.set_auto_escape_callback(|_| AutoEscape::None);
 
-    environment.set_keep_trailing_newline(
-        options.keep_trailing_newline,
-    );
+    environment.set_keep_trailing_newline(options.keep_trailing_newline);
 
     environment.set_trim_blocks(options.trim_blocks);
     environment.set_lstrip_blocks(options.lstrip_blocks);
@@ -409,52 +387,26 @@ pub fn render_chat(
 
     environment
         .add_template("chat.txt", binding.template)
-        .map_err(|error| {
-            execution_error(
-                "compile chat template",
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| execution_error("compile chat template", error.to_string()))?;
 
     let template = environment
         .get_template("chat.txt")
-        .map_err(|error| {
-            execution_error(
-                "resolve chat template",
-                error.to_string(),
-            )
-        })?;
+        .map_err(|error| execution_error("resolve chat template", error.to_string()))?;
 
-    let mut writer = BoundedWriter::new(
-        limits.max_rendered_bytes,
-    );
+    let mut writer = BoundedWriter::new(limits.max_rendered_bytes);
 
-    let rendering = template.render_to_write(
-        Value::Object(variables),
-        &mut writer,
-    );
+    let rendering = template.render_to_write(Value::Object(variables), &mut writer);
 
     // Inspect the recorded writer failure rather than parsing a template
     // error's human-readable text.
     if let Some(failure) = writer.failure.take() {
-        return Err(failure.into_engine_error(
-            limits.max_rendered_bytes,
-        ));
+        return Err(failure.into_engine_error(limits.max_rendered_bytes));
     }
 
-    rendering.map_err(|error| {
-        execution_error(
-            "render chat template",
-            error.to_string(),
-        )
-    })?;
+    rendering.map_err(|error| execution_error("render chat template", error.to_string()))?;
 
-    String::from_utf8(writer.bytes).map_err(|error| {
-        execution_error(
-            "decode rendered template UTF-8",
-            error.to_string(),
-        )
-    })
+    String::from_utf8(writer.bytes)
+        .map_err(|error| execution_error("decode rendered template UTF-8", error.to_string()))
 }
 
 /// Render and tokenize exact model-visible input.
@@ -471,25 +423,12 @@ pub fn render_and_count(
     options: &RenderingOptions<'_>,
     limits: RenderingLimits,
 ) -> Result<RenderedContext, EngineError> {
-    let text = render_chat(
-        context,
-        binding,
-        options,
-        limits,
-    )?;
+    let text = render_chat(context, binding, options, limits)?;
 
     let encoding = tokenizer
         .tokenizer
-        .encode(
-            text.as_str(),
-            options.add_special_tokens,
-        )
-        .map_err(|error| {
-            execution_error(
-                "tokenize rendered context",
-                error.to_string(),
-            )
-        })?;
+        .encode(text.as_str(), options.add_special_tokens)
+        .map_err(|error| execution_error("tokenize rendered context", error.to_string()))?;
 
     let ids = encoding.get_ids();
 
@@ -512,9 +451,7 @@ pub fn render_and_count(
     let token_bytes = ids
         .len()
         .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| internal(
-            "rendered token storage size overflow",
-        ))?;
+        .ok_or_else(|| internal("rendered token storage size overflow"))?;
 
     let mut token_ids = Vec::new();
 
@@ -527,14 +464,7 @@ pub fn render_and_count(
 
     token_ids.extend_from_slice(ids);
 
-    let render_hash = compute_render_hash(
-        context,
-        binding,
-        tokenizer,
-        options,
-        &text,
-        &token_ids,
-    )?;
+    let render_hash = compute_render_hash(context, binding, tokenizer, options, &text, &token_ids)?;
 
     Ok(RenderedContext {
         snapshot_id: context.snapshot_id().clone(),
@@ -573,16 +503,10 @@ fn validate_render_input(
         )?);
     }
 
-    if sha256(binding.template.as_bytes())
-        != binding.template_sha256
-    {
+    if sha256(binding.template.as_bytes()) != binding.template_sha256 {
         return Err(EngineError::ArtifactValidationFailed {
-            artifact_id: Some(
-                binding.artifact_id.as_str().to_owned(),
-            ),
-            message:
-                "chat template SHA-256 does not match its trusted pin"
-                    .to_owned(),
+            artifact_id: Some(binding.artifact_id.as_str().to_owned()),
+            message: "chat template SHA-256 does not match its trusted pin".to_owned(),
         });
     }
 
@@ -607,9 +531,7 @@ fn validate_render_input(
     for message in context.messages() {
         input_bytes = input_bytes
             .checked_add(message.content.len())
-            .ok_or_else(|| internal(
-                "message-content byte count overflow",
-            ))?;
+            .ok_or_else(|| internal("message-content byte count overflow"))?;
 
         if input_bytes > limits.max_input_bytes {
             return Err(memory_limit(
@@ -622,9 +544,7 @@ fn validate_render_input(
         if options
             .reserved_spellings
             .iter()
-            .any(|spelling| {
-                message.content.contains(*spelling)
-            })
+            .any(|spelling| message.content.contains(*spelling))
         {
             return Err(EngineError::invalid_request(
                 "message.content",
@@ -660,20 +580,11 @@ fn compute_render_hash(
         hash_field(&mut hash, field)?;
     }
 
-    hash_field(
-        &mut hash,
-        &binding.template_sha256,
-    )?;
+    hash_field(&mut hash, &binding.template_sha256)?;
 
-    hash_field(
-        &mut hash,
-        &binding.artifact_manifest_sha256,
-    )?;
+    hash_field(&mut hash, &binding.artifact_manifest_sha256)?;
 
-    hash_field(
-        &mut hash,
-        &tokenizer.source_sha256,
-    )?;
+    hash_field(&mut hash, &tokenizer.source_sha256)?;
 
     let thinking = match options.enable_thinking {
         None => 0_u8,
@@ -688,18 +599,12 @@ fn compute_render_hash(
         u8::from(options.keep_trailing_newline),
         u8::from(options.trim_blocks),
         u8::from(options.lstrip_blocks),
-        u8::from(
-            tokenizer
-                .tokenizer
-                .get_encode_special_tokens(),
-        ),
+        u8::from(tokenizer.tokenizer.get_encode_special_tokens()),
     ];
 
     hash_field(&mut hash, &flags)?;
 
-    hash.update(
-        as_u64(token_ids.len())?.to_le_bytes(),
-    );
+    hash.update(as_u64(token_ids.len())?.to_le_bytes());
 
     for token in token_ids {
         hash.update(token.to_le_bytes());
@@ -708,10 +613,7 @@ fn compute_render_hash(
     Ok(hash.finalize().into())
 }
 
-fn hash_field(
-    hash: &mut Sha256,
-    bytes: &[u8],
-) -> Result<(), EngineError> {
+fn hash_field(hash: &mut Sha256, bytes: &[u8]) -> Result<(), EngineError> {
     hash.update(as_u64(bytes.len())?.to_le_bytes());
     hash.update(bytes);
     Ok(())
@@ -722,11 +624,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn as_u64(value: usize) -> Result<u64, EngineError> {
-    u64::try_from(value).map_err(|_| {
-        internal(
-            "rendering size cannot be represented as u64",
-        )
-    })
+    u64::try_from(value).map_err(|_| internal("rendering size cannot be represented as u64"))
 }
 
 fn memory_limit(
@@ -747,54 +645,31 @@ fn internal(message: &'static str) -> EngineError {
     }
 }
 
-fn execution_error(
-    stage: &'static str,
-    message: String,
-) -> EngineError {
-    EngineError::ExecutionFailed {
-        stage,
-        message,
-    }
+fn execution_error(stage: &'static str, message: String) -> EngineError {
+    EngineError::ExecutionFailed { stage, message }
 }
 
 enum WriterFailure {
-    Limit {
-        required: usize,
-    },
+    Limit { required: usize },
     SizeOverflow,
-    Allocation {
-        requested: usize,
-    },
+    Allocation { requested: usize },
 }
 
 impl WriterFailure {
-    fn into_engine_error(
-        self,
-        limit: usize,
-    ) -> EngineError {
+    fn into_engine_error(self, limit: usize) -> EngineError {
         match self {
             Self::Limit { required } => {
-                match memory_limit(
-                    "render chat template output",
-                    required,
-                    limit,
-                ) {
+                match memory_limit("render chat template output", required, limit) {
                     Ok(error) | Err(error) => error,
                 }
             }
 
-            Self::SizeOverflow => internal(
-                "rendered output byte count overflow",
-            ),
+            Self::SizeOverflow => internal("rendered output byte count overflow"),
 
-            Self::Allocation { requested } => {
-                EngineError::AllocationFailed {
-                    operation:
-                        "allocate rendered template output",
-                    requested_bytes:
-                        u64::try_from(requested).ok(),
-                }
-            }
+            Self::Allocation { requested } => EngineError::AllocationFailed {
+                operation: "allocate rendered template output",
+                requested_bytes: u64::try_from(requested).ok(),
+            },
         }
     }
 }
@@ -814,60 +689,38 @@ impl BoundedWriter {
         }
     }
 
-    fn fail(
-        &mut self,
-        failure: WriterFailure,
-    ) -> io::Error {
+    fn fail(&mut self, failure: WriterFailure) -> io::Error {
         if self.failure.is_none() {
             self.failure = Some(failure);
         }
 
-        io::Error::other(
-            "bounded template output failed",
-        )
+        io::Error::other("bounded template output failed")
     }
 }
 
 impl Write for BoundedWriter {
-    fn write(
-        &mut self,
-        bytes: &[u8],
-    ) -> io::Result<usize> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.failure.is_some() {
             return Err(io::Error::other(
                 "bounded template output previously failed",
             ));
         }
 
-        let required = match self
-            .bytes
-            .len()
-            .checked_add(bytes.len())
-        {
+        let required = match self.bytes.len().checked_add(bytes.len()) {
             Some(required) => required,
             None => {
-                return Err(self.fail(
-                    WriterFailure::SizeOverflow,
-                ));
+                return Err(self.fail(WriterFailure::SizeOverflow));
             }
         };
 
         if required > self.limit {
-            return Err(self.fail(
-                WriterFailure::Limit { required },
-            ));
+            return Err(self.fail(WriterFailure::Limit { required }));
         }
 
-        if self
-            .bytes
-            .try_reserve_exact(bytes.len())
-            .is_err()
-        {
-            return Err(self.fail(
-                WriterFailure::Allocation {
-                    requested: required,
-                },
-            ));
+        if self.bytes.try_reserve_exact(bytes.len()).is_err() {
+            return Err(self.fail(WriterFailure::Allocation {
+                requested: required,
+            }));
         }
 
         self.bytes.extend_from_slice(bytes);
@@ -890,24 +743,12 @@ mod tests {
     use super::*;
     use crate::{
         error::ErrorKind,
-        types::{
-            ContextSnapshotId, Message, MessageRole,
-        },
+        types::{ContextSnapshotId, Message, MessageRole},
     };
-    use tokenizers::{
-        models::wordlevel::WordLevel,
-        pre_tokenizers::whitespace::WhitespaceSplit,
-    };
+    use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::WhitespaceSplit};
 
     fn limits() -> RenderingLimits {
-        RenderingLimits::new(
-            16,
-            4096,
-            4096,
-            4096,
-            128,
-        )
-        .expect("limits")
+        RenderingLimits::new(16, 4096, 4096, 4096, 128).expect("limits")
     }
 
     fn options() -> RenderingOptions<'static> {
@@ -923,19 +764,16 @@ mod tests {
     }
 
     fn profile() -> ModelProfileId {
-        ModelProfileId::new("render-test")
-            .expect("profile")
+        ModelProfileId::new("render-test").expect("profile")
     }
 
     fn artifact() -> ArtifactId {
-        ArtifactId::new("render-test-artifact")
-            .expect("artifact")
+        ArtifactId::new("render-test-artifact").expect("artifact")
     }
 
     fn snapshot(content: &str) -> ContextSnapshot {
         ContextSnapshot::new(
-            ContextSnapshotId::new("snapshot-a")
-                .expect("snapshot"),
+            ContextSnapshotId::new("snapshot-a").expect("snapshot"),
             profile(),
             vec![Message {
                 role: MessageRole::User,
@@ -956,8 +794,7 @@ mod tests {
             profile_id: profile,
             artifact_id: artifact,
             template,
-            template_sha256:
-                sha256(template.as_bytes()),
+            template_sha256: sha256(template.as_bytes()),
             artifact_manifest_sha256: [7; 32],
         }
     }
@@ -982,20 +819,12 @@ mod tests {
 
         let mut tokenizer = Tokenizer::new(model);
 
-        tokenizer.with_pre_tokenizer(
-            Some(WhitespaceSplit),
-        );
+        tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
 
-        let source = tokenizer
-            .to_string(false)
-            .expect("tokenizer JSON");
+        let source = tokenizer.to_string(false).expect("tokenizer JSON");
 
-        PinnedTokenizer::from_pinned_json(
-            source.as_bytes(),
-            sha256(source.as_bytes()),
-            16 * 1024,
-        )
-        .expect("pinned tokenizer")
+        PinnedTokenizer::from_pinned_json(source.as_bytes(), sha256(source.as_bytes()), 16 * 1024)
+            .expect("pinned tokenizer")
     }
 
     #[test]
@@ -1003,11 +832,7 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         let tokenizer = pinned_tokenizer();
 
@@ -1024,10 +849,7 @@ mod tests {
         assert_eq!(rendered.token_ids(), &[1, 2]);
         assert_eq!(rendered.token_count(), 2);
 
-        assert_eq!(
-            rendered.tokenizer_id(),
-            tokenizer.identity(),
-        );
+        assert_eq!(rendered.tokenizer_id(), tokenizer.identity(),);
     }
 
     #[test]
@@ -1035,19 +857,10 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
-        let text = render_chat(
-            &snapshot("<tag>&value"),
-            &binding,
-            &options(),
-            limits(),
-        )
-        .expect("render");
+        let text =
+            render_chat(&snapshot("<tag>&value"), &binding, &options(), limits()).expect("render");
 
         assert_eq!(text, "<tag>&value");
     }
@@ -1057,19 +870,9 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}\n",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}\n");
 
-        let text = render_chat(
-            &snapshot("hello"),
-            &binding,
-            &options(),
-            limits(),
-        )
-        .expect("render");
+        let text = render_chat(&snapshot("hello"), &binding, &options(), limits()).expect("render");
 
         assert_eq!(text, "hello\n");
     }
@@ -1079,45 +882,23 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let mut binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let mut binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         binding.template_sha256 = [0; 32];
 
-        let error = render_chat(
-            &snapshot("hello"),
-            &binding,
-            &options(),
-            limits(),
-        )
-        .expect_err("bad template pin");
+        let error = render_chat(&snapshot("hello"), &binding, &options(), limits())
+            .expect_err("bad template pin");
 
-        assert_eq!(
-            error.kind(),
-            ErrorKind::ArtifactValidationFailed,
-        );
+        assert_eq!(error.kind(), ErrorKind::ArtifactValidationFailed,);
     }
 
     #[test]
     fn tokenizer_digest_is_checked_before_parsing() {
-        let result =
-            PinnedTokenizer::from_pinned_json(
-                b"not tokenizer JSON",
-                [0; 32],
-                1024,
-            );
+        let result = PinnedTokenizer::from_pinned_json(b"not tokenizer JSON", [0; 32], 1024);
 
         match result {
-            Err(error) => assert_eq!(
-                error.kind(),
-                ErrorKind::ArtifactValidationFailed,
-            ),
-            Ok(_) => panic!(
-                "mismatched tokenizer source was accepted"
-            ),
+            Err(error) => assert_eq!(error.kind(), ErrorKind::ArtifactValidationFailed,),
+            Ok(_) => panic!("mismatched tokenizer source was accepted"),
         }
     }
 
@@ -1126,15 +907,10 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         let mut options = options();
-        options.reserved_spellings =
-            &["<|im_start|>"];
+        options.reserved_spellings = &["<|im_start|>"];
 
         let error = render_chat(
             &snapshot("hello <|im_start|>"),
@@ -1144,10 +920,7 @@ mod tests {
         )
         .expect_err("reserved spelling");
 
-        assert_eq!(
-            error.kind(),
-            ErrorKind::InvalidRequest,
-        );
+        assert_eq!(error.kind(), ErrorKind::InvalidRequest,);
     }
 
     #[test]
@@ -1155,33 +928,14 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
-        let small = RenderingLimits::new(
-            16,
-            4096,
-            4096,
-            2,
-            128,
-        )
-        .expect("small output limit");
+        let small = RenderingLimits::new(16, 4096, 4096, 2, 128).expect("small output limit");
 
-        let error = render_chat(
-            &snapshot("hello"),
-            &binding,
-            &options(),
-            small,
-        )
-        .expect_err("output exceeds limit");
+        let error = render_chat(&snapshot("hello"), &binding, &options(), small)
+            .expect_err("output exceeds limit");
 
-        assert_eq!(
-            error.kind(),
-            ErrorKind::MemoryLimitExceeded,
-        );
+        assert_eq!(error.kind(), ErrorKind::MemoryLimitExceeded,);
     }
 
     #[test]
@@ -1189,24 +943,12 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ not_supplied }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ not_supplied }}");
 
-        let error = render_chat(
-            &snapshot("hello"),
-            &binding,
-            &options(),
-            limits(),
-        )
-        .expect_err("undefined variable");
+        let error = render_chat(&snapshot("hello"), &binding, &options(), limits())
+            .expect_err("undefined variable");
 
-        assert_eq!(
-            error.kind(),
-            ErrorKind::ExecutionFailed,
-        );
+        assert_eq!(error.kind(), ErrorKind::ExecutionFailed,);
     }
 
     #[test]
@@ -1214,22 +956,11 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         let tokenizer = pinned_tokenizer();
 
-        let small = RenderingLimits::new(
-            16,
-            4096,
-            4096,
-            4096,
-            1,
-        )
-        .expect("one-token limit");
+        let small = RenderingLimits::new(16, 4096, 4096, 4096, 1).expect("one-token limit");
 
         let error = render_and_count(
             &snapshot("hello world"),
@@ -1249,9 +980,7 @@ mod tests {
                 assert_eq!(input_tokens, 2);
                 assert_eq!(limit_tokens, 1);
             }
-            other => panic!(
-                "unexpected error: {other:?}"
-            ),
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -1260,32 +989,16 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         let tokenizer = pinned_tokenizer();
         let context = snapshot("hello world");
 
-        let first = render_and_count(
-            &context,
-            &binding,
-            &tokenizer,
-            &options(),
-            limits(),
-        )
-        .expect("first");
+        let first =
+            render_and_count(&context, &binding, &tokenizer, &options(), limits()).expect("first");
 
-        let second = render_and_count(
-            &context,
-            &binding,
-            &tokenizer,
-            &options(),
-            limits(),
-        )
-        .expect("second");
+        let second =
+            render_and_count(&context, &binding, &tokenizer, &options(), limits()).expect("second");
 
         assert_eq!(first, second);
     }
@@ -1295,68 +1008,38 @@ mod tests {
         let profile = profile();
         let artifact = artifact();
 
-        let first_binding = binding(
-            &profile,
-            &artifact,
-            "{{ messages[0].content }}",
-        );
+        let first_binding = binding(&profile, &artifact, "{{ messages[0].content }}");
 
         let mut second_binding = first_binding;
-        second_binding.artifact_manifest_sha256 =
-            [8; 32];
+        second_binding.artifact_manifest_sha256 = [8; 32];
 
         let tokenizer = pinned_tokenizer();
         let context = snapshot("hello");
 
-        let first = render_and_count(
-            &context,
-            &first_binding,
-            &tokenizer,
-            &options(),
-            limits(),
-        )
-        .expect("first");
+        let first = render_and_count(&context, &first_binding, &tokenizer, &options(), limits())
+            .expect("first");
 
-        let second = render_and_count(
-            &context,
-            &second_binding,
-            &tokenizer,
-            &options(),
-            limits(),
-        )
-        .expect("second");
+        let second = render_and_count(&context, &second_binding, &tokenizer, &options(), limits())
+            .expect("second");
 
-        assert_eq!(
-            first.token_ids(),
-            second.token_ids(),
-        );
+        assert_eq!(first.token_ids(), second.token_ids(),);
 
-        assert_ne!(
-            first.render_hash(),
-            second.render_hash(),
-        );
+        assert_ne!(first.render_hash(), second.render_hash(),);
     }
 
     #[test]
     fn bounded_writer_does_not_retain_rejected_bytes() {
         let mut writer = BoundedWriter::new(4);
 
-        writer
-            .write_all(b"ab")
-            .expect("initial write");
+        writer.write_all(b"ab").expect("initial write");
 
         assert!(writer.write_all(b"cde").is_err());
 
-        assert_eq!(
-            writer.bytes.as_slice(),
-            b"ab",
-        );
+        assert_eq!(writer.bytes.as_slice(), b"ab",);
 
         assert!(matches!(
             writer.failure,
-            Some(WriterFailure::Limit {
-                required: 5,
-            }),
+            Some(WriterFailure::Limit { required: 5 }),
         ));
     }
 }
