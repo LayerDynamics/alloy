@@ -523,22 +523,39 @@ fn startup_budget(plan: &RuntimePlan) -> u64 {
     ])
 }
 
-fn load_entry_reservation(plan: &RuntimePlan) -> u64 {
+/// Full cold-start grant after AdmitOutput for retained-contents policy.
+///
+/// Output has been taken; workspace, loading peak, KV, and history remain
+/// on the grant until prepare partitions them. Reserved bytes equal this
+/// total for the whole pending interval.
+fn pending_startup_reservation(plan: &RuntimePlan) -> u64 {
     sum(&[
         plan.output_bytes,
         plan.temporary_bytes,
         plan.headroom_bytes,
         plan.load_limits.max_load_peak_bytes(),
+        plan.cache.max_cache_bytes(),
+        (plan.cache.capacity_tokens() * std::mem::size_of::<u32>()) as u64,
     ])
 }
 
+fn load_entry_reservation(plan: &RuntimePlan) -> u64 {
+    // Load runs during prepare after workspace/peak takes. Cache and
+    // history bytes stay on the grant, so the ledger still holds the
+    // full pending startup total.
+    pending_startup_reservation(plan)
+}
+
 fn cache_entry_reservation(plan: &RuntimePlan) -> u64 {
+    // Peak has been resized to resident; history remains on the grant
+    // until candidate construction.
     sum(&[
         plan.output_bytes,
         plan.temporary_bytes,
         plan.headroom_bytes,
         plan.load_limits.max_resident_bytes(),
         plan.cache.max_cache_bytes(),
+        (plan.cache.capacity_tokens() * std::mem::size_of::<u32>()) as u64,
     ])
 }
 
@@ -925,7 +942,7 @@ fn policy_abandoned_pending_startup_cleans_admission_before_slot_release() {
     );
     assert_eq!(
         environment.snapshot().reserved_bytes(),
-        environment.plan_a.output_bytes,
+        pending_startup_reservation(&environment.plan_a),
     );
     assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 0,);
 

@@ -380,7 +380,7 @@ impl ReservationGrant {
         self.remaining_bytes == 0
     }
 
-        /// Transfer part of the grant to the resource that will own it.
+    /// Transfer part of the grant to the resource that will own it.
     ///
     /// Total reserved bytes remain unchanged.
     ///
@@ -406,15 +406,12 @@ impl ReservationGrant {
             ));
         }
 
-        let remaining_bytes = self
-            .remaining_bytes
-            .checked_sub(bytes)
-            .ok_or_else(|| {
-                EngineError::invalid_request(
-                    "grant_partition",
-                    "requested bytes exceed the remaining startup grant",
-                )
-            })?;
+        let remaining_bytes = self.remaining_bytes.checked_sub(bytes).ok_or_else(|| {
+            EngineError::invalid_request(
+                "grant_partition",
+                "requested bytes exceed the remaining startup grant",
+            )
+        })?;
 
         let shared = Arc::clone(&self.shared);
 
@@ -427,9 +424,7 @@ impl ReservationGrant {
                 ));
             }
 
-            if self.remaining_bytes > state.reserved_bytes
-                || state.active_reservations == 0
-            {
+            if self.remaining_bytes > state.reserved_bytes || state.active_reservations == 0 {
                 return Err(internal_error(
                     "startup grant exceeds shared reservation accounting",
                 ));
@@ -440,14 +435,9 @@ impl ReservationGrant {
                 state.active_reservations
             } else {
                 // Both the remainder and returned reservation own bytes.
-                state
-                    .active_reservations
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        internal_error(
-                            "admission reservation-count arithmetic overflow",
-                        )
-                    })?
+                state.active_reservations.checked_add(1).ok_or_else(|| {
+                    internal_error("admission reservation-count arithmetic overflow")
+                })?
             };
 
             // All fallible checks completed. Reserved bytes do not change.
@@ -957,21 +947,23 @@ mod tests {
             .expect("workspace guard");
 
         assert_eq!(grant.remaining_bytes(), 20);
+        // Before resizing: 80 loading + 20 workspace + 20 grant remainder.
         assert_eq!(
             admission
                 .snapshot()
                 .expect("before resize")
                 .reserved_bytes(),
-            100
+            120,
         );
 
         loading
             .try_resize(60)
             .expect("release loader-overlap allowance");
         assert_eq!(loading.bytes(), 60);
+        // After resizing: 60 loading + 20 workspace + 20 grant remainder.
         assert_eq!(
             admission.snapshot().expect("after resize").reserved_bytes(),
-            80
+            100,
         );
 
         let resident = grant
@@ -979,9 +971,10 @@ mod tests {
             .expect("take resident")
             .expect("resident guard");
         assert!(grant.is_empty());
+        // Taking the remaining 20 transfers ownership; it releases no bytes.
         assert_eq!(
             admission.snapshot().expect("transferred").reserved_bytes(),
-            80
+            100,
         );
 
         drop(workspace);

@@ -32,7 +32,7 @@
 //! production-path verification has passed.
 
 use crate::{
-    admission::{AdmissionController, AdmissionSnapshot, MemoryReservation},
+    admission::{AdmissionController, AdmissionSnapshot, MemoryReservation, ReservationGrant},
     api::{ENGINE_API_VERSION, EngineFuture, EngineRuntime, ExecutionContext},
     cache_identity::{CacheIdentityInputs, compute_session_state_id},
     cancellation::CancellationToken,
@@ -1307,11 +1307,25 @@ struct TokenHistory {
 }
 
 impl TokenHistory {
+    #[cfg(test)]
     fn new(admission: &AdmissionController, capacity: usize) -> Result<Self, EngineError> {
         let requested = token_storage_bytes(capacity)?;
-        let mut reservation = admission.reserve("executed token history", requested)?;
-        let mut tokens = Vec::new();
+        let reservation = admission.reserve("executed token history", requested)?;
+        Self::from_reservation(reservation, capacity)
+    }
 
+    fn from_reservation(
+        mut reservation: MemoryReservation,
+        capacity: usize,
+    ) -> Result<Self, EngineError> {
+        let requested = token_storage_bytes(capacity)?;
+        if reservation.bytes() < requested {
+            return Err(internal(
+                "history reservation is smaller than the requested capacity",
+            ));
+        }
+
+        let mut tokens = Vec::new();
         tokens
             .try_reserve_exact(capacity)
             .map_err(|_| EngineError::AllocationFailed {
@@ -1459,9 +1473,18 @@ struct Active {
     _workspace: Option<MemoryReservation>,
 }
 
+/// Admitted startup that still owns unpartitioned grant bytes.
+///
+/// Output has already been taken. Remaining components are transferred in
+/// `prepare`, or released when pending startup is abandoned.
+struct PendingStartup {
+    request_id: RequestId,
+    grant: ReservationGrant,
+}
+
 struct NativeState {
     active: Option<Active>,
-    pending: Option<RequestId>,
+    pending: Option<PendingStartup>,
     resident: Option<Resident>,
     states: HashMap<SessionStateId, StateEntry>,
     admission: AdmissionController,
@@ -1608,7 +1631,7 @@ impl NativeState {
         self.active
             .as_ref()
             .map(|active| active.control.request_id())
-            .or(self.pending.as_ref())
+            .or_else(|| self.pending.as_ref().map(|pending| &pending.request_id))
     }
 
     fn require_idle(&self) -> Result<(), EngineError> {
@@ -2019,7 +2042,8 @@ impl NativeState {
         self.unpublish_idle_state()?;
 
         let admission = self.admission.clone();
-        let output = reserve_output_after_reclaim(&admission, setup.plan.output_bytes, || {
+        let output_bytes = setup.plan.output_bytes;
+        let (output, grant) = admit_startup_after_reclaim(&admission, output_bytes, || {
             let same_model = self
                 .resident
                 .as_ref()
@@ -2042,10 +2066,25 @@ impl NativeState {
 
             self.publish();
             check_startup(control, abandoned)?;
-            self.apply_startup_pressure(setup, control, abandoned)
+            self.apply_startup_pressure(setup, control, abandoned)?;
+
+            // Size the grant from post-reclaim residency so pressure and
+            // admission cannot disagree about incremental demand.
+            let residency = self.pressure_residency(setup)?;
+            let same_cache = residency.reusable_model
+                && self
+                    .resident
+                    .as_ref()
+                    .or_else(|| self.states.values().next().map(|entry| &entry.resident))
+                    .and_then(|resident| resident.cache.as_ref())
+                    .is_some_and(|cache| cache_matches(cache, &setup.plan));
+            incremental_startup_components(&setup.plan, self.retention, &residency, same_cache)
         })?;
 
-        self.pending = Some(control.request_id().clone());
+        self.pending = Some(PendingStartup {
+            request_id: control.request_id().clone(),
+            grant,
+        });
         Ok(output)
     }
 
@@ -2061,7 +2100,7 @@ impl NativeState {
                 message: "native worker already owns an active request".to_owned(),
             });
         }
-        if self.pending.as_ref() != Some(control.request_id()) {
+        if self.pending.as_ref().map(|pending| &pending.request_id) != Some(control.request_id()) {
             return Err(internal("prefill has no matching admitted startup"));
         }
         if !self.states.is_empty() {
@@ -2098,20 +2137,27 @@ impl NativeState {
         }
 
         let workspace_bytes = add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?;
-        let workspace = if workspace_bytes == 0 {
-            None
-        } else {
-            Some(
-                self.admission
-                    .reserve("generation workspaces", workspace_bytes)?,
-            )
+        let workspace = {
+            let grant = &mut self
+                .pending
+                .as_mut()
+                .ok_or_else(|| internal("admitted startup grant disappeared"))?
+                .grant;
+            grant.take("generation workspaces", workspace_bytes)?
         };
 
         if self.resident.is_none() {
-            let mut weights = self.admission.reserve(
-                "model loading peak",
-                setup.plan.load_limits.max_load_peak_bytes(),
-            )?;
+            let peak = setup.plan.load_limits.max_load_peak_bytes();
+            let mut weights = {
+                let grant = &mut self
+                    .pending
+                    .as_mut()
+                    .ok_or_else(|| internal("admitted startup grant disappeared"))?
+                    .grant;
+                grant
+                    .take("model loading peak", peak)?
+                    .ok_or_else(|| internal("startup grant missing model loading peak"))?
+            };
             let model = setup.backend.load(ModelLoadRequest::new(
                 artifact,
                 setup.plan.load_limits,
@@ -2167,6 +2213,45 @@ impl NativeState {
         }
 
         control.check_cancelled()?;
+        let cache_bytes = setup.plan.cache.max_cache_bytes();
+        let needs_cache = self
+            .resident
+            .as_ref()
+            .ok_or_else(|| internal("loaded model unavailable"))?
+            .cache
+            .is_none();
+        if needs_cache {
+            let reservation = {
+                let grant = &mut self
+                    .pending
+                    .as_mut()
+                    .ok_or_else(|| internal("admitted startup grant disappeared"))?
+                    .grant;
+                grant
+                    .take("model KV buffers", cache_bytes)?
+                    .ok_or_else(|| internal("startup grant missing model KV buffers"))?
+            };
+            let resident = self
+                .resident
+                .as_mut()
+                .ok_or_else(|| internal("loaded model unavailable"))?;
+            let model = resident.model.autoregressive().ok_or_else(|| {
+                EngineError::unsupported("task", "loaded model has no autoregressive execution")
+            })?;
+            let cache = model.allocate_cache(&setup.plan.cache, &control)?;
+
+            if cache.owner() != model.instance_id()
+                || cache.mode() != setup.plan.cache.mode()
+                || cache.representation() != &setup.plan.cache.mode().representation
+                || cache.capacity_tokens() < setup.plan.cache.capacity_tokens()
+                || cache.len() != 0
+            {
+                return Err(internal("family allocated an incompatible cache"));
+            }
+            check_cache_bytes(cache.as_ref(), reservation.bytes())?;
+            resident.cache = Some(ResidentCache { cache, reservation });
+        }
+
         let resident = self
             .resident
             .as_mut()
@@ -2192,27 +2277,6 @@ impl NativeState {
                 "cache mode",
                 "loaded model does not support the planned cache",
             ));
-        }
-
-        if resident.cache.is_none() {
-            let reservation = self
-                .admission
-                .reserve("model KV buffers", setup.plan.cache.max_cache_bytes())?;
-            let model = resident.model.autoregressive().ok_or_else(|| {
-                EngineError::unsupported("task", "loaded model has no autoregressive execution")
-            })?;
-            let cache = model.allocate_cache(&setup.plan.cache, &control)?;
-
-            if cache.owner() != model.instance_id()
-                || cache.mode() != setup.plan.cache.mode()
-                || cache.representation() != &setup.plan.cache.mode().representation
-                || cache.capacity_tokens() < setup.plan.cache.capacity_tokens()
-                || cache.len() != 0
-            {
-                return Err(internal("family allocated an incompatible cache"));
-            }
-            check_cache_bytes(cache.as_ref(), reservation.bytes())?;
-            resident.cache = Some(ResidentCache { cache, reservation });
         }
 
         if let Some(candidate) = &resident.candidate {
@@ -2299,24 +2363,30 @@ impl NativeState {
             return Err(internal("invalid vocabulary, EOS, or retained logits"));
         }
 
+        let history_capacity = setup.plan.cache.capacity_tokens();
         let candidate = if retains_contents(self.retention) {
             let history = match previous.take() {
-                Some(mut previous)
-                    if previous.history.tokens.capacity() >= setup.plan.cache.capacity_tokens() =>
-                {
+                Some(mut previous) if previous.history.tokens.capacity() >= history_capacity => {
                     previous.history.tokens.truncate(reused);
                     previous.history
                 }
-                Some(previous) => {
+                previous => {
                     drop(previous);
+                    let history_bytes = token_storage_bytes(history_capacity)?;
+                    let reservation = {
+                        let grant = &mut self
+                            .pending
+                            .as_mut()
+                            .ok_or_else(|| internal("admitted startup grant disappeared"))?
+                            .grant;
+                        grant
+                            .take("executed token history", history_bytes)?
+                            .ok_or_else(|| {
+                                internal("startup grant missing executed token history")
+                            })?
+                    };
                     let mut history =
-                        TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?;
-                    history.append(&context.token_ids()[..reused])?;
-                    history
-                }
-                None => {
-                    let mut history =
-                        TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?;
+                        TokenHistory::from_reservation(reservation, history_capacity)?;
                     history.append(&context.token_ids()[..reused])?;
                     history
                 }
@@ -2336,7 +2406,10 @@ impl NativeState {
             None
         };
 
-        self.pending = None;
+        // Release any unused forecast (for example history when reused).
+        if let Some(pending) = self.pending.take() {
+            pending.grant.release()?;
+        }
         self.active = Some(Active {
             decoder,
             logits: initial_logits,
@@ -2508,7 +2581,7 @@ impl NativeState {
         if self
             .pending
             .as_ref()
-            .is_some_and(|pending| pending != request)
+            .is_some_and(|pending| &pending.request_id != request)
         {
             return Err(internal("cleanup request does not own pending startup"));
         }
@@ -2523,6 +2596,7 @@ impl NativeState {
             return Ok(());
         }
 
+        // Dropping pending releases any unpartitioned grant remainder.
         self.pending = None;
         let mut active = self.active.take();
         let mut candidate = None;
@@ -2598,7 +2672,10 @@ impl NativeState {
             .active
             .as_ref()
             .is_some_and(|active| active.control.request_id() == request)
-            || self.pending.as_ref() == Some(request)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| &pending.request_id == request)
         {
             if let Some(active) = &mut self.active {
                 active.text_finished = false;
@@ -2973,15 +3050,54 @@ fn validate_entry(entry: &StateEntry) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn reserve_output_after_reclaim(
+/// Run reclaim, then atomically admit the incremental startup components
+/// and transfer the output allowance into an independent reservation.
+///
+/// `reclaim` must return the post-reclaim component vector. The first
+/// component should be `output_bytes`; remaining entries are workspace,
+/// optional loading peak, optional KV, and optional history.
+fn admit_startup_after_reclaim(
     admission: &AdmissionController,
     output_bytes: u64,
-    reclaim: impl FnOnce() -> Result<(), EngineError>,
-) -> Result<Arc<MemoryReservation>, EngineError> {
-    reclaim()?;
-    admission
-        .reserve("generation output buffers", output_bytes)
-        .map(Arc::new)
+    reclaim: impl FnOnce() -> Result<Vec<u64>, EngineError>,
+) -> Result<(Arc<MemoryReservation>, ReservationGrant), EngineError> {
+    let components = reclaim()?;
+    let mut grant = admission.reserve_grant("generation startup", &components)?;
+    let output = grant
+        .take("generation output buffers", output_bytes)?
+        .ok_or_else(|| {
+            EngineError::invalid_request(
+                "generation output buffers",
+                "startup output allowance must be positive",
+            )
+        })?;
+    Ok((Arc::new(output), grant))
+}
+
+/// Incremental startup ledger matching `pressure_demand` reservation bytes.
+fn incremental_startup_components(
+    plan: &RuntimePlan,
+    retention: RetentionPolicy,
+    residency: &RuntimeResidency,
+    same_cache: bool,
+) -> Result<Vec<u64>, EngineError> {
+    let workspace = add(plan.temporary_bytes, plan.headroom_bytes)?;
+    let weights = if residency.reusable_model {
+        0
+    } else {
+        plan.load_limits.max_load_peak_bytes()
+    };
+    let cache = if same_cache {
+        0
+    } else {
+        plan.cache.max_cache_bytes()
+    };
+    let history = if retains_contents(retention) {
+        token_storage_bytes(plan.cache.capacity_tokens())?
+    } else {
+        0
+    };
+    Ok(vec![plan.output_bytes, workspace, weights, cache, history])
 }
 
 fn cache_matches(cache: &ResidentCache, plan: &RuntimePlan) -> bool {
@@ -3188,12 +3304,13 @@ mod tests {
                 .is_err()
         );
 
-        let output = reserve_output_after_reclaim(&admission, 20 * MIB, || {
+        let (output, grant) = admit_startup_after_reclaim(&admission, 20 * MIB, || {
             drop(idle);
-            Ok(())
+            Ok(vec![20 * MIB])
         })
         .expect("output after reclamation");
 
+        assert!(grant.is_empty());
         assert_eq!(
             admission.snapshot().expect("snapshot").reserved_bytes(),
             20 * MIB,
@@ -3208,12 +3325,13 @@ mod tests {
         let model = admission.reserve("model", 60).expect("model");
         let cache = admission.reserve("cache", 30).expect("cache");
 
-        let output = reserve_output_after_reclaim(&admission, 20, || {
+        let (output, grant) = admit_startup_after_reclaim(&admission, 20, || {
             drop(cache);
-            Ok(())
+            Ok(vec![20])
         })
         .expect("output");
 
+        assert!(grant.is_empty());
         assert_eq!(model.bytes(), 60);
         assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 80);
         drop(output);
@@ -3227,9 +3345,9 @@ mod tests {
         let unrelated = admission.reserve("unrelated", 85).expect("unrelated");
         let idle = admission.reserve("idle", 10).expect("idle");
 
-        let result = reserve_output_after_reclaim(&admission, 20, || {
+        let result = admit_startup_after_reclaim(&admission, 20, || {
             drop(idle);
-            Ok(())
+            Ok(vec![20])
         });
 
         assert!(matches!(
@@ -3252,22 +3370,116 @@ mod tests {
         let before = admission.snapshot().expect("before");
 
         assert!(
-            reserve_output_after_reclaim(&admission, 20, || {
-                Err(internal("reclamation failed"))
-            })
-            .is_err()
+            admit_startup_after_reclaim(&admission, 20, || { Err(internal("reclamation failed")) })
+                .is_err()
         );
         assert_eq!(admission.snapshot().expect("after"), before);
     }
 
     #[test]
+    fn startup_grant_partitions_output_without_double_counting() {
+        let admission = AdmissionController::new(200).expect("controller");
+        // output 20 + workspace 30 + peak 80 + cache 40 + history 10
+        let components = vec![20, 30, 80, 40, 10];
+
+        let (output, mut grant) =
+            admit_startup_after_reclaim(&admission, 20, || Ok(components.clone())).expect("grant");
+
+        assert_eq!(output.bytes(), 20);
+        assert_eq!(grant.remaining_bytes(), 160);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("after output take")
+                .reserved_bytes(),
+            180
+        );
+
+        let workspace = grant
+            .take("generation workspaces", 30)
+            .expect("workspace")
+            .expect("nonzero");
+        let peak = grant
+            .take("model loading peak", 80)
+            .expect("peak")
+            .expect("nonzero");
+        assert_eq!(grant.remaining_bytes(), 50);
+        assert_eq!(
+            admission.snapshot().expect("after takes").reserved_bytes(),
+            180
+        );
+
+        drop(workspace);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("workspace dropped")
+                .reserved_bytes(),
+            150
+        );
+
+        grant.release().expect("release unused cache+history");
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("remainder released")
+                .reserved_bytes(),
+            100
+        );
+
+        drop(peak);
+        drop(output);
+        assert_eq!(admission.snapshot().expect("empty").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn startup_grant_rejects_when_incremental_total_does_not_fit() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let _blocking = admission.reserve("blocking", 50).expect("blocking");
+
+        let error = admit_startup_after_reclaim(&admission, 20, || Ok(vec![20, 20, 40, 30, 0]))
+            .expect_err("110 does not fit in 50 available");
+
+        assert!(matches!(
+            error,
+            EngineError::MemoryLimitExceeded {
+                required_bytes: 110,
+                available_bytes: 50,
+                ..
+            }
+        ));
+        assert_eq!(
+            admission.snapshot().expect("unchanged").reserved_bytes(),
+            50
+        );
+    }
+
+    fn test_pending(admission: &AdmissionController, id: &str) -> PendingStartup {
+        PendingStartup {
+            request_id: RequestId::new(id).expect("request"),
+            grant: admission
+                .reserve_grant("test pending startup", &[1])
+                .expect("grant"),
+        }
+    }
+
+    #[test]
     fn pending_startup_can_finish_without_prefill() {
-        let request = RequestId::new("pending-startup").expect("request");
         let mut state = empty_native_state(RetentionPolicy {
             retain_model: true,
             retain_cache_buffers: true,
         });
-        state.pending = Some(request.clone());
+        let pending = test_pending(&state.admission, "pending-startup");
+        let request = pending.request_id.clone();
+        assert_eq!(
+            state
+                .admission
+                .snapshot()
+                .expect("granted")
+                .reserved_bytes(),
+            1
+        );
+        state.pending = Some(pending);
         state.publish();
 
         assert!(lock_metadata(&state.summary).active);
@@ -3276,6 +3488,14 @@ mod tests {
 
         assert!(state.pending.is_none());
         assert!(!lock_metadata(&state.summary).active);
+        assert_eq!(
+            state
+                .admission
+                .snapshot()
+                .expect("released")
+                .reserved_bytes(),
+            0
+        );
     }
 
     #[test]
@@ -3314,8 +3534,9 @@ mod tests {
             retain_model: true,
             retain_cache_buffers: true,
         });
-        let request = RequestId::new("pending-publication").expect("request");
-        state.pending = Some(request.clone());
+        let pending = test_pending(&state.admission, "pending-publication");
+        let request = pending.request_id.clone();
+        state.pending = Some(pending);
 
         assert!(matches!(
             state.retain_state(&request, b"prefix"),
@@ -3490,11 +3711,17 @@ mod mlx_allocator_runtime_tests {
         let _unrelated = admission
             .reserve("unrelated owner", 512)
             .expect("reservation");
+        let pending = PendingStartup {
+            request_id: RequestId::new("pending-allocator-reclaim").expect("request"),
+            grant: admission
+                .reserve_grant("test pending startup", &[1])
+                .expect("grant"),
+        };
         let before = admission.snapshot().expect("before");
 
         let state = NativeState {
             active: None,
-            pending: Some(RequestId::new("pending-allocator-reclaim").expect("request")),
+            pending: Some(pending),
             resident: None,
             states: HashMap::new(),
             admission: admission.clone(),
@@ -3548,7 +3775,13 @@ mod pressure_resource_reclamation_tests {
     fn pending_native_ownership_blocks_destructive_pressure_actions() {
         let admission = AdmissionController::new(4096).expect("admission");
         let mut state = empty_state(admission.clone());
-        state.pending = Some(RequestId::new("pending-pressure").expect("ID"));
+        state.pending = Some(PendingStartup {
+            request_id: RequestId::new("pending-pressure").expect("ID"),
+            grant: admission
+                .reserve_grant("test pending startup", &[1])
+                .expect("grant"),
+        });
+        assert_eq!(admission.snapshot().expect("before").reserved_bytes(), 1);
         assert!(matches!(
             state.pressure_release_idle_state(),
             Err(EngineError::Busy { .. })
@@ -3557,7 +3790,7 @@ mod pressure_resource_reclamation_tests {
             state.pressure_unload_idle_model(),
             Err(EngineError::Busy { .. })
         ));
-        assert_eq!(admission.snapshot().expect("after").reserved_bytes(), 0);
+        assert_eq!(admission.snapshot().expect("after").reserved_bytes(), 1);
     }
 }
 
