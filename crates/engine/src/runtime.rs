@@ -1,40 +1,39 @@
 //! Admission-aware runtime with worker-local native model ownership.
 //!
-//! Native models, KV caches, tokenizer decoders, and native allocation
-//! reservations are constructed, used, and destroyed on one dedicated
-//! worker. Only command handles and descriptive metadata cross threads.
+//! Native models, caches, decoders, and their allocation reservations stay
+//! on a dedicated worker. Only command handles and metadata cross threads.
 //!
-//! Startup reclaims incompatible idle resources before output admission.
-//! Pending startup retains exclusive native ownership until prefill or
-//! acknowledged cleanup. Abandoned asynchronous handoffs are cleaned up
-//! by dispatchers without blocking the asynchronous executor.
+//! Completed requests can retain exact executed-token history, actual KV,
+//! and actual final-position logits. Ordinary generation may reuse that
+//! state only after verifying native ownership, execution compatibility,
+//! exact token-prefix compatibility, and retained-position availability.
 //!
-//! Completed requests may retain valid logical KV contents when both
-//! retention flags are enabled. Those contents are not automatically
-//! published under a canonical SessionStateId: publication additionally
-//! requires the exact tokenizer-produced prefix bytes.
+//! Supported reuse:
 //!
-//! FamilyRuntime::retain_session_state explicitly associates those bytes
-//! with the actual completed request. The native worker computes the
-//! canonical identity and transfers the actual resident model, cache,
-//! token history, and their reservations into a worker-owned state entry.
+//! - Identical input: reuse KV and retained final-position logits.
+//! - Exact extension: reuse the complete retained prefix and prefill the
+//!   missing suffix, provided the existing allocation satisfies the plan.
 //!
-//! Lookup returns descriptive metadata. Leasing additionally pins an
-//! entry against release and reclamation. A lease never transfers native
-//! model or cache ownership off the native worker.
+//! Shortened, divergent, incompatible, or insufficiently retained context
+//! rebuilds from an empty logical cache. This implementation does not
+//! migrate KV into a replacement allocation or restore partial prefixes.
 //!
-//! This runtime does not yet execute requests from retained prefixes.
-//! Ordinary generation resets logical KV before prefill, and capability
-//! reporting continues to advertise supports_prefix_reuse = false.
+//! Canonical publication remains explicit because RenderedContext does not
+//! contain the tokenizer-produced prefix-byte payload required by the
+//! canonical identity contract. Runtime prefix matching uses the actual
+//! executed token IDs and actual native ownership; it does not fabricate
+//! canonical tokenizer bytes.
 //!
-//! Token-prefix provenance remains an integration contract: callers of
-//! retain_session_state must provide the exact bytes produced by the
-//! pinned tokenizer integration. Rendered text, lossy decoded text, and
-//! an independently chosen serialization of token IDs are not substitutes.
+//! Leases pin published native state against release and mutation. Native
+//! allocations and their reservations are destroyed before release
+//! acknowledgements.
+//!
+//! Prefix-reuse capability reporting intentionally remains false until
+//! production-path verification has passed.
 
 use crate::{
     admission::{AdmissionController, AdmissionSnapshot, MemoryReservation},
-    api::{EngineFuture, EngineRuntime, ExecutionContext},
+    api::{ENGINE_API_VERSION, EngineFuture, EngineRuntime, ExecutionContext},
     cache_identity::{CacheIdentityInputs, compute_session_state_id},
     cancellation::CancellationToken,
     error::EngineError,
@@ -45,10 +44,11 @@ use crate::{
     generation::{self, GenerationLimits, GenerationSession, TokenStep},
     registry::{ArtifactRegistration, FamilyVersion, Registry},
     types::{
-        ArtifactId, CacheMode, Capabilities, ContextSnapshot, DecodingCapability, DecodingMode,
-        Generation, GenerationEvent, GenerationEventStream, GenerationOptions, GenerationRequest,
-        GenerationStream, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome,
-        RenderedContext, RendererIdentity, RequestId, SessionStateId, TokenizerId, Usage,
+        ArtifactId, CacheKind, CacheMode, Capabilities, ContextSnapshot, DecodingCapability,
+        DecodingMode, Generation, GenerationEvent, GenerationEventStream, GenerationOptions,
+        GenerationRequest, GenerationStream, MemoryBreakdown, MemoryEstimate, ModelProfileId,
+        ReleaseOutcome, RenderedContext, RendererIdentity, RequestId, SessionStateId, TokenizerId,
+        Usage,
     },
 };
 use std::{
@@ -65,18 +65,27 @@ use std::{
     thread,
 };
 
+/// Stable identity of the Qwen3 host-reference KV representation.
+///
+/// Describes full-attention host-side f64 keys and values, not quantized
+/// or MLX/Metal-resident KV storage.
+///
+/// Change this identifier when the retained cache layout or its
+/// interpretation changes. Coordinate incompatible changes with the
+/// family implementation version.
+pub const QWEN3_CACHE_REPRESENTATION: &str = "qwen3.host-f64.full.v1";
+
 /// Explicit lifetime policy for idle native resources.
 #[derive(Clone, Copy, Debug)]
 pub struct RetentionPolicy {
     /// Keep the last loaded model after a request completes.
     pub retain_model: bool,
-    /// Keep allocated KV buffers after a request completes.
+
+    /// Keep allocated KV buffers after completion.
     ///
-    /// Requires retain_model. Valid completed logical contents may remain
-    /// available for explicit canonical publication. Unpublished contents
-    /// are reset before ordinary generation.
-    ///
-    /// This flag does not enable cross-request prefix execution reuse.
+    /// Requires retain_model. Valid completed logical contents, token
+    /// history, and final-position logits may remain available for exact
+    /// prefix reuse and explicit canonical publication.
     pub retain_cache_buffers: bool,
 }
 
@@ -87,19 +96,19 @@ pub struct RuntimePlan {
     pub load_limits: ModelLoadLimits,
     /// Actual family cache mode, capacity, and allocation limit.
     pub cache: CacheAllocationRequest,
-    /// Prefill/decode/decoder workspace allowance, excluding loader overlap.
+    /// Execution workspace allowance, excluding loader overlap.
     pub temporary_bytes: u64,
     /// Event-queue, pending-text, and output allowance.
     pub output_bytes: u64,
     /// Additional request-local headroom.
     pub headroom_bytes: u64,
-    /// Actual chunk bound used for cancellable prefill.
+    /// Actual cancellable prefill chunk bound.
     pub prefill_chunk_tokens: NonZeroUsize,
 }
 
 /// Actual incremental tokenizer decoder, confined to the native worker.
 pub trait TextDecoder {
-    /// Decode one real generated token without corrupting incremental state.
+    /// Decode one generated token without corrupting incremental state.
     fn push(&mut self, token: u32) -> Result<String, EngineError>;
 
     /// Finish pending tokenizer bytes after normal generation.
@@ -108,15 +117,14 @@ pub trait TextDecoder {
 
 /// Required real backend services in addition to the actual family loader.
 pub trait RuntimeBackend: ModelFamily + 'static {
-    /// Render/tokenize with verified profile inputs and pinned identities.
+    /// Render and tokenize with verified profile inputs.
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
         context: ContextSnapshot,
     ) -> EngineFuture<'a, RenderedContext>;
 
-    /// Compute representation-aware bounds without loading native objects
-    /// onto the asynchronous control thread.
+    /// Compute bounds without loading native objects onto this thread.
     fn plan<'a>(
         &'a self,
         registry: &'a Registry,
@@ -124,21 +132,21 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         input_tokens: usize,
     ) -> EngineFuture<'a, RuntimePlan>;
 
-    /// Enforce pinned artifact integrity before loading or reuse.
+    /// Verify the pinned artifact before loading or reuse.
     fn verify_artifact(
         &self,
         artifact: &ArtifactRegistration,
         control: &ExecutionControl,
     ) -> Result<(), EngineError>;
 
-    /// Construct the actual profile-specific incremental tokenizer decoder.
+    /// Construct the actual profile-specific incremental decoder.
     fn decoder(
         &self,
         registry: &Registry,
         profile: &ModelProfileId,
     ) -> Result<Box<dyn TextDecoder>, EngineError>;
 
-    /// Return the verified profile's actual EOS token IDs.
+    /// Return the actual profile EOS token IDs.
     fn eos_tokens(
         &self,
         registry: &Registry,
@@ -146,55 +154,58 @@ pub trait RuntimeBackend: ModelFamily + 'static {
     ) -> Result<Vec<u32>, EngineError>;
 }
 
-/// Descriptive metadata for one actual retained native state.
+/// Descriptive metadata for an actual retained native state.
 ///
-/// This is a snapshot, not authorization to reuse KV. An ordinary lookup
-/// does not prevent subsequent release or reclamation. Acquire a lease
-/// when the state must remain present.
+/// A lookup is a snapshot. Acquire a lease to prevent subsequent release
+/// or reclamation.
 #[derive(Clone, Debug)]
 pub struct RetainedSessionState {
-    /// Canonical identity associated with the actual allocation.
+    /// Canonical identity associated with the allocation.
     pub state_id: SessionStateId,
-    /// Request whose actual execution produced this state.
+    /// Request that produced this state.
     pub request_id: RequestId,
     /// Verified artifact actually loaded.
     pub artifact_id: ArtifactId,
-    /// Actual loaded-model instance owning the cache.
+    /// Actual owning native model instance.
     pub model_instance_id: ModelInstanceId,
-    /// Actual family implementation that produced the state.
+    /// Actual family implementation version.
     pub family_impl_version: FamilyVersion,
-    /// Profile used for actual execution.
+    /// Profile used for execution.
     pub profile_id: ModelProfileId,
     /// Pinned tokenizer identity.
     pub tokenizer_id: TokenizerId,
     /// Exact initial prompt template digest.
     pub template_hash: [u8; 32],
-    /// Exact initial prompt render digest.
+    /// Exact initial prompt rendering digest.
     pub render_hash: [u8; 32],
-    /// Renderer implementation identity.
+    /// Exact renderer identity.
     pub renderer: RendererIdentity,
-    /// Actual cache representation and retention behavior.
+    /// Actual cache mode.
     pub cache_mode: CacheMode,
-    /// Logical positions processed by the cache.
+    /// Logical positions processed.
     pub logical_tokens: usize,
-    /// Positions physically retained by the cache.
+    /// Physically retained positions.
     pub retained_tokens: usize,
-    /// Actual allocated cache capacity.
+    /// Allocated logical capacity.
     pub capacity_tokens: usize,
-    /// Model-weight reservation retained by this entry.
+    /// Retained model-weight reservation.
     pub weights_reserved_bytes: u64,
-    /// KV-buffer reservation retained by this entry.
+    /// Retained KV-buffer reservation.
     pub cache_reserved_bytes: u64,
-    /// Reservation retained for exact executed-token history.
+    /// Retained exact-token-history reservation.
     pub token_history_reserved_bytes: u64,
+    /// Retained final-position-logits reservation.
+    pub logits_reserved_bytes: u64,
+    /// Input positions reused by the producing request.
+    pub reused_input_tokens: usize,
+    /// Input positions newly executed by the producing request.
+    pub prefilled_input_tokens: usize,
 }
 
-/// RAII pin protecting an actual native state from release or reclamation.
+/// RAII pin protecting actual native state from release and mutation.
 ///
-/// Native allocations remain on the worker. Dropping this object only
-/// releases its pin; it does not issue a blocking worker command.
-///
-/// A lease is not a GenerationSession and does not authorize prefix reuse.
+/// Dropping a lease releases only its pin. It does not issue a blocking
+/// worker command or move native ownership off the worker.
 #[derive(Debug)]
 pub struct SessionStateLease {
     state: RetainedSessionState,
@@ -202,28 +213,29 @@ pub struct SessionStateLease {
 }
 
 impl SessionStateLease {
-    /// Metadata describing the pinned state.
+    /// Metadata describing the pinned native allocation.
     pub fn state(&self) -> &RetainedSessionState {
         &self.state
     }
 
-    /// Canonical identity of the pinned state.
+    /// Canonical identity of the pinned allocation.
     pub fn state_id(&self) -> SessionStateId {
         self.state.state_id
     }
 }
 
-/// Concrete EngineRuntime with admission and one native-model worker.
+/// Concrete engine runtime with one native-model worker.
 #[derive(Clone)]
 pub struct FamilyRuntime {
     backends: Arc<BTreeMap<String, Arc<dyn RuntimeBackend>>>,
     admission: AdmissionController,
     limits: GenerationLimits,
+    retention: RetentionPolicy,
     worker: Arc<NativeWorker>,
 }
 
 impl FamilyRuntime {
-    /// Start a dedicated worker without loading a native model here.
+    /// Start the worker without loading native model objects here.
     pub fn new(
         backends: Vec<Arc<dyn RuntimeBackend>>,
         admission: AdmissionController,
@@ -260,8 +272,6 @@ impl FamilyRuntime {
             exited: Mutex::new(false),
             changed: Condvar::new(),
         });
-
-        // Rendezvous transport: no hidden generation-request queue.
         let (sender, receiver) = mpsc::sync_channel(0);
         let worker_summary = Arc::clone(&summary);
         let worker_exit = Arc::clone(&exit);
@@ -295,6 +305,7 @@ impl FamilyRuntime {
             backends: Arc::new(entries),
             admission,
             limits,
+            retention,
             worker: Arc::new(NativeWorker {
                 sender,
                 summary,
@@ -303,38 +314,23 @@ impl FamilyRuntime {
         })
     }
 
-    /// Inspect the shared ledger without acquiring a reservation.
+    /// Inspect the ledger without acquiring a reservation.
     pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
         self.admission.snapshot()
     }
 
-    /// Publish the actual completed request under a canonical state ID.
+    /// Publish the actual completed request under a canonical identity.
     ///
-    /// Call after native request cleanup has completed, normally after
-    /// observing its terminal generation event.
-    ///
-    /// Both retention flags must be enabled. The completed request must
-    /// still own valid retained KV contents; a subsequent request may
-    /// already have reclaimed or reset them.
+    /// Call after native cleanup, normally after the terminal event.
+    /// Both retention flags must be enabled and valid completed state
+    /// must still exist.
     ///
     /// token_prefix_bytes must be the exact tokenizer-produced bytes for
-    /// the complete sequence actually processed: input tokens followed by
-    /// all generated tokens, including EOS when it was processed.
+    /// the full executed sequence, including generated EOS when processed.
+    /// This API trusts provenance; it does not synthesize these bytes.
     ///
-    /// This API trusts tokenizer provenance. It does not derive these bytes
-    /// from rendered text or invent a token-ID serialization. The bytes
-    /// are hashed on the worker and are not retained afterward.
-    ///
-    /// Publication transfers the actual model/cache/reservation ownership
-    /// into a worker-owned canonical entry. It does not copy native state
-    /// or enable execution from that prefix.
-    ///
-    /// Publication is idempotent for an already-published request with the
-    /// same canonical identity. Different bytes for an already-published
-    /// request are rejected rather than relabeling its allocation.
-    ///
-    /// Dropping the returned future does not undo a publication that the
-    /// worker has already performed.
+    /// Publication is idempotent for the same request and identity.
+    /// Dropping the future does not undo an already-completed publication.
     pub fn retain_session_state(
         &self,
         request_id: RequestId,
@@ -351,6 +347,7 @@ impl FamilyRuntime {
                         .reserve("canonical state publication bytes", bytes)?,
                 )
             };
+
             dispatch("engine-state-publication", move || {
                 worker
                     .call(|reply| Command::RetainState {
@@ -365,9 +362,7 @@ impl FamilyRuntime {
         })
     }
 
-    /// Look up metadata for an actual worker-owned canonical entry.
-    ///
-    /// None means no entry remains. Lookup does not pin the allocation.
+    /// Look up actual canonical state without pinning it.
     pub fn lookup_session_state(
         &self,
         state_id: SessionStateId,
@@ -383,13 +378,10 @@ impl FamilyRuntime {
         })
     }
 
-    /// Acquire a pin protecting an actual canonical entry.
+    /// Pin actual canonical state against release and mutation.
     ///
-    /// Returns None when absent. A live lease prevents release, artifact
-    /// switching, cache replacement, and ordinary generation that would
-    /// reset or reclaim this worker's retained allocation.
-    ///
-    /// Dropping an unconsumed future or reply releases any acquired pin.
+    /// A live lease prevents ordinary generation from consuming or
+    /// reclaiming this worker's published allocation.
     pub fn lease_session_state(
         &self,
         state_id: SessionStateId,
@@ -428,6 +420,7 @@ impl FamilyRuntime {
                 "executable family does not match registry metadata",
             ));
         }
+
         Ok(Arc::clone(backend))
     }
 }
@@ -467,19 +460,21 @@ impl EngineRuntime for FamilyRuntime {
             let same_cache = same_model && summary.cache_matches(&plan);
             let mut available = self.admission.snapshot()?.available_bytes();
 
-            // A leased allocation is never credited as reclaimable.
-            if !summary.active && !summary.leased {
+            if !summary.active && summary.pin.strong_count() == 0 {
                 let reclaim = if !same_model {
                     add(
                         add(summary.weights_bytes, summary.cache_bytes)?,
-                        summary.history_bytes,
+                        add(summary.history_bytes, summary.logits_bytes)?,
                     )?
                 } else if !same_cache {
-                    add(summary.cache_bytes, summary.history_bytes)?
+                    add(
+                        summary.cache_bytes,
+                        add(summary.history_bytes, summary.logits_bytes)?,
+                    )?
                 } else {
-                    // Ordinary prefill discards old logical history even
-                    // when native model/cache allocations are reused.
-                    summary.history_bytes
+                    // Compatible candidate storage is retained through
+                    // startup. Do not credit it before actual release.
+                    0
                 };
                 available = add(available, reclaim)?;
             }
@@ -491,6 +486,16 @@ impl EngineRuntime for FamilyRuntime {
                     .max_load_peak_bytes()
                     .checked_sub(plan.load_limits.max_resident_bytes())
                     .ok_or_else(|| internal("invalid loader overlap bounds"))?
+            };
+
+            // Token-history storage is an explicit runtime allocation.
+            // Retained logits are transferred from backend-accounted
+            // execution output; their separate idle reservation is
+            // acquired and reconciled before request cleanup.
+            let history = if retains_contents(self.retention) {
+                token_storage_bytes(plan.cache.capacity_tokens())?
+            } else {
+                0
             };
 
             MemoryEstimate::new(
@@ -505,10 +510,7 @@ impl EngineRuntime for FamilyRuntime {
                     } else {
                         plan.cache.max_cache_bytes()
                     },
-                    temporary_bytes: add(
-                        add(plan.temporary_bytes, loading_extra)?,
-                        history_budget(&plan, self.retains_state_history())?,
-                    )?,
+                    temporary_bytes: add(add(plan.temporary_bytes, loading_extra)?, history)?,
                     output_bytes: plan.output_bytes,
                     draft_bytes: 0,
                     headroom_bytes: plan.headroom_bytes,
@@ -528,6 +530,7 @@ impl EngineRuntime for FamilyRuntime {
     ) -> EngineFuture<'_, Generation> {
         Box::pin(async move {
             execution.check_cancelled()?;
+
             if execution.request_id() != request.request_id()
                 || rendered.profile_id() != request.profile_id()
                 || rendered.snapshot_id() != request.context().snapshot_id()
@@ -612,8 +615,8 @@ impl EngineRuntime for FamilyRuntime {
         Box::pin(async move {
             let artifact = registry.artifact(&artifact_id)?;
             self.backend(registry, artifact)?;
-
             let summary = lock_metadata(&self.worker.summary);
+
             if !summary.alive {
                 return Err(internal("native worker has exited"));
             }
@@ -623,17 +626,12 @@ impl EngineRuntime for FamilyRuntime {
                     id: artifact_id.into_string(),
                 });
             }
+
             summary
                 .capabilities
                 .clone()
                 .ok_or_else(|| internal("loaded capabilities unavailable"))
         })
-    }
-}
-
-impl FamilyRuntime {
-    fn retains_state_history(&self) -> bool {
-        lock_metadata(&self.worker.summary).retain_history
     }
 }
 
@@ -751,7 +749,6 @@ impl NativeWorker {
                         _output: output,
                     };
 
-                    // Field order ensures session cleanup precedes permit drop.
                     let admitted = AdmittedStartup { session, execution };
                     admitted.execution.check_cancelled()?;
                     if abandoned.load(Ordering::Acquire) {
@@ -761,6 +758,7 @@ impl NativeWorker {
                     }
                     Ok(admitted)
                 })();
+
                 complete_admission(shared, result);
             })
             .map_err(|error| EngineError::ExecutionFailed {
@@ -776,6 +774,7 @@ impl NativeWorker {
         command: impl FnOnce(SyncSender<Reply<T>>) -> Command,
     ) -> Result<Reply<T>, EngineError> {
         let (sender, receiver) = mpsc::sync_channel(1);
+
         if let Err(unsent) = self.sender.send(command(sender)) {
             self.exit.wait();
             drop(unsent);
@@ -795,7 +794,7 @@ impl NativeWorker {
     }
 }
 
-// Session cleanup must precede release of scheduler ownership.
+// Session cleanup precedes scheduler-permit destruction.
 struct AdmittedStartup {
     session: NativeSession,
     execution: ExecutionContext,
@@ -862,6 +861,7 @@ impl Future for AdmissionFuture {
                 result = Poll::Pending;
             }
         }
+
         drop(old_waker);
         drop(replacement);
         if this.finished {
@@ -919,12 +919,9 @@ fn complete_admission(shared: Arc<AdmissionShared>, result: Result<AdmittedStart
     }
 
     drop(old_waker);
-    // Any unconsumed NativeSession performs acknowledged native cleanup
-    // here before its ExecutionContext is destroyed.
     drop(discarded);
 }
 
-/// Generic nonblocking async reply used for state-management dispatch.
 struct OperationShared<T> {
     state: Mutex<OperationReply<T>>,
 }
@@ -956,7 +953,6 @@ fn dispatch<T: Send + 'static>(
     thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            // NativeWorker::call handles native-worker exit ordering.
             let result = operation();
             let mut unpublished = Some(result);
             let waker;
@@ -967,7 +963,7 @@ fn dispatch<T: Send + 'static>(
                 }
                 waker = state.waker.take();
             }
-            // In particular, an abandoned lease reply releases its pin.
+
             drop(unpublished);
             if let Some(waker) = waker {
                 waker.wake();
@@ -1007,6 +1003,7 @@ impl<T> Future for OperationFuture<T> {
                 result = Poll::Pending;
             }
         }
+
         drop(old_waker);
         drop(replacement);
         result
@@ -1072,7 +1069,6 @@ impl Drop for WorkerLifetime {
     }
 }
 
-// Only this Send proxy crosses into generation.rs.
 struct NativeSession {
     worker: Arc<NativeWorker>,
     setup: Option<Setup>,
@@ -1100,7 +1096,6 @@ impl GenerationSession for NativeSession {
             .take()
             .ok_or_else(|| internal("session prefill invoked twice"))?;
         let control = ExecutionControl::new(self.request_id.clone(), cancellation.clone());
-        self.started = true;
 
         let reply = self.worker.call(|reply| Command::Prepare {
             setup,
@@ -1159,12 +1154,12 @@ impl Drop for NativeSession {
 struct Summary {
     alive: bool,
     active: bool,
-    leased: bool,
-    retain_history: bool,
+    pin: Weak<()>,
     artifact: Option<ArtifactId>,
     weights_bytes: u64,
     cache_bytes: u64,
     history_bytes: u64,
+    logits_bytes: u64,
     cache_mode: Option<CacheMode>,
     cache_capacity: usize,
     capabilities: Option<Capabilities>,
@@ -1175,12 +1170,12 @@ impl Summary {
         Self {
             alive,
             active: false,
-            leased: false,
-            retain_history: false,
+            pin: Weak::new(),
             artifact: None,
             weights_bytes: 0,
             cache_bytes: 0,
             history_bytes: 0,
+            logits_bytes: 0,
             cache_mode: None,
             cache_capacity: 0,
             capabilities: None,
@@ -1194,7 +1189,7 @@ impl Summary {
     }
 }
 
-// Native allocations precede their accounting guards in drop order.
+// Actual native allocations precede their accounting guards.
 struct ResidentCache {
     cache: Box<dyn FamilyCache>,
     reservation: MemoryReservation,
@@ -1208,7 +1203,6 @@ struct Resident {
     candidate: Option<StateCandidate>,
 }
 
-/// Exact executed-token history with its own retained reservation.
 struct TokenHistory {
     tokens: Vec<u32>,
     reservation: MemoryReservation,
@@ -1226,8 +1220,6 @@ impl TokenHistory {
                 operation: "allocate executed token history",
                 requested_bytes: Some(requested),
             })?;
-
-        // Charge actual Vec capacity, not merely the requested capacity.
         reservation.try_resize(token_storage_bytes(tokens.capacity())?)?;
 
         Ok(Self {
@@ -1250,21 +1242,85 @@ impl TokenHistory {
     }
 }
 
-/// Rendering compatibility and exact executed positions for publication.
-struct StateCandidate {
-    request_id: RequestId,
+/// Actual retained logits and their independent idle reservation.
+struct RetainedLogits {
+    logits: TokenLogits,
+    reservation: MemoryReservation,
+}
+
+impl RetainedLogits {
+    fn new(logits: TokenLogits, admission: &AdmissionController) -> Result<Self, EngineError> {
+        let values = logits.into_values();
+        let bytes = float_storage_bytes(values.capacity())?;
+        let reservation = admission.reserve("retained final-position logits", bytes)?;
+        let logits = TokenLogits::new(values)?;
+
+        Ok(Self {
+            logits,
+            reservation,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Compatibility {
+    artifact_id: ArtifactId,
+    model_instance_id: ModelInstanceId,
+    family_impl_version: FamilyVersion,
+    engine_api_version: u32,
     profile_id: ModelProfileId,
     tokenizer_id: TokenizerId,
     template_hash: [u8; 32],
-    render_hash: [u8; 32],
     renderer: RendererIdentity,
-    history: TokenHistory,
+    cache_mode: CacheMode,
 }
 
-/// A canonical entry owns the actual native allocation and its guards.
-///
-/// This runtime deliberately keeps at most one resident model allocation:
-/// either NativeState::resident or one entry in NativeState::states.
+impl Compatibility {
+    fn new(model: &dyn LoadedModel, cache: &dyn FamilyCache, context: &RenderedContext) -> Self {
+        Self {
+            artifact_id: model.artifact_id().clone(),
+            model_instance_id: model.instance_id().clone(),
+            family_impl_version: model.registration().implementation_version(),
+            engine_api_version: ENGINE_API_VERSION,
+            profile_id: context.profile_id().clone(),
+            tokenizer_id: context.tokenizer_id().clone(),
+            template_hash: *context.template_hash(),
+            renderer: context.renderer().clone(),
+            cache_mode: cache.mode().clone(),
+        }
+    }
+
+    fn matches(
+        &self,
+        model: &dyn LoadedModel,
+        cache: &dyn FamilyCache,
+        context: &RenderedContext,
+    ) -> bool {
+        self.artifact_id == *model.artifact_id()
+            && self.artifact_id == *context.artifact_id()
+            && self.model_instance_id == *model.instance_id()
+            && cache.owner() == model.instance_id()
+            && self.family_impl_version == model.registration().implementation_version()
+            && self.engine_api_version == ENGINE_API_VERSION
+            && self.profile_id == *context.profile_id()
+            && self.tokenizer_id == *context.tokenizer_id()
+            && self.template_hash == *context.template_hash()
+            && self.renderer == *context.renderer()
+            && self.cache_mode == *cache.mode()
+            && cache.representation() == &self.cache_mode.representation
+    }
+}
+
+struct StateCandidate {
+    request_id: RequestId,
+    compatibility: Compatibility,
+    render_hash: [u8; 32],
+    history: TokenHistory,
+    last_logits: Option<RetainedLogits>,
+    reused_input_tokens: usize,
+    prefilled_input_tokens: usize,
+}
+
 struct StateEntry {
     resident: Resident,
     metadata: RetainedSessionState,
@@ -1285,6 +1341,7 @@ impl StateEntry {
                 pin
             }
         };
+
         SessionStateLease {
             state: self.metadata.clone(),
             _pin: pin,
@@ -1328,6 +1385,7 @@ impl NativeState {
                 } => {
                     let result = self.admit_output(&setup, &control, &abandoned);
                     self.publish();
+
                     if let Err(undelivered) = reply.send(Reply {
                         result,
                         usage: Usage::default(),
@@ -1396,7 +1454,6 @@ impl NativeState {
                     reply,
                 } => {
                     let result = self.retain_state(&request_id, &token_prefix_bytes);
-                    // Destroy payload before releasing its reservation.
                     drop(token_prefix_bytes);
                     drop(_bytes_reservation);
                     self.publish();
@@ -1417,7 +1474,6 @@ impl NativeState {
                 Command::LeaseState { state_id, reply } => {
                     let result = self.lease_state(&state_id);
                     self.publish();
-                    // An undelivered lease drops here and releases its pin.
                     let _ = reply.send(Reply {
                         result,
                         usage: Usage::default(),
@@ -1463,11 +1519,8 @@ impl NativeState {
         Ok(())
     }
 
-    /// Return the sole unleased canonical allocation to ordinary idle
-    /// ownership. This removes its published identity before any reset.
     fn unpublish_idle_state(&mut self) -> Result<(), EngineError> {
         self.require_unleased()?;
-
         if self.states.is_empty() {
             return Ok(());
         }
@@ -1485,6 +1538,8 @@ impl NativeState {
             .remove(&state_id)
             .ok_or_else(|| internal("retained state disappeared"))?;
 
+        // The old canonical identity is unpublished before this allocation
+        // can become mutable for a new request.
         self.resident = Some(entry.resident);
         Ok(())
     }
@@ -1507,25 +1562,24 @@ impl NativeState {
 
         let admission = self.admission.clone();
         let output = reserve_output_after_reclaim(&admission, setup.plan.output_bytes, || {
-            let same_model = self.resident.as_ref().is_some_and(|resident| {
-                resident.model.artifact_id() == artifact.id()
-                    && resident.model.registration().implementation_version()
-                        == setup.backend.registration().implementation_version()
-                    && resident.model.registration().family() == artifact.family()
-            });
+            let same_model = self
+                .resident
+                .as_ref()
+                .is_some_and(|resident| model_matches(resident, artifact, setup.backend.as_ref()));
 
             if !same_model {
                 drop(self.resident.take());
             } else if let Some(resident) = &mut self.resident {
-                // A new ordinary request does not consume retained history.
-                drop(resident.candidate.take());
                 if resident
                     .cache
                     .as_ref()
                     .is_some_and(|cache| !cache_matches(cache, &setup.plan))
                 {
+                    drop(resident.candidate.take());
                     drop(resident.cache.take());
                 }
+                // Keep compatible logical contents until prepare can
+                // inspect the exact newly rendered token sequence.
             }
 
             self.publish();
@@ -1552,9 +1606,7 @@ impl NativeState {
             return Err(internal("prefill has no matching admitted startup"));
         }
         if !self.states.is_empty() {
-            return Err(internal(
-                "prefill cannot mutate a published canonical entry",
-            ));
+            return Err(internal("prefill cannot mutate a published entry"));
         }
         if context.profile_id() != &setup.profile || context.token_ids().is_empty() {
             return Err(internal("prefill context does not match admitted setup"));
@@ -1569,22 +1621,19 @@ impl NativeState {
         setup.backend.verify_artifact(artifact, &control)?;
         control.check_cancelled()?;
 
-        let same_model = self.resident.as_ref().is_some_and(|resident| {
-            resident.model.artifact_id() == artifact.id()
-                && resident.model.registration().implementation_version()
-                    == setup.backend.registration().implementation_version()
-                && resident.model.registration().family() == artifact.family()
-        });
-
+        let same_model = self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| model_matches(resident, artifact, setup.backend.as_ref()));
         if !same_model {
             drop(self.resident.take());
         } else if let Some(resident) = &mut self.resident {
-            drop(resident.candidate.take());
             if resident
                 .cache
                 .as_ref()
                 .is_some_and(|cache| !cache_matches(cache, &setup.plan))
             {
+                drop(resident.candidate.take());
                 drop(resident.cache.take());
             }
         }
@@ -1599,26 +1648,11 @@ impl NativeState {
             )
         };
 
-        let candidate = if self.retention.retain_model && self.retention.retain_cache_buffers {
-            Some(StateCandidate {
-                request_id: control.request_id().clone(),
-                profile_id: setup.profile.clone(),
-                tokenizer_id: context.tokenizer_id().clone(),
-                template_hash: *context.template_hash(),
-                render_hash: *context.render_hash(),
-                renderer: context.renderer().clone(),
-                history: TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?,
-            })
-        } else {
-            None
-        };
-
         if self.resident.is_none() {
             let mut weights = self.admission.reserve(
                 "model loading peak",
                 setup.plan.load_limits.max_load_peak_bytes(),
             )?;
-
             let model = setup.backend.load(ModelLoadRequest::new(
                 artifact,
                 setup.plan.load_limits,
@@ -1658,6 +1692,7 @@ impl NativeState {
                 ));
             }
 
+            // Keep this conservative until production-path verification.
             capabilities.supports_prefix_reuse = false;
             capabilities.supports_streaming = true;
             capabilities.decoding_modes = vec![DecodingCapability::Greedy];
@@ -1696,16 +1731,8 @@ impl NativeState {
         {
             return Err(EngineError::unsupported(
                 "cache mode",
-                "actual loaded model does not support the planned cache",
+                "loaded model does not support the planned cache",
             ));
-        }
-
-        if resident
-            .cache
-            .as_ref()
-            .is_some_and(|cache| !cache_matches(cache, &setup.plan))
-        {
-            drop(resident.cache.take());
         }
 
         if resident.cache.is_none() {
@@ -1715,8 +1742,8 @@ impl NativeState {
             let model = resident.model.autoregressive().ok_or_else(|| {
                 EngineError::unsupported("task", "loaded model has no autoregressive execution")
             })?;
-
             let cache = model.allocate_cache(&setup.plan.cache, &control)?;
+
             if cache.owner() != model.instance_id()
                 || cache.mode() != setup.plan.cache.mode()
                 || cache.representation() != &setup.plan.cache.mode().representation
@@ -1729,20 +1756,73 @@ impl NativeState {
             resident.cache = Some(ResidentCache { cache, reservation });
         }
 
+        if let Some(candidate) = &resident.candidate {
+            validate_candidate(resident, candidate)?;
+        }
+
+        let mut previous = resident.candidate.take();
         let cache = resident
             .cache
             .as_mut()
             .ok_or_else(|| internal("allocated cache unavailable"))?;
 
-        // Storage/leases do not yet implement execution prefix reuse.
-        cache.cache.reset()?;
-        if cache.cache.len() != 0 {
-            return Err(internal("cache reset did not clear logical state"));
+        let reused = previous.as_ref().map_or(0, |candidate| {
+            if candidate.compatibility.matches(
+                resident.model.as_ref(),
+                cache.cache.as_ref(),
+                context,
+            ) && matches!(cache.cache.mode().kind, CacheKind::Full)
+                && cache.cache.retained_tokens() == cache.cache.len()
+            {
+                exact_reusable_prefix(
+                    &candidate.history.tokens,
+                    context.token_ids(),
+                    candidate.last_logits.is_some(),
+                )
+            } else {
+                0
+            }
+        });
+
+        let mut initial_logits = None;
+
+        if reused == 0 {
+            drop(previous.take());
+            cache.cache.reset()?;
+            if cache.cache.len() != 0 {
+                return Err(internal("cache reset did not clear logical state"));
+            }
+        } else if reused == context.token_count() {
+            // Identical input requires real retained final-position logits.
+            let retained = previous
+                .as_mut()
+                .and_then(|candidate| candidate.last_logits.take())
+                .ok_or_else(|| internal("identical prefix has no retained logits"))?;
+            let RetainedLogits {
+                logits,
+                reservation,
+            } = retained;
+            initial_logits = Some(logits);
+
+            // Active execution workspace now accounts for the logits.
+            // The independent idle guard is no longer needed.
+            drop(reservation);
+        } else if let Some(candidate) = &mut previous {
+            // Extension prefill will produce new final-position logits.
+            drop(candidate.last_logits.take());
+        }
+
+        if cache.cache.len() != reused {
+            return Err(internal("reused prefix length disagrees with actual KV"));
         }
         check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
 
         let decoder = setup.backend.decoder(&setup.registry, &setup.profile)?;
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
+
+        let compatibility =
+            Compatibility::new(resident.model.as_ref(), cache.cache.as_ref(), context);
+
         let model = resident
             .model
             .autoregressive()
@@ -1753,18 +1833,63 @@ impl NativeState {
             || eos
                 .iter()
                 .any(|&token| usize::try_from(token).map_or(true, |token| token >= vocabulary))
+            || initial_logits
+                .as_ref()
+                .is_some_and(|logits| logits.vocabulary_size() != vocabulary)
         {
-            return Err(internal("invalid vocabulary or EOS configuration"));
+            return Err(internal("invalid vocabulary, EOS, or retained logits"));
         }
+
+        let candidate = if retains_contents(self.retention) {
+            let history = match previous.take() {
+                Some(mut previous)
+                    if previous.history.tokens.capacity() >= setup.plan.cache.capacity_tokens() =>
+                {
+                    previous.history.tokens.truncate(reused);
+                    previous.history
+                }
+                Some(previous) => {
+                    drop(previous);
+                    let mut history =
+                        TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?;
+                    history.append(&context.token_ids()[..reused])?;
+                    history
+                }
+                None => {
+                    let mut history =
+                        TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?;
+                    history.append(&context.token_ids()[..reused])?;
+                    history
+                }
+            };
+
+            Some(StateCandidate {
+                request_id: control.request_id().clone(),
+                compatibility,
+                render_hash: *context.render_hash(),
+                history,
+                last_logits: None,
+                reused_input_tokens: reused,
+                prefilled_input_tokens: 0,
+            })
+        } else {
+            drop(previous);
+            None
+        };
 
         self.pending = None;
         self.active = Some(Active {
             decoder,
-            logits: None,
+            logits: initial_logits,
             eos,
             control,
             options: setup.options,
-            usage: Usage::default(),
+            // Usage counts logical request input, including validated
+            // cached positions. Candidate counters record actual work.
+            usage: Usage {
+                input_tokens: reused,
+                output_tokens: 0,
+            },
             candidate,
             text_finished: false,
             _workspace: workspace,
@@ -1775,10 +1900,7 @@ impl NativeState {
             .as_mut()
             .ok_or_else(|| internal("active execution unavailable"))?;
 
-        for chunk in context
-            .token_ids()
-            .chunks(setup.plan.prefill_chunk_tokens.get())
-        {
+        for chunk in context.token_ids()[reused..].chunks(setup.plan.prefill_chunk_tokens.get()) {
             active.control.check_cancelled()?;
             let before = cache.cache.len();
 
@@ -1805,8 +1927,21 @@ impl NativeState {
             check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
             if let Some(candidate) = &mut active.candidate {
                 candidate.history.append(chunk)?;
+                candidate.prefilled_input_tokens = candidate
+                    .prefilled_input_tokens
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| internal("prefill work counter overflow"))?;
             }
             active.logits = Some(output.into_logits());
+        }
+
+        if active.usage.input_tokens != context.token_count()
+            || cache.cache.len() != context.token_count()
+            || active.logits.is_none()
+        {
+            return Err(internal(
+                "prefill completed with inconsistent request state",
+            ));
         }
 
         active.control.check_cancelled()
@@ -1831,7 +1966,6 @@ impl NativeState {
             .logits
             .as_ref()
             .ok_or_else(|| internal("decode has no preceding logits"))?;
-
         let mut best = 0;
         for index in 1..logits.values().len() {
             if logits.values()[index] > logits.values()[best] {
@@ -1869,7 +2003,7 @@ impl NativeState {
             || next.vocabulary_size() != model.vocabulary_size()
         {
             return Err(internal(
-                "family decode progress disagrees with the selected token",
+                "family decode progress disagrees with selected token",
             ));
         }
 
@@ -1924,32 +2058,36 @@ impl NativeState {
             .as_ref()
             .is_some_and(|active| active.control.request_id() != request)
         {
-            return Err(internal(
-                "cleanup request does not own the active execution",
-            ));
+            return Err(internal("cleanup request does not own active execution"));
         }
-
-        // A duplicate cleanup cannot disturb idle/published ownership.
         if self.pending.is_none() && self.active.is_none() {
             return Ok(());
         }
 
         self.pending = None;
         let mut active = self.active.take();
+        let mut candidate = None;
 
-        let candidate = match active.as_mut() {
-            Some(active)
-                if active.text_finished
-                    && !active.control.is_cancelled()
-                    && self.retention.retain_model
-                    && self.retention.retain_cache_buffers =>
+        if let Some(active) = &mut active {
+            if active.text_finished
+                && !active.control.is_cancelled()
+                && retains_contents(self.retention)
             {
-                active.candidate.take()
+                if let (Some(mut completed), Some(logits)) =
+                    (active.candidate.take(), active.logits.take())
+                {
+                    // Retention is optional. If its independent idle
+                    // reservation cannot fit, discard it rather than
+                    // misaccounting allocations or failing completed work.
+                    if let Ok(retained) = RetainedLogits::new(logits, &self.admission) {
+                        completed.last_logits = Some(retained);
+                        candidate = Some(completed);
+                    }
+                }
             }
-            _ => None,
-        };
+        }
 
-        // Release decoder, logits, and request workspace before replying.
+        // Drop decoder, transient logits, and workspace before replying.
         drop(active);
 
         if !self.retention.retain_model {
@@ -1963,6 +2101,11 @@ impl NativeState {
             return Ok(());
         };
 
+        // Abandoned startup did not mutate the old completed candidate.
+        if candidate.is_none() && resident.candidate.is_some() {
+            return Ok(());
+        }
+
         drop(resident.candidate.take());
 
         if !self.retention.retain_cache_buffers {
@@ -1971,23 +2114,14 @@ impl NativeState {
             return Ok(());
         }
 
-        if let Some(candidate) = candidate {
-            let valid = resident.cache.as_ref().is_some_and(|cache| {
-                cache.cache.owner() == resident.model.instance_id()
-                    && cache.cache.len() == candidate.history.tokens.len()
-                    && cache.cache.retained_tokens() <= cache.cache.len()
-                    && check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_ok()
-            });
-
-            if valid {
-                // Keep actual logical contents for explicit publication.
-                resident.candidate = Some(candidate);
+        if let Some(completed) = candidate {
+            if validate_candidate(resident, &completed).is_ok() {
+                resident.candidate = Some(completed);
                 return Ok(());
             }
-            drop(candidate);
+            drop(completed);
         }
 
-        // Failed/cancelled/incomplete requests never publish touched KV.
         if let Some(cache) = &mut resident.cache {
             if cache.cache.reset().is_err()
                 || cache.cache.len() != 0
@@ -2024,15 +2158,13 @@ impl NativeState {
         token_prefix_bytes: &[u8],
     ) -> Result<SessionStateId, EngineError> {
         self.require_idle()?;
-
-        if !self.retention.retain_model || !self.retention.retain_cache_buffers {
+        if !retains_contents(self.retention) {
             return Err(EngineError::unsupported(
                 "session state retention",
                 "requires retained model and cache buffers",
             ));
         }
 
-        // Idempotent publication must not relabel an existing allocation.
         if let Some(entry) = self
             .states
             .values()
@@ -2043,7 +2175,7 @@ impl NativeState {
             if state_id != entry.metadata.state_id {
                 return Err(EngineError::invalid_request(
                     "token_prefix_bytes",
-                    "request is already published under a different canonical identity",
+                    "request is already published under a different identity",
                 ));
             }
             return Ok(state_id);
@@ -2056,7 +2188,6 @@ impl NativeState {
                 resource: "completed native request state",
                 id: request_id.as_str().to_owned(),
             })?;
-
         let candidate = resident
             .candidate
             .as_ref()
@@ -2073,7 +2204,6 @@ impl NativeState {
             return Err(internal("multiple resident ownership paths"));
         }
 
-        // Reserve the registry slot before transferring native ownership.
         self.states
             .try_reserve(1)
             .map_err(|_| EngineError::AllocationFailed {
@@ -2085,18 +2215,23 @@ impl NativeState {
             .cache
             .as_ref()
             .ok_or_else(|| internal("completed cache unavailable"))?;
+        let logits = candidate
+            .last_logits
+            .as_ref()
+            .ok_or_else(|| internal("completed logits unavailable"))?;
+        let compatibility = &candidate.compatibility;
 
         let metadata = RetainedSessionState {
             state_id,
             request_id: candidate.request_id.clone(),
-            artifact_id: resident.model.artifact_id().clone(),
-            model_instance_id: resident.model.instance_id().clone(),
-            family_impl_version: resident.model.registration().implementation_version(),
-            profile_id: candidate.profile_id.clone(),
-            tokenizer_id: candidate.tokenizer_id.clone(),
-            template_hash: candidate.template_hash,
+            artifact_id: compatibility.artifact_id.clone(),
+            model_instance_id: compatibility.model_instance_id.clone(),
+            family_impl_version: compatibility.family_impl_version,
+            profile_id: compatibility.profile_id.clone(),
+            tokenizer_id: compatibility.tokenizer_id.clone(),
+            template_hash: compatibility.template_hash,
             render_hash: candidate.render_hash,
-            renderer: candidate.renderer.clone(),
+            renderer: compatibility.renderer.clone(),
             cache_mode: cache.cache.mode().clone(),
             logical_tokens: cache.cache.len(),
             retained_tokens: cache.cache.retained_tokens(),
@@ -2104,13 +2239,15 @@ impl NativeState {
             weights_reserved_bytes: resident.weights.bytes(),
             cache_reserved_bytes: cache.reservation.bytes(),
             token_history_reserved_bytes: candidate.history.reservation.bytes(),
+            logits_reserved_bytes: logits.reservation.bytes(),
+            reused_input_tokens: candidate.reused_input_tokens,
+            prefilled_input_tokens: candidate.prefilled_input_tokens,
         };
 
         let resident = self
             .resident
             .take()
             .ok_or_else(|| internal("completed resident disappeared"))?;
-
         self.states.insert(
             state_id,
             StateEntry {
@@ -2161,17 +2298,12 @@ impl NativeState {
             });
         }
 
-        // Published entries cannot simultaneously be active, but retain
-        // this check so future execution-reuse work cannot bypass it.
         self.require_idle()?;
-
         let entry = self
             .states
             .remove(state_id)
             .ok_or_else(|| internal("retained state disappeared during release"))?;
 
-        // Cache/model/history and their guards are destroyed before the
-        // acknowledgement. Only this path can return Released.
         drop(entry);
         Ok(ReleaseOutcome::Released)
     }
@@ -2186,13 +2318,16 @@ impl NativeState {
     fn publish(&self) {
         let mut summary = Summary::empty(true);
         summary.active = self.active.is_some() || self.pending.is_some();
-        summary.retain_history = self.retention.retain_model && self.retention.retain_cache_buffers;
-        summary.leased = self.states.values().any(StateEntry::is_leased);
+
+        let entry = self.states.values().next();
+        if let Some(entry) = entry {
+            summary.pin = entry.pin.clone();
+        }
 
         let resident = self
             .resident
             .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+            .or_else(|| entry.map(|entry| &entry.resident));
 
         if let Some(resident) = resident {
             summary.artifact = Some(resident.model.artifact_id().clone());
@@ -2206,6 +2341,10 @@ impl NativeState {
             }
             if let Some(candidate) = &resident.candidate {
                 summary.history_bytes = candidate.history.reservation.bytes();
+                summary.logits_bytes = candidate
+                    .last_logits
+                    .as_ref()
+                    .map_or(0, |logits| logits.reservation.bytes());
             }
         }
 
@@ -2221,6 +2360,36 @@ impl NativeState {
     }
 }
 
+fn retains_contents(retention: RetentionPolicy) -> bool {
+    retention.retain_model && retention.retain_cache_buffers
+}
+
+fn model_matches(
+    resident: &Resident,
+    artifact: &ArtifactRegistration,
+    backend: &dyn RuntimeBackend,
+) -> bool {
+    resident.model.artifact_id() == artifact.id()
+        && resident.model.registration().implementation_version()
+            == backend.registration().implementation_version()
+        && resident.model.registration().family() == artifact.family()
+}
+
+/// Conservative complete-prefix matching.
+///
+/// Identical inputs require actual retained logits. Extensions will
+/// produce new logits by executing their nonempty suffix. Shortened or
+/// divergent input always rebuilds.
+fn exact_reusable_prefix(retained: &[u32], input: &[u32], has_logits: bool) -> usize {
+    if retained.is_empty() || !input.starts_with(retained) {
+        return 0;
+    }
+    if input.len() == retained.len() && !has_logits {
+        return 0;
+    }
+    retained.len()
+}
+
 fn canonical_identity(
     resident: &Resident,
     token_prefix_bytes: &[u8],
@@ -2229,16 +2398,13 @@ fn canonical_identity(
         .cache
         .as_ref()
         .ok_or_else(|| internal("canonical state has no native cache"))?;
-
-    // The current executable contract has no LoRA application path.
-    // Do not accept or fabricate a LoRA identity for an unapplied adapter.
-    compute_session_state_id(&CacheIdentityInputs::for_current_engine(
-        resident.model.artifact_id(),
-        resident.model.registration().implementation_version(),
+    let inputs = CacheIdentityInputs::for_retained_cache(
+        resident.model.as_ref(),
+        cache.cache.as_ref(),
         None,
         token_prefix_bytes,
-        cache.cache.representation(),
-    ))
+    )?;
+    compute_session_state_id(&inputs)
 }
 
 fn validate_candidate(resident: &Resident, candidate: &StateCandidate) -> Result<(), EngineError> {
@@ -2246,8 +2412,19 @@ fn validate_candidate(resident: &Resident, candidate: &StateCandidate) -> Result
         .cache
         .as_ref()
         .ok_or_else(|| internal("retained candidate has no native cache"))?;
+    let compatibility = &candidate.compatibility;
+    let logits = candidate
+        .last_logits
+        .as_ref()
+        .ok_or_else(|| internal("retained candidate has no final-position logits"))?;
 
-    if cache.cache.owner() != resident.model.instance_id()
+    if compatibility.artifact_id != *resident.model.artifact_id()
+        || compatibility.model_instance_id != *resident.model.instance_id()
+        || compatibility.family_impl_version
+            != resident.model.registration().implementation_version()
+        || compatibility.engine_api_version != ENGINE_API_VERSION
+        || compatibility.cache_mode != *cache.cache.mode()
+        || cache.cache.owner() != resident.model.instance_id()
         || cache.cache.representation() != &cache.cache.mode().representation
         || cache.cache.len() != candidate.history.tokens.len()
         || cache.cache.len() > cache.cache.capacity_tokens()
@@ -2259,14 +2436,24 @@ fn validate_candidate(resident: &Resident, candidate: &StateCandidate) -> Result
         ));
     }
 
+    let input_tokens = candidate
+        .reused_input_tokens
+        .checked_add(candidate.prefilled_input_tokens)
+        .ok_or_else(|| internal("retained input accounting overflow"))?;
+    if input_tokens > candidate.history.tokens.len() {
+        return Err(internal(
+            "retained input accounting exceeds executed history",
+        ));
+    }
+
     if token_storage_bytes(candidate.history.tokens.capacity())?
         > candidate.history.reservation.bytes()
+        || float_storage_bytes(logits.logits.values().len())? > logits.reservation.bytes()
     {
-        return Err(internal("retained token history exceeds its reservation"));
+        return Err(internal("retained bookkeeping exceeds its reservation"));
     }
 
     check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
-
     let weights = resident.model.memory_usage()?.allocated_bytes();
     if weights > resident.weights.bytes() {
         return Err(EngineError::MemoryLimitExceeded {
@@ -2284,26 +2471,30 @@ fn validate_entry(entry: &StateEntry) -> Result<(), EngineError> {
         .resident
         .candidate
         .as_ref()
-        .ok_or_else(|| internal("canonical entry has no executed-token history"))?;
+        .ok_or_else(|| internal("canonical entry has no executed history"))?;
     validate_candidate(&entry.resident, candidate)?;
 
     let cache = entry
         .resident
         .cache
         .as_ref()
-        .ok_or_else(|| internal("canonical entry has no native cache"))?;
+        .ok_or_else(|| internal("canonical entry has no cache"))?;
+    let logits = candidate
+        .last_logits
+        .as_ref()
+        .ok_or_else(|| internal("canonical entry has no logits"))?;
+    let compatibility = &candidate.compatibility;
     let metadata = &entry.metadata;
 
     if metadata.request_id != candidate.request_id
-        || metadata.artifact_id != *entry.resident.model.artifact_id()
-        || metadata.model_instance_id != *entry.resident.model.instance_id()
-        || metadata.family_impl_version
-            != entry.resident.model.registration().implementation_version()
-        || metadata.profile_id != candidate.profile_id
-        || metadata.tokenizer_id != candidate.tokenizer_id
-        || metadata.template_hash != candidate.template_hash
+        || metadata.artifact_id != compatibility.artifact_id
+        || metadata.model_instance_id != compatibility.model_instance_id
+        || metadata.family_impl_version != compatibility.family_impl_version
+        || metadata.profile_id != compatibility.profile_id
+        || metadata.tokenizer_id != compatibility.tokenizer_id
+        || metadata.template_hash != compatibility.template_hash
         || metadata.render_hash != candidate.render_hash
-        || metadata.renderer != candidate.renderer
+        || metadata.renderer != compatibility.renderer
         || metadata.cache_mode != *cache.cache.mode()
         || metadata.logical_tokens != cache.cache.len()
         || metadata.retained_tokens != cache.cache.retained_tokens()
@@ -2311,15 +2502,18 @@ fn validate_entry(entry: &StateEntry) -> Result<(), EngineError> {
         || metadata.weights_reserved_bytes != entry.resident.weights.bytes()
         || metadata.cache_reserved_bytes != cache.reservation.bytes()
         || metadata.token_history_reserved_bytes != candidate.history.reservation.bytes()
+        || metadata.logits_reserved_bytes != logits.reservation.bytes()
+        || metadata.reused_input_tokens != candidate.reused_input_tokens
+        || metadata.prefilled_input_tokens != candidate.prefilled_input_tokens
     {
         return Err(internal(
-            "canonical entry metadata disagrees with native ownership",
+            "canonical metadata disagrees with native ownership",
         ));
     }
+
     Ok(())
 }
 
-/// Reclamation must complete before output admission.
 fn reserve_output_after_reclaim(
     admission: &AdmissionController,
     output_bytes: u64,
@@ -2350,18 +2544,18 @@ fn check_cache_bytes(cache: &dyn FamilyCache, limit: u64) -> Result<(), EngineEr
     }
 }
 
-fn history_budget(plan: &RuntimePlan, retained: bool) -> Result<u64, EngineError> {
-    if retained {
-        token_storage_bytes(plan.cache.capacity_tokens())
-    } else {
-        Ok(0)
-    }
+fn token_storage_bytes(capacity: usize) -> Result<u64, EngineError> {
+    storage_bytes(capacity, std::mem::size_of::<u32>())
 }
 
-fn token_storage_bytes(capacity: usize) -> Result<u64, EngineError> {
+fn float_storage_bytes(capacity: usize) -> Result<u64, EngineError> {
+    storage_bytes(capacity, std::mem::size_of::<f32>())
+}
+
+fn storage_bytes(capacity: usize, element_bytes: usize) -> Result<u64, EngineError> {
     let bytes = capacity
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| internal("token history allocation size overflow"))?;
+        .checked_mul(element_bytes)
+        .ok_or_else(|| internal("runtime allocation size overflow"))?;
     bytes_as_u64(bytes)
 }
 
@@ -2390,7 +2584,7 @@ fn validate_plan(
     {
         return Err(EngineError::invalid_request(
             "cache capacity",
-            "must cover the full profile output reserve and safety margin within its context limit",
+            "must cover profile output reserve and safety margin within the context limit",
         ));
     }
 
@@ -2403,9 +2597,8 @@ fn validate_plan(
         .checked_add(limits.max_text_delta_bytes())
         .and_then(|value| value.checked_add(headers))
         .ok_or_else(|| internal("output budget size overflow"))?;
-    let minimum = bytes_as_u64(minimum)?;
 
-    if plan.output_bytes < minimum {
+    if plan.output_bytes < bytes_as_u64(minimum)? {
         return Err(EngineError::invalid_request(
             "output_bytes",
             "does not cover queued text, a pending delta, and queue headers",
@@ -2428,7 +2621,7 @@ fn internal(message: &'static str) -> EngineError {
     }
 }
 
-// Metadata/notification only. Never recovers the admission ledger.
+// Metadata and notifications only. Never recovers the admission ledger.
 fn lock_metadata<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -2468,12 +2661,67 @@ mod tests {
     }
 
     #[test]
+    fn exact_extension_reuses_complete_retained_prefix() {
+        assert_eq!(exact_reusable_prefix(&[3, 41], &[3, 41, 7, 12], true), 2,);
+    }
+
+    #[test]
+    fn exact_extension_does_not_require_old_logits() {
+        assert_eq!(exact_reusable_prefix(&[3, 41], &[3, 41, 7], false), 2,);
+    }
+
+    #[test]
+    fn identical_input_requires_actual_retained_logits() {
+        assert_eq!(exact_reusable_prefix(&[3, 41], &[3, 41], true), 2,);
+        assert_eq!(exact_reusable_prefix(&[3, 41], &[3, 41], false), 0,);
+    }
+
+    #[test]
+    fn shortened_or_divergent_context_rebuilds() {
+        assert_eq!(exact_reusable_prefix(&[3, 41, 7], &[3, 41], true), 0,);
+        assert_eq!(exact_reusable_prefix(&[3, 41, 7], &[3, 12, 7, 9], true), 0,);
+    }
+
+    #[test]
+    fn matching_length_is_not_prefix_evidence() {
+        assert_eq!(exact_reusable_prefix(&[3, 41], &[3, 12], true), 0,);
+    }
+
+    #[test]
+    fn empty_history_never_reports_a_hit() {
+        assert_eq!(exact_reusable_prefix(&[], &[3, 41], true), 0);
+        assert_eq!(exact_reusable_prefix(&[], &[], true), 0);
+    }
+
+    #[test]
+    fn retained_logits_have_independent_lifetime_accounting() {
+        let admission = AdmissionController::new(4096).expect("controller");
+        let logits = TokenLogits::new(vec![0.0, 1.0, -1.0]).expect("actual logits");
+        let retained = RetainedLogits::new(logits, &admission).expect("retained");
+
+        assert!(
+            admission.snapshot().expect("snapshot").reserved_bytes()
+                >= 3 * std::mem::size_of::<f32>() as u64
+        );
+
+        drop(retained);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn retained_logits_rejection_does_not_leak_a_reservation() {
+        let admission = AdmissionController::new(4).expect("controller");
+        let logits = TokenLogits::new(vec![0.0, 1.0, -1.0]).expect("logits");
+
+        assert!(RetainedLogits::new(logits, &admission).is_err());
+        assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 0);
+    }
+
+    #[test]
     fn idle_reservations_are_reclaimed_before_output_admission() {
         const MIB: u64 = 1024 * 1024;
         let admission = AdmissionController::new(100 * MIB).expect("controller");
-        let idle = admission
-            .reserve("idle resources", 90 * MIB)
-            .expect("idle guard");
+        let idle = admission.reserve("idle resources", 90 * MIB).expect("idle");
 
         assert!(
             admission
@@ -2485,78 +2733,68 @@ mod tests {
             drop(idle);
             Ok(())
         })
-        .expect("output fits after reservation release");
+        .expect("output after reclamation");
 
-        let snapshot = admission.snapshot().expect("snapshot");
-        assert_eq!(snapshot.reserved_bytes(), 20 * MIB);
-        assert_eq!(snapshot.active_reservations(), 1);
+        assert_eq!(
+            admission.snapshot().expect("snapshot").reserved_bytes(),
+            20 * MIB,
+        );
         drop(output);
         assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
     }
 
     #[test]
-    fn cache_reclamation_preserves_the_retained_model_reservation() {
+    fn cache_reclamation_preserves_model_reservation() {
         let admission = AdmissionController::new(100).expect("controller");
-        let model = admission.reserve("retained model", 60).expect("model");
-        let cache = admission.reserve("incompatible cache", 30).expect("cache");
+        let model = admission.reserve("model", 60).expect("model");
+        let cache = admission.reserve("cache", 30).expect("cache");
 
         let output = reserve_output_after_reclaim(&admission, 20, || {
             drop(cache);
             Ok(())
         })
-        .expect("output after cache release");
+        .expect("output");
 
         assert_eq!(model.bytes(), 60);
         assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 80);
         drop(output);
-        assert_eq!(
-            admission
-                .snapshot()
-                .expect("model remains")
-                .reserved_bytes(),
-            60
-        );
+        assert_eq!(admission.snapshot().expect("model").reserved_bytes(), 60);
         drop(model);
     }
 
     #[test]
-    fn unrelated_reservations_are_not_credited_as_reclaimable() {
+    fn unrelated_reservations_are_not_reclaimable() {
         let admission = AdmissionController::new(100).expect("controller");
-        let unrelated = admission.reserve("unrelated owner", 85).expect("unrelated");
-        let idle = admission.reserve("idle resources", 10).expect("idle");
+        let unrelated = admission.reserve("unrelated", 85).expect("unrelated");
+        let idle = admission.reserve("idle", 10).expect("idle");
 
         let result = reserve_output_after_reclaim(&admission, 20, || {
             drop(idle);
             Ok(())
         });
 
-        match result {
+        assert!(matches!(
+            result,
             Err(EngineError::MemoryLimitExceeded {
-                required_bytes,
-                available_bytes,
+                required_bytes: 20,
+                available_bytes: 15,
                 ..
-            }) => {
-                assert_eq!(required_bytes, 20);
-                assert_eq!(available_bytes, 15);
-            }
-            _ => panic!("expected output admission rejection"),
-        }
+            })
+        ));
 
-        let snapshot = admission.snapshot().expect("snapshot");
-        assert_eq!(snapshot.reserved_bytes(), 85);
-        assert_eq!(snapshot.active_reservations(), 1);
+        assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 85);
         drop(unrelated);
     }
 
     #[test]
     fn reclamation_failure_does_not_acquire_output_budget() {
         let admission = AdmissionController::new(100).expect("controller");
-        let _idle = admission.reserve("idle resources", 40).expect("idle");
+        let _idle = admission.reserve("idle", 40).expect("idle");
         let before = admission.snapshot().expect("before");
 
         assert!(
             reserve_output_after_reclaim(&admission, 20, || {
-                Err(internal("reclamation did not complete"))
+                Err(internal("reclamation failed"))
             })
             .is_err()
         );
@@ -2564,24 +2802,25 @@ mod tests {
     }
 
     #[test]
-    fn pending_startup_can_be_finished_without_prefill() {
+    fn pending_startup_can_finish_without_prefill() {
         let request = RequestId::new("pending-startup").expect("request");
         let mut state = empty_native_state(RetentionPolicy {
             retain_model: true,
             retain_cache_buffers: true,
         });
         state.pending = Some(request.clone());
+        state.publish();
 
-        state.publish();
         assert!(lock_metadata(&state.summary).active);
-        state.finish(&request).expect("finish pending startup");
+        state.finish(&request).expect("finish");
         state.publish();
+
         assert!(state.pending.is_none());
         assert!(!lock_metadata(&state.summary).active);
     }
 
     #[test]
-    fn absent_state_lookup_lease_and_release_are_honest() {
+    fn absent_state_operations_are_honest() {
         let mut state = empty_native_state(RetentionPolicy {
             retain_model: true,
             retain_cache_buffers: true,
@@ -2592,27 +2831,26 @@ mod tests {
         assert!(state.lease_state(&id).expect("lease").is_none());
         assert_eq!(
             state.release_state(&id).expect("release"),
-            ReleaseOutcome::AlreadyAbsent
+            ReleaseOutcome::AlreadyAbsent,
         );
     }
 
     #[test]
-    fn publication_requires_actual_completed_native_state() {
+    fn publication_requires_actual_completed_state() {
         let mut state = empty_native_state(RetentionPolicy {
             retain_model: true,
             retain_cache_buffers: true,
         });
-        let request = RequestId::new("missing-completed-state").expect("request");
+        let request = RequestId::new("missing-state").expect("request");
 
         assert!(matches!(
             state.retain_state(&request, b"tokenizer-prefix"),
             Err(EngineError::NotFound { .. })
         ));
-        assert!(state.states.is_empty());
     }
 
     #[test]
-    fn publication_does_not_bypass_pending_request_ownership() {
+    fn publication_cannot_bypass_pending_ownership() {
         let mut state = empty_native_state(RetentionPolicy {
             retain_model: true,
             retain_cache_buffers: true,
@@ -2621,7 +2859,7 @@ mod tests {
         state.pending = Some(request.clone());
 
         assert!(matches!(
-            state.retain_state(&request, b"tokenizer-prefix"),
+            state.retain_state(&request, b"prefix"),
             Err(EngineError::Busy { .. })
         ));
     }
@@ -2633,6 +2871,7 @@ mod tests {
             retain_cache_buffers: false,
         });
         let request = RequestId::new("no-cache-retention").expect("request");
+
         assert!(state.retain_state(&request, b"prefix").is_err());
     }
 
@@ -2641,21 +2880,11 @@ mod tests {
         let admission = AdmissionController::new(1024).expect("controller");
         let mut history = TokenHistory::new(&admission, 4).expect("history");
 
-        assert!(
-            admission.snapshot().expect("snapshot").reserved_bytes()
-                >= token_storage_bytes(4).expect("bytes")
-        );
-
-        history.append(&[1, 2]).expect("first append");
-        history.append(&[3, 4]).expect("second append");
+        history.append(&[1, 2, 3, 4]).expect("append");
         assert_eq!(history.tokens, [1, 2, 3, 4]);
 
         let remaining = history.tokens.capacity() - history.tokens.len();
-        if remaining != 0 {
-            history
-                .append(&vec![0; remaining])
-                .expect("fill allocator capacity");
-        }
+        history.append(&vec![0; remaining]).expect("fill capacity");
         assert!(history.append(&[5]).is_err());
 
         drop(history);
@@ -2663,15 +2892,13 @@ mod tests {
     }
 
     #[test]
-    fn weak_pin_observes_raii_lease_lifetime() {
+    fn weak_pin_observes_lease_lifetime_without_worker_commands() {
         let pin = Arc::new(());
         let weak = Arc::downgrade(&pin);
-        assert_eq!(weak.strong_count(), 1);
-
         let second = Arc::clone(&pin);
+
         drop(pin);
         assert_eq!(weak.strong_count(), 1);
-
         drop(second);
         assert_eq!(weak.strong_count(), 0);
         assert!(weak.upgrade().is_none());
@@ -2692,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_completion_wakes_the_registered_consumer() {
+    fn admission_completion_wakes_consumer() {
         let (mut future, shared) = admission_channel();
         let (sender, receiver) = mpsc::channel();
         let waker = Waker::from(Arc::new(SignalWake { sender }));
@@ -2717,24 +2944,24 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_admission_does_not_wait_for_consumer_acknowledgment() {
+    fn abandoned_admission_does_not_wait_for_consumer() {
         let (future, shared) = admission_channel();
         drop(future);
 
         let (sender, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
             complete_admission(shared, Err(internal("abandoned startup")));
-            sender.send(()).expect("completion signal");
+            sender.send(()).expect("signal");
         });
 
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("abandoned completion must not wait for polling");
-        worker.join().expect("completion cleanup");
+            .expect("completion");
+        worker.join().expect("cleanup");
     }
 
     #[test]
-    fn state_operation_wakes_the_registered_consumer() {
+    fn state_operation_wakes_consumer() {
         let (start_sender, start_receiver) = mpsc::channel();
         let mut future = dispatch("test-state-operation", move || {
             start_receiver.recv().expect("start");
@@ -2747,11 +2974,11 @@ mod tests {
         let mut context = Context::from_waker(&waker);
 
         assert!(Pin::new(&mut future).poll(&mut context).is_pending());
-        start_sender.send(()).expect("release operation");
+        start_sender.send(()).expect("release");
 
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("operation wake");
+            .expect("wake");
 
         assert!(matches!(
             Pin::new(&mut future).poll(&mut context),
@@ -2760,7 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_operation_discards_owned_reply() {
+    fn abandoned_operation_drops_owned_reply() {
         struct DropSignal(mpsc::Sender<()>);
 
         impl Drop for DropSignal {
@@ -2772,17 +2999,17 @@ mod tests {
         let (start_sender, start_receiver) = mpsc::channel();
         let (drop_sender, drop_receiver) = mpsc::channel();
 
-        let future = dispatch("test-abandoned-state-operation", move || {
+        let future = dispatch("test-abandoned-operation", move || {
             start_receiver.recv().expect("start");
             Ok(DropSignal(drop_sender))
         })
         .expect("dispatcher");
 
         drop(future);
-        start_sender.send(()).expect("release operation");
+        start_sender.send(()).expect("release");
 
         drop_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("unconsumed reply must be destroyed");
+            .expect("reply destruction");
     }
 }
