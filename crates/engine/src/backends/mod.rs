@@ -1,6 +1,6 @@
 //! Executable adapters for the shared family-independent runtime.
 
-/// Actual Qwen3 host-reference loader, cache, renderer, and tokenizer adapter.
+/// Unified-memory MLX Qwen3 execution, verified loading, and pinned rendering.
 pub mod qwen;
 
-pub use qwen::{FilePin, Qwen3Artifact, Qwen3Backend, Qwen3BackendLimits};
+pub use qwen::{FilePin, Qwen3Artifact, Qwen3Backend, Qwen3BackendLimits, Qwen3Execution};
