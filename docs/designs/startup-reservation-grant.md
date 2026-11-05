@@ -1,6 +1,6 @@
 # Design: Atomic startup reservation grants in the native runtime
 
-Status: implemented — awaiting commit  
+Status: landed on `4-engine-core` (`6c750f3`)  
 Date: 2026-04-09  
 Branch: `4-engine-core`  
 Refs: #4

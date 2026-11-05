@@ -27,3 +27,6 @@ pub mod rendering;
 pub mod runtime;
 pub mod scheduler;
 pub mod types;
+
+#[cfg(test)]
+mod w3_acceptance;

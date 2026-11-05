@@ -559,6 +559,43 @@ mod tests {
         }
     }
 
+    /// Phase-1 acceptance name kept for issue #4 discoverability.
+    ///
+    /// The original plan called for a stub that reported unimplemented.
+    /// The engine shipped a real single-session cache instead; this test
+    /// exercises that real interface.
+    #[test]
+    fn cache_stub_interface() {
+        let model = loaded_model();
+        let mut session = cache(model.clone());
+
+        assert!(session.is_empty());
+        assert_eq!(session.capacity_tokens(), 16);
+        assert_eq!(session.artifact_id().as_str(), "tiny-qwen3");
+
+        let first = session
+            .prefill(&context(&[3, 41]))
+            .expect("initial prefill");
+        assert_eq!(first.reused_prefix_tokens(), 0);
+        assert_eq!(first.processed_input_tokens(), 2);
+        assert_eq!(session.len(), 2);
+        assert_eq!(session.retained_tokens(), &[3, 41]);
+        assert!(session.last_logits().is_some());
+
+        let extended = session
+            .prefill(&context(&[3, 41, 7, 12]))
+            .expect("suffix prefill");
+        assert_eq!(extended.reused_prefix_tokens(), 2);
+        assert_eq!(extended.processed_input_tokens(), 2);
+
+        let full = model.forward(&[3, 41, 7, 12]).expect("real full forward");
+        assert_close(extended.logits(), full.last().expect("last logits"));
+
+        session.clear();
+        assert!(session.is_empty());
+        assert!(session.last_logits().is_none());
+    }
+
     #[test]
     fn actual_prefix_state_is_reused_for_an_extension() {
         let model = loaded_model();

@@ -49,8 +49,10 @@ src/{loader,forward,decode,registry}.rs
 tests/{forward_cpu.rs,template.rs}
 fixtures/tiny-qwen3/ synthetic small config + weights, CI-sized
 crates/engine/ engine core
-src/{api.rs,registry.rs,scheduler.rs,cache_stub.rs,admission.rs}
-tests/{api_mock.rs,stream_events.rs}
+src/{api.rs,registry.rs,scheduler.rs,cache.rs,cache_identity.rs,admission.rs}
+tests include named W3 acceptance coverage (`stream_events_order`,
+`admission_estimate`, `cache_stub_interface` over the real cache,
+`engine_traits_documented`)
 crates/harness-core/ supervisor skeleton, context, session store
 src/{supervisor.rs,context.rs,store.rs,telemetry.rs}
 tests/{events.rs,resume.rs,telemetry.rs}

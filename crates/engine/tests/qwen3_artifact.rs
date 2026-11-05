@@ -611,6 +611,55 @@ fn load_fixture(
     backend.load(ModelLoadRequest::new(artifact, plan.load_limits, control))
 }
 
+/// Phase-1 / issue #4 acceptance: estimate_memory honesty on the synthetic model.
+///
+/// Compares the cold-start weight payload used by `estimate_memory` (resident
+/// budget minus the explicit loader headroom) to the measured resident
+/// allocation after a real load. The Phase-1 band is 20%; full multi-component
+/// calibration remains Phase 5.
+#[test]
+fn admission_estimate() {
+    let fixture = ArtifactFixture::new();
+    let backend = fixture.backend();
+    let registry = fixture.registry(&backend);
+    let input_tokens = 3;
+    let plan = fixture.plan(&backend, &registry, input_tokens);
+
+    let estimated_budget = plan.load_limits.max_resident_bytes();
+    let loader_headroom = backend_limits().loader_headroom_bytes;
+    let estimated_payload = estimated_budget
+        .checked_sub(loader_headroom)
+        .expect("resident budget includes loader headroom");
+    assert!(
+        estimated_payload > 0,
+        "plan must estimate a positive weight payload"
+    );
+
+    let (_source, control) = control("admission-estimate");
+    let artifact = registry.artifact(&artifact_id()).expect("artifact");
+    backend
+        .verify_artifact(artifact, &control)
+        .expect("verify");
+
+    let loaded = load_fixture(&backend, &registry, &plan, &control).expect("load");
+    let measured = loaded
+        .memory_usage()
+        .expect("measured resident weights")
+        .allocated_bytes();
+
+    assert!(measured > 0, "loaded model must report allocated bytes");
+    assert!(
+        measured <= estimated_budget,
+        "measured {measured} exceeds estimated weight budget {estimated_budget}",
+    );
+
+    let delta = measured.abs_diff(estimated_payload);
+    assert!(
+        delta.saturating_mul(5) <= estimated_payload,
+        "payload estimate {estimated_payload} measured {measured} delta {delta} exceeds 20%",
+    );
+}
+
 #[test]
 fn pinned_fixture_registers_the_real_family_and_profile() {
     let fixture = ArtifactFixture::new();
