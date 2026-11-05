@@ -7,6 +7,8 @@
 //! - Checked byte and reservation-count arithmetic.
 //! - Non-cloneable RAII reservation ownership.
 //! - Atomic reservation resizing.
+//! - A transferable startup grant that reserves a complete budget once
+//!   and partitions that ownership without releasing and reacquiring bytes.
 //! - Explicit release with structured errors.
 //! - Fail-closed handling of poisoned accounting state.
 //!
@@ -27,6 +29,12 @@
 //! allocation must occur only after admission, and reservation ownership
 //! must remain alive until the corresponding allocations are no longer
 //! retained or used.
+//!
+//! A ReservationGrant is useful for startup operations with multiple
+//! resource categories. The whole total is checked and reserved under one
+//! lock. Its reservation pieces then transfer to actual resource owners
+//! without changing shared accounting. Dropping the grant releases only
+//! its unclaimed remainder.
 
 use crate::{error::EngineError, types::MemoryEstimate};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -118,6 +126,24 @@ pub struct MemoryReservation {
     shared: Arc<Shared>,
     operation: &'static str,
     bytes: u64,
+    active: bool,
+}
+
+/// One atomically admitted startup budget partitioned into reservation
+/// pieces.
+///
+/// Each call to `take` transfers accounting ownership of a portion to the
+/// caller without changing total reserved bytes. The returned
+/// MemoryReservation must be retained by the resource owner. Any remaining
+/// grant bytes are released when the grant is dropped.
+///
+/// This type is intentionally not Clone.
+#[derive(Debug)]
+#[must_use = "take and retain each resource reservation or drop the grant"]
+pub struct ReservationGrant {
+    shared: Arc<Shared>,
+    operation: &'static str,
+    remaining_bytes: u64,
     active: bool,
 }
 
@@ -226,6 +252,79 @@ impl AdmissionController {
         })
     }
 
+    /// Atomically admit the sum of non-overlapping startup requirements.
+    ///
+    /// Every component must describe a distinct allocation or allowance.
+    /// Do not list the same native allocation in multiple components.
+    ///
+    /// The total is checked and reserved under one lock. A failed admission
+    /// leaves all accounting unchanged. The returned grant is exclusive
+    /// accounting ownership of the entire total.
+    ///
+    /// Components may be zero, but the total must be positive.
+    pub fn reserve_grant(
+        &self,
+        operation: &'static str,
+        components: &[u64],
+    ) -> Result<ReservationGrant, EngineError> {
+        let total = components.iter().try_fold(0_u64, |total, &component| {
+            total.checked_add(component).ok_or_else(|| {
+                EngineError::invalid_request(
+                    "memory_components",
+                    "memory requirement arithmetic overflow",
+                )
+            })
+        })?;
+
+        if total == 0 {
+            return Err(EngineError::invalid_request(
+                "memory_components",
+                "startup grant total must be positive",
+            ));
+        }
+
+        {
+            let mut state = self.shared.lock_state()?;
+
+            let available_bytes = state
+                .budget_bytes
+                .checked_sub(state.reserved_bytes)
+                .ok_or_else(|| {
+                    internal_error("admission reservations exceed the configured budget")
+                })?;
+
+            if total > available_bytes {
+                return Err(EngineError::MemoryLimitExceeded {
+                    operation,
+                    required_bytes: total,
+                    available_bytes,
+                });
+            }
+
+            let reserved_bytes = state
+                .reserved_bytes
+                .checked_add(total)
+                .ok_or_else(|| internal_error("admission reserved-byte arithmetic overflow"))?;
+
+            let active_reservations = state
+                .active_reservations
+                .checked_add(1)
+                .ok_or_else(|| internal_error("admission reservation-count arithmetic overflow"))?;
+
+            // One accounting entry represents the whole grant until pieces
+            // are transferred. This is the atomic admission point.
+            state.reserved_bytes = reserved_bytes;
+            state.active_reservations = active_reservations;
+        }
+
+        Ok(ReservationGrant {
+            shared: Arc::clone(&self.shared),
+            operation,
+            remaining_bytes: total,
+            active: true,
+        })
+    }
+
     /// Reserve the full byte requirement recorded by an estimate.
     ///
     /// The estimate's earlier fit decision and available-byte observation
@@ -265,6 +364,99 @@ impl AdmissionController {
         })?;
 
         self.reserve(operation, total)
+    }
+}
+
+impl ReservationGrant {
+    /// Total bytes still controlled by this grant.
+    ///
+    /// Bytes already transferred to independent reservations are excluded.
+    pub fn remaining_bytes(&self) -> u64 {
+        self.remaining_bytes
+    }
+
+    /// Whether this grant still owns unpartitioned bytes.
+    pub fn is_empty(&self) -> bool {
+        self.remaining_bytes == 0
+    }
+
+    /// Transfer part of the grant to the resource that will own it.
+    ///
+    /// Shared reservation accounting is unchanged: this operation only
+    /// transfers ownership of bytes already admitted by reserve_grant.
+    ///
+    /// On an invalid size or poisoned accounting lock, the grant is
+    /// unchanged. A zero-byte reservation is not created.
+    pub fn take(
+        &mut self,
+        operation: &'static str,
+        bytes: u64,
+    ) -> Result<Option<MemoryReservation>, EngineError> {
+        if !self.active {
+            return Err(internal_error(
+                "cannot partition an inactive reservation grant",
+            ));
+        }
+
+        if bytes == 0 {
+            return Ok(None);
+        }
+
+        if bytes > self.remaining_bytes {
+            return Err(EngineError::invalid_request(
+                "grant_partition",
+                "requested bytes exceed the remaining startup grant",
+            ));
+        }
+
+        // Fail closed before changing grant ownership if accounting is
+        // poisoned. No accounting mutation is performed under this guard.
+        {
+            let _state = self.shared.lock_state()?;
+        }
+
+        self.remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| internal_error("startup grant partition underflow"))?;
+
+        if self.remaining_bytes == 0 {
+            self.active = false;
+        }
+
+        Ok(Some(MemoryReservation {
+            shared: Arc::clone(&self.shared),
+            operation,
+            bytes,
+            active: true,
+        }))
+    }
+
+    /// Explicitly release the grant's unpartitioned remainder.
+    ///
+    /// Already-transferred reservations remain owned by their receivers.
+    pub fn release(mut self) -> Result<(), EngineError> {
+        if !self.active {
+            return Ok(());
+        }
+
+        self.shared.release(self.remaining_bytes)?;
+        self.remaining_bytes = 0;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReservationGrant {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        if self.shared.release(self.remaining_bytes).is_ok() {
+            self.remaining_bytes = 0;
+            self.active = false;
+        }
     }
 }
 
@@ -346,7 +538,6 @@ impl MemoryReservation {
 
         state.reserved_bytes = reserved_bytes;
         self.bytes = new_bytes;
-
         Ok(())
     }
 
@@ -361,7 +552,6 @@ impl MemoryReservation {
 
         self.shared.release(self.bytes)?;
         self.active = false;
-
         Ok(())
     }
 }
@@ -402,7 +592,6 @@ impl Shared {
         // Commit together after both checked operations succeed.
         state.reserved_bytes = reserved_bytes;
         state.active_reservations = active_reservations;
-
         Ok(())
     }
 }
@@ -426,14 +615,12 @@ mod tests {
     #[test]
     fn zero_budget_is_rejected() {
         let error = AdmissionController::new(0).expect_err("zero budget must be rejected");
-
         assert_eq!(error.kind(), ErrorKind::InvalidRequest);
     }
 
     #[test]
     fn zero_reservation_is_rejected_without_changing_accounting() {
         let admission = AdmissionController::new(100).expect("controller");
-
         let error = admission
             .reserve("test allocation", 0)
             .expect_err("zero reservation");
@@ -448,7 +635,6 @@ mod tests {
     #[test]
     fn reservation_updates_shared_accounting() {
         let admission = AdmissionController::new(100).expect("controller");
-
         let reservation = admission
             .reserve("test allocation", 40)
             .expect("reservation");
@@ -457,7 +643,6 @@ mod tests {
         assert_eq!(reservation.operation(), "test allocation");
 
         let snapshot = admission.snapshot().expect("snapshot");
-
         assert_eq!(snapshot.budget_bytes(), 100);
         assert_eq!(snapshot.reserved_bytes(), 40);
         assert_eq!(snapshot.available_bytes(), 60);
@@ -467,13 +652,11 @@ mod tests {
     #[test]
     fn exact_budget_can_be_reserved() {
         let admission = AdmissionController::new(100).expect("controller");
-
         let reservation = admission
             .reserve("exact allocation", 100)
             .expect("exact fit");
 
-        let snapshot = admission.snapshot().expect("snapshot");
-        assert_eq!(snapshot.available_bytes(), 0);
+        assert_eq!(admission.snapshot().expect("snapshot").available_bytes(), 0);
 
         let error = admission
             .reserve("additional allocation", 1)
@@ -497,11 +680,9 @@ mod tests {
     #[test]
     fn failed_reservation_leaves_accounting_unchanged() {
         let admission = AdmissionController::new(100).expect("controller");
-
         let _reservation = admission
             .reserve("existing allocation", 90)
             .expect("reservation");
-
         let before = admission.snapshot().expect("before");
 
         let error = admission
@@ -520,7 +701,6 @@ mod tests {
             let _reservation = admission
                 .reserve("scoped allocation", 70)
                 .expect("reservation");
-
             assert_eq!(admission.snapshot().expect("reserved").reserved_bytes(), 70);
         }
 
@@ -533,19 +713,15 @@ mod tests {
     #[test]
     fn explicit_release_does_not_release_twice() {
         let admission = AdmissionController::new(100).expect("controller");
-
         let first = admission.reserve("first allocation", 40).expect("first");
-
         let second = admission.reserve("second allocation", 30).expect("second");
 
         first.release().expect("explicit release");
-
         let snapshot = admission.snapshot().expect("snapshot");
         assert_eq!(snapshot.reserved_bytes(), 30);
         assert_eq!(snapshot.active_reservations(), 1);
 
         second.release().expect("release second");
-
         assert_eq!(admission.snapshot().expect("empty").reserved_bytes(), 0);
     }
 
@@ -553,7 +729,6 @@ mod tests {
     fn cloned_controllers_share_one_budget() {
         let admission = AdmissionController::new(100).expect("controller");
         let other = admission.clone();
-
         let _reservation = admission
             .reserve("first allocation", 80)
             .expect("reservation");
@@ -570,83 +745,68 @@ mod tests {
     }
 
     #[test]
-    fn resizing_updates_only_the_owned_reservation() {
+    fn grant_admission_is_atomic_and_partitions_without_reacquiring() {
         let admission = AdmissionController::new(100).expect("controller");
 
-        let mut first = admission.reserve("first allocation", 20).expect("first");
+        let mut grant = admission
+            .reserve_grant("generation startup", &[20, 30, 10])
+            .expect("atomic startup grant");
 
-        let _second = admission.reserve("second allocation", 30).expect("second");
+        let admitted = admission.snapshot().expect("admitted");
+        assert_eq!(admitted.reserved_bytes(), 60);
+        assert_eq!(admitted.active_reservations(), 1);
+        assert_eq!(grant.remaining_bytes(), 60);
 
-        first.try_resize(60).expect("grow");
+        let output = grant
+            .take("output buffers", 20)
+            .expect("output grant")
+            .expect("positive portion");
+        let workspace = grant
+            .take("workspace", 30)
+            .expect("workspace grant")
+            .expect("positive portion");
+        let kv = grant
+            .take("KV allocation", 10)
+            .expect("KV grant")
+            .expect("positive portion");
 
-        assert_eq!(first.bytes(), 60);
-        assert_eq!(admission.snapshot().expect("grown").reserved_bytes(), 90);
+        // Partition transfers ownership without accounting churn.
+        let partitioned = admission.snapshot().expect("partitioned");
+        assert_eq!(partitioned.reserved_bytes(), 60);
+        assert_eq!(partitioned.active_reservations(), 3);
+        assert_eq!(grant.remaining_bytes(), 0);
+        assert!(grant.is_empty());
 
-        first.try_resize(10).expect("shrink");
+        drop(output);
+        drop(workspace);
+        drop(kv);
 
-        let snapshot = admission.snapshot().expect("shrunk");
-        assert_eq!(first.bytes(), 10);
-        assert_eq!(snapshot.reserved_bytes(), 40);
-        assert_eq!(snapshot.active_reservations(), 2);
+        let released = admission.snapshot().expect("all portions released");
+        assert_eq!(released.reserved_bytes(), 0);
+        assert_eq!(released.active_reservations(), 0);
     }
 
     #[test]
-    fn failed_growth_preserves_guard_and_accounting() {
+    fn failed_grant_does_not_reserve_a_partial_total() {
         let admission = AdmissionController::new(100).expect("controller");
-
-        let mut reservation = admission
-            .reserve("resizable allocation", 40)
-            .expect("reservation");
-
-        let _other = admission.reserve("other allocation", 50).expect("other");
-
+        let existing = admission.reserve("existing", 80).expect("existing");
         let before = admission.snapshot().expect("before");
 
-        let error = reservation
-            .try_resize(51)
-            .expect_err("growth exceeds remaining budget");
+        let error = admission
+            .reserve_grant("startup", &[10, 11])
+            .expect_err("complete startup grant does not fit");
 
-        assert_eq!(error.kind(), ErrorKind::MemoryLimitExceeded);
-        assert_eq!(reservation.bytes(), 40);
+        assert!(matches!(error, EngineError::MemoryLimitExceeded { .. }));
         assert_eq!(admission.snapshot().expect("after"), before);
+        drop(existing);
     }
 
     #[test]
-    fn zero_resize_is_rejected_without_releasing_the_guard() {
-        let admission = AdmissionController::new(100).expect("controller");
-
-        let mut reservation = admission
-            .reserve("resizable allocation", 40)
-            .expect("reservation");
-
-        let error = reservation.try_resize(0).expect_err("zero resize");
-
-        assert_eq!(error.kind(), ErrorKind::InvalidRequest);
-        assert_eq!(reservation.bytes(), 40);
-        assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 40);
-    }
-
-    #[test]
-    fn component_sum_is_reserved_as_one_guard() {
-        let admission = AdmissionController::new(100).expect("controller");
-
-        let reservation = admission
-            .reserve_components("combined allocation", &[20, 0, 30, 10])
-            .expect("components");
-
-        assert_eq!(reservation.bytes(), 60);
-
-        let snapshot = admission.snapshot().expect("snapshot");
-        assert_eq!(snapshot.reserved_bytes(), 60);
-        assert_eq!(snapshot.active_reservations(), 1);
-    }
-
-    #[test]
-    fn component_overflow_does_not_change_accounting() {
+    fn checked_grant_sum_overflow_does_not_change_accounting() {
         let admission = AdmissionController::new(u64::MAX).expect("controller");
 
         let error = admission
-            .reserve_components("overflowing components", &[u64::MAX, 1])
+            .reserve_grant("overflow", &[u64::MAX, 1])
             .expect_err("checked sum");
 
         assert_eq!(error.kind(), ErrorKind::InvalidRequest);
@@ -654,11 +814,155 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_callers_cannot_over_admit() {
+    fn zero_total_grant_is_rejected() {
+        let admission = AdmissionController::new(100).expect("controller");
+
+        let error = admission
+            .reserve_grant("zero grant", &[0, 0])
+            .expect_err("zero total");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidRequest);
+        assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn grant_rejects_overpartition_without_changing_ownership() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let mut grant = admission
+            .reserve_grant("startup", &[40, 60])
+            .expect("grant");
+        let before = admission.snapshot().expect("before");
+
+        let error = grant.take("oversized part", 101).expect_err("overclaim");
+        assert_eq!(error.kind(), ErrorKind::InvalidRequest);
+        assert_eq!(grant.remaining_bytes(), 100);
+        assert_eq!(admission.snapshot().expect("after"), before);
+    }
+
+    #[test]
+    fn zero_partition_creates_no_reservation() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let mut grant = admission.reserve_grant("startup", &[100]).expect("grant");
+        let before = admission.snapshot().expect("before");
+
+        assert!(
+            grant
+                .take("optional empty resource", 0)
+                .expect("zero part")
+                .is_none()
+        );
+        assert_eq!(grant.remaining_bytes(), 100);
+        assert_eq!(admission.snapshot().expect("after"), before);
+    }
+
+    #[test]
+    fn dropping_partially_used_grant_releases_only_its_remainder() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let mut grant = admission
+            .reserve_grant("startup", &[70, 30])
+            .expect("grant");
+        let output = grant
+            .take("output", 30)
+            .expect("partition")
+            .expect("portion");
+
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("grant plus portion")
+                .reserved_bytes(),
+            100
+        );
+        assert_eq!(grant.remaining_bytes(), 70);
+
+        drop(grant);
+
+        let snapshot = admission.snapshot().expect("grant remainder dropped");
+        assert_eq!(snapshot.reserved_bytes(), 30);
+        assert_eq!(snapshot.active_reservations(), 1);
+        assert_eq!(output.bytes(), 30);
+
+        drop(output);
+        let empty = admission.snapshot().expect("all released");
+        assert_eq!(empty.reserved_bytes(), 0);
+        assert_eq!(empty.active_reservations(), 0);
+    }
+
+    #[test]
+    fn explicit_grant_release_preserves_previously_partitioned_resources() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let mut grant = admission
+            .reserve_grant("startup", &[25, 75])
+            .expect("grant");
+        let output = grant.take("output", 25).expect("take").expect("output");
+
+        grant.release().expect("release unused grant");
+
+        let snapshot = admission.snapshot().expect("only output remains");
+        assert_eq!(snapshot.reserved_bytes(), 25);
+        assert_eq!(snapshot.active_reservations(), 1);
+        drop(output);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn grant_can_be_split_into_loading_peak_then_resident_weights() {
+        let admission = AdmissionController::new(120).expect("controller");
+        let mut grant = admission
+            .reserve_grant("load request", &[100, 20])
+            .expect("loading peak plus workspace");
+
+        // The peak reservation owns overlapping source/resident bytes.
+        // After the loader drops source temporaries, resize that same guard
+        // to the retained resident model amount.
+        let mut loading = grant
+            .take("model loading peak", 80)
+            .expect("take loading")
+            .expect("loading guard");
+        let workspace = grant
+            .take("request workspace", 20)
+            .expect("take workspace")
+            .expect("workspace guard");
+
+        assert_eq!(grant.remaining_bytes(), 20);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("before resize")
+                .reserved_bytes(),
+            100
+        );
+
+        loading
+            .try_resize(60)
+            .expect("release loader-overlap allowance");
+        assert_eq!(loading.bytes(), 60);
+        assert_eq!(
+            admission.snapshot().expect("after resize").reserved_bytes(),
+            80
+        );
+
+        let resident = grant
+            .take("resident model remainder", 20)
+            .expect("take resident")
+            .expect("resident guard");
+        assert!(grant.is_empty());
+        assert_eq!(
+            admission.snapshot().expect("transferred").reserved_bytes(),
+            80
+        );
+
+        drop(workspace);
+        drop(loading);
+        drop(resident);
+        assert_eq!(admission.snapshot().expect("empty").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_grants_cannot_overadmit() {
         let admission = AdmissionController::new(100).expect("controller");
         let start = Arc::new(Barrier::new(3));
         let release = Arc::new(Barrier::new(3));
-
         let mut workers = Vec::new();
 
         for _ in 0..2 {
@@ -668,21 +972,17 @@ mod tests {
 
             workers.push(thread::spawn(move || {
                 start.wait();
-
-                let result = admission.reserve("concurrent allocation", 75);
-
-                // Retain a successful guard until both attempts have
-                // completed their admission checks.
+                let grant = admission.reserve_grant("concurrent startup", &[75]);
                 release.wait();
 
-                match result {
-                    Ok(reservation) => {
-                        assert_eq!(reservation.bytes(), 75);
-                        drop(reservation);
+                match grant {
+                    Ok(grant) => {
+                        assert_eq!(grant.remaining_bytes(), 75);
+                        drop(grant);
                         true
                     }
                     Err(error) => {
-                        assert_eq!(error.kind(), ErrorKind::MemoryLimitExceeded);
+                        assert!(matches!(error, EngineError::MemoryLimitExceeded { .. }));
                         false
                     }
                 }
@@ -695,38 +995,56 @@ mod tests {
         let successes = workers
             .into_iter()
             .map(|worker| worker.join().expect("worker"))
-            .filter(|&admitted| admitted)
+            .filter(|admitted| *admitted)
             .count();
 
         assert_eq!(successes, 1);
-
-        let snapshot = admission.snapshot().expect("released");
+        let snapshot = admission.snapshot().expect("final snapshot");
         assert_eq!(snapshot.reserved_bytes(), 0);
         assert_eq!(snapshot.active_reservations(), 0);
     }
 
     #[test]
-    fn unwinding_releases_an_owned_reservation() {
+    fn regular_resize_and_component_reservation_still_work() {
         let admission = AdmissionController::new(100).expect("controller");
-        let worker_admission = admission.clone();
+        let mut reservation = admission.reserve("resizable", 20).expect("reserve");
+        reservation.try_resize(40).expect("grow");
+        assert_eq!(reservation.bytes(), 40);
+
+        let components = admission
+            .reserve_components("components", &[10, 0, 5])
+            .expect("components");
+        assert_eq!(components.bytes(), 15);
+
+        let snapshot = admission.snapshot().expect("snapshot");
+        assert_eq!(snapshot.reserved_bytes(), 55);
+        assert_eq!(snapshot.active_reservations(), 2);
+    }
+
+    #[test]
+    fn unwind_drops_grant_and_partitioned_guards() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let cloned = admission.clone();
 
         let result = catch_unwind(AssertUnwindSafe(move || {
-            let _reservation = worker_admission
-                .reserve("panicking owner", 60)
-                .expect("reservation");
-
-            panic!("exercise reservation cleanup");
+            let mut grant = cloned
+                .reserve_grant("unwinding startup", &[60, 40])
+                .expect("grant");
+            let _output = grant
+                .take("output", 40)
+                .expect("partition")
+                .expect("output");
+            panic!("exercise grant unwind cleanup");
         }));
 
         assert!(result.is_err());
-
-        let snapshot = admission.snapshot().expect("released");
+        let snapshot = admission.snapshot().expect("unwound");
         assert_eq!(snapshot.reserved_bytes(), 0);
         assert_eq!(snapshot.active_reservations(), 0);
     }
 
     #[test]
-    fn poisoned_accounting_fails_closed() {
+    fn poisoned_accounting_fails_closed_for_grant_and_partition() {
         let admission = AdmissionController::new(100).expect("controller");
         let shared = Arc::clone(&admission.shared);
 
@@ -734,19 +1052,21 @@ mod tests {
             let _guard = shared.state.lock().expect("accounting lock");
             panic!("poison admission accounting");
         });
-
         assert!(worker.join().is_err());
 
-        let error = admission
-            .reserve("allocation after poison", 1)
-            .expect_err("poisoned accounting must reject admission");
-
-        assert_eq!(error.kind(), ErrorKind::Internal);
-
-        let error = admission
-            .snapshot()
-            .expect_err("poisoned accounting must not report trusted state");
-
-        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(
+            admission
+                .reserve_grant("after poison", &[1])
+                .expect_err("grant must fail closed")
+                .kind(),
+            ErrorKind::Internal,
+        );
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect_err("snapshot must fail closed")
+                .kind(),
+            ErrorKind::Internal,
+        );
     }
 }
