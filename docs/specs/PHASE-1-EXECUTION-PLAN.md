@@ -55,7 +55,21 @@ tests include named W3 acceptance coverage (`stream_events_order`,
 `engine_traits_documented`)
 crates/harness-core/ supervisor skeleton, context, session store
 src/{supervisor.rs,context.rs,store.rs,telemetry.rs}
-tests/{events.rs,resume.rs,telemetry.rs}
+tests/{events.rs,resume.rs,telemetry.rs,token_count.rs}
+B.4 sessions table DDL (pinned here; SPEC B.4 deferred the pin to this plan):
+  CREATE TABLE sessions (
+    session_id  TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,   -- active | paused | completed
+    created_ts  INTEGER NOT NULL, -- unix epoch ms
+    updated_ts  INTEGER NOT NULL,
+    profile_id  TEXT NOT NULL
+  );
+  CREATE TABLE meta (
+    schema_version INTEGER NOT NULL,
+    spec_version   TEXT NOT NULL
+  );
+W4 `session_resume_restart` proves durable history by dropping and reopening
+the SQLite store at the same path (daemon process restart remains W5 / test 14).
 crates/alloyd/ daemon binary
 src/{main.rs,rpc.rs}
 tests/rpc_surface.rs
@@ -77,7 +91,7 @@ text
 | 3 | `chat_template_render` | minijinja renders the Qwen3 chat template; template-hash identity is stable across renders | Linux CI |
 | 4 | `token_count_exact` | render_and_count returns HF-tokenizer counts for fixed fixtures | Linux CI |
 | 5 | `events_append_only` | B.4 schema v1: gapless per-session seq, monotonic ids, events survive reopen | Linux CI |
-| 6 | `session_resume_restart` | a session appends, daemon restarts, session resumes with history intact | Linux CI |
+| 6 | `session_resume_restart` | a session appends, store handle drops, same DB reopens, history intact (W4); full `alloyd` process restart is W5 / Mac test 14 | Linux CI |
 | 7 | `rpc_surface_v1` | B.6 subset: apiversion negotiation, method dispatch, error kinds on bad requests | Linux CI |
 | 8 | `stream_events_order` | mocked engine: text_delta stream ordering, generation_completed, cancel | Linux CI |
 | 9 | `telemetry_schema_conforms` | emitted events validate against docs/events/telemetry-v1.json; anonymity invariants hold (no prompts, paths, or model identifiers) | Linux CI |

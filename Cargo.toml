@@ -13,7 +13,7 @@
 # manifest (no [package] here), where cargo would otherwise default to
 # the legacy resolver.
 resolver = "3"
-members = ["crates/engine","crates/families/qwen3","crates/inference-infra","crates/mlx-ffi"]
+members = ["crates/engine","crates/families/qwen3","crates/harness-core","crates/inference-infra","crates/mlx-ffi"]
 
 [workspace.package]
 # Shared metadata inherited by member crates via `workspace = true`.
@@ -28,6 +28,12 @@ repository = "https://github.com/LayerDynamics/alloy"
 [workspace.dependencies]
 # Exact renderer pin for Qwen3 template identity.
 minijinja = "=2.12.0"
+# Session event log (B.4). Bundled SQLite keeps Linux CI self-contained.
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+# FR-35 flush client: sync HTTPS/TLS, no async runtime required for Phase 1.
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
 # bindgen is pinned EXACTLY ("="), not caret-ranged. Its generated code
 # must be byte-identical across regenerations for named test
 # `bindgen_output_stable` (test 10); a caret range would silently admit
