@@ -106,13 +106,13 @@ fn main() {
             .blocklist_type("_IO_.*")
             .blocklist_type("__off_t")
             .blocklist_type("__off64_t")
-            .raw_line(
-                "#[repr(C)]\n\
-                 #[derive(Debug)]\n\
-                 pub struct FILE {\n\
-                     _private: [u8; 0],\n\
-                 }",
-            )
+            .raw_line(concat!(
+                "#[repr(C)]\n",
+                "#[derive(Debug)]\n",
+                "pub struct FILE {\n",
+                "    _private: [u8; 0],\n",
+                "}",
+            ))
             .formatter(bindgen::Formatter::Rustfmt)
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .generate()

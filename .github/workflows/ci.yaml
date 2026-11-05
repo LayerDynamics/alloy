@@ -3,8 +3,11 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
-    tags: ["*"]
+    branches:
+      - main
+      - 4-engine-core
+    tags:
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -19,52 +22,171 @@ jobs:
     name: linux-arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
+
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@v4
 
       - name: pins and corpus
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-jsonschema
+
           bash scripts/pins_check.sh --test
           bash bench/corpus/validate.sh
 
       - name: bindgen image and test 10
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker build --platform linux/arm64 \
             -t alloy-builder:phase0 \
             -f scripts/docker/Dockerfile \
             scripts/docker
+
           bash scripts/bindgen_check.sh --test
 
       - name: inventory gate
-        run: bash scripts/coverage_inventory.sh --test
-
-      - name: native image, FFI, reproducibility, infra, and Qwen3 tests
+        shell: bash
         run: |
+          set -euo pipefail
+
+          bash scripts/coverage_inventory.sh --test
+
+      - name: build native test image
+        shell: bash
+        run: |
+          set -euo pipefail
+
           docker build --platform linux/arm64 \
             -t alloy-native-builder:phase0 \
             -f scripts/docker/Dockerfile.repro \
             scripts/docker
+
+      - name: native build reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+
           ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
             bash scripts/repro_check.sh --test
+
+      - name: FFI, infrastructure, Qwen3, and engine verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
             -e CARGO_TERM_COLOR=never \
             -w /work \
             alloy-native-builder:phase0 \
-            bash -euo pipefail -c 'tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf -; cargo test --locked -p mlx-ffi --test raii --test compile --test ops -- --test-threads=1; cargo test --locked -p inference-infra --test infra_cpu_ops; cargo test --locked -p qwen3 --all-targets; cargo test --locked -p qwen3 --doc'
+            bash -euo pipefail -c '
+              # Compile from a writable copy, preserving the read-only
+              # source checkout and excluding previous build artifacts.
+              tar -C /src \
+                --exclude=target \
+                --exclude=.git \
+                -cf - . |
+                tar -C /work -xf -
+
+              echo "::group::MLX FFI tests"
+              cargo test --locked -p mlx-ffi \
+                --test raii \
+                --test compile \
+                --test ops \
+                -- --test-threads=1
+              echo "::endgroup::"
+
+              echo "::group::Inference infrastructure tests"
+              cargo test --locked -p inference-infra \
+                --test infra_cpu_ops
+              echo "::endgroup::"
+
+              echo "::group::Qwen3 tests"
+              cargo test --locked -p qwen3 --all-targets
+              cargo test --locked -p qwen3 --doc
+              echo "::endgroup::"
+
+              echo "::group::Engine all-target check"
+              cargo check --locked -p engine --all-targets
+              echo "::endgroup::"
+
+              echo "::group::Engine all-target tests"
+              cargo test --locked -p engine --all-targets
+              echo "::endgroup::"
+
+              echo "::group::Engine documentation tests"
+              cargo test --locked -p engine --doc
+              echo "::endgroup::"
+
+              echo "::group::Engine documentation build"
+              RUSTDOCFLAGS="-D warnings" \
+                cargo doc --locked -p engine --no-deps
+              echo "::endgroup::"
+            '
 
   mac:
     name: mac-metal
+
+    # Keep self-hosted execution explicitly requested by a maintainer.
+    # Ordinary branch pushes and pull requests run the Linux lane only.
     if: github.event_name == 'workflow_dispatch'
+
     runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@v4
+
       - name: Metal and unified tests
-        run: cargo test --locked -p mlx-ffi --no-fail-fast -- --test-threads=1
-      - name: Qwen3 tests
+        shell: bash
         run: |
+          set -euo pipefail
+
+          cargo test --locked -p mlx-ffi \
+            --no-fail-fast \
+            -- --test-threads=1
+
+      - name: Qwen3 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cargo test --locked -p qwen3 --all-targets
           cargo test --locked -p qwen3 --doc
+
+      - name: engine all-target check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo check --locked -p engine --all-targets
+
+      - name: engine all-target tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p engine --all-targets
+
+      - name: engine documentation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p engine --doc
+
+      - name: engine documentation build
+        shell: bash
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+
+          cargo doc --locked -p engine --no-deps

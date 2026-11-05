@@ -11,30 +11,47 @@ pub enum ModelError {
         expected: usize,
         got: usize,
     },
+
     /// The configuration is invalid or unsupported.
     InvalidConfig(&'static str),
+
     /// A dimension calculation overflowed.
     DimensionOverflow(&'static str),
+
     /// The input token sequence is empty.
     EmptyInput,
+
+    /// Cooperative cancellation was observed during loading or execution.
+    ///
+    /// This reports an observed cancellation boundary. It does not imply
+    /// that an in-flight native operation was interrupted immediately.
+    Cancelled,
+
     /// The input exceeds the configured context limit.
     ContextTooLong { maximum: usize, got: usize },
+
     /// An input token is outside the vocabulary.
     InvalidToken {
         position: usize,
         token: u32,
         vocab_size: usize,
     },
+
     /// A weight tensor contains NaN or infinity.
     NonFiniteWeight { tensor: &'static str, index: usize },
+
     /// A computation produced NaN or infinity.
     NonFiniteActivation(&'static str),
+
     /// A configured resource budget would be exceeded.
     MemoryLimit { required: usize, limit: usize },
+
     /// A fallible allocation failed.
     AllocationFailed,
+
     /// A checkpoint could not be read or validated.
     Checkpoint(String),
+
     /// I/O failure, classified without parsing an error message.
     CheckpointIo {
         operation: &'static str,
@@ -42,11 +59,13 @@ pub enum ModelError {
         kind: std::io::ErrorKind,
         message: String,
     },
+
     /// Malformed JSON or safetensors representation.
     CheckpointFormat {
         format: &'static str,
         message: String,
     },
+
     /// Well-formed checkpoint data violates the supported model contract.
     CheckpointValidation(String),
 }
@@ -61,16 +80,27 @@ impl fmt::Display for ModelError {
             } => {
                 write!(f, "{tensor}: expected {expected} elements, got {got}")
             }
+
             Self::InvalidConfig(message) => {
                 write!(f, "invalid configuration: {message}")
             }
+
             Self::DimensionOverflow(name) => {
                 write!(f, "dimension overflow: {name}")
             }
-            Self::EmptyInput => write!(f, "input token sequence is empty"),
+
+            Self::EmptyInput => {
+                write!(f, "input token sequence is empty")
+            }
+
+            Self::Cancelled => {
+                write!(f, "model loading or execution cancelled")
+            }
+
             Self::ContextTooLong { maximum, got } => {
                 write!(f, "context length {got} exceeds maximum {maximum}")
             }
+
             Self::InvalidToken {
                 position,
                 token,
@@ -82,15 +112,31 @@ impl fmt::Display for ModelError {
                      vocabulary size {vocab_size}"
                 )
             }
+
             Self::NonFiniteWeight { tensor, index } => {
                 write!(f, "{tensor}: non-finite weight at index {index}")
             }
-            Self::MemoryLimit { required, limit } => write!(
-                f,
-                "memory budget exceeded: {required} bytes required, limit {limit}"
-            ),
-            Self::AllocationFailed => write!(f, "allocation failed"),
-            Self::Checkpoint(message) => write!(f, "checkpoint error: {message}"),
+
+            Self::NonFiniteActivation(stage) => {
+                write!(f, "non-finite activation during {stage}")
+            }
+
+            Self::MemoryLimit { required, limit } => {
+                write!(
+                    f,
+                    "memory budget exceeded: {required} bytes required, \
+                     limit {limit}"
+                )
+            }
+
+            Self::AllocationFailed => {
+                write!(f, "allocation failed")
+            }
+
+            Self::Checkpoint(message) => {
+                write!(f, "checkpoint error: {message}")
+            }
+
             Self::CheckpointIo {
                 operation,
                 path,
@@ -103,14 +149,13 @@ impl fmt::Display for ModelError {
                     path.display()
                 )
             }
+
             Self::CheckpointFormat { format, message } => {
                 write!(f, "checkpoint {format} parse error: {message}")
             }
+
             Self::CheckpointValidation(message) => {
                 write!(f, "checkpoint validation error: {message}")
-            }
-            Self::NonFiniteActivation(stage) => {
-                write!(f, "non-finite activation during {stage}")
             }
         }
     }
@@ -143,17 +188,24 @@ impl Qwen3Model {
         Self::from_weights(config, weights)
     }
 
-    /// Load safetensors with explicitly chosen raw-file and decoded-weight limits.
+    /// Load safetensors with explicitly chosen raw-file and decoded-weight
+    /// limits.
+    ///
+    /// This entry point uses the ordinary loader. Engine paths requiring
+    /// trusted checkpoint digests must use the verified loader path.
     pub fn load_safetensors(
         config: Qwen3Config,
         path: &std::path::Path,
         options: crate::loader::LoadOptions,
     ) -> Result<Self, ModelError> {
         let weights = crate::loader::load_weights(&config, path, options)?;
+
         Self::from_weights(config, weights)
     }
 
-    /// Validate in-memory weights. Supports tied and separate output projections.
+    /// Validate in-memory weights.
+    ///
+    /// Supports tied and separate output projections.
     pub fn from_weights(config: Qwen3Config, weights: Qwen3Weights) -> Result<Self, ModelError> {
         let c = &config;
 
@@ -194,11 +246,13 @@ impl Qwen3Model {
                 "tied embeddings must not supply lm_head",
             ));
         }
+
         if !c.tie_embeddings && weights.lm_head.is_none() {
             return Err(ModelError::InvalidConfig(
                 "untied embeddings require lm_head",
             ));
         }
+
         if let Some(head) = &weights.lm_head {
             check_tensor(
                 "lm_head",
@@ -226,43 +280,53 @@ impl Qwen3Model {
 
         for layer in &weights.layers {
             check_tensor("input_layernorm", c.hidden_size, &layer.input_layernorm)?;
+
             check_tensor(
                 "q_proj",
                 checked_product(q_dim, c.hidden_size, "q_proj")?,
                 &layer.q_proj,
             )?;
+
             check_tensor(
                 "k_proj",
                 checked_product(kv_dim, c.hidden_size, "k_proj")?,
                 &layer.k_proj,
             )?;
+
             check_tensor(
                 "v_proj",
                 checked_product(kv_dim, c.hidden_size, "v_proj")?,
                 &layer.v_proj,
             )?;
+
             check_tensor("q_norm", c.head_dim, &layer.q_norm)?;
+
             check_tensor("k_norm", c.head_dim, &layer.k_norm)?;
+
             check_tensor(
                 "o_proj",
                 checked_product(c.hidden_size, q_dim, "o_proj")?,
                 &layer.o_proj,
             )?;
+
             check_tensor(
                 "post_attention_layernorm",
                 c.hidden_size,
                 &layer.post_attention_layernorm,
             )?;
+
             check_tensor(
                 "gate_proj",
                 checked_product(c.intermediate_size, c.hidden_size, "gate_proj")?,
                 &layer.gate_proj,
             )?;
+
             check_tensor(
                 "up_proj",
                 checked_product(c.intermediate_size, c.hidden_size, "up_proj")?,
                 &layer.up_proj,
             )?;
+
             check_tensor(
                 "down_proj",
                 checked_product(c.hidden_size, c.intermediate_size, "down_proj")?,
@@ -294,8 +358,10 @@ impl Qwen3Model {
     }
 
     /// Full-logits prefill with an explicit peak output-memory budget.
-    /// The budget covers result storage, row headers, and one f64 projection row;
-    /// it is not a process-wide budget for weights and hidden activations.
+    ///
+    /// The budget covers result storage, row headers, and one f64
+    /// projection row. It is not a process-wide budget for weights
+    /// and hidden activations.
     pub fn forward_with_output_limit(
         &self,
         tokens: &[u32],
@@ -315,14 +381,20 @@ impl Qwen3Model {
         }
 
         let token_count = tokens.len();
+
         check_output_budget(token_count, c.vocab_size, max_output_bytes)?;
+
         let q_dim = c.q_heads * c.head_dim;
         let kv_dim = c.kv_heads * c.head_dim;
 
         checked_product(token_count, c.hidden_size, "hidden activations")?;
+
         checked_product(token_count, q_dim, "query activations")?;
+
         checked_product(token_count, kv_dim, "key/value activations")?;
+
         checked_product(token_count, c.intermediate_size, "MLP activations")?;
+
         checked_product(token_count, c.vocab_size, "output logits")?;
 
         let mut hidden = Vec::with_capacity(token_count * c.hidden_size);
@@ -339,6 +411,7 @@ impl Qwen3Model {
             }
 
             let start = id * c.hidden_size;
+
             hidden.extend(
                 self.weights.embed_tokens[start..start + c.hidden_size]
                     .iter()
@@ -350,10 +423,13 @@ impl Qwen3Model {
             let normalized = rmsnorm_rows(&hidden, c.hidden_size, &layer.input_layernorm);
 
             let mut query = linear(&normalized, c.hidden_size, &layer.q_proj, q_dim);
+
             let mut key = linear(&normalized, c.hidden_size, &layer.k_proj, kv_dim);
+
             let value = linear(&normalized, c.hidden_size, &layer.v_proj, kv_dim);
 
             query = rmsnorm_rows(&query, c.head_dim, &layer.q_norm);
+
             key = rmsnorm_rows(&key, c.head_dim, &layer.k_norm);
 
             apply_rope(
@@ -363,6 +439,7 @@ impl Qwen3Model {
                 c.head_dim,
                 f64::from(c.rope_theta),
             );
+
             apply_rope(
                 &mut key,
                 token_count,
@@ -372,7 +449,9 @@ impl Qwen3Model {
             );
 
             ensure_finite(&query, "query normalization and RoPE")?;
+
             ensure_finite(&key, "key normalization and RoPE")?;
+
             ensure_finite(&value, "value projection")?;
 
             let attended = causal_attention(
@@ -398,6 +477,7 @@ impl Qwen3Model {
                 &layer.gate_proj,
                 c.intermediate_size,
             );
+
             let up = linear(
                 &normalized,
                 c.hidden_size,
@@ -425,27 +505,39 @@ impl Qwen3Model {
                 .as_ref()
                 .ok_or(ModelError::InvalidConfig("missing lm_head"))?
         };
+
         let mut result = Vec::new();
+
         result
             .try_reserve_exact(token_count)
             .map_err(|_| ModelError::AllocationFailed)?;
-        // Project one row at a time: never retain the full f64 logits matrix.
+
+        // Project one row at a time: never retain the full f64
+        // logits matrix.
         for row in normalized.chunks_exact(c.hidden_size) {
             let logits = linear(row, c.hidden_size, head, c.vocab_size);
+
             ensure_finite(&logits, "output projection")?;
+
             let mut output = Vec::new();
+
             output
                 .try_reserve_exact(c.vocab_size)
                 .map_err(|_| ModelError::AllocationFailed)?;
+
             for value in logits {
                 let value = value as f32;
+
                 if !value.is_finite() {
                     return Err(ModelError::NonFiniteActivation("f32 logit conversion"));
                 }
+
                 output.push(value);
             }
+
             result.push(output);
         }
+
         Ok(result)
     }
 }
@@ -485,6 +577,7 @@ fn rmsnorm_rows(input: &[f64], width: usize, weight: &[f32]) -> Vec<f64> {
 
     for row in input.chunks_exact(width) {
         let mean_square = row.iter().map(|value| value * value).sum::<f64>() / width as f64;
+
         let denominator = (mean_square + f64::from(Qwen3Config::RMS_EPS)).sqrt();
 
         output.extend(
@@ -497,7 +590,8 @@ fn rmsnorm_rows(input: &[f64], width: usize, weight: &[f32]) -> Vec<f64> {
     output
 }
 
-/// Multiply input `[rows, input_width]` by weight `[output_width, input_width]`.
+/// Multiply input `[rows, input_width]` by weight
+/// `[output_width, input_width]`.
 fn linear(input: &[f64], input_width: usize, weight: &[f32], output_width: usize) -> Vec<f64> {
     let rows = input.len() / input_width;
     let mut output = vec![0.0; rows * output_width];
@@ -525,6 +619,7 @@ fn apply_rope(values: &mut [f64], token_count: usize, heads: usize, head_dim: us
 
             for dimension in 0..half {
                 let inverse_frequency = theta.powf(-(2.0 * dimension as f64) / head_dim as f64);
+
                 let angle = position as f64 * inverse_frequency;
                 let (sin, cos) = angle.sin_cos();
 
@@ -552,12 +647,14 @@ fn causal_attention(
 ) -> Result<Vec<f64>, ModelError> {
     let group_size = query_heads / kv_heads;
     let scale = 1.0 / (head_dim as f64).sqrt();
+
     let mut output = vec![0.0; query.len()];
     let mut scores = Vec::with_capacity(token_count);
 
     for position in 0..token_count {
         for query_head in 0..query_heads {
             let kv_head = query_head / group_size;
+
             let query_base = (position * query_heads + query_head) * head_dim;
 
             scores.clear();
@@ -589,6 +686,7 @@ fn causal_attention(
 
             for (key_position, &score) in scores.iter().enumerate() {
                 let probability = score / denominator;
+
                 let value_base = (key_position * kv_heads + kv_head) * head_dim;
 
                 for dimension in 0..head_dim {
@@ -627,15 +725,20 @@ pub fn full_logits_bytes(tokens: usize, vocabulary: usize) -> Result<usize, Mode
         std::mem::size_of::<f32>(),
         "f32 output bytes",
     )?;
+
     let temporary = checked_product(vocabulary, std::mem::size_of::<f64>(), "f64 row bytes")?;
+
     let headers = checked_product(tokens, std::mem::size_of::<Vec<f32>>(), "row headers")?;
+
     output
         .checked_add(temporary)
-        .and_then(|v| v.checked_add(headers))
+        .and_then(|value| value.checked_add(headers))
         .ok_or(ModelError::DimensionOverflow("logit memory"))
 }
+
 fn check_output_budget(tokens: usize, vocabulary: usize, limit: usize) -> Result<(), ModelError> {
     let required = full_logits_bytes(tokens, vocabulary)?;
+
     if required > limit {
         Err(ModelError::MemoryLimit { required, limit })
     } else {
@@ -644,3 +747,27 @@ fn check_output_budget(tokens: usize, vocabulary: usize, limit: usize) -> Result
 }
 
 include!("decode_impl.rs");
+
+#[cfg(test)]
+mod model_error_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_has_a_typed_error_variant() {
+        let error = ModelError::Cancelled;
+
+        assert_eq!(error.clone(), ModelError::Cancelled);
+        assert_ne!(
+            error,
+            ModelError::CheckpointValidation("checkpoint loading cancelled".to_owned(),),
+        );
+    }
+
+    #[test]
+    fn cancellation_has_explicit_display_text() {
+        assert_eq!(
+            ModelError::Cancelled.to_string(),
+            "model loading or execution cancelled",
+        );
+    }
+}
