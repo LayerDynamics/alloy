@@ -455,6 +455,48 @@ impl Qwen3Backend {
         Ok(registry)
     }
 
+    // ALLOY_UNIFIED_PLATFORM_FACTORY_V1
+
+    /// Construct an engine using actual unified-memory observations.
+    ///
+    /// Returns the derived plan for diagnostics and explicit allocator
+    /// configuration. Does not automatically change process-wide MLX
+    /// settings; configure the returned plan during coordinated setup
+    /// before starting generation.
+    ///
+    /// Discovery requires an actual unified-memory Metal device. CPU and
+    /// Metal operation placement still use this same shared budget.
+    pub fn into_unified_engine(
+        self,
+        profiles: Vec<ModelProfile>,
+        scheduler: Scheduler,
+        retention: RetentionPolicy,
+        policy: crate::platform::UnifiedMemoryPolicy,
+    ) -> Result<
+        (
+            EngineCore<FamilyRuntime>,
+            crate::platform::UnifiedBudgetPlan,
+        ),
+        EngineError,
+    > {
+        let info = crate::platform::discover().map_err(|error| EngineError::ExecutionFailed {
+            stage: "discover unified-memory platform",
+            message: error.to_string(),
+        })?;
+
+        let plan = info
+            .plan(policy)
+            .map_err(|error| EngineError::ExecutionFailed {
+                stage: "derive unified-memory budget",
+                message: error.to_string(),
+            })?;
+
+        let admission = plan.admission_controller()?;
+        let engine = self.into_engine(profiles, admission, scheduler, retention)?;
+
+        Ok((engine, plan))
+    }
+
     /// Connect this real backend to FamilyRuntime and EngineCore.
     /// The caller supplies budget, scheduling, output, and retention policy.
     pub fn into_engine(

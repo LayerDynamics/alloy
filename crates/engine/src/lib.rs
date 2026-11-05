@@ -18,6 +18,8 @@ pub mod cancellation;
 pub mod error;
 pub mod family;
 pub mod generation;
+/// Unified CPU/Metal memory discovery and shared budgeting.
+pub mod platform;
 pub mod registry;
 pub mod rendering;
 pub mod runtime;

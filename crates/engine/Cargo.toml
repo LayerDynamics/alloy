@@ -21,3 +21,6 @@ safetensors = "=0.4.3"
 
 [lints]
 workspace = true
+
+[build-dependencies]
+cc = "1"
