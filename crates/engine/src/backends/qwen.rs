@@ -1,31 +1,30 @@
-//! Actual Qwen3 host-reference adapter for the family-independent runtime.
+//! Qwen3 unified-memory MLX adapter for the family-independent runtime.
 //!
-//! This adapter loads verified safetensors into the existing real Qwen3Model.
-//! Weights reside in f32 buffers; cached attention uses full host f64 K/V.
-//! It does not claim MLX/Metal execution, resident quantized weights,
-//! sampling, rotating caches, thinking-mode rendering, or prefix reuse.
+//! Verified safetensors are decoded to f32 and consumed into one set of
+//! MLX weight arrays. Full f32 MLX K/V is shared by supported CPU and Metal
+//! operations; it is not the legacy host-reference f64 cache.
 //!
-//! Supported tokenizer contract: a pinned Hugging Face BPE tokenizer.json
-//! with the ByteLevel decoder, no truncation/padding, and explicitly declared
-//! special tokens. Incremental decoding preserves incomplete UTF-8 bytes and
-//! rejects invalid/truncated sequences instead of inserting replacements.
+//! new() selects MLX CPU for portable, deterministic setup. Use
+//! new_with_execution(..., Qwen3Execution::MlxMetal) to request Metal.
+//! A requested Metal device is checked on the native worker and is never
+//! silently replaced with CPU execution. Streams and arrays stay there.
 //!
-//! The renderer is the existing versioned Qwen3 non-thinking CHAT_TEMPLATE.
-//! Its expected SHA-256 is supplied by the trusted caller, not inferred as
-//! trustworthy from mutable artifact contents. Production rendering and
-//! tokenization delegate to crate::rendering; this adapter has no private
-//! template engine, output writer, tokenizer identity, or render-hash path.
-//! The incremental decoder shares the same immutable PinnedTokenizer.
+//! Shared pinned rendering, artifact checks, and incremental ByteLevel
+//! decoding retain their existing contracts.
 //!
-//! Tokenizer/configuration objects are bounded control-plane metadata.
-//! Their library-internal heap storage is not reported as model tensors.
-//! The caller must exclude an appropriate control-plane allowance from the
-//! engine-managed allocation budget, as required by admission.rs.
+//! Planning counts decoded/native loading overlap, full-cache functional
+//! update overlap, and conservative f32 graph/workspace payload estimates.
+//! These are engine-accounted allowances, NOT measured process RSS or a
+//! hard MLX allocator limit. Library/allocator overhead requires separately
+//! provisioned headroom; RAM discovery and allocator-pressure integration
+//! are not implemented by this adapter.
+//!
+//! No resident quantized-weight, rotating-cache, sampling, thinking-mode,
+//! or cross-request prefix-reuse capability is advertised here.
 
 use crate::{
     admission::AdmissionController,
     api::{EngineCore, EngineFuture},
-    cache::QWEN3_CACHE_REPRESENTATION,
     error::EngineError,
     family::{
         AutoregressiveModel, BufferMemoryUsage, CacheAllocationRequest, ExecutionControl,
@@ -43,11 +42,14 @@ use crate::{
         WeightRepresentation,
     },
 };
+use inference_infra::kv_cache::{KvCacheError, KvCacheSpec, MlxKvCache, MlxModelId};
+use mlx_ffi::{Device, DeviceType, Stream, ops::OperationError};
 use qwen3::{
     config::Qwen3Config,
     fixture::{LayerWeights, Qwen3Weights},
     loader::{CheckpointVerification, LoadOptions, load_weights_verified},
-    model::{ModelError, Qwen3Cache, Qwen3Model},
+    mlx_model::{MlxQwen3Model, MlxQwenError},
+    model::ModelError,
     template::CHAT_TEMPLATE,
 };
 use serde_json::Value;
@@ -59,6 +61,7 @@ use std::{
     io::{self, Read},
     num::NonZeroUsize,
     path::{Component, Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 // Qwen policy remains in the adapter; rendering mechanics and identities
@@ -72,6 +75,31 @@ const QWEN3_RESERVED_SPELLINGS: &[&str] = &[
     "<tool_response>",
     "</tool_response>",
 ];
+
+/// Qwen MLX full-cache identity, distinct from the legacy host f64 cache.
+pub const QWEN3_MLX_CACHE_REPRESENTATION: &str = "qwen3.mlx-f32.full.bhtd.v1";
+
+/// Execution placement for one unified-memory MLX model instance.
+///
+/// Both selections use the same f32 array layout, not separate CPU/GPU
+/// model representations. Selection does not mutate the global device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen3Execution {
+    /// Execute transformer operations through an explicit MLX CPU stream.
+    MlxCpu,
+    /// Execute transformer operations through an explicit Metal stream.
+    /// Unavailability is an error; there is no automatic CPU fallback.
+    MlxMetal,
+}
+
+impl Qwen3Execution {
+    fn backend(self) -> ExecutionBackend {
+        match self {
+            Self::MlxCpu => ExecutionBackend::MlxCpu,
+            Self::MlxMetal => ExecutionBackend::MlxMetal,
+        }
+    }
+}
 
 /// A file identity obtained through the caller's trusted artifact policy.
 /// Do not create these pins from an untrusted manifest and call that verification.
@@ -145,7 +173,7 @@ pub struct Qwen3BackendLimits {
     /// Caller-selected validated context ceiling for this execution path.
     pub context_limit_tokens: usize,
     /// Maximum chunk handed to family prefill. The adapter additionally
-    /// checks cancellation before each actual token execution.
+    /// checks cancellation between transformer layers and before KV commit.
     pub prefill_chunk_tokens: NonZeroUsize,
     /// Extra allowance for loader metadata/allocator/control structures.
     pub loader_headroom_bytes: u64,
@@ -199,15 +227,27 @@ pub struct Qwen3Backend {
     registration: FamilyRegistration,
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
+    execution: Qwen3Execution,
 }
 
 impl Qwen3Backend {
     /// Validate pinned metadata and tokenizer configuration without loading
     /// model weights. This synchronous constructor can perform substantial
     /// tokenizer parsing; call it during setup, not on a cancellation loop.
+    /// Selects MLX CPU. Use new_with_execution to request Metal explicitly.
     pub fn new(
         specifications: Vec<Qwen3Artifact>,
         limits: Qwen3BackendLimits,
+    ) -> Result<Self, EngineError> {
+        Self::new_with_execution(specifications, limits, Qwen3Execution::MlxCpu)
+    }
+
+    /// Construct with explicit unified-memory MLX execution placement.
+    /// Native streams/devices are created only during worker-side loading.
+    pub fn new_with_execution(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
         limits.validate()?;
         if specifications.is_empty() {
@@ -216,7 +256,7 @@ impl Qwen3Backend {
                 "must not be empty",
             ));
         }
-        let registration = registration(limits.context_limit_tokens)?;
+        let registration = registration(limits.context_limit_tokens, execution)?;
         let mut artifacts = BTreeMap::new();
         let inverse = Arc::new(byte_decoder_map());
         for mut specification in specifications {
@@ -394,6 +434,7 @@ impl Qwen3Backend {
             registration,
             artifacts,
             limits,
+            execution,
         })
     }
 
@@ -460,6 +501,69 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
+        let native_payload = resident_bound(&data.config)?;
+        let decoded_bound = decoded_weight_bound(&data.config)?;
+        let required_peak = sum(&[
+            data.source_bytes,
+            decoded_bound,
+            native_payload,
+            self.limits.loader_headroom_bytes,
+        ])?;
+        if request.limits().max_source_bytes() < data.source_bytes
+            || request.limits().max_resident_bytes() < native_payload
+            || request.limits().max_load_peak_bytes() < required_peak
+        {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "MLX Qwen loading overlap",
+                required_bytes: required_peak,
+                available_bytes: request.limits().max_load_peak_bytes(),
+            });
+        }
+
+        let cpu_device = Device::new(DeviceType::Cpu, 0)
+            .map_err(|e| execution_error("create MLX CPU device", e.to_string()))?;
+        if !cpu_device
+            .is_available()
+            .map_err(|e| execution_error("query MLX CPU", e.to_string()))?
+        {
+            return Err(EngineError::unsupported(
+                "MLX CPU",
+                "requested device is unavailable",
+            ));
+        }
+        let loading_stream = Stream::new(&cpu_device)
+            .map_err(|e| execution_error("create MLX loading stream", e.to_string()))?;
+        let execution_stream = match self.execution {
+            Qwen3Execution::MlxCpu => Rc::new(loading_stream),
+            Qwen3Execution::MlxMetal => {
+                if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    return Err(EngineError::unsupported(
+                        "MLX Metal",
+                        "requires an Apple-Silicon macOS worker",
+                    ));
+                }
+                let gpu = Device::new(DeviceType::Gpu, 0)
+                    .map_err(|e| execution_error("create MLX Metal device", e.to_string()))?;
+                if !gpu
+                    .is_available()
+                    .map_err(|e| execution_error("query MLX Metal", e.to_string()))?
+                {
+                    return Err(EngineError::unsupported(
+                        "MLX Metal",
+                        "requested device is unavailable; no CPU fallback",
+                    ));
+                }
+                // Array construction copies decoded source buffers; the
+                // model subsequently evaluates its arrays on this worker.
+                // The unused CPU setup stream has no submitted operations.
+                drop(loading_stream);
+                Rc::new(
+                    Stream::new(&gpu)
+                        .map_err(|e| execution_error("create MLX Metal stream", e.to_string()))?,
+                )
+            }
+        };
+        control.check_cancelled()?;
         let cancelled = || control.is_cancelled();
         let verification = CheckpointVerification {
             sha256: &data.checksums,
@@ -470,35 +574,44 @@ impl ModelFamily for Qwen3Backend {
             &data.specification.directory,
             LoadOptions {
                 max_file_bytes: as_usize(request.limits().max_source_bytes())?,
-                max_weight_bytes: as_usize(request.limits().max_resident_bytes())?,
+                max_weight_bytes: as_usize(decoded_bound)?,
             },
             &verification,
         );
         control.check_cancelled()?;
-        let weights = result.map_err(|e| model_error(e, "load Qwen3 weights"))?;
-        let measured = weight_memory(&weights)?;
-        if measured.allocated_bytes() > request.limits().max_resident_bytes() {
+        let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
+        let decoded = weight_memory(&weights)?;
+        if decoded.allocated_bytes() > decoded_bound {
             return Err(EngineError::MemoryLimitExceeded {
-                operation: "Qwen3 resident buffers",
-                required_bytes: measured.allocated_bytes(),
-                available_bytes: request.limits().max_resident_bytes(),
+                operation: "decoded MLX Qwen weight buffers",
+                required_bytes: decoded.allocated_bytes(),
+                available_bytes: decoded_bound,
             });
         }
-        let model = Qwen3Model::from_weights(data.config.clone(), weights)
-            .map_err(|e| model_error(e, "construct Qwen3 model"))?;
+        let model = MlxQwen3Model::from_weights(
+            data.config.clone(),
+            weights,
+            request.limits().max_resident_bytes(),
+            execution_stream.as_ref(),
+        )
+        .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
         control.check_cancelled()?;
+        let payload = model.weight_payload_bytes();
         let mut capabilities = self.registration.capabilities().clone();
         capabilities.context_limit_tokens = capabilities
             .context_limit_tokens
             .min(data.config.max_context);
         Ok(Box::new(Qwen3Loaded {
             model,
+            stream: execution_stream,
             artifact: request.artifact().id().clone(),
             instance: ModelInstanceId::new(),
             registration: self.registration.clone(),
             capabilities,
-            memory: measured,
+            memory: BufferMemoryUsage::new(payload, payload)?,
             vocabulary: data.config.vocab_size,
+            max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
+            logits_payload_bytes: logits_payload_bound(&data.config)?,
         }))
     }
 }
@@ -578,6 +691,7 @@ impl RuntimeBackend for Qwen3Backend {
                 .ok_or_else(|| internal("Qwen3 context arithmetic overflow"))?;
             let load_peak = sum(&[
                 data.source_bytes,
+                decoded_weight_bound(&data.config)?,
                 data.resident_bound,
                 self.limits.loader_headroom_bytes,
             ])?;
@@ -595,6 +709,7 @@ impl RuntimeBackend for Qwen3Backend {
                 temporary_bytes: workspace_bound(
                     &data.config,
                     capacity,
+                    self.limits.prefill_chunk_tokens.get(),
                     self.limits.max_token_bytes,
                 )?,
                 output_bytes: output_bytes(self.limits.generation)?,
@@ -694,13 +809,17 @@ impl RuntimeBackend for Qwen3Backend {
 }
 
 struct Qwen3Loaded {
-    model: Qwen3Model,
+    model: MlxQwen3Model,
+    stream: Rc<Stream>,
     artifact: ArtifactId,
     instance: ModelInstanceId,
     registration: FamilyRegistration,
     capabilities: Capabilities,
+    // Tracks float32 tensor payload, not allocator cache or process RSS.
     memory: BufferMemoryUsage,
     vocabulary: usize,
+    max_prefill_tokens: usize,
+    logits_payload_bytes: u64,
 }
 
 impl LoadedModel for Qwen3Loaded {
@@ -724,11 +843,21 @@ impl LoadedModel for Qwen3Loaded {
     }
 }
 
+impl Drop for Qwen3Loaded {
+    fn drop(&mut self) {
+        // Normal model operations already synchronize on every return.
+        // This is best-effort teardown, not native device-failure recovery.
+        let _ = self.stream.synchronize();
+    }
+}
+
 struct Qwen3NativeCache {
-    inner: Qwen3Cache,
+    inner: MlxKvCache,
     owner: ModelInstanceId,
+    mlx_owner: MlxModelId,
     mode: CacheMode,
     capacity: usize,
+    stream: Rc<Stream>,
 }
 
 impl FamilyCache for Qwen3NativeCache {
@@ -751,30 +880,45 @@ impl FamilyCache for Qwen3NativeCache {
         self.capacity
     }
     fn memory_usage(&self) -> Result<BufferMemoryUsage, EngineError> {
-        let (allocated, used) = self
-            .inner
-            .tracked_memory_bytes()
-            .map_err(|e| model_error(e, "measure Qwen3 KV buffers"))?;
-        BufferMemoryUsage::new(as_u64(allocated)?, as_u64(used)?)
+        // Known full-array f32 payload. Does not claim MLX allocator RSS.
+        let allocated = self.inner.payload_plan().resident_bytes;
+        let spec = self.inner.spec();
+        let used = product(
+            product(
+                product(
+                    product(as_u64(spec.layers)?, as_u64(spec.kv_heads)?)?,
+                    as_u64(spec.head_dim)?,
+                )?,
+                as_u64(self.inner.len())?,
+            )?,
+            8,
+        )?;
+        BufferMemoryUsage::new(allocated, used)
     }
     fn supports_truncation(&self) -> bool {
-        false
+        true
     }
     fn reset(&mut self) -> Result<(), EngineError> {
-        self.inner.reset();
-        Ok(())
+        self.inner
+            .reset(&self.mlx_owner)
+            .map_err(|e| cache_error(e, "reset MLX Qwen KV"))
     }
-    fn truncate(&mut self, _token_count: usize) -> Result<(), EngineError> {
-        Err(EngineError::unsupported(
-            "cache truncation",
-            "Qwen3 full cache must be reset and re-prefilled",
-        ))
+    fn truncate(&mut self, tokens: usize) -> Result<(), EngineError> {
+        self.inner
+            .truncate(&self.mlx_owner, tokens)
+            .map_err(|e| cache_error(e, "truncate MLX Qwen KV"))
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+impl Drop for Qwen3NativeCache {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
     }
 }
 
@@ -789,12 +933,21 @@ impl Qwen3Loaded {
                 "cache belongs to another model or representation",
             ));
         }
-        cache
+        let cache = cache
             .as_any_mut()
             .downcast_mut::<Qwen3NativeCache>()
             .ok_or_else(|| {
                 EngineError::invalid_request("cache", "cache has a different family type")
-            })
+            })?;
+        if !cache.inner.owner().same_instance(self.model.instance_id())
+            || !cache.mlx_owner.same_instance(self.model.instance_id())
+        {
+            return Err(EngineError::invalid_request(
+                "cache",
+                "native MLX cache belongs to another model load",
+            ));
+        }
+        Ok(cache)
     }
 }
 
@@ -802,7 +955,6 @@ impl AutoregressiveModel for Qwen3Loaded {
     fn vocabulary_size(&self) -> usize {
         self.vocabulary
     }
-
     fn allocate_cache(
         &mut self,
         request: &CacheAllocationRequest,
@@ -812,7 +964,7 @@ impl AutoregressiveModel for Qwen3Loaded {
         if request.mode() != &cache_mode()? {
             return Err(EngineError::unsupported(
                 "cache mode",
-                "only actual full host-f64 KV is implemented",
+                "only full MLX float32 KV is implemented",
             ));
         }
         if request.capacity_tokens() > self.capabilities.context_limit_tokens {
@@ -823,31 +975,32 @@ impl AutoregressiveModel for Qwen3Loaded {
                 limit_tokens: self.capabilities.context_limit_tokens,
             });
         }
+        let required = cache_bound(self.model.config(), request.capacity_tokens())?;
+        if required > request.max_cache_bytes() {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "MLX Qwen KV update overlap",
+                required_bytes: required,
+                available_bytes: request.max_cache_bytes(),
+            });
+        }
         let inner = self
             .model
             .new_cache(
                 request.capacity_tokens(),
-                as_usize(request.max_cache_bytes())?,
+                request.max_cache_bytes(),
+                self.stream.as_ref(),
             )
-            .map_err(|e| model_error(e, "allocate Qwen3 KV"))?;
-        let cache = Qwen3NativeCache {
+            .map_err(|e| mlx_model_error(e, control, "allocate MLX Qwen KV"))?;
+        control.check_cancelled()?;
+        Ok(Box::new(Qwen3NativeCache {
             inner,
             owner: self.instance.clone(),
+            mlx_owner: self.model.instance_id().clone(),
             mode: request.mode().clone(),
             capacity: request.capacity_tokens(),
-        };
-        let actual = cache.memory_usage()?.allocated_bytes();
-        if actual > request.max_cache_bytes() {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "allocated Qwen3 KV buffers",
-                required_bytes: actual,
-                available_bytes: request.max_cache_bytes(),
-            });
-        }
-        control.check_cancelled()?;
-        Ok(Box::new(cache))
+            stream: Rc::clone(&self.stream),
+        }))
     }
-
     fn prefill(
         &mut self,
         tokens: &[u32],
@@ -856,10 +1009,10 @@ impl AutoregressiveModel for Qwen3Loaded {
     ) -> Result<PrefillOutput, EngineError> {
         let cache = self.owned_cache(cache)?;
         control.check_cancelled()?;
-        if tokens.is_empty() {
+        if tokens.is_empty() || tokens.len() > self.max_prefill_tokens {
             return Err(EngineError::invalid_request(
                 "tokens",
-                "prefill chunk must not be empty",
+                "prefill must be nonempty and fit the planned chunk bound",
             ));
         }
         let end = cache
@@ -875,25 +1028,23 @@ impl AutoregressiveModel for Qwen3Loaded {
                 limit_tokens: cache.capacity,
             });
         }
-        let result = (|| {
-            let mut last = None;
-            for &token in tokens {
-                control.check_cancelled()?;
-                let logits = self
-                    .model
-                    .decode_token(token, &mut cache.inner)
-                    .map_err(|e| model_error(e, "Qwen3 prefill"))?;
-                last = Some(TokenLogits::new(logits)?);
-            }
-            let logits = last.ok_or_else(|| internal("prefill produced no logits"))?;
-            PrefillOutput::new(tokens.len(), logits)
-        })();
+        let result = self
+            .model
+            .prefill_cancellable(
+                tokens,
+                &mut cache.inner,
+                self.logits_payload_bytes,
+                self.stream.as_ref(),
+                || control.is_cancelled(),
+            )
+            .map_err(|e| mlx_model_error(e, control, "MLX Qwen prefill"))
+            .and_then(|output| TokenLogits::new(output.into_values()))
+            .and_then(|logits| PrefillOutput::new(tokens.len(), logits));
         if result.is_err() {
-            cache.inner.reset();
+            let _ = cache.inner.reset(&cache.mlx_owner);
         }
         result
     }
-
     fn decode(
         &mut self,
         token: u32,
@@ -908,13 +1059,34 @@ impl AutoregressiveModel for Qwen3Loaded {
                 "prefill before decoding a continuation",
             ));
         }
+        let end = cache
+            .inner
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| internal("decode position overflow"))?;
+        if end > cache.capacity {
+            return Err(EngineError::ContextLimitExceeded {
+                input_tokens: end,
+                output_reserve_tokens: 0,
+                safety_margin_tokens: 0,
+                limit_tokens: cache.capacity,
+            });
+        }
+        // Use the cancellable one-token path, not the noncancellable
+        // convenience decode method. It has identical model semantics.
         let result = self
             .model
-            .decode_token(token, &mut cache.inner)
-            .map_err(|e| model_error(e, "Qwen3 decode"))
-            .and_then(TokenLogits::new);
+            .prefill_cancellable(
+                &[token],
+                &mut cache.inner,
+                self.logits_payload_bytes,
+                self.stream.as_ref(),
+                || control.is_cancelled(),
+            )
+            .map_err(|e| mlx_model_error(e, control, "MLX Qwen decode"))
+            .and_then(|output| TokenLogits::new(output.into_values()));
         if result.is_err() {
-            cache.inner.reset();
+            let _ = cache.inner.reset(&cache.mlx_owner);
         }
         result
     }
@@ -998,11 +1170,14 @@ impl TextDecoder for Qwen3TextDecoder {
     }
 }
 
-fn registration(context_limit: usize) -> Result<FamilyRegistration, EngineError> {
+fn registration(
+    context_limit: usize,
+    execution: Qwen3Execution,
+) -> Result<FamilyRegistration, EngineError> {
     FamilyRegistration::new(
-        // Shared rendering changes tokenizer/render identities. Keep the
-        // adapter implementation version distinct from the legacy path.
-        FamilyVersion::new(qwen3::register::IMPL_VERSION, 2, 0),
+        // Numerical execution and KV layout differ from host-reference
+        // v2: canonical state identity must use the new adapter version.
+        FamilyVersion::new(qwen3::register::IMPL_VERSION, 3, 0),
         qwen3::register::ARCHITECTURES
             .iter()
             .map(|s| (*s).to_owned())
@@ -1010,7 +1185,7 @@ fn registration(context_limit: usize) -> Result<FamilyRegistration, EngineError>
         Capabilities {
             task: "text-generation".to_owned(),
             family: "qwen3".to_owned(),
-            backend: ExecutionBackend::HostCpu,
+            backend: execution.backend(),
             weight_representations: vec![WeightRepresentation::F32],
             cache_modes: vec![cache_mode()?],
             context_limit_tokens: context_limit,
@@ -1024,7 +1199,7 @@ fn registration(context_limit: usize) -> Result<FamilyRegistration, EngineError>
 
 fn cache_mode() -> Result<CacheMode, EngineError> {
     Ok(CacheMode {
-        representation: CacheRepresentationId::new(QWEN3_CACHE_REPRESENTATION)?,
+        representation: CacheRepresentationId::new(QWEN3_MLX_CACHE_REPRESENTATION)?,
         kind: CacheKind::Full,
     })
 }
@@ -1200,6 +1375,25 @@ fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
             "invalid attention dimensions or token-ID range",
         ));
     }
+    for dimension in [
+        config.hidden_size,
+        config.num_layers,
+        config.q_heads,
+        config.kv_heads,
+        config.head_dim,
+        config.intermediate_size,
+        config.vocab_size,
+        config.max_context,
+    ] {
+        if i32::try_from(dimension).is_err() {
+            return Err(validation(None, "MLX model dimension exceeds C int"));
+        }
+    }
+    let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
+    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
+    if q > i32::MAX as u64 || kv > i32::MAX as u64 {
+        return Err(validation(None, "MLX projection width exceeds C int"));
+    }
     resident_bound(&config)?;
     cache_bound(&config, 1)?;
     Ok(config)
@@ -1293,8 +1487,12 @@ fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
             product(v, h)?
         },
     ])?;
+    product(elements, 4)
+}
+
+fn decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
     sum(&[
-        product(elements, 4)?,
+        resident_bound(config)?,
         product(
             as_u64(config.num_layers)?,
             as_u64(std::mem::size_of::<LayerWeights>())?,
@@ -1341,44 +1539,65 @@ fn weight_memory(weights: &Qwen3Weights) -> Result<BufferMemoryUsage, EngineErro
     BufferMemoryUsage::new(allocated, used)
 }
 
-fn cache_bound(config: &Qwen3Config, capacity: usize) -> Result<u64, EngineError> {
-    let layers = as_u64(config.num_layers)?;
-    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    sum(&[
-        product(product(product(layers, as_u64(capacity)?)?, kv)?, 16)?,
-        product(layers, as_u64(std::mem::size_of::<(Vec<f64>, Vec<f64>)>())?)?,
-    ])
+fn cache_spec(config: &Qwen3Config, capacity: usize) -> KvCacheSpec {
+    KvCacheSpec {
+        layers: config.num_layers,
+        batch: 1,
+        kv_heads: config.kv_heads,
+        capacity_tokens: capacity,
+        head_dim: config.head_dim,
+    }
 }
 
-/// Conservative bound for the existing per-token host reference routine.
-/// Counts pending layer K/V, overlapping projection/normalization/MLP
-/// rows, logits, attention scores, Vec headers, and decoder byte buffers.
-/// It is not an estimate of MLX memory and is tied to this implementation.
+fn cache_bound(config: &Qwen3Config, capacity: usize) -> Result<u64, EngineError> {
+    cache_spec(config, capacity)
+        .payload_plan()
+        .map(|plan| plan.update_overlap_bytes)
+        .map_err(|e| cache_error(e, "plan MLX Qwen KV overlap"))
+}
+
+fn logits_payload_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    // The model's last-row API admits projection, possible contiguous
+    // output, and host result. Four rows' bytes leave capacity headroom.
+    product(as_u64(config.vocab_size)?, 16)
+}
+
+/// Conservative f32 graph-payload allowance for the selected chunk bound.
+/// Counts per-layer projection/normalization/MLP intermediates, possible
+/// attention score/softmax buffers, and prefix-layout temporaries.
+///
+/// KV old/new overlap is separately reserved in cache_bound, not here.
+/// MLX allocator internals, kernels' hidden workspace, caches and alignment
+/// are not a certified hard bound: execution_headroom_bytes must be sized
+/// and calibrated for the supported MLX pin/device/model. This adapter does
+/// not claim OS OOM prevention or allocator-pressure discovery.
 fn workspace_bound(
     config: &Qwen3Config,
     capacity: usize,
+    chunk_tokens: usize,
     token_bytes: usize,
 ) -> Result<u64, EngineError> {
     let layers = as_u64(config.num_layers)?;
+    let t = as_u64(chunk_tokens.min(capacity).max(1))?;
+    let s = as_u64(capacity)?;
     let h = as_u64(config.hidden_size)?;
     let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
     let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    let rows = sum(&[
-        product(2, product(layers, kv)?)?,
-        product(8, h)?,
-        product(8, q)?,
-        product(8, kv)?,
-        product(8, as_u64(config.intermediate_size)?)?,
-        product(4, as_u64(config.vocab_size)?)?,
-        product(2, as_u64(capacity)?)?,
+    let i = as_u64(config.intermediate_size)?;
+    let per_layer_elements = sum(&[
+        product(12, product(t, h)?)?,
+        product(12, product(t, q)?)?,
+        product(12, product(t, kv)?)?,
+        product(10, product(t, i)?)?,
+        product(8, product(product(as_u64(config.q_heads)?, t)?, s)?)?,
+        product(4, product(s, kv)?)?,
     ])?;
     sum(&[
-        product(rows, 8)?,
-        product(
-            sum(&[layers, 32])?,
-            as_u64(std::mem::size_of::<(Vec<f64>, Vec<f64>)>())?,
-        )?,
+        product(product(layers, per_layer_elements)?, 4)?,
+        product(product(t, h)?, 16)?,
+        logits_payload_bound(config)?,
         product(as_u64(token_bytes)?, 8)?,
+        product(sum(&[layers, 64])?, 256)?,
         32,
     ])
 }
@@ -1435,6 +1654,60 @@ fn execution_error(stage: &'static str, message: impl Into<String>) -> EngineErr
         message: message.into(),
     }
 }
+fn cancelled_error(control: &ExecutionControl) -> EngineError {
+    EngineError::Cancelled {
+        request_id: control.request_id().as_str().to_owned(),
+    }
+}
+
+fn cache_error(error: KvCacheError, stage: &'static str) -> EngineError {
+    match error {
+        KvCacheError::PayloadLimit {
+            required_bytes,
+            limit_bytes,
+        } => EngineError::MemoryLimitExceeded {
+            operation: stage,
+            required_bytes,
+            available_bytes: limit_bytes,
+        },
+        KvCacheError::ForeignModel => {
+            EngineError::invalid_request("cache", "native cache belongs to another model")
+        }
+        KvCacheError::InvalidInput(message) => EngineError::invalid_request("cache", message),
+        KvCacheError::AllocationFailed(_) => allocation(stage, None),
+        other => execution_error(stage, other.to_string()),
+    }
+}
+
+fn mlx_model_error(
+    error: MlxQwenError,
+    control: &ExecutionControl,
+    stage: &'static str,
+) -> EngineError {
+    match error {
+        MlxQwenError::Cancelled | MlxQwenError::Model(ModelError::Cancelled) => {
+            cancelled_error(control)
+        }
+        MlxQwenError::PayloadLimit {
+            operation,
+            required_bytes,
+            limit_bytes,
+        } => EngineError::MemoryLimitExceeded {
+            operation,
+            required_bytes,
+            available_bytes: limit_bytes,
+        },
+        MlxQwenError::AllocationFailed(_) => allocation(stage, None),
+        MlxQwenError::Operation(OperationError::AllocationFailed(_)) => allocation(stage, None),
+        MlxQwenError::Operation(OperationError::InvalidInput(message)) => {
+            EngineError::invalid_request("MLX operation", message)
+        }
+        MlxQwenError::Cache(error) => cache_error(error, stage),
+        MlxQwenError::Model(error) => model_error(error, stage),
+        other => execution_error(stage, other.to_string()),
+    }
+}
+
 fn model_error(error: ModelError, stage: &'static str) -> EngineError {
     match error {
         ModelError::MemoryLimit { required, limit } => {
@@ -1589,7 +1862,18 @@ mod shared_rendering_wiring_tests {
     // Serialize actual deterministic fixture weights. The rendering tests
     // do not execute inference, but do not use a fake checkpoint either.
     fn checkpoint_bytes(config: &Qwen3Config) -> Vec<u8> {
-        let weights = qwen3::fixture::generate_fixture(config);
+        checkpoint_bytes_selected(config, false)
+    }
+
+    fn checkpoint_bytes_selected(config: &Qwen3Config, zero_head: bool) -> Vec<u8> {
+        let mut weights = qwen3::fixture::generate_fixture(config);
+        if zero_head {
+            weights
+                .lm_head
+                .as_mut()
+                .expect("untied test output head")
+                .fill(0.0);
+        }
         let mut records = Vec::new();
         add_tensor(
             &mut records,
@@ -1967,5 +2251,130 @@ mod shared_rendering_wiring_tests {
             original,
             changed.manifest_sha256().expect("changed template")
         );
+    }
+
+    fn executable_fixture() -> Fixture {
+        let mut fixture = Fixture::new();
+        let config_path = fixture.directory.0.join("config.json");
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).expect("config")).expect("JSON");
+        value["tie_word_embeddings"] = Value::Bool(false);
+        let config = parse_config(&value).expect("untied config");
+        for (name, bytes) in [
+            (
+                "config.json",
+                serde_json::to_vec(&value).expect("config JSON"),
+            ),
+            (
+                "model.safetensors",
+                checkpoint_bytes_selected(&config, true),
+            ),
+        ] {
+            std::fs::write(fixture.directory.0.join(name), &bytes).expect("fixture update");
+            fixture.specification.files.insert(
+                name.to_owned(),
+                FilePin {
+                    bytes: bytes.len() as u64,
+                    sha256: digest(&bytes),
+                },
+            );
+        }
+        fixture
+    }
+
+    fn execute_engine_path(execution: Qwen3Execution) {
+        let fixture = executable_fixture();
+        let backend = Qwen3Backend::new_with_execution(
+            vec![fixture.specification.clone()],
+            fixture.limits.clone(),
+            execution,
+        )
+        .expect("MLX backend");
+        let engine = backend
+            .into_engine(
+                vec![fixture.profile.clone()],
+                AdmissionController::new(16 * 1024 * 1024).expect("budget"),
+                Scheduler::new(8).expect("scheduler"),
+                RetentionPolicy {
+                    retain_model: true,
+                    retain_cache_buffers: false,
+                },
+            )
+            .expect("engine");
+        let rendered = block_on(engine.render_and_count(fixture.context.clone())).expect("render");
+        let request = crate::types::GenerationRequest::new(
+            crate::types::RequestId::new("mlx-adapter-execution").expect("ID"),
+            fixture.context.profile_id().clone(),
+            fixture.context.clone(),
+            GenerationOptions::greedy(4).expect("options"),
+        )
+        .expect("request");
+        let generation = block_on(engine.generate(request)).expect("admitted MLX execution");
+        let mut events = generation.into_events();
+        let mut text = String::new();
+        let mut terminal = false;
+        while let Some(event) = block_on(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
+            assert!(!terminal, "event after completion");
+            match event {
+                crate::types::GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
+                crate::types::GenerationEvent::GenerationCompleted {
+                    finish_reason,
+                    usage,
+                } => {
+                    assert_eq!(finish_reason, crate::types::FinishReason::OutputLimit);
+                    assert_eq!(usage.input_tokens, rendered.token_count());
+                    assert_eq!(usage.output_tokens, 4);
+                    terminal = true;
+                }
+                other => panic!("unexpected MLX execution event: {other:?}"),
+            }
+        }
+        assert!(terminal);
+        assert_eq!(text, "!!!!");
+        drop(events);
+        let caps = block_on(engine.capabilities(fixture.specification.id.clone()))
+            .expect("loaded capabilities");
+        assert_eq!(caps.backend, execution.backend());
+        assert_eq!(caps.weight_representations, vec![WeightRepresentation::F32]);
+        assert_eq!(
+            caps.cache_modes[0].representation.as_str(),
+            QWEN3_MLX_CACHE_REPRESENTATION
+        );
+        assert!(!caps.supports_prefix_reuse);
+    }
+
+    #[test]
+    fn engine_generate_executes_mlx_cpu_with_new_cache_identity() {
+        execute_engine_path(Qwen3Execution::MlxCpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn engine_generate_executes_metal_with_unified_mlx_weights_and_kv() {
+        execute_engine_path(Qwen3Execution::MlxMetal);
+    }
+
+    #[test]
+    fn mlx_planning_counts_native_weights_and_kv_update_overlap() {
+        for tied in [true, false] {
+            let mut config = Qwen3Config::tiny_fixture();
+            config.tie_embeddings = tied;
+            let weights = qwen3::fixture::generate_fixture(&config);
+            let measured = weight_memory(&weights).expect("decoded accounting");
+            let headers = config.num_layers * std::mem::size_of::<LayerWeights>();
+            assert_eq!(
+                measured.used_bytes() - headers as u64,
+                resident_bound(&config).expect("native payload")
+            );
+            let plan = cache_spec(&config, 16).payload_plan().expect("cache plan");
+            assert_eq!(
+                cache_bound(&config, 16).expect("cache allowance"),
+                plan.resident_bytes * 2
+            );
+            assert!(
+                logits_payload_bound(&config).expect("output allowance")
+                    >= config.vocab_size as u64 * 12
+            );
+        }
     }
 }

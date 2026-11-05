@@ -320,7 +320,9 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "inference-infra",
  "minijinja",
+ "mlx-ffi",
  "qwen3",
  "safetensors",
  "serde_json",

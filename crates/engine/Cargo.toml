@@ -13,6 +13,8 @@ minijinja = { workspace = true }
 sha2 = "=0.10.9"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 blake3 = "=1.8.7"
+mlx-ffi = { path = "../mlx-ffi" }
+inference-infra = { path = "../inference-infra" }
 
 [dev-dependencies]
 safetensors = "=0.4.3"
