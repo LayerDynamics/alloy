@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://alloy.local/events/telemetry-v1.json",
+  "title": "Alloy anonymous telemetry payload v1",
+  "description": "FR-35 Phase-1 event schema. Anonymous aggregate counts only. Forbidden: prompts, file paths, model identifiers, artifact ids, tokenizer ids.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "daemon_version",
+    "hardware_tier",
+    "session_count",
+    "turn_count",
+    "tokens_per_s",
+    "ttft_ms",
+    "cache_hit_rate",
+    "tool_latency_ms",
+    "memory_reserved_bytes",
+    "memory_actual_bytes"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "telemetry-v1"
+    },
+    "daemon_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Daemon package version string. Must not encode a model or artifact id."
+    },
+    "hardware_tier": {
+      "type": "string",
+      "enum": [
+        "ram_8_gb",
+        "ram_16_gb",
+        "ram_18_gb",
+        "ram_24_gb",
+        "ram_32_gb",
+        "ram_36_gb",
+        "ram_48_gb",
+        "ram_64_gb",
+        "ram_96_gb",
+        "ram_128_gb_plus",
+        "unknown"
+      ]
+    },
+    "session_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "turn_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tokens_per_s": {
+      "type": "number",
+      "minimum": 0
+    },
+    "ttft_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "cache_hit_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "tool_latency_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "memory_reserved_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "memory_actual_bytes": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "x-anonymity-invariants": [
+    "no prompts or message bodies",
+    "no filesystem paths",
+    "no model identifiers",
+    "no artifact or tokenizer identifiers"
+  ]
+}

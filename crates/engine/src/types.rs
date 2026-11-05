@@ -720,6 +720,14 @@ pub struct Generation {
 }
 
 impl Generation {
+    /// Construct a generation handle from an accepted request and event stream.
+    ///
+    /// Engine runtimes and in-process adapters (including harness tests) use
+    /// this to return a live stream after admission succeeds.
+    pub fn from_stream(request_id: RequestId, events: GenerationStream) -> Self {
+        Self { request_id, events }
+    }
+
     /// Return the accepted request identifier.
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
