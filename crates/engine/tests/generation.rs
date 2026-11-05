@@ -1575,3 +1575,6 @@ fn discard_policy_cannot_report_reuse_for_matching_executed_history() {
 
 #[path = "support/runtime_policies.rs"]
 mod runtime_policies;
+
+#[path = "support/state_lifecycle.rs"]
+mod state_lifecycle;
