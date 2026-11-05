@@ -322,6 +322,7 @@ dependencies = [
  "blake3",
  "minijinja",
  "qwen3",
+ "safetensors",
  "serde_json",
  "sha2",
  "tokenizers",

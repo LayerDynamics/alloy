@@ -14,5 +14,8 @@ sha2 = "=0.10.9"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 blake3 = "=1.8.7"
 
+[dev-dependencies]
+safetensors = "=0.4.3"
+
 [lints]
 workspace = true
