@@ -12,7 +12,10 @@
 //!
 //! The renderer is the existing versioned Qwen3 non-thinking CHAT_TEMPLATE.
 //! Its expected SHA-256 is supplied by the trusted caller, not inferred as
-//! trustworthy from mutable artifact contents.
+//! trustworthy from mutable artifact contents. Production rendering and
+//! tokenization delegate to crate::rendering; this adapter has no private
+//! template engine, output writer, tokenizer identity, or render-hash path.
+//! The incremental decoder shares the same immutable PinnedTokenizer.
 //!
 //! Tokenizer/configuration objects are bounded control-plane metadata.
 //! Their library-internal heap storage is not reported as model tensors.
@@ -31,15 +34,15 @@ use crate::{
     },
     generation::GenerationLimits,
     registry::{ArtifactRegistration, FamilyRegistration, FamilyVersion, ModelProfile, Registry},
+    rendering::{self, PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions},
     runtime::{FamilyRuntime, RetentionPolicy, RuntimeBackend, RuntimePlan, TextDecoder},
     scheduler::Scheduler,
     types::{
         ArtifactId, CacheKind, CacheMode, CacheRepresentationId, Capabilities, ContextSnapshot,
-        DecodingCapability, ExecutionBackend, ModelProfileId, RenderedContext, RendererIdentity,
-        TokenizerId, WeightRepresentation,
+        DecodingCapability, ExecutionBackend, ModelProfileId, RenderedContext,
+        WeightRepresentation,
     },
 };
-use minijinja::{Environment, UndefinedBehavior, context};
 use qwen3::{
     config::Qwen3Config,
     fixture::{LayerWeights, Qwen3Weights},
@@ -53,15 +56,22 @@ use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     num::NonZeroUsize,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::Tokenizer;
-
-const TOKENIZERS_VERSION: &str = "0.23.2";
-const RENDERER_VERSION: &str = "2.12.0";
+// Qwen policy remains in the adapter; rendering mechanics and identities
+// are owned exclusively by crate::rendering.
+const QWEN3_RESERVED_SPELLINGS: &[&str] = &[
+    "<|",
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>",
+];
 
 /// A file identity obtained through the caller's trusted artifact policy.
 /// Do not create these pins from an untrusted manifest and call that verification.
@@ -85,6 +95,32 @@ pub struct Qwen3Artifact {
     pub files: BTreeMap<String, FilePin>,
     /// Trusted digest of qwen3::template::CHAT_TEMPLATE for this profile path.
     pub template_sha256: [u8; 32],
+}
+
+impl Qwen3Artifact {
+    /// Fingerprint the trusted manifest record used for render identity.
+    ///
+    /// Encoding: the NUL-terminated domain below, u64-LE file count, then
+    /// each BTreeMap entry in UTF-8 name order as u64-LE name byte length,
+    /// UTF-8 name, u64-LE pinned file size, and the 32-byte SHA-256 pin.
+    /// Finally append the 32-byte trusted compiled-template digest.
+    ///
+    /// The artifact ID is framed separately by the shared renderer. Local
+    /// directory paths are intentionally excluded. This function performs
+    /// no I/O and does not itself verify that files match these pins.
+    pub fn manifest_sha256(&self) -> Result<[u8; 32], EngineError> {
+        let mut hash = Sha256::new();
+        hash.update(b"alloy.qwen3.artifact-manifest.v1\0");
+        hash.update(as_u64(self.files.len())?.to_le_bytes());
+        for (name, pin) in &self.files {
+            hash.update(as_u64(name.len())?.to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update(pin.bytes.to_le_bytes());
+            hash.update(pin.sha256);
+        }
+        hash.update(self.template_sha256);
+        Ok(hash.finalize().into())
+    }
 }
 
 /// Explicit bounds; no model, output, or memory policy is silently selected.
@@ -147,10 +183,10 @@ impl Qwen3BackendLimits {
 struct ArtifactData {
     specification: Qwen3Artifact,
     config: Qwen3Config,
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<PinnedTokenizer>,
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
-    tokenizer_id: TokenizerId,
+    manifest_sha256: [u8; 32],
     eos: Vec<u32>,
     source_bytes: u64,
     resident_bound: u64,
@@ -258,20 +294,21 @@ impl Qwen3Backend {
                     "this adapter supports the actual BPE/ByteLevel Qwen3 tokenizer contract only",
                 ));
             }
-            let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes).map_err(|source| {
-                EngineError::CheckpointFormat {
-                    format: "tokenizer.json",
-                    path: Some(specification.directory.join("tokenizer.json")),
-                    source,
-                }
+            let tokenizer_pin = specification.files.get("tokenizer.json").ok_or_else(|| {
+                validation(
+                    Some(&specification.id),
+                    "tokenizer.json lacks a trusted pin",
+                )
             })?;
-            if tokenizer.get_truncation().is_some()
-                || tokenizer.get_padding().is_some()
-                || tokenizer.get_encode_special_tokens()
-            {
+            let tokenizer = Arc::new(PinnedTokenizer::from_pinned_json(
+                &tokenizer_bytes,
+                tokenizer_pin.sha256,
+                limits.max_tokenizer_bytes,
+            )?);
+            if tokenizer.tokenizer().get_encode_special_tokens() {
                 return Err(EngineError::unsupported(
                     "tokenizer options",
-                    "truncation, padding, and special-token splitting are not enabled by this profile",
+                    "special-token splitting is not enabled by this Qwen3 profile",
                 ));
             }
             let mut specials = BTreeSet::new();
@@ -292,7 +329,7 @@ impl Qwen3Backend {
                     }
                 }
             }
-            for (spelling, id) in tokenizer.get_vocab(true) {
+            for (spelling, id) in tokenizer.tokenizer().get_vocab(true) {
                 if u64::from(id) >= as_u64(config.vocab_size)?
                     || spelling.len() > limits.max_token_bytes
                 {
@@ -329,7 +366,7 @@ impl Qwen3Backend {
             let eos = parse_eos(eos_value.as_ref())?;
             for &token in &eos {
                 if u64::from(token) >= as_u64(config.vocab_size)?
-                    || tokenizer.id_to_token(token).is_none()
+                    || tokenizer.tokenizer().id_to_token(token).is_none()
                     || !specials.contains(&token)
                 {
                     return Err(validation(
@@ -338,18 +375,14 @@ impl Qwen3Backend {
                     ));
                 }
             }
-            let mut identity = Sha256::new();
-            identity.update(b"alloy.qwen3.tokenizer.v1\0");
-            identity.update(TOKENIZERS_VERSION.as_bytes());
-            identity.update(digest(&tokenizer_bytes));
-            let tokenizer_id = TokenizerId::new(format!("sha256:{:x}", identity.finalize()))?;
+            let manifest_sha256 = specification.manifest_sha256()?;
             let data = ArtifactData {
                 specification,
                 config,
-                tokenizer: Arc::new(tokenizer),
+                tokenizer,
                 special_tokens: Arc::new(specials),
                 byte_decoder: Arc::clone(&inverse),
-                tokenizer_id,
+                manifest_sha256,
                 eos,
                 source_bytes,
                 resident_bound,
@@ -479,64 +512,53 @@ impl RuntimeBackend for Qwen3Backend {
         Box::pin(async move {
             let resolved = registry.resolve_profile(context.profile_id())?;
             let data = self.data(resolved.artifact())?;
-            let text = render_bounded(&context, &self.limits)?;
-            let encoding = data
-                .tokenizer
-                .encode(text.as_str(), false)
-                .map_err(|e| execution_error("tokenize", e.to_string()))?;
-            let ids = encoding.get_ids();
-            resolved.profile().check_context(ids.len())?;
-            if ids
+            let profile = resolved.profile();
+            let binding = RenderingBinding {
+                profile_id: context.profile_id(),
+                artifact_id: &data.specification.id,
+                template: CHAT_TEMPLATE,
+                template_sha256: data.specification.template_sha256,
+                artifact_manifest_sha256: data.manifest_sha256,
+            };
+            let limits = RenderingLimits::new(
+                self.limits.max_messages,
+                self.limits.max_input_bytes,
+                CHAT_TEMPLATE.len(),
+                self.limits.max_rendered_bytes,
+                profile.context_limit_tokens(),
+            )?;
+            let rendered = rendering::render_and_count(
+                &context,
+                &binding,
+                data.tokenizer.as_ref(),
+                &qwen3_rendering_options(),
+                limits,
+            )
+            .map_err(|error| match error {
+                // Keep the profile's actual reserve/margin in context errors.
+                EngineError::ContextLimitExceeded { input_tokens, .. } => {
+                    EngineError::ContextLimitExceeded {
+                        input_tokens,
+                        output_reserve_tokens: profile.max_output_tokens(),
+                        safety_margin_tokens: profile.safety_margin_tokens(),
+                        limit_tokens: profile.context_limit_tokens(),
+                    }
+                }
+                other => other,
+            })?;
+            profile.check_context(rendered.token_count())?;
+            let vocabulary = as_u64(data.config.vocab_size)?;
+            if rendered
+                .token_ids()
                 .iter()
-                .any(|&id| u64::from(id) >= as_u64(data.config.vocab_size).unwrap_or(0))
+                .any(|&id| u64::from(id) >= vocabulary)
             {
                 return Err(validation(
                     Some(resolved.artifact().id()),
                     "tokenizer produced an ID outside the loaded model vocabulary",
                 ));
             }
-            let mut tokens = Vec::new();
-            tokens
-                .try_reserve_exact(ids.len())
-                .map_err(|_| allocation("rendered token IDs", ids.len().checked_mul(4)))?;
-            tokens.extend_from_slice(ids);
-            let mut hash = Sha256::new();
-            hash.update(b"alloy.qwen3.render.v1\0");
-            for value in [
-                context.profile_id().as_str(),
-                data.specification.id.as_str(),
-                data.tokenizer_id.as_str(),
-                RENDERER_VERSION,
-                text.as_str(),
-            ] {
-                hash.update(as_u64(value.len())?.to_le_bytes());
-                hash.update(value.as_bytes());
-            }
-            hash.update(data.specification.template_sha256);
-            for (name, pin) in &data.specification.files {
-                hash.update(as_u64(name.len())?.to_le_bytes());
-                hash.update(name.as_bytes());
-                hash.update(pin.bytes.to_le_bytes());
-                hash.update(pin.sha256);
-            }
-            hash.update(as_u64(tokens.len())?.to_le_bytes());
-            for token in &tokens {
-                hash.update(token.to_le_bytes());
-            }
-            Ok(RenderedContext {
-                snapshot_id: context.snapshot_id().clone(),
-                profile_id: context.profile_id().clone(),
-                artifact_id: data.specification.id.clone(),
-                text,
-                token_ids: tokens,
-                render_hash: hash.finalize().into(),
-                template_hash: data.specification.template_sha256,
-                tokenizer_id: data.tokenizer_id.clone(),
-                renderer: RendererIdentity {
-                    implementation: "minijinja".to_owned(),
-                    version: RENDERER_VERSION.to_owned(),
-                },
-            })
+            Ok(rendered)
         })
     }
 
@@ -899,7 +921,7 @@ impl AutoregressiveModel for Qwen3Loaded {
 }
 
 struct Qwen3TextDecoder {
-    tokenizer: Arc<Tokenizer>,
+    tokenizer: Arc<PinnedTokenizer>,
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
     pending: Vec<u8>,
@@ -915,12 +937,16 @@ impl TextDecoder for Qwen3TextDecoder {
         if self.special_tokens.contains(&token) {
             return Ok(String::new());
         }
-        let spelling = self.tokenizer.id_to_token(token).ok_or_else(|| {
-            execution_error(
-                "detokenize",
-                "model selected an ID absent from the tokenizer",
-            )
-        })?;
+        let spelling = self
+            .tokenizer
+            .tokenizer()
+            .id_to_token(token)
+            .ok_or_else(|| {
+                execution_error(
+                    "detokenize",
+                    "model selected an ID absent from the tokenizer",
+                )
+            })?;
         if spelling.len() > self.max_token_bytes {
             return Err(execution_error(
                 "detokenize",
@@ -974,7 +1000,9 @@ impl TextDecoder for Qwen3TextDecoder {
 
 fn registration(context_limit: usize) -> Result<FamilyRegistration, EngineError> {
     FamilyRegistration::new(
-        FamilyVersion::new(qwen3::register::IMPL_VERSION, 1, 0),
+        // Shared rendering changes tokenizer/render identities. Keep the
+        // adapter implementation version distinct from the legacy path.
+        FamilyVersion::new(qwen3::register::IMPL_VERSION, 2, 0),
         qwen3::register::ARCHITECTURES
             .iter()
             .map(|s| (*s).to_owned())
@@ -1207,105 +1235,17 @@ fn parse_eos(value: Option<&Value>) -> Result<Vec<u32>, EngineError> {
     Ok(eos)
 }
 
-struct BoundedWriter {
-    bytes: Vec<u8>,
-    limit: usize,
-    failed: bool,
-    allocation_failed: bool,
-}
-
-impl Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let new_size = self.bytes.len().checked_add(bytes.len());
-        if new_size.is_none_or(|size| size > self.limit) {
-            self.failed = true;
-            return Err(io::Error::other(
-                "rendered output exceeds its explicit bound",
-            ));
-        }
-        if self.bytes.try_reserve_exact(bytes.len()).is_err() {
-            self.allocation_failed = true;
-            return Err(io::Error::other("rendered output allocation failed"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+fn qwen3_rendering_options() -> RenderingOptions<'static> {
+    RenderingOptions {
+        add_generation_prompt: true,
+        enable_thinking: Some(false),
+        add_special_tokens: false,
+        // Match the previous Environment defaults for this pinned template.
+        keep_trailing_newline: false,
+        trim_blocks: false,
+        lstrip_blocks: false,
+        reserved_spellings: QWEN3_RESERVED_SPELLINGS,
     }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn render_bounded(
-    context: &ContextSnapshot,
-    limits: &Qwen3BackendLimits,
-) -> Result<String, EngineError> {
-    if context.messages().len() > limits.max_messages {
-        return Err(EngineError::invalid_request(
-            "messages",
-            "message count exceeds its explicit limit",
-        ));
-    }
-    let mut total = 0_usize;
-    let mut messages = Vec::new();
-    messages
-        .try_reserve_exact(context.messages().len())
-        .map_err(|_| allocation("rendering messages", None))?;
-    for message in context.messages() {
-        total = total
-            .checked_add(message.content.len())
-            .ok_or_else(|| internal("input byte count overflow"))?;
-        if total > limits.max_input_bytes {
-            return Err(EngineError::invalid_request(
-                "messages",
-                "input byte limit exceeded",
-            ));
-        }
-        if message.content.contains("<|")
-            || [
-                "<think>",
-                "</think>",
-                "<tool_call>",
-                "</tool_call>",
-                "<tool_response>",
-                "</tool_response>",
-            ]
-            .iter()
-            .any(|control| message.content.contains(control))
-        {
-            return Err(EngineError::invalid_request(
-                "messages",
-                "message body contains reserved Qwen3 control syntax",
-            ));
-        }
-        messages
-            .push(context! { role => message.role.as_str(), content => message.content.as_str() });
-    }
-    let mut environment = Environment::new();
-    environment.set_undefined_behavior(UndefinedBehavior::Strict);
-    environment
-        .add_template("qwen3-text", CHAT_TEMPLATE)
-        .map_err(|e| execution_error("compile chat template", e.to_string()))?;
-    let template = environment
-        .get_template("qwen3-text")
-        .map_err(|e| execution_error("get chat template", e.to_string()))?;
-    let mut writer = BoundedWriter {
-        bytes: Vec::new(),
-        limit: limits.max_rendered_bytes,
-        failed: false,
-        allocation_failed: false,
-    };
-    let result = template.render_to_write(context! { messages => messages }, &mut writer);
-    if writer.allocation_failed {
-        return Err(allocation("rendered output", None));
-    }
-    if writer.failed {
-        return Err(EngineError::invalid_request(
-            "rendered context",
-            "rendered byte limit exceeded",
-        ));
-    }
-    result.map_err(|e| execution_error("render chat template", e.to_string()))?;
-    String::from_utf8(writer.bytes).map_err(|_| internal("template emitted invalid UTF-8"))
 }
 
 fn byte_decoder_map() -> BTreeMap<char, u8> {
@@ -1542,5 +1482,490 @@ fn model_error(error: ModelError, stage: &'static str) -> EngineError {
         }
         ModelError::DimensionOverflow(_) => internal("Qwen3 dimension arithmetic overflow"),
         other => execution_error(stage, other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod shared_rendering_wiring_tests {
+    use super::*;
+    use crate::{
+        api::Engine,
+        types::{ContextSnapshotId, GenerationOptions, Message, MessageRole},
+    };
+    use safetensors::{
+        Dtype,
+        tensor::{TensorView, serialize},
+    };
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+        thread,
+        time::{Duration, Instant},
+    };
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "alloy-qwen-shared-renderer-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed),
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path.canonicalize().expect("canonical directory")),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create fixture directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ThreadWake(thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => {
+                    let now = Instant::now();
+                    assert!(now < deadline, "renderer wiring test timed out");
+                    thread::park_timeout(deadline.saturating_duration_since(now));
+                }
+            }
+        }
+    }
+
+    struct TensorRecord {
+        name: String,
+        shape: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    fn add_tensor(
+        records: &mut Vec<TensorRecord>,
+        name: String,
+        shape: Vec<usize>,
+        values: &[f32],
+    ) {
+        let count = shape
+            .iter()
+            .try_fold(1_usize, |n, &dimension| n.checked_mul(dimension))
+            .expect("tensor element count");
+        assert_eq!(count, values.len(), "fixture tensor {name}");
+        records.push(TensorRecord {
+            name,
+            shape,
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        });
+    }
+
+    // Serialize actual deterministic fixture weights. The rendering tests
+    // do not execute inference, but do not use a fake checkpoint either.
+    fn checkpoint_bytes(config: &Qwen3Config) -> Vec<u8> {
+        let weights = qwen3::fixture::generate_fixture(config);
+        let mut records = Vec::new();
+        add_tensor(
+            &mut records,
+            "model.embed_tokens.weight".to_owned(),
+            vec![config.vocab_size, config.hidden_size],
+            &weights.embed_tokens,
+        );
+        for (index, layer) in weights.layers.iter().enumerate() {
+            let prefix = format!("model.layers.{index}");
+            for (suffix, shape, values) in [
+                (
+                    "input_layernorm.weight",
+                    vec![config.hidden_size],
+                    layer.input_layernorm.as_slice(),
+                ),
+                (
+                    "self_attn.q_proj.weight",
+                    vec![config.q_dim(), config.hidden_size],
+                    layer.q_proj.as_slice(),
+                ),
+                (
+                    "self_attn.k_proj.weight",
+                    vec![config.kv_dim(), config.hidden_size],
+                    layer.k_proj.as_slice(),
+                ),
+                (
+                    "self_attn.v_proj.weight",
+                    vec![config.kv_dim(), config.hidden_size],
+                    layer.v_proj.as_slice(),
+                ),
+                (
+                    "self_attn.q_norm.weight",
+                    vec![config.head_dim],
+                    layer.q_norm.as_slice(),
+                ),
+                (
+                    "self_attn.k_norm.weight",
+                    vec![config.head_dim],
+                    layer.k_norm.as_slice(),
+                ),
+                (
+                    "self_attn.o_proj.weight",
+                    vec![config.hidden_size, config.q_dim()],
+                    layer.o_proj.as_slice(),
+                ),
+                (
+                    "post_attention_layernorm.weight",
+                    vec![config.hidden_size],
+                    layer.post_attention_layernorm.as_slice(),
+                ),
+                (
+                    "mlp.gate_proj.weight",
+                    vec![config.intermediate_size, config.hidden_size],
+                    layer.gate_proj.as_slice(),
+                ),
+                (
+                    "mlp.up_proj.weight",
+                    vec![config.intermediate_size, config.hidden_size],
+                    layer.up_proj.as_slice(),
+                ),
+                (
+                    "mlp.down_proj.weight",
+                    vec![config.hidden_size, config.intermediate_size],
+                    layer.down_proj.as_slice(),
+                ),
+            ] {
+                add_tensor(&mut records, format!("{prefix}.{suffix}"), shape, values);
+            }
+        }
+        add_tensor(
+            &mut records,
+            "model.norm.weight".to_owned(),
+            vec![config.hidden_size],
+            &weights.final_layernorm,
+        );
+        if let Some(head) = &weights.lm_head {
+            add_tensor(
+                &mut records,
+                "lm_head.weight".to_owned(),
+                vec![config.vocab_size, config.hidden_size],
+                head,
+            );
+        }
+        let views: Vec<_> = records
+            .iter()
+            .map(|record| {
+                (
+                    record.name.as_str(),
+                    TensorView::new(Dtype::F32, record.shape.clone(), &record.bytes)
+                        .expect("tensor"),
+                )
+            })
+            .collect();
+        serialize(views, &None).expect("actual safetensors checkpoint")
+    }
+
+    fn tokenizer_bytes() -> Vec<u8> {
+        let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
+        alphabet.sort_unstable();
+        assert_eq!(alphabet.len(), 256);
+        let mut vocabulary = serde_json::Map::new();
+        for (id, character) in alphabet.into_iter().enumerate() {
+            vocabulary.insert(character.to_string(), Value::from(id as u64));
+        }
+        vocabulary.insert("<|im_start|>".to_owned(), Value::from(256));
+        vocabulary.insert("<|im_end|>".to_owned(), Value::from(257));
+        serde_json::to_vec(&serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id":256,"content":"<|im_start|>","single_word":false,
+                 "lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                {"id":257,"content":"<|im_end|>","single_word":false,
+                 "lstrip":false,"rstrip":false,"normalized":false,"special":true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type":"ByteLevel","add_prefix_space":false,
+                              "trim_offsets":true,"use_regex":true},
+            "post_processor": null,
+            "decoder": {"type":"ByteLevel","add_prefix_space":false,
+                        "trim_offsets":true,"use_regex":true},
+            "model": {"type":"BPE","dropout":null,"unk_token":null,
+                      "continuing_subword_prefix":null,"end_of_word_suffix":null,
+                      "fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+                      "vocab":vocabulary,"merges":[]}
+        }))
+        .expect("tokenizer JSON")
+    }
+
+    struct Fixture {
+        directory: Directory,
+        specification: Qwen3Artifact,
+        limits: Qwen3BackendLimits,
+        profile: ModelProfile,
+        context: ContextSnapshot,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = Directory::new();
+            let mut config = Qwen3Config::tiny_fixture();
+            config.vocab_size = 258;
+            let configuration = serde_json::to_vec(&serde_json::json!({
+                "architectures":["Qwen3ForCausalLM"], "model_type":"qwen3",
+                "hidden_size":config.hidden_size, "num_hidden_layers":config.num_layers,
+                "num_attention_heads":config.q_heads, "num_key_value_heads":config.kv_heads,
+                "head_dim":config.head_dim, "intermediate_size":config.intermediate_size,
+                "vocab_size":config.vocab_size, "rope_theta":config.rope_theta,
+                "max_position_embeddings":config.max_context,
+                "tie_word_embeddings":config.tie_embeddings, "hidden_act":"silu",
+                "rms_norm_eps":0.000001, "attention_bias":false,
+                "rope_scaling":null, "torch_dtype":"float32", "eos_token_id":257
+            }))
+            .expect("config JSON");
+            let mut files = BTreeMap::new();
+            for (name, bytes) in [
+                ("config.json", configuration),
+                ("tokenizer.json", tokenizer_bytes()),
+                ("model.safetensors", checkpoint_bytes(&config)),
+            ] {
+                std::fs::write(directory.0.join(name), &bytes).expect("fixture component");
+                files.insert(
+                    name.to_owned(),
+                    FilePin {
+                        bytes: bytes.len() as u64,
+                        sha256: digest(&bytes),
+                    },
+                );
+            }
+            let artifact = ArtifactId::new("shared-renderer-artifact").expect("artifact");
+            let profile_id = ModelProfileId::new("shared-renderer-profile").expect("profile");
+            let profile = ModelProfile::new(
+                profile_id.clone(),
+                artifact.clone(),
+                config.max_context,
+                4,
+                8,
+                GenerationOptions::greedy(4).expect("options"),
+            )
+            .expect("profile");
+            let context = ContextSnapshot::new(
+                ContextSnapshotId::new("shared-renderer-snapshot").expect("snapshot"),
+                profile_id,
+                vec![Message {
+                    role: MessageRole::User,
+                    content: "hello".to_owned(),
+                }],
+            )
+            .expect("context");
+            let specification = Qwen3Artifact {
+                id: artifact,
+                directory: directory.0.clone(),
+                files,
+                template_sha256: digest(CHAT_TEMPLATE.as_bytes()),
+            };
+            let limits = Qwen3BackendLimits {
+                max_files: 16,
+                max_config_bytes: 1024 * 1024,
+                max_tokenizer_bytes: 1024 * 1024,
+                max_messages: 16,
+                max_input_bytes: 4096,
+                max_rendered_bytes: 16 * 1024,
+                max_token_bytes: 128,
+                verification_chunk_bytes: 4096,
+                context_limit_tokens: config.max_context,
+                prefill_chunk_tokens: NonZeroUsize::new(2).expect("chunk"),
+                loader_headroom_bytes: 64 * 1024,
+                execution_headroom_bytes: 64 * 1024,
+                generation: GenerationLimits::new(8, 4096, 1024).expect("buffers"),
+            };
+            Self {
+                directory,
+                specification,
+                limits,
+                profile,
+                context,
+            }
+        }
+
+        fn engine(&self) -> EngineCore<FamilyRuntime> {
+            Qwen3Backend::new(vec![self.specification.clone()], self.limits.clone())
+                .expect("actual backend")
+                .into_engine(
+                    vec![self.profile.clone()],
+                    AdmissionController::new(16 * 1024 * 1024).expect("admission"),
+                    Scheduler::new(8).expect("scheduler"),
+                    RetentionPolicy {
+                        retain_model: false,
+                        retain_cache_buffers: false,
+                    },
+                )
+                .expect("actual engine")
+        }
+    }
+
+    #[test]
+    fn engine_rendering_matches_shared_renderer_and_legacy_prompt_text() {
+        let fixture = Fixture::new();
+        let engine = fixture.engine();
+        let actual = block_on(engine.render_and_count(fixture.context.clone()))
+            .expect("production Engine rendering");
+        let bytes = std::fs::read(fixture.directory.0.join("tokenizer.json"))
+            .expect("known fixture tokenizer source");
+        let tokenizer = PinnedTokenizer::from_pinned_json(
+            &bytes,
+            fixture.specification.files["tokenizer.json"].sha256,
+            fixture.limits.max_tokenizer_bytes,
+        )
+        .expect("shared pinned tokenizer");
+        let binding = RenderingBinding {
+            profile_id: fixture.context.profile_id(),
+            artifact_id: &fixture.specification.id,
+            template: CHAT_TEMPLATE,
+            template_sha256: fixture.specification.template_sha256,
+            artifact_manifest_sha256: fixture.specification.manifest_sha256().expect("manifest"),
+        };
+        // Intentionally spell the expected Qwen policy independently of
+        // qwen3_rendering_options, including the prior whitespace defaults.
+        let options = RenderingOptions {
+            add_generation_prompt: true,
+            enable_thinking: Some(false),
+            add_special_tokens: false,
+            keep_trailing_newline: false,
+            trim_blocks: false,
+            lstrip_blocks: false,
+            reserved_spellings: QWEN3_RESERVED_SPELLINGS,
+        };
+        let expected = rendering::render_and_count(
+            &fixture.context,
+            &binding,
+            &tokenizer,
+            &options,
+            RenderingLimits::new(
+                fixture.limits.max_messages,
+                fixture.limits.max_input_bytes,
+                CHAT_TEMPLATE.len(),
+                fixture.limits.max_rendered_bytes,
+                fixture.profile.context_limit_tokens(),
+            )
+            .expect("render limits"),
+        )
+        .expect("shared render");
+        // Includes the shared tokenizer ID and render hash. The removed
+        // private implementation cannot satisfy this equality.
+        assert_eq!(actual, expected);
+        assert_eq!(actual.tokenizer_id(), tokenizer.identity());
+
+        // Preserve the actual previously selected model-visible prompt,
+        // not just equivalence between two new-code call sites.
+        let mut legacy = minijinja::Environment::new();
+        legacy.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        legacy
+            .add_template("qwen3-text", CHAT_TEMPLATE)
+            .expect("legacy template");
+        let legacy_text = legacy
+            .get_template("qwen3-text")
+            .expect("template")
+            .render(minijinja::context! {
+                messages => vec![minijinja::context! { role => "user", content => "hello" }]
+            })
+            .expect("prior prompt contract");
+        assert_eq!(actual.text(), legacy_text.as_str());
+        assert!(
+            engine
+                .active_request_id()
+                .expect("execution owner")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn engine_reserved_syntax_errors_come_from_shared_renderer() {
+        let fixture = Fixture::new();
+        let engine = fixture.engine();
+        let context = ContextSnapshot::new(
+            ContextSnapshotId::new("reserved-syntax").expect("snapshot"),
+            fixture.context.profile_id().clone(),
+            vec![Message {
+                role: MessageRole::User,
+                content: "hello <think>".to_owned(),
+            }],
+        )
+        .expect("context");
+        let error = block_on(engine.render_and_count(context)).expect_err("reserved syntax");
+        match error {
+            EngineError::InvalidRequest { field, .. } => assert_eq!(field, "message.content"),
+            other => panic!("expected shared validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_output_bounds_use_shared_writer_errors() {
+        let mut fixture = Fixture::new();
+        fixture.limits.max_rendered_bytes = 1;
+        let engine = fixture.engine();
+        let error =
+            block_on(engine.render_and_count(fixture.context.clone())).expect_err("output bound");
+        match error {
+            EngineError::MemoryLimitExceeded {
+                operation,
+                required_bytes,
+                available_bytes,
+            } => {
+                assert_eq!(operation, "render chat template output");
+                assert!(required_bytes > 1);
+                assert_eq!(available_bytes, 1);
+            }
+            other => panic!("expected shared writer error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_fingerprint_tracks_relevant_pins_not_local_directory() {
+        let fixture = Fixture::new();
+        let original = fixture.specification.manifest_sha256().expect("manifest");
+        let mut relocated = fixture.specification.clone();
+        relocated.directory = PathBuf::from("another-local-directory");
+        assert_eq!(original, relocated.manifest_sha256().expect("relocated"));
+        let mut changed = fixture.specification.clone();
+        changed
+            .files
+            .get_mut("tokenizer.json")
+            .expect("tokenizer pin")
+            .sha256[0] ^= 1;
+        assert_ne!(original, changed.manifest_sha256().expect("changed pin"));
+        let mut changed = fixture.specification.clone();
+        changed
+            .files
+            .get_mut("model.safetensors")
+            .expect("weight pin")
+            .bytes += 1;
+        assert_ne!(original, changed.manifest_sha256().expect("changed length"));
+        let mut changed = fixture.specification.clone();
+        changed.template_sha256[0] ^= 1;
+        assert_ne!(
+            original,
+            changed.manifest_sha256().expect("changed template")
+        );
     }
 }
