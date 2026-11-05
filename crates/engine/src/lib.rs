@@ -25,3 +25,5 @@ pub mod rendering;
 pub mod runtime;
 pub mod scheduler;
 pub mod types;
+/// Bounded unified-memory pressure and reclamation decisions.
+pub mod pressure;
