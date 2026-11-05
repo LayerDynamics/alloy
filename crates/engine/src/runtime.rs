@@ -397,6 +397,52 @@ impl FamilyRuntime {
         })
     }
 
+    // ALLOY_RUNTIME_MLX_MEMORY_V1
+
+    /// Observe process-wide MLX allocator counters on the native worker.
+    ///
+    /// This does not synchronize execution, acquire admission, or change
+    /// reservation ownership. Counter fields are sequential observations,
+    /// not an atomic snapshot or process RSS.
+    pub fn mlx_memory_snapshot(&self) -> EngineFuture<'_, mlx_ffi::memory::MemorySnapshot> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-mlx-memory-snapshot", move || {
+                worker
+                    .call(|reply| Command::MlxMemorySnapshot { reply })?
+                    .result
+            })?
+            .await
+        })
+    }
+
+    /// Clear unused process-wide MLX allocator cache while this runtime
+    /// has no active execution or pending startup.
+    ///
+    /// Does not destroy live tensors, invalidate published state, release
+    /// leases, alter retention policy, or credit the admission ledger.
+    ///
+    /// This runtime's backends must satisfy their native-completion
+    /// contract before becoming idle. This operation does not synchronize
+    /// arbitrary streams belonging to other runtimes or libraries.
+    ///
+    /// The application must coordinate process-wide allocator policy.
+    /// Reported before/after differences are observations, not proof of
+    /// an equal reduction in process RSS.
+    pub fn reclaim_mlx_allocator_cache(
+        &self,
+    ) -> EngineFuture<'_, mlx_ffi::memory::CacheReclaimReport> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-mlx-cache-reclaim", move || {
+                worker
+                    .call(|reply| Command::ReclaimMlxAllocatorCache { reply })?
+                    .result
+            })?
+            .await
+        })
+    }
+
     fn backend(
         &self,
         registry: &Registry,
@@ -690,6 +736,12 @@ enum Command {
         token_prefix_bytes: Vec<u8>,
         _bytes_reservation: Option<MemoryReservation>,
         reply: SyncSender<Reply<SessionStateId>>,
+    },
+    MlxMemorySnapshot {
+        reply: SyncSender<Reply<mlx_ffi::memory::MemorySnapshot>>,
+    },
+    ReclaimMlxAllocatorCache {
+        reply: SyncSender<Reply<mlx_ffi::memory::CacheReclaimReport>>,
     },
     LookupState {
         state_id: SessionStateId,
@@ -1463,6 +1515,20 @@ impl NativeState {
                     });
                 }
 
+                Command::MlxMemorySnapshot { reply } => {
+                    let result = self.mlx_memory_snapshot();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+                Command::ReclaimMlxAllocatorCache { reply } => {
+                    let result = self.reclaim_mlx_allocator_cache();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
                 Command::LookupState { state_id, reply } => {
                     let result = self.lookup_state(&state_id);
                     let _ = reply.send(Reply {
@@ -1506,6 +1572,78 @@ impl NativeState {
                 message: "native worker owns an active or pending request".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn mlx_memory_snapshot(&self) -> Result<mlx_ffi::memory::MemorySnapshot, EngineError> {
+        mlx_ffi::memory::snapshot().map_err(|error| EngineError::ExecutionFailed {
+            stage: "observe MLX allocator memory",
+            message: error.to_string(),
+        })
+    }
+
+    fn reclaim_mlx_allocator_cache(
+        &self,
+    ) -> Result<mlx_ffi::memory::CacheReclaimReport, EngineError> {
+        // Check ownership before invoking any process-wide allocator call.
+        self.require_idle()?;
+
+        let before = self.mlx_memory_snapshot()?;
+        mlx_ffi::memory::clear_cache().map_err(|error| EngineError::ExecutionFailed {
+            stage: "clear unused MLX allocator cache",
+            message: error.to_string(),
+        })?;
+        let after = self.mlx_memory_snapshot()?;
+
+        // In particular, do not release or resize any MemoryReservation
+        // based on observed allocator counter differences.
+        Ok(mlx_ffi::memory::CacheReclaimReport { before, after })
+    }
+
+    fn reclaim_mlx_cache_before_idle_replacement(
+        &self,
+        setup: &Setup,
+        artifact: &ArtifactRegistration,
+    ) -> Result<(), EngineError> {
+        let resident = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+
+        let Some(resident) = resident else {
+            return Ok(());
+        };
+
+        let incoming_is_mlx = matches!(
+            &setup.backend.registration().capabilities().backend,
+            crate::types::ExecutionBackend::MlxCpu | crate::types::ExecutionBackend::MlxMetal
+        );
+        let resident_is_mlx = matches!(
+            &resident.capabilities.backend,
+            crate::types::ExecutionBackend::MlxCpu | crate::types::ExecutionBackend::MlxMetal
+        );
+
+        if !incoming_is_mlx && !resident_is_mlx {
+            return Ok(());
+        }
+
+        let incompatible_model = resident.model.artifact_id() != artifact.id()
+            || resident.model.registration().implementation_version()
+                != setup.backend.registration().implementation_version()
+            || resident.model.registration().family() != artifact.family();
+
+        let incompatible_cache = resident
+            .cache
+            .as_ref()
+            .is_some_and(|cache| !cache_matches(cache, &setup.plan));
+
+        if incompatible_model || incompatible_cache {
+            // First clear unused allocator buffers. Actual incompatible
+            // live resources are still destroyed by the existing startup
+            // reclamation path, with their guards kept until destruction.
+            let _report = self.reclaim_mlx_allocator_cache()?;
+        }
+
         Ok(())
     }
 
@@ -1558,6 +1696,7 @@ impl NativeState {
         setup.backend.verify_artifact(artifact, control)?;
         check_startup(control, abandoned)?;
 
+        self.reclaim_mlx_cache_before_idle_replacement(setup, artifact)?;
         self.unpublish_idle_state()?;
 
         let admission = self.admission.clone();
@@ -3011,5 +3150,45 @@ mod tests {
         drop_receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("reply destruction");
+    }
+}
+
+#[cfg(test)]
+mod mlx_allocator_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn allocator_observation_types_can_cross_dispatch_boundaries() {
+        fn assert_send<T: Send>() {}
+        assert_send::<mlx_ffi::memory::MemorySnapshot>();
+        assert_send::<mlx_ffi::memory::CacheReclaimReport>();
+    }
+
+    #[test]
+    fn pending_startup_rejects_reclamation_before_allocator_access() {
+        let admission = AdmissionController::new(4096).expect("admission");
+        let _unrelated = admission
+            .reserve("unrelated owner", 512)
+            .expect("reservation");
+        let before = admission.snapshot().expect("before");
+
+        let state = NativeState {
+            active: None,
+            pending: Some(RequestId::new("pending-allocator-reclaim").expect("request")),
+            resident: None,
+            states: HashMap::new(),
+            admission: admission.clone(),
+            retention: RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+            summary: Arc::new(Mutex::new(Summary::empty(true))),
+        };
+
+        assert!(matches!(
+            state.reclaim_mlx_allocator_cache(),
+            Err(EngineError::Busy { .. }),
+        ));
+        assert_eq!(admission.snapshot().expect("after"), before);
     }
 }
