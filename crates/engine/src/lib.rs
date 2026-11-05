@@ -17,5 +17,6 @@ pub mod error;
 pub mod family;
 pub mod generation;
 pub mod registry;
+pub mod runtime;
 pub mod scheduler;
 pub mod types;
