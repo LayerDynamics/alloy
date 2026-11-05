@@ -1,54 +1,67 @@
 //! Admission-aware runtime with worker-local native model ownership.
 //!
-//! The asynchronous handle contains only shareable factories, accounting,
-//! and command handles. LoadedModel, FamilyCache, tokenizer decoders, and
-//! their reservations are constructed and destroyed on a dedicated worker.
+//! Native models, KV caches, tokenizer decoders, and native allocation
+//! reservations are constructed, used, and destroyed on one dedicated
+//! worker. Only command handles and descriptive metadata cross threads.
 //!
-//! Startup reclaims incompatible idle resources and acquires output
-//! admission on the native worker before the event queue is allocated.
-//! A pending request claim prevents competing startup from evicting those
-//! resources before prefill. Abandoned handoffs are cleaned up by a
-//! dispatcher while scheduler ownership remains retained.
+//! Startup reclaims incompatible idle resources before output admission.
+//! Pending startup retains exclusive native ownership until prefill or
+//! acknowledged cleanup. Abandoned asynchronous handoffs are cleaned up
+//! by dispatchers without blocking the asynchronous executor.
 //!
-//! Existing generation workers use a Send command proxy; no native model
-//! is moved between threads or unsafely marked Send.
+//! Completed requests may retain valid logical KV contents when both
+//! retention flags are enabled. Those contents are not automatically
+//! published under a canonical SessionStateId: publication additionally
+//! requires the exact tokenizer-produced prefix bytes.
 //!
-//! This runtime implements greedy text generation. It reuses retained
-//! allocations, but resets logical KV contents between requests. It does
-//! not advertise cross-request prefix reuse or canonical session storage.
+//! FamilyRuntime::retain_session_state explicitly associates those bytes
+//! with the actual completed request. The native worker computes the
+//! canonical identity and transfers the actual resident model, cache,
+//! token history, and their reservations into a worker-owned state entry.
 //!
-//! Backend implementations must supply real verification, memory planning,
-//! rendering, tokenization, and model loading. There is no fallback backend.
+//! Lookup returns descriptive metadata. Leasing additionally pins an
+//! entry against release and reclamation. A lease never transfers native
+//! model or cache ownership off the native worker.
+//!
+//! This runtime does not yet execute requests from retained prefixes.
+//! Ordinary generation resets logical KV before prefill, and capability
+//! reporting continues to advertise supports_prefix_reuse = false.
+//!
+//! Token-prefix provenance remains an integration contract: callers of
+//! retain_session_state must provide the exact bytes produced by the
+//! pinned tokenizer integration. Rendered text, lossy decoded text, and
+//! an independently chosen serialization of token IDs are not substitutes.
 
 use crate::{
     admission::{AdmissionController, AdmissionSnapshot, MemoryReservation},
     api::{EngineFuture, EngineRuntime, ExecutionContext},
+    cache_identity::{CacheIdentityInputs, compute_session_state_id},
     cancellation::CancellationToken,
     error::EngineError,
     family::{
         CacheAllocationRequest, ExecutionControl, FamilyCache, LoadedModel, ModelFamily,
-        ModelLoadLimits, ModelLoadRequest, TokenLogits,
+        ModelInstanceId, ModelLoadLimits, ModelLoadRequest, TokenLogits,
     },
     generation::{self, GenerationLimits, GenerationSession, TokenStep},
-    registry::{ArtifactRegistration, Registry},
+    registry::{ArtifactRegistration, FamilyVersion, Registry},
     types::{
         ArtifactId, CacheMode, Capabilities, ContextSnapshot, DecodingCapability, DecodingMode,
         Generation, GenerationEvent, GenerationEventStream, GenerationOptions, GenerationRequest,
         GenerationStream, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome,
-        RenderedContext, RequestId, SessionStateId, Usage,
+        RenderedContext, RendererIdentity, RequestId, SessionStateId, TokenizerId, Usage,
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     thread,
 };
 
@@ -57,12 +70,17 @@ use std::{
 pub struct RetentionPolicy {
     /// Keep the last loaded model after a request completes.
     pub retain_model: bool,
-    /// Keep its allocated KV buffers after resetting logical contents.
-    /// Requires retain_model. This does not enable prefix reuse.
+    /// Keep allocated KV buffers after a request completes.
+    ///
+    /// Requires retain_model. Valid completed logical contents may remain
+    /// available for explicit canonical publication. Unpublished contents
+    /// are reset before ordinary generation.
+    ///
+    /// This flag does not enable cross-request prefix execution reuse.
     pub retain_cache_buffers: bool,
 }
 
-/// Backend-derived upper bounds for the actual selected representation.
+/// Backend-derived bounds for the actual selected representation.
 #[derive(Clone, Debug)]
 pub struct RuntimePlan {
     /// Actual loader source/resident/overlap limits.
@@ -83,16 +101,14 @@ pub struct RuntimePlan {
 pub trait TextDecoder {
     /// Decode one real generated token without corrupting incremental state.
     fn push(&mut self, token: u32) -> Result<String, EngineError>;
+
     /// Finish pending tokenizer bytes after normal generation.
     fn finish(&mut self) -> Result<String, EngineError>;
 }
 
 /// Required real backend services in addition to the actual family loader.
-///
-/// Implement this on a concrete family adapter. Methods have no default
-/// success path; registering metadata alone cannot execute a model.
 pub trait RuntimeBackend: ModelFamily + 'static {
-    /// Render/tokenize with the verified profile inputs and pinned identities.
+    /// Render/tokenize with verified profile inputs and pinned identities.
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -108,16 +124,14 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         input_tokens: usize,
     ) -> EngineFuture<'a, RuntimePlan>;
 
-    /// Enforce the pinned artifact integrity policy before loading or reuse.
-    /// Runs on the native worker and must observe the supplied control.
+    /// Enforce pinned artifact integrity before loading or reuse.
     fn verify_artifact(
         &self,
         artifact: &ArtifactRegistration,
         control: &ExecutionControl,
     ) -> Result<(), EngineError>;
 
-    /// Construct the real profile-specific incremental tokenizer decoder.
-    /// Runs on the native worker under request-local admission.
+    /// Construct the actual profile-specific incremental tokenizer decoder.
     fn decoder(
         &self,
         registry: &Registry,
@@ -125,7 +139,6 @@ pub trait RuntimeBackend: ModelFamily + 'static {
     ) -> Result<Box<dyn TextDecoder>, EngineError>;
 
     /// Return the verified profile's actual EOS token IDs.
-    /// An explicitly empty list means output-limit-only stopping.
     fn eos_tokens(
         &self,
         registry: &Registry,
@@ -133,7 +146,74 @@ pub trait RuntimeBackend: ModelFamily + 'static {
     ) -> Result<Vec<u32>, EngineError>;
 }
 
-/// Concrete EngineRuntime with shared admission and one native model worker.
+/// Descriptive metadata for one actual retained native state.
+///
+/// This is a snapshot, not authorization to reuse KV. An ordinary lookup
+/// does not prevent subsequent release or reclamation. Acquire a lease
+/// when the state must remain present.
+#[derive(Clone, Debug)]
+pub struct RetainedSessionState {
+    /// Canonical identity associated with the actual allocation.
+    pub state_id: SessionStateId,
+    /// Request whose actual execution produced this state.
+    pub request_id: RequestId,
+    /// Verified artifact actually loaded.
+    pub artifact_id: ArtifactId,
+    /// Actual loaded-model instance owning the cache.
+    pub model_instance_id: ModelInstanceId,
+    /// Actual family implementation that produced the state.
+    pub family_impl_version: FamilyVersion,
+    /// Profile used for actual execution.
+    pub profile_id: ModelProfileId,
+    /// Pinned tokenizer identity.
+    pub tokenizer_id: TokenizerId,
+    /// Exact initial prompt template digest.
+    pub template_hash: [u8; 32],
+    /// Exact initial prompt render digest.
+    pub render_hash: [u8; 32],
+    /// Renderer implementation identity.
+    pub renderer: RendererIdentity,
+    /// Actual cache representation and retention behavior.
+    pub cache_mode: CacheMode,
+    /// Logical positions processed by the cache.
+    pub logical_tokens: usize,
+    /// Positions physically retained by the cache.
+    pub retained_tokens: usize,
+    /// Actual allocated cache capacity.
+    pub capacity_tokens: usize,
+    /// Model-weight reservation retained by this entry.
+    pub weights_reserved_bytes: u64,
+    /// KV-buffer reservation retained by this entry.
+    pub cache_reserved_bytes: u64,
+    /// Reservation retained for exact executed-token history.
+    pub token_history_reserved_bytes: u64,
+}
+
+/// RAII pin protecting an actual native state from release or reclamation.
+///
+/// Native allocations remain on the worker. Dropping this object only
+/// releases its pin; it does not issue a blocking worker command.
+///
+/// A lease is not a GenerationSession and does not authorize prefix reuse.
+#[derive(Debug)]
+pub struct SessionStateLease {
+    state: RetainedSessionState,
+    _pin: Arc<()>,
+}
+
+impl SessionStateLease {
+    /// Metadata describing the pinned state.
+    pub fn state(&self) -> &RetainedSessionState {
+        &self.state
+    }
+
+    /// Canonical identity of the pinned state.
+    pub fn state_id(&self) -> SessionStateId {
+        self.state.state_id
+    }
+}
+
+/// Concrete EngineRuntime with admission and one native-model worker.
 #[derive(Clone)]
 pub struct FamilyRuntime {
     backends: Arc<BTreeMap<String, Arc<dyn RuntimeBackend>>>,
@@ -143,10 +223,7 @@ pub struct FamilyRuntime {
 }
 
 impl FamilyRuntime {
-    /// Start a dedicated worker without loading a native model on this thread.
-    ///
-    /// Supply actual adapters and explicit budget/buffering/retention policy.
-    /// Registry metadata must match each executable adapter's registration.
+    /// Start a dedicated worker without loading a native model here.
     pub fn new(
         backends: Vec<Arc<dyn RuntimeBackend>>,
         admission: AdmissionController,
@@ -165,6 +242,7 @@ impl FamilyRuntime {
                 "retaining cache buffers requires retaining their model",
             ));
         }
+
         let mut entries = BTreeMap::new();
         for backend in backends {
             let name = backend.registration().family().to_owned();
@@ -176,20 +254,23 @@ impl FamilyRuntime {
             }
             entries.insert(name, backend);
         }
+
         let summary = Arc::new(Mutex::new(Summary::empty(true)));
         let exit = Arc::new(ExitSignal {
             exited: Mutex::new(false),
             changed: Condvar::new(),
         });
-        // Rendezvous transport: no hidden queue of generation requests.
+
+        // Rendezvous transport: no hidden generation-request queue.
         let (sender, receiver) = mpsc::sync_channel(0);
         let worker_summary = Arc::clone(&summary);
         let worker_exit = Arc::clone(&exit);
         let worker_admission = admission.clone();
+
         thread::Builder::new()
             .name("engine-native-model".to_owned())
             .spawn(move || {
-                // Locals drop in reverse order: native state first, exit signal last.
+                // Native state drops before the exit notification.
                 let _lifetime = WorkerLifetime {
                     summary: Arc::clone(&worker_summary),
                     exit: worker_exit,
@@ -198,6 +279,7 @@ impl FamilyRuntime {
                     active: None,
                     pending: None,
                     resident: None,
+                    states: HashMap::new(),
                     admission: worker_admission,
                     retention,
                     summary: worker_summary,
@@ -208,6 +290,7 @@ impl FamilyRuntime {
                 stage: "spawn native model worker",
                 message: error.to_string(),
             })?;
+
         Ok(Self {
             backends: Arc::new(entries),
             admission,
@@ -220,9 +303,106 @@ impl FamilyRuntime {
         })
     }
 
-    /// Inspect the shared memory ledger without acquiring a reservation.
+    /// Inspect the shared ledger without acquiring a reservation.
     pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
         self.admission.snapshot()
+    }
+
+    /// Publish the actual completed request under a canonical state ID.
+    ///
+    /// Call after native request cleanup has completed, normally after
+    /// observing its terminal generation event.
+    ///
+    /// Both retention flags must be enabled. The completed request must
+    /// still own valid retained KV contents; a subsequent request may
+    /// already have reclaimed or reset them.
+    ///
+    /// token_prefix_bytes must be the exact tokenizer-produced bytes for
+    /// the complete sequence actually processed: input tokens followed by
+    /// all generated tokens, including EOS when it was processed.
+    ///
+    /// This API trusts tokenizer provenance. It does not derive these bytes
+    /// from rendered text or invent a token-ID serialization. The bytes
+    /// are hashed on the worker and are not retained afterward.
+    ///
+    /// Publication transfers the actual model/cache/reservation ownership
+    /// into a worker-owned canonical entry. It does not copy native state
+    /// or enable execution from that prefix.
+    ///
+    /// Publication is idempotent for an already-published request with the
+    /// same canonical identity. Different bytes for an already-published
+    /// request are rejected rather than relabeling its allocation.
+    ///
+    /// Dropping the returned future does not undo a publication that the
+    /// worker has already performed.
+    pub fn retain_session_state(
+        &self,
+        request_id: RequestId,
+        token_prefix_bytes: Vec<u8>,
+    ) -> EngineFuture<'_, SessionStateId> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            let bytes = bytes_as_u64(token_prefix_bytes.capacity())?;
+            let reservation = if bytes == 0 {
+                None
+            } else {
+                Some(
+                    self.admission
+                        .reserve("canonical state publication bytes", bytes)?,
+                )
+            };
+            dispatch("engine-state-publication", move || {
+                worker
+                    .call(|reply| Command::RetainState {
+                        request_id,
+                        token_prefix_bytes,
+                        _bytes_reservation: reservation,
+                        reply,
+                    })?
+                    .result
+            })?
+            .await
+        })
+    }
+
+    /// Look up metadata for an actual worker-owned canonical entry.
+    ///
+    /// None means no entry remains. Lookup does not pin the allocation.
+    pub fn lookup_session_state(
+        &self,
+        state_id: SessionStateId,
+    ) -> EngineFuture<'_, Option<RetainedSessionState>> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-state-lookup", move || {
+                worker
+                    .call(|reply| Command::LookupState { state_id, reply })?
+                    .result
+            })?
+            .await
+        })
+    }
+
+    /// Acquire a pin protecting an actual canonical entry.
+    ///
+    /// Returns None when absent. A live lease prevents release, artifact
+    /// switching, cache replacement, and ordinary generation that would
+    /// reset or reclaim this worker's retained allocation.
+    ///
+    /// Dropping an unconsumed future or reply releases any acquired pin.
+    pub fn lease_session_state(
+        &self,
+        state_id: SessionStateId,
+    ) -> EngineFuture<'_, Option<SessionStateLease>> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-state-lease", move || {
+                worker
+                    .call(|reply| Command::LeaseState { state_id, reply })?
+                    .result
+            })?
+            .await
+        })
     }
 
     fn backend(
@@ -239,6 +419,7 @@ impl FamilyRuntime {
                 })?;
         let expected = registry.family(artifact.family())?;
         let actual = backend.registration();
+
         if actual.implementation_version() != expected.implementation_version()
             || actual.architectures() != expected.architectures()
             || actual.capabilities() != expected.capabilities()
@@ -276,24 +457,33 @@ impl EngineRuntime for FamilyRuntime {
             let backend = self.backend(registry, resolved.artifact())?;
             let plan = backend.plan(registry, &profile, input_tokens).await?;
             validate_plan(registry, &profile, input_tokens, &plan, self.limits)?;
+
             let summary = lock_metadata(&self.worker.summary).clone();
             if !summary.alive {
                 return Err(internal("native worker has exited"));
             }
+
             let same_model = summary.artifact.as_ref() == Some(resolved.artifact().id());
             let same_cache = same_model && summary.cache_matches(&plan);
             let mut available = self.admission.snapshot()?.available_bytes();
-            // Credit only allocations this worker will actually evict while idle.
-            if !summary.active {
+
+            // A leased allocation is never credited as reclaimable.
+            if !summary.active && !summary.leased {
                 let reclaim = if !same_model {
-                    add(summary.weights_bytes, summary.cache_bytes)?
+                    add(
+                        add(summary.weights_bytes, summary.cache_bytes)?,
+                        summary.history_bytes,
+                    )?
                 } else if !same_cache {
-                    summary.cache_bytes
+                    add(summary.cache_bytes, summary.history_bytes)?
                 } else {
-                    0
+                    // Ordinary prefill discards old logical history even
+                    // when native model/cache allocations are reused.
+                    summary.history_bytes
                 };
                 available = add(available, reclaim)?;
             }
+
             let loading_extra = if same_model {
                 0
             } else {
@@ -302,6 +492,7 @@ impl EngineRuntime for FamilyRuntime {
                     .checked_sub(plan.load_limits.max_resident_bytes())
                     .ok_or_else(|| internal("invalid loader overlap bounds"))?
             };
+
             MemoryEstimate::new(
                 MemoryBreakdown {
                     weights_bytes: if same_model {
@@ -314,7 +505,10 @@ impl EngineRuntime for FamilyRuntime {
                     } else {
                         plan.cache.max_cache_bytes()
                     },
-                    temporary_bytes: add(plan.temporary_bytes, loading_extra)?,
+                    temporary_bytes: add(
+                        add(plan.temporary_bytes, loading_extra)?,
+                        history_budget(&plan, self.retains_state_history())?,
+                    )?,
                     output_bytes: plan.output_bytes,
                     draft_bytes: 0,
                     headroom_bytes: plan.headroom_bytes,
@@ -346,6 +540,7 @@ impl EngineRuntime for FamilyRuntime {
                     "this runtime implements greedy selection only",
                 ));
             }
+
             registry.validate_generation_options(request.profile_id(), request.options())?;
             let resolved = registry.resolve_profile(request.profile_id())?;
             if rendered.artifact_id() != resolved.artifact().id() {
@@ -353,6 +548,7 @@ impl EngineRuntime for FamilyRuntime {
                     "rendered artifact does not match selected profile",
                 ));
             }
+
             let backend = self.backend(&registry, resolved.artifact())?;
             let plan = backend
                 .plan(&registry, request.profile_id(), rendered.token_count())
@@ -365,6 +561,7 @@ impl EngineRuntime for FamilyRuntime {
                 self.limits,
             )?;
             execution.check_cancelled()?;
+
             let setup = Setup {
                 registry,
                 backend,
@@ -372,11 +569,10 @@ impl EngineRuntime for FamilyRuntime {
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
             };
-            // Reclaim incompatible idle resources and reserve output on the
-            // native worker before generation.rs allocates its event queue.
-            // The handoff owns execution until accepted or fully cleaned up.
+
             let admitted = self.worker.admit(setup, execution)?.await?;
             let output = Arc::clone(&admitted.session._output);
+
             let generation = generation::start_generation(
                 admitted.execution,
                 rendered,
@@ -385,6 +581,7 @@ impl EngineRuntime for FamilyRuntime {
                 self.limits,
             )?;
             let Generation { request_id, events } = generation;
+
             Ok(Generation {
                 request_id,
                 events: Box::pin(BudgetedStream {
@@ -395,10 +592,16 @@ impl EngineRuntime for FamilyRuntime {
         })
     }
 
-    fn release_session_state(&self, _state_id: SessionStateId) -> EngineFuture<'_, ReleaseOutcome> {
-        // No canonical SessionStateId registry is implemented by this runtime.
-        // Its reusable empty KV allocations are not published session states.
-        Box::pin(async { Ok(ReleaseOutcome::AlreadyAbsent) })
+    fn release_session_state(&self, state_id: SessionStateId) -> EngineFuture<'_, ReleaseOutcome> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-state-release", move || {
+                worker
+                    .call(|reply| Command::ReleaseState { state_id, reply })?
+                    .result
+            })?
+            .await
+        })
     }
 
     fn capabilities<'a>(
@@ -409,6 +612,7 @@ impl EngineRuntime for FamilyRuntime {
         Box::pin(async move {
             let artifact = registry.artifact(&artifact_id)?;
             self.backend(registry, artifact)?;
+
             let summary = lock_metadata(&self.worker.summary);
             if !summary.alive {
                 return Err(internal("native worker has exited"));
@@ -427,9 +631,14 @@ impl EngineRuntime for FamilyRuntime {
     }
 }
 
+impl FamilyRuntime {
+    fn retains_state_history(&self) -> bool {
+        lock_metadata(&self.worker.summary).retain_history
+    }
+}
+
 struct BudgetedStream {
     inner: GenerationStream,
-    // Declared after inner: destroy queue ownership before this Arc owner.
     _output: Arc<MemoryReservation>,
 }
 
@@ -478,6 +687,24 @@ enum Command {
         request: RequestId,
         reply: SyncSender<Reply<()>>,
     },
+    RetainState {
+        request_id: RequestId,
+        token_prefix_bytes: Vec<u8>,
+        _bytes_reservation: Option<MemoryReservation>,
+        reply: SyncSender<Reply<SessionStateId>>,
+    },
+    LookupState {
+        state_id: SessionStateId,
+        reply: SyncSender<Reply<Option<RetainedSessionState>>>,
+    },
+    LeaseState {
+        state_id: SessionStateId,
+        reply: SyncSender<Reply<Option<SessionStateLease>>>,
+    },
+    ReleaseState {
+        state_id: SessionStateId,
+        reply: SyncSender<Reply<ReleaseOutcome>>,
+    },
 }
 
 struct NativeWorker {
@@ -495,16 +722,16 @@ impl NativeWorker {
         let (future, shared) = admission_channel();
         let worker = Arc::clone(self);
         let abandoned = Arc::clone(&shared.abandoned);
+
         thread::Builder::new()
             .name("engine-startup-admission".to_owned())
             .spawn(move || {
-                // This dispatcher, not the async caller, retains execution
-                // while the native worker reclaims resources or unwinds.
                 let result = (|| {
                     let request_id = execution.request_id().clone();
                     let control =
                         ExecutionControl::new(request_id.clone(), execution.cancellation_token());
                     check_startup(&control, &abandoned)?;
+
                     let output = worker
                         .call(|reply| Command::AdmitOutput {
                             setup: setup.clone(),
@@ -513,17 +740,18 @@ impl NativeWorker {
                             reply,
                         })?
                         .result?;
+
                     let session = NativeSession {
                         worker: Arc::clone(&worker),
                         options: setup.options.clone(),
                         setup: Some(setup),
                         request_id,
                         usage: Usage::default(),
-                        // Admission registered pending native ownership.
-                        // Cleanup is needed even if prefill never starts.
                         started: true,
                         _output: output,
                     };
+
+                    // Field order ensures session cleanup precedes permit drop.
                     let admitted = AdmittedStartup { session, execution };
                     admitted.execution.check_cancelled()?;
                     if abandoned.load(Ordering::Acquire) {
@@ -539,6 +767,7 @@ impl NativeWorker {
                 stage: "spawn startup admission dispatcher",
                 message: error.to_string(),
             })?;
+
         Ok(future)
     }
 
@@ -548,16 +777,14 @@ impl NativeWorker {
     ) -> Result<Reply<T>, EngineError> {
         let (sender, receiver) = mpsc::sync_channel(1);
         if let Err(unsent) = self.sender.send(command(sender)) {
-            // Retain command ownership until native destruction completes.
             self.exit.wait();
             drop(unsent);
             return Err(internal("native worker exited before accepting execution"));
         }
+
         match receiver.recv() {
             Ok(reply) => Ok(reply),
             Err(_) => {
-                // Do not relinquish scheduler ownership while a failed
-                // native worker is still destroying model resources.
                 self.exit.wait();
                 Err(EngineError::ExecutionFailed {
                     stage: "native model worker",
@@ -568,8 +795,7 @@ impl NativeWorker {
     }
 }
 
-// Field order is intentional: pending native ownership is cleaned up
-// before execution ownership is relinquished on an abandoned handoff.
+// Session cleanup must precede release of scheduler ownership.
 struct AdmittedStartup {
     session: NativeSession,
     execution: ExecutionContext,
@@ -584,7 +810,7 @@ struct AdmissionShared {
 struct AdmissionReplyState {
     result: Option<Result<AdmittedStartup, EngineError>>,
     consumed: bool,
-    waker: Option<std::task::Waker>,
+    waker: Option<Waker>,
 }
 
 struct AdmissionFuture {
@@ -602,6 +828,7 @@ fn admission_channel() -> (AdmissionFuture, Arc<AdmissionShared>) {
         changed: Condvar::new(),
         abandoned: Arc::new(AtomicBool::new(false)),
     });
+
     (
         AdmissionFuture {
             shared: Arc::clone(&shared),
@@ -619,6 +846,7 @@ impl Future for AdmissionFuture {
         if this.finished {
             return Poll::Ready(Err(internal("startup admission polled after completion")));
         }
+
         let mut replacement = Some(cx.waker().clone());
         let old_waker;
         let result;
@@ -648,6 +876,7 @@ impl Drop for AdmissionFuture {
         if self.finished {
             return;
         }
+
         let old_waker;
         {
             let mut state = lock_metadata(&self.shared.state);
@@ -656,8 +885,6 @@ impl Drop for AdmissionFuture {
         }
         drop(old_waker);
         self.shared.changed.notify_all();
-        // The dispatcher owns cleanup. Never block an async executor here
-        // waiting for native destruction or a Finish acknowledgment.
     }
 }
 
@@ -671,10 +898,12 @@ fn complete_admission(shared: Arc<AdmissionShared>, result: Result<AdmittedStart
         }
         consumer_waker = state.waker.take();
     }
+
     drop(unpublished);
     if let Some(waker) = consumer_waker {
         waker.wake();
     }
+
     let discarded;
     let old_waker;
     {
@@ -688,10 +917,119 @@ fn complete_admission(shared: Arc<AdmissionShared>, result: Result<AdmittedStart
         discarded = state.result.take();
         old_waker = state.waker.take();
     }
+
     drop(old_waker);
-    // If startup was abandoned, NativeSession's Finish acknowledgment is
-    // awaited on this dispatcher before the execution permit is dropped.
+    // Any unconsumed NativeSession performs acknowledged native cleanup
+    // here before its ExecutionContext is destroyed.
     drop(discarded);
+}
+
+/// Generic nonblocking async reply used for state-management dispatch.
+struct OperationShared<T> {
+    state: Mutex<OperationReply<T>>,
+}
+
+struct OperationReply<T> {
+    result: Option<Result<T, EngineError>>,
+    abandoned: bool,
+    waker: Option<Waker>,
+}
+
+struct OperationFuture<T> {
+    shared: Arc<OperationShared<T>>,
+    finished: bool,
+}
+
+fn dispatch<T: Send + 'static>(
+    name: &'static str,
+    operation: impl FnOnce() -> Result<T, EngineError> + Send + 'static,
+) -> Result<OperationFuture<T>, EngineError> {
+    let shared = Arc::new(OperationShared {
+        state: Mutex::new(OperationReply {
+            result: None,
+            abandoned: false,
+            waker: None,
+        }),
+    });
+    let producer = Arc::clone(&shared);
+
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            // NativeWorker::call handles native-worker exit ordering.
+            let result = operation();
+            let mut unpublished = Some(result);
+            let waker;
+            {
+                let mut state = lock_metadata(&producer.state);
+                if !state.abandoned {
+                    state.result = unpublished.take();
+                }
+                waker = state.waker.take();
+            }
+            // In particular, an abandoned lease reply releases its pin.
+            drop(unpublished);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        })
+        .map_err(|error| EngineError::ExecutionFailed {
+            stage: "spawn state operation dispatcher",
+            message: error.to_string(),
+        })?;
+
+    Ok(OperationFuture {
+        shared,
+        finished: false,
+    })
+}
+
+impl<T> Future for OperationFuture<T> {
+    type Output = Result<T, EngineError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Err(internal("state operation polled after completion")));
+        }
+
+        let mut replacement = Some(cx.waker().clone());
+        let old_waker;
+        let result;
+        {
+            let mut state = lock_metadata(&this.shared.state);
+            if let Some(reply) = state.result.take() {
+                this.finished = true;
+                old_waker = state.waker.take();
+                result = Poll::Ready(reply);
+            } else {
+                old_waker = std::mem::replace(&mut state.waker, replacement.take());
+                result = Poll::Pending;
+            }
+        }
+        drop(old_waker);
+        drop(replacement);
+        result
+    }
+}
+
+impl<T> Drop for OperationFuture<T> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        let discarded;
+        let old_waker;
+        {
+            let mut state = lock_metadata(&self.shared.state);
+            state.abandoned = true;
+            discarded = state.result.take();
+            old_waker = state.waker.take();
+        }
+        drop(old_waker);
+        drop(discarded);
+    }
 }
 
 fn check_startup(control: &ExecutionControl, abandoned: &AtomicBool) -> Result<(), EngineError> {
@@ -734,8 +1072,7 @@ impl Drop for WorkerLifetime {
     }
 }
 
-// Only this proxy crosses into generation.rs's Send session. All native
-// objects remain in NativeState on the dedicated model thread.
+// Only this Send proxy crosses into generation.rs.
 struct NativeSession {
     worker: Arc<NativeWorker>,
     setup: Option<Setup>,
@@ -757,12 +1094,14 @@ impl GenerationSession for NativeSession {
         if options != &self.options {
             return Err(internal("session generation options changed"));
         }
+
         let setup = self
             .setup
             .take()
             .ok_or_else(|| internal("session prefill invoked twice"))?;
         let control = ExecutionControl::new(self.request_id.clone(), cancellation.clone());
         self.started = true;
+
         let reply = self.worker.call(|reply| Command::Prepare {
             setup,
             context: context.clone(),
@@ -782,6 +1121,7 @@ impl GenerationSession for NativeSession {
         if options != &self.options {
             return Err(internal("session generation options changed"));
         }
+
         let reply = self.worker.call(|reply| Command::Decode {
             request: self.request_id.clone(),
             reply,
@@ -807,8 +1147,6 @@ impl GenerationSession for NativeSession {
 impl Drop for NativeSession {
     fn drop(&mut self) {
         if self.started {
-            // The acknowledgment is sent only AFTER request-local native
-            // resources are dropped and idle retention policy is applied.
             let _ = self.worker.call(|reply| Command::Finish {
                 request: self.request_id.clone(),
                 reply,
@@ -821,9 +1159,12 @@ impl Drop for NativeSession {
 struct Summary {
     alive: bool,
     active: bool,
+    leased: bool,
+    retain_history: bool,
     artifact: Option<ArtifactId>,
     weights_bytes: u64,
     cache_bytes: u64,
+    history_bytes: u64,
     cache_mode: Option<CacheMode>,
     cache_capacity: usize,
     capabilities: Option<Capabilities>,
@@ -834,14 +1175,18 @@ impl Summary {
         Self {
             alive,
             active: false,
+            leased: false,
+            retain_history: false,
             artifact: None,
             weights_bytes: 0,
             cache_bytes: 0,
+            history_bytes: 0,
             cache_mode: None,
             cache_capacity: 0,
             capabilities: None,
         }
     }
+
     fn cache_matches(&self, plan: &RuntimePlan) -> bool {
         self.cache_mode.as_ref() == Some(plan.cache.mode())
             && self.cache_capacity >= plan.cache.capacity_tokens()
@@ -849,17 +1194,104 @@ impl Summary {
     }
 }
 
-// Field order is intentional: actual native allocations precede guards.
+// Native allocations precede their accounting guards in drop order.
 struct ResidentCache {
     cache: Box<dyn FamilyCache>,
     reservation: MemoryReservation,
 }
+
 struct Resident {
     cache: Option<ResidentCache>,
     model: Box<dyn LoadedModel>,
     weights: MemoryReservation,
     capabilities: Capabilities,
+    candidate: Option<StateCandidate>,
 }
+
+/// Exact executed-token history with its own retained reservation.
+struct TokenHistory {
+    tokens: Vec<u32>,
+    reservation: MemoryReservation,
+}
+
+impl TokenHistory {
+    fn new(admission: &AdmissionController, capacity: usize) -> Result<Self, EngineError> {
+        let requested = token_storage_bytes(capacity)?;
+        let mut reservation = admission.reserve("executed token history", requested)?;
+        let mut tokens = Vec::new();
+
+        tokens
+            .try_reserve_exact(capacity)
+            .map_err(|_| EngineError::AllocationFailed {
+                operation: "allocate executed token history",
+                requested_bytes: Some(requested),
+            })?;
+
+        // Charge actual Vec capacity, not merely the requested capacity.
+        reservation.try_resize(token_storage_bytes(tokens.capacity())?)?;
+
+        Ok(Self {
+            tokens,
+            reservation,
+        })
+    }
+
+    fn append(&mut self, tokens: &[u32]) -> Result<(), EngineError> {
+        let required = self
+            .tokens
+            .len()
+            .checked_add(tokens.len())
+            .ok_or_else(|| internal("token history length overflow"))?;
+        if required > self.tokens.capacity() {
+            return Err(internal("executed tokens exceed admitted history capacity"));
+        }
+        self.tokens.extend_from_slice(tokens);
+        Ok(())
+    }
+}
+
+/// Rendering compatibility and exact executed positions for publication.
+struct StateCandidate {
+    request_id: RequestId,
+    profile_id: ModelProfileId,
+    tokenizer_id: TokenizerId,
+    template_hash: [u8; 32],
+    render_hash: [u8; 32],
+    renderer: RendererIdentity,
+    history: TokenHistory,
+}
+
+/// A canonical entry owns the actual native allocation and its guards.
+///
+/// This runtime deliberately keeps at most one resident model allocation:
+/// either NativeState::resident or one entry in NativeState::states.
+struct StateEntry {
+    resident: Resident,
+    metadata: RetainedSessionState,
+    pin: Weak<()>,
+}
+
+impl StateEntry {
+    fn is_leased(&self) -> bool {
+        self.pin.strong_count() != 0
+    }
+
+    fn lease(&mut self) -> SessionStateLease {
+        let pin = match self.pin.upgrade() {
+            Some(pin) => pin,
+            None => {
+                let pin = Arc::new(());
+                self.pin = Arc::downgrade(&pin);
+                pin
+            }
+        };
+        SessionStateLease {
+            state: self.metadata.clone(),
+            _pin: pin,
+        }
+    }
+}
+
 struct Active {
     decoder: Box<dyn TextDecoder>,
     logits: Option<TokenLogits>,
@@ -867,12 +1299,16 @@ struct Active {
     control: ExecutionControl,
     options: GenerationOptions,
     usage: Usage,
+    candidate: Option<StateCandidate>,
+    text_finished: bool,
     _workspace: Option<MemoryReservation>,
 }
+
 struct NativeState {
     active: Option<Active>,
     pending: Option<RequestId>,
     resident: Option<Resident>,
+    states: HashMap<SessionStateId, StateEntry>,
     admission: AdmissionController,
     retention: RetentionPolicy,
     summary: Arc<Mutex<Summary>>,
@@ -880,6 +1316,8 @@ struct NativeState {
 
 impl NativeState {
     fn run(&mut self, receiver: Receiver<Command>) {
+        self.publish();
+
         while let Ok(command) = receiver.recv() {
             match command {
                 Command::AdmitOutput {
@@ -890,8 +1328,6 @@ impl NativeState {
                 } => {
                     let result = self.admit_output(&setup, &control, &abandoned);
                     self.publish();
-                    // If the reply receiver disappeared, cancel the pending
-                    // claim before dropping the admitted output reservation.
                     if let Err(undelivered) = reply.send(Reply {
                         result,
                         usage: Usage::default(),
@@ -903,6 +1339,7 @@ impl NativeState {
                         drop(undelivered);
                     }
                 }
+
                 Command::Prepare {
                     setup,
                     context,
@@ -920,6 +1357,7 @@ impl NativeState {
                         usage: self.usage(&request),
                     });
                 }
+
                 Command::Decode { request, reply } => {
                     let result = self.decode(&request);
                     if result.is_err() {
@@ -931,22 +1369,124 @@ impl NativeState {
                         usage: self.usage(&request),
                     });
                 }
+
                 Command::Flush { request, reply } => {
                     let result = self.flush(&request);
+                    if result.is_err() {
+                        self.invalidate_cache_for(&request);
+                    }
                     self.publish();
                     let _ = reply.send(Reply {
                         result,
                         usage: self.usage(&request),
                     });
                 }
+
                 Command::Finish { request, reply } => {
                     let usage = self.usage(&request);
                     let result = self.finish(&request);
                     self.publish();
                     let _ = reply.send(Reply { result, usage });
                 }
+
+                Command::RetainState {
+                    request_id,
+                    token_prefix_bytes,
+                    _bytes_reservation,
+                    reply,
+                } => {
+                    let result = self.retain_state(&request_id, &token_prefix_bytes);
+                    // Destroy payload before releasing its reservation.
+                    drop(token_prefix_bytes);
+                    drop(_bytes_reservation);
+                    self.publish();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+
+                Command::LookupState { state_id, reply } => {
+                    let result = self.lookup_state(&state_id);
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+
+                Command::LeaseState { state_id, reply } => {
+                    let result = self.lease_state(&state_id);
+                    self.publish();
+                    // An undelivered lease drops here and releases its pin.
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+
+                Command::ReleaseState { state_id, reply } => {
+                    let result = self.release_state(&state_id);
+                    self.publish();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
             }
         }
+    }
+
+    fn request_owner(&self) -> Option<&RequestId> {
+        self.active
+            .as_ref()
+            .map(|active| active.control.request_id())
+            .or(self.pending.as_ref())
+    }
+
+    fn require_idle(&self) -> Result<(), EngineError> {
+        if let Some(owner) = self.request_owner() {
+            return Err(EngineError::Busy {
+                active_request_id: Some(owner.as_str().to_owned()),
+                message: "native worker owns an active or pending request".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_unleased(&self) -> Result<(), EngineError> {
+        if self.states.values().any(StateEntry::is_leased) {
+            return Err(EngineError::Busy {
+                active_request_id: None,
+                message: "retained native state has a live lease".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the sole unleased canonical allocation to ordinary idle
+    /// ownership. This removes its published identity before any reset.
+    fn unpublish_idle_state(&mut self) -> Result<(), EngineError> {
+        self.require_unleased()?;
+
+        if self.states.is_empty() {
+            return Ok(());
+        }
+        if self.resident.is_some() || self.states.len() != 1 {
+            return Err(internal("multiple resident ownership paths"));
+        }
+
+        let state_id = *self
+            .states
+            .keys()
+            .next()
+            .ok_or_else(|| internal("retained state disappeared"))?;
+        let entry = self
+            .states
+            .remove(&state_id)
+            .ok_or_else(|| internal("retained state disappeared"))?;
+
+        self.resident = Some(entry.resident);
+        Ok(())
     }
 
     fn admit_output(
@@ -955,30 +1495,30 @@ impl NativeState {
         control: &ExecutionControl,
         abandoned: &AtomicBool,
     ) -> Result<Arc<MemoryReservation>, EngineError> {
-        if let Some(owner) = self
-            .active
-            .as_ref()
-            .map(|active| active.control.request_id())
-            .or(self.pending.as_ref())
-        {
-            return Err(EngineError::Busy {
-                active_request_id: Some(owner.as_str().to_owned()),
-                message: "native worker already owns an active or pending request".to_owned(),
-            });
-        }
+        self.require_idle()?;
+        self.require_unleased()?;
         check_startup(control, abandoned)?;
+
         let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
         setup.backend.verify_artifact(artifact, control)?;
         check_startup(control, abandoned)?;
+
+        self.unpublish_idle_state()?;
+
         let admission = self.admission.clone();
         let output = reserve_output_after_reclaim(&admission, setup.plan.output_bytes, || {
-            let same_model = self
-                .resident
-                .as_ref()
-                .is_some_and(|resident| resident.model.artifact_id() == artifact.id());
+            let same_model = self.resident.as_ref().is_some_and(|resident| {
+                resident.model.artifact_id() == artifact.id()
+                    && resident.model.registration().implementation_version()
+                        == setup.backend.registration().implementation_version()
+                    && resident.model.registration().family() == artifact.family()
+            });
+
             if !same_model {
                 drop(self.resident.take());
             } else if let Some(resident) = &mut self.resident {
+                // A new ordinary request does not consume retained history.
+                drop(resident.candidate.take());
                 if resident
                     .cache
                     .as_ref()
@@ -987,11 +1527,11 @@ impl NativeState {
                     drop(resident.cache.take());
                 }
             }
-            // Publish only after actual native resources and their
-            // guards have been destroyed; estimates remain advisory.
+
             self.publish();
             check_startup(control, abandoned)
         })?;
+
         self.pending = Some(control.request_id().clone());
         Ok(output)
     }
@@ -1011,27 +1551,44 @@ impl NativeState {
         if self.pending.as_ref() != Some(control.request_id()) {
             return Err(internal("prefill has no matching admitted startup"));
         }
+        if !self.states.is_empty() {
+            return Err(internal(
+                "prefill cannot mutate a published canonical entry",
+            ));
+        }
+        if context.profile_id() != &setup.profile || context.token_ids().is_empty() {
+            return Err(internal("prefill context does not match admitted setup"));
+        }
+
         control.check_cancelled()?;
         let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
+        if context.artifact_id() != artifact.id() {
+            return Err(internal("prefill artifact does not match admitted setup"));
+        }
+
         setup.backend.verify_artifact(artifact, &control)?;
         control.check_cancelled()?;
-        let same_model = self
-            .resident
-            .as_ref()
-            .is_some_and(|r| r.model.artifact_id() == artifact.id());
+
+        let same_model = self.resident.as_ref().is_some_and(|resident| {
+            resident.model.artifact_id() == artifact.id()
+                && resident.model.registration().implementation_version()
+                    == setup.backend.registration().implementation_version()
+                && resident.model.registration().family() == artifact.family()
+        });
+
         if !same_model {
-            // Destroy the old native cache/model before releasing their guards.
             drop(self.resident.take());
-        } else if self
-            .resident
-            .as_ref()
-            .and_then(|r| r.cache.as_ref())
-            .is_some_and(|c| !cache_matches(c, &setup.plan))
-        {
-            if let Some(resident) = &mut self.resident {
+        } else if let Some(resident) = &mut self.resident {
+            drop(resident.candidate.take());
+            if resident
+                .cache
+                .as_ref()
+                .is_some_and(|cache| !cache_matches(cache, &setup.plan))
+            {
                 drop(resident.cache.take());
             }
         }
+
         let workspace_bytes = add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?;
         let workspace = if workspace_bytes == 0 {
             None
@@ -1041,17 +1598,33 @@ impl NativeState {
                     .reserve("generation workspaces", workspace_bytes)?,
             )
         };
+
+        let candidate = if self.retention.retain_model && self.retention.retain_cache_buffers {
+            Some(StateCandidate {
+                request_id: control.request_id().clone(),
+                profile_id: setup.profile.clone(),
+                tokenizer_id: context.tokenizer_id().clone(),
+                template_hash: *context.template_hash(),
+                render_hash: *context.render_hash(),
+                renderer: context.renderer().clone(),
+                history: TokenHistory::new(&self.admission, setup.plan.cache.capacity_tokens())?,
+            })
+        } else {
+            None
+        };
+
         if self.resident.is_none() {
-            // Full loader overlap is admitted BEFORE ModelFamily::load.
             let mut weights = self.admission.reserve(
                 "model loading peak",
                 setup.plan.load_limits.max_load_peak_bytes(),
             )?;
+
             let model = setup.backend.load(ModelLoadRequest::new(
                 artifact,
                 setup.plan.load_limits,
                 &control,
             ))?;
+
             if model.artifact_id() != artifact.id()
                 || model.registration().implementation_version()
                     != setup.backend.registration().implementation_version()
@@ -1061,6 +1634,7 @@ impl NativeState {
                     "loader returned a different artifact or implementation",
                 ));
             }
+
             let observed = model.memory_usage()?.allocated_bytes();
             if observed > setup.plan.load_limits.max_resident_bytes() {
                 return Err(EngineError::MemoryLimitExceeded {
@@ -1069,6 +1643,7 @@ impl NativeState {
                     available_bytes: setup.plan.load_limits.max_resident_bytes(),
                 });
             }
+
             let mut capabilities = model.capabilities().clone();
             if capabilities.family != artifact.family()
                 || capabilities.task != "text-generation"
@@ -1082,24 +1657,27 @@ impl NativeState {
                     "requires actual greedy text generation with incremental KV",
                 ));
             }
-            // These are the capabilities of this runtime, not just the model.
+
             capabilities.supports_prefix_reuse = false;
             capabilities.supports_streaming = true;
             capabilities.decoding_modes = vec![DecodingCapability::Greedy];
-            // Loading sources/temporaries must have been released by load().
+
             weights.try_resize(setup.plan.load_limits.max_resident_bytes())?;
             self.resident = Some(Resident {
                 cache: None,
                 model,
                 weights,
                 capabilities,
+                candidate: None,
             });
         }
+
         control.check_cancelled()?;
         let resident = self
             .resident
             .as_mut()
             .ok_or_else(|| internal("loaded model unavailable"))?;
+
         if setup
             .registry
             .profile(&setup.profile)?
@@ -1121,13 +1699,15 @@ impl NativeState {
                 "actual loaded model does not support the planned cache",
             ));
         }
+
         if resident
             .cache
             .as_ref()
-            .is_some_and(|c| !cache_matches(c, &setup.plan))
+            .is_some_and(|cache| !cache_matches(cache, &setup.plan))
         {
             drop(resident.cache.take());
         }
+
         if resident.cache.is_none() {
             let reservation = self
                 .admission
@@ -1135,6 +1715,7 @@ impl NativeState {
             let model = resident.model.autoregressive().ok_or_else(|| {
                 EngineError::unsupported("task", "loaded model has no autoregressive execution")
             })?;
+
             let cache = model.allocate_cache(&setup.plan.cache, &control)?;
             if cache.owner() != model.instance_id()
                 || cache.mode() != setup.plan.cache.mode()
@@ -1147,15 +1728,19 @@ impl NativeState {
             check_cache_bytes(cache.as_ref(), reservation.bytes())?;
             resident.cache = Some(ResidentCache { cache, reservation });
         }
+
         let cache = resident
             .cache
             .as_mut()
             .ok_or_else(|| internal("allocated cache unavailable"))?;
+
+        // Storage/leases do not yet implement execution prefix reuse.
         cache.cache.reset()?;
         if cache.cache.len() != 0 {
             return Err(internal("cache reset did not clear logical state"));
         }
         check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
+
         let decoder = setup.backend.decoder(&setup.registry, &setup.profile)?;
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
         let model = resident
@@ -1163,13 +1748,15 @@ impl NativeState {
             .autoregressive()
             .ok_or_else(|| internal("autoregressive model disappeared"))?;
         let vocabulary = model.vocabulary_size();
+
         if vocabulary == 0
             || eos
                 .iter()
-                .any(|&token| usize::try_from(token).map_or(true, |t| t >= vocabulary))
+                .any(|&token| usize::try_from(token).map_or(true, |token| token >= vocabulary))
         {
             return Err(internal("invalid vocabulary or EOS configuration"));
         }
+
         self.pending = None;
         self.active = Some(Active {
             decoder,
@@ -1178,28 +1765,34 @@ impl NativeState {
             control,
             options: setup.options,
             usage: Usage::default(),
+            candidate,
+            text_finished: false,
             _workspace: workspace,
         });
+
         let active = self
             .active
             .as_mut()
             .ok_or_else(|| internal("active execution unavailable"))?;
+
         for chunk in context
             .token_ids()
             .chunks(setup.plan.prefill_chunk_tokens.get())
         {
             active.control.check_cancelled()?;
             let before = cache.cache.len();
-            // Usage is the number of real token IDs supplied to execution.
+
             active.usage.input_tokens = active
                 .usage
                 .input_tokens
                 .checked_add(chunk.len())
                 .ok_or_else(|| internal("input usage overflow"))?;
+
             let output = model.prefill(chunk, cache.cache.as_mut(), &active.control)?;
             let expected = before
                 .checked_add(chunk.len())
                 .ok_or_else(|| internal("cache position overflow"))?;
+
             if output.processed_tokens() != chunk.len()
                 || cache.cache.len() != expected
                 || output.logits().vocabulary_size() != vocabulary
@@ -1208,9 +1801,14 @@ impl NativeState {
                     "family prefill progress disagrees with supplied tokens",
                 ));
             }
+
             check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
+            if let Some(candidate) = &mut active.candidate {
+                candidate.history.append(chunk)?;
+            }
             active.logits = Some(output.into_logits());
         }
+
         active.control.check_cancelled()
     }
 
@@ -1218,24 +1816,31 @@ impl NativeState {
         let active = self
             .active
             .as_mut()
-            .filter(|a| a.control.request_id() == request)
+            .filter(|active| active.control.request_id() == request)
             .ok_or_else(|| internal("decode has no matching active request"))?;
+
         active.control.check_cancelled()?;
+        if active.text_finished {
+            return Err(internal("decode requested after text completion"));
+        }
         if active.usage.output_tokens >= active.options.max_output_tokens() {
             return Err(internal("decode exceeded admitted output allowance"));
         }
+
         let logits = active
             .logits
             .as_ref()
             .ok_or_else(|| internal("decode has no preceding logits"))?;
+
         let mut best = 0;
-        for i in 1..logits.values().len() {
-            if logits.values()[i] > logits.values()[best] {
-                best = i;
+        for index in 1..logits.values().len() {
+            if logits.values()[index] > logits.values()[best] {
+                best = index;
             }
         }
         let token =
             u32::try_from(best).map_err(|_| internal("selected token exceeds u32 range"))?;
+
         let resident = self
             .resident
             .as_mut()
@@ -1249,12 +1854,13 @@ impl NativeState {
             .model
             .autoregressive()
             .ok_or_else(|| internal("decode model is not autoregressive"))?;
-        // This token ID was actually selected from actual model logits.
+
         active.usage.output_tokens = active
             .usage
             .output_tokens
             .checked_add(1)
             .ok_or_else(|| internal("output usage overflow"))?;
+
         let next = model.decode(token, cache.cache.as_mut(), &active.control)?;
         if cache.cache.len()
             != before
@@ -1266,14 +1872,20 @@ impl NativeState {
                 "family decode progress disagrees with the selected token",
             ));
         }
+
         check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
+        if let Some(candidate) = &mut active.candidate {
+            candidate.history.append(&[token])?;
+        }
         active.logits = Some(next);
+
         let end_of_sequence = active.eos.contains(&token);
         let text_delta = if end_of_sequence {
             String::new()
         } else {
             active.decoder.push(token)?
         };
+
         Ok(TokenStep {
             token_id: token,
             text_delta,
@@ -1285,10 +1897,18 @@ impl NativeState {
         let active = self
             .active
             .as_mut()
-            .filter(|a| a.control.request_id() == request)
+            .filter(|active| active.control.request_id() == request)
             .ok_or_else(|| internal("flush has no matching active request"))?;
+
         active.control.check_cancelled()?;
-        active.decoder.finish()
+        if active.text_finished {
+            return Err(internal("text completion requested twice"));
+        }
+
+        let text = active.decoder.finish()?;
+        active.control.check_cancelled()?;
+        active.text_finished = true;
+        Ok(text)
     }
 
     fn finish(&mut self, request: &RequestId) -> Result<(), EngineError> {
@@ -1302,26 +1922,81 @@ impl NativeState {
         if self
             .active
             .as_ref()
-            .is_some_and(|a| a.control.request_id() != request)
+            .is_some_and(|active| active.control.request_id() != request)
         {
             return Err(internal(
                 "cleanup request does not own the active execution",
             ));
         }
+
+        // A duplicate cleanup cannot disturb idle/published ownership.
+        if self.pending.is_none() && self.active.is_none() {
+            return Ok(());
+        }
+
         self.pending = None;
-        drop(self.active.take());
+        let mut active = self.active.take();
+
+        let candidate = match active.as_mut() {
+            Some(active)
+                if active.text_finished
+                    && !active.control.is_cancelled()
+                    && self.retention.retain_model
+                    && self.retention.retain_cache_buffers =>
+            {
+                active.candidate.take()
+            }
+            _ => None,
+        };
+
+        // Release decoder, logits, and request workspace before replying.
+        drop(active);
+
         if !self.retention.retain_model {
+            drop(candidate);
             drop(self.resident.take());
-        } else if let Some(resident) = &mut self.resident {
-            if !self.retention.retain_cache_buffers {
+            return Ok(());
+        }
+
+        let Some(resident) = &mut self.resident else {
+            drop(candidate);
+            return Ok(());
+        };
+
+        drop(resident.candidate.take());
+
+        if !self.retention.retain_cache_buffers {
+            drop(candidate);
+            drop(resident.cache.take());
+            return Ok(());
+        }
+
+        if let Some(candidate) = candidate {
+            let valid = resident.cache.as_ref().is_some_and(|cache| {
+                cache.cache.owner() == resident.model.instance_id()
+                    && cache.cache.len() == candidate.history.tokens.len()
+                    && cache.cache.retained_tokens() <= cache.cache.len()
+                    && check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_ok()
+            });
+
+            if valid {
+                // Keep actual logical contents for explicit publication.
+                resident.candidate = Some(candidate);
+                return Ok(());
+            }
+            drop(candidate);
+        }
+
+        // Failed/cancelled/incomplete requests never publish touched KV.
+        if let Some(cache) = &mut resident.cache {
+            if cache.cache.reset().is_err()
+                || cache.cache.len() != 0
+                || check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_err()
+            {
                 drop(resident.cache.take());
-            } else if let Some(cache) = &mut resident.cache {
-                // A failed reset makes retained state unusable: discard it.
-                if cache.cache.reset().is_err() || cache.cache.len() != 0 {
-                    drop(resident.cache.take());
-                }
             }
         }
+
         Ok(())
     }
 
@@ -1329,41 +2004,322 @@ impl NativeState {
         if self
             .active
             .as_ref()
-            .is_some_and(|a| a.control.request_id() == request)
+            .is_some_and(|active| active.control.request_id() == request)
             || self.pending.as_ref() == Some(request)
         {
+            if let Some(active) = &mut self.active {
+                active.text_finished = false;
+                drop(active.candidate.take());
+            }
             if let Some(resident) = &mut self.resident {
+                drop(resident.candidate.take());
                 drop(resident.cache.take());
             }
         }
     }
 
+    fn retain_state(
+        &mut self,
+        request_id: &RequestId,
+        token_prefix_bytes: &[u8],
+    ) -> Result<SessionStateId, EngineError> {
+        self.require_idle()?;
+
+        if !self.retention.retain_model || !self.retention.retain_cache_buffers {
+            return Err(EngineError::unsupported(
+                "session state retention",
+                "requires retained model and cache buffers",
+            ));
+        }
+
+        // Idempotent publication must not relabel an existing allocation.
+        if let Some(entry) = self
+            .states
+            .values()
+            .find(|entry| &entry.metadata.request_id == request_id)
+        {
+            validate_entry(entry)?;
+            let state_id = canonical_identity(&entry.resident, token_prefix_bytes)?;
+            if state_id != entry.metadata.state_id {
+                return Err(EngineError::invalid_request(
+                    "token_prefix_bytes",
+                    "request is already published under a different canonical identity",
+                ));
+            }
+            return Ok(state_id);
+        }
+
+        let resident = self
+            .resident
+            .as_ref()
+            .ok_or_else(|| EngineError::NotFound {
+                resource: "completed native request state",
+                id: request_id.as_str().to_owned(),
+            })?;
+
+        let candidate = resident
+            .candidate
+            .as_ref()
+            .filter(|candidate| &candidate.request_id == request_id)
+            .ok_or_else(|| EngineError::NotFound {
+                resource: "completed native request state",
+                id: request_id.as_str().to_owned(),
+            })?;
+
+        validate_candidate(resident, candidate)?;
+        let state_id = canonical_identity(resident, token_prefix_bytes)?;
+
+        if !self.states.is_empty() {
+            return Err(internal("multiple resident ownership paths"));
+        }
+
+        // Reserve the registry slot before transferring native ownership.
+        self.states
+            .try_reserve(1)
+            .map_err(|_| EngineError::AllocationFailed {
+                operation: "allocate canonical state registry entry",
+                requested_bytes: None,
+            })?;
+
+        let cache = resident
+            .cache
+            .as_ref()
+            .ok_or_else(|| internal("completed cache unavailable"))?;
+
+        let metadata = RetainedSessionState {
+            state_id,
+            request_id: candidate.request_id.clone(),
+            artifact_id: resident.model.artifact_id().clone(),
+            model_instance_id: resident.model.instance_id().clone(),
+            family_impl_version: resident.model.registration().implementation_version(),
+            profile_id: candidate.profile_id.clone(),
+            tokenizer_id: candidate.tokenizer_id.clone(),
+            template_hash: candidate.template_hash,
+            render_hash: candidate.render_hash,
+            renderer: candidate.renderer.clone(),
+            cache_mode: cache.cache.mode().clone(),
+            logical_tokens: cache.cache.len(),
+            retained_tokens: cache.cache.retained_tokens(),
+            capacity_tokens: cache.cache.capacity_tokens(),
+            weights_reserved_bytes: resident.weights.bytes(),
+            cache_reserved_bytes: cache.reservation.bytes(),
+            token_history_reserved_bytes: candidate.history.reservation.bytes(),
+        };
+
+        let resident = self
+            .resident
+            .take()
+            .ok_or_else(|| internal("completed resident disappeared"))?;
+
+        self.states.insert(
+            state_id,
+            StateEntry {
+                resident,
+                metadata,
+                pin: Weak::new(),
+            },
+        );
+
+        Ok(state_id)
+    }
+
+    fn lookup_state(
+        &self,
+        state_id: &SessionStateId,
+    ) -> Result<Option<RetainedSessionState>, EngineError> {
+        match self.states.get(state_id) {
+            Some(entry) => {
+                validate_entry(entry)?;
+                Ok(Some(entry.metadata.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn lease_state(
+        &mut self,
+        state_id: &SessionStateId,
+    ) -> Result<Option<SessionStateLease>, EngineError> {
+        match self.states.get_mut(state_id) {
+            Some(entry) => {
+                validate_entry(entry)?;
+                Ok(Some(entry.lease()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn release_state(&mut self, state_id: &SessionStateId) -> Result<ReleaseOutcome, EngineError> {
+        let Some(entry) = self.states.get(state_id) else {
+            return Ok(ReleaseOutcome::AlreadyAbsent);
+        };
+
+        if entry.is_leased() {
+            return Err(EngineError::Busy {
+                active_request_id: None,
+                message: "cannot release retained state while a lease is alive".to_owned(),
+            });
+        }
+
+        // Published entries cannot simultaneously be active, but retain
+        // this check so future execution-reuse work cannot bypass it.
+        self.require_idle()?;
+
+        let entry = self
+            .states
+            .remove(state_id)
+            .ok_or_else(|| internal("retained state disappeared during release"))?;
+
+        // Cache/model/history and their guards are destroyed before the
+        // acknowledgement. Only this path can return Released.
+        drop(entry);
+        Ok(ReleaseOutcome::Released)
+    }
+
     fn usage(&self, request: &RequestId) -> Usage {
         self.active
             .as_ref()
-            .filter(|a| a.control.request_id() == request)
-            .map_or(Usage::default(), |a| a.usage)
+            .filter(|active| active.control.request_id() == request)
+            .map_or(Usage::default(), |active| active.usage)
     }
 
     fn publish(&self) {
         let mut summary = Summary::empty(true);
         summary.active = self.active.is_some() || self.pending.is_some();
-        if let Some(resident) = &self.resident {
+        summary.retain_history = self.retention.retain_model && self.retention.retain_cache_buffers;
+        summary.leased = self.states.values().any(StateEntry::is_leased);
+
+        let resident = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+
+        if let Some(resident) = resident {
             summary.artifact = Some(resident.model.artifact_id().clone());
             summary.weights_bytes = resident.weights.bytes();
             summary.capabilities = Some(resident.capabilities.clone());
+
             if let Some(cache) = &resident.cache {
                 summary.cache_bytes = cache.reservation.bytes();
                 summary.cache_mode = Some(cache.cache.mode().clone());
                 summary.cache_capacity = cache.cache.capacity_tokens();
             }
+            if let Some(candidate) = &resident.candidate {
+                summary.history_bytes = candidate.history.reservation.bytes();
+            }
         }
+
+        if let Some(candidate) = self
+            .active
+            .as_ref()
+            .and_then(|active| active.candidate.as_ref())
+        {
+            summary.history_bytes = candidate.history.reservation.bytes();
+        }
+
         *lock_metadata(&self.summary) = summary;
     }
 }
 
-/// Reclamation must finish before output admission is attempted. This is
-/// also the exact ordering exercised by the reservation regression tests.
+fn canonical_identity(
+    resident: &Resident,
+    token_prefix_bytes: &[u8],
+) -> Result<SessionStateId, EngineError> {
+    let cache = resident
+        .cache
+        .as_ref()
+        .ok_or_else(|| internal("canonical state has no native cache"))?;
+
+    // The current executable contract has no LoRA application path.
+    // Do not accept or fabricate a LoRA identity for an unapplied adapter.
+    compute_session_state_id(&CacheIdentityInputs::for_current_engine(
+        resident.model.artifact_id(),
+        resident.model.registration().implementation_version(),
+        None,
+        token_prefix_bytes,
+        cache.cache.representation(),
+    ))
+}
+
+fn validate_candidate(resident: &Resident, candidate: &StateCandidate) -> Result<(), EngineError> {
+    let cache = resident
+        .cache
+        .as_ref()
+        .ok_or_else(|| internal("retained candidate has no native cache"))?;
+
+    if cache.cache.owner() != resident.model.instance_id()
+        || cache.cache.representation() != &cache.cache.mode().representation
+        || cache.cache.len() != candidate.history.tokens.len()
+        || cache.cache.len() > cache.cache.capacity_tokens()
+        || cache.cache.retained_tokens() > cache.cache.len()
+        || candidate.history.tokens.is_empty()
+    {
+        return Err(internal(
+            "retained candidate ownership or positions disagree",
+        ));
+    }
+
+    if token_storage_bytes(candidate.history.tokens.capacity())?
+        > candidate.history.reservation.bytes()
+    {
+        return Err(internal("retained token history exceeds its reservation"));
+    }
+
+    check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
+
+    let weights = resident.model.memory_usage()?.allocated_bytes();
+    if weights > resident.weights.bytes() {
+        return Err(EngineError::MemoryLimitExceeded {
+            operation: "retained model buffers",
+            required_bytes: weights,
+            available_bytes: resident.weights.bytes(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_entry(entry: &StateEntry) -> Result<(), EngineError> {
+    let candidate = entry
+        .resident
+        .candidate
+        .as_ref()
+        .ok_or_else(|| internal("canonical entry has no executed-token history"))?;
+    validate_candidate(&entry.resident, candidate)?;
+
+    let cache = entry
+        .resident
+        .cache
+        .as_ref()
+        .ok_or_else(|| internal("canonical entry has no native cache"))?;
+    let metadata = &entry.metadata;
+
+    if metadata.request_id != candidate.request_id
+        || metadata.artifact_id != *entry.resident.model.artifact_id()
+        || metadata.model_instance_id != *entry.resident.model.instance_id()
+        || metadata.family_impl_version
+            != entry.resident.model.registration().implementation_version()
+        || metadata.profile_id != candidate.profile_id
+        || metadata.tokenizer_id != candidate.tokenizer_id
+        || metadata.template_hash != candidate.template_hash
+        || metadata.render_hash != candidate.render_hash
+        || metadata.renderer != candidate.renderer
+        || metadata.cache_mode != *cache.cache.mode()
+        || metadata.logical_tokens != cache.cache.len()
+        || metadata.retained_tokens != cache.cache.retained_tokens()
+        || metadata.capacity_tokens != cache.cache.capacity_tokens()
+        || metadata.weights_reserved_bytes != entry.resident.weights.bytes()
+        || metadata.cache_reserved_bytes != cache.reservation.bytes()
+        || metadata.token_history_reserved_bytes != candidate.history.reservation.bytes()
+    {
+        return Err(internal(
+            "canonical entry metadata disagrees with native ownership",
+        ));
+    }
+    Ok(())
+}
+
+/// Reclamation must complete before output admission.
 fn reserve_output_after_reclaim(
     admission: &AdmissionController,
     output_bytes: u64,
@@ -1394,6 +2350,25 @@ fn check_cache_bytes(cache: &dyn FamilyCache, limit: u64) -> Result<(), EngineEr
     }
 }
 
+fn history_budget(plan: &RuntimePlan, retained: bool) -> Result<u64, EngineError> {
+    if retained {
+        token_storage_bytes(plan.cache.capacity_tokens())
+    } else {
+        Ok(0)
+    }
+}
+
+fn token_storage_bytes(capacity: usize) -> Result<u64, EngineError> {
+    let bytes = capacity
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| internal("token history allocation size overflow"))?;
+    bytes_as_u64(bytes)
+}
+
+fn bytes_as_u64(bytes: usize) -> Result<u64, EngineError> {
+    u64::try_from(bytes).map_err(|_| internal("runtime allocation size exceeds u64"))
+}
+
 fn validate_plan(
     registry: &Registry,
     profile: &ModelProfileId,
@@ -1404,10 +2379,12 @@ fn validate_plan(
     let resolved = registry.resolve_profile(profile)?;
     let profile = resolved.profile();
     profile.check_context(input)?;
+
     let capacity = input
         .checked_add(profile.max_output_tokens())
-        .and_then(|v| v.checked_add(profile.safety_margin_tokens()))
+        .and_then(|value| value.checked_add(profile.safety_margin_tokens()))
         .ok_or_else(|| internal("planned context arithmetic overflow"))?;
+
     if plan.cache.capacity_tokens() < capacity
         || plan.cache.capacity_tokens() > profile.context_limit_tokens()
     {
@@ -1416,6 +2393,7 @@ fn validate_plan(
             "must cover the full profile output reserve and safety margin within its context limit",
         ));
     }
+
     let headers = limits
         .event_capacity()
         .checked_mul(std::mem::size_of::<String>())
@@ -1423,16 +2401,19 @@ fn validate_plan(
     let minimum = limits
         .max_buffered_text_bytes()
         .checked_add(limits.max_text_delta_bytes())
-        .and_then(|v| v.checked_add(headers))
+        .and_then(|value| value.checked_add(headers))
         .ok_or_else(|| internal("output budget size overflow"))?;
-    let minimum = u64::try_from(minimum).map_err(|_| internal("output budget exceeds u64"))?;
+    let minimum = bytes_as_u64(minimum)?;
+
     if plan.output_bytes < minimum {
         return Err(EngineError::invalid_request(
             "output_bytes",
             "does not cover queued text, a pending delta, and queue headers",
         ));
     }
+
     add(plan.temporary_bytes, plan.headroom_bytes)?;
+    token_storage_bytes(plan.cache.capacity_tokens())?;
     Ok(())
 }
 
@@ -1440,13 +2421,14 @@ fn add(left: u64, right: u64) -> Result<u64, EngineError> {
     left.checked_add(right)
         .ok_or_else(|| internal("runtime memory arithmetic overflow"))
 }
+
 fn internal(message: &'static str) -> EngineError {
     EngineError::Internal {
         message: message.to_owned(),
     }
 }
 
-// Metadata/exit notification only. Never recovers the admission ledger.
+// Metadata/notification only. Never recovers the admission ledger.
 fn lock_metadata<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -1457,8 +2439,22 @@ fn lock_metadata<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
+
+    fn empty_native_state(retention: RetentionPolicy) -> NativeState {
+        NativeState {
+            active: None,
+            pending: None,
+            resident: None,
+            states: HashMap::new(),
+            admission: AdmissionController::new(4096).expect("controller"),
+            retention,
+            summary: Arc::new(Mutex::new(Summary::empty(true))),
+        }
+    }
+
     #[test]
     fn control_and_generation_proxy_can_cross_task_boundaries() {
         assert_send_sync::<FamilyRuntime>();
@@ -1466,6 +2462,9 @@ mod tests {
         assert_send::<Command>();
         assert_send::<AdmissionFuture>();
         assert_send::<AdmittedStartup>();
+        assert_send::<OperationFuture<Option<SessionStateLease>>>();
+        assert_send_sync::<SessionStateLease>();
+        assert_send_sync::<RetainedSessionState>();
     }
 
     #[test]
@@ -1475,16 +2474,19 @@ mod tests {
         let idle = admission
             .reserve("idle resources", 90 * MIB)
             .expect("idle guard");
+
         assert!(
             admission
                 .reserve("output before reclamation", 20 * MIB)
                 .is_err()
         );
+
         let output = reserve_output_after_reclaim(&admission, 20 * MIB, || {
             drop(idle);
             Ok(())
         })
-        .expect("output fits after real reservation release");
+        .expect("output fits after reservation release");
+
         let snapshot = admission.snapshot().expect("snapshot");
         assert_eq!(snapshot.reserved_bytes(), 20 * MIB);
         assert_eq!(snapshot.active_reservations(), 1);
@@ -1497,11 +2499,13 @@ mod tests {
         let admission = AdmissionController::new(100).expect("controller");
         let model = admission.reserve("retained model", 60).expect("model");
         let cache = admission.reserve("incompatible cache", 30).expect("cache");
+
         let output = reserve_output_after_reclaim(&admission, 20, || {
             drop(cache);
             Ok(())
         })
         .expect("output after cache release");
+
         assert_eq!(model.bytes(), 60);
         assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 80);
         drop(output);
@@ -1520,10 +2524,12 @@ mod tests {
         let admission = AdmissionController::new(100).expect("controller");
         let unrelated = admission.reserve("unrelated owner", 85).expect("unrelated");
         let idle = admission.reserve("idle resources", 10).expect("idle");
+
         let result = reserve_output_after_reclaim(&admission, 20, || {
             drop(idle);
             Ok(())
         });
+
         match result {
             Err(EngineError::MemoryLimitExceeded {
                 required_bytes,
@@ -1535,6 +2541,7 @@ mod tests {
             }
             _ => panic!("expected output admission rejection"),
         }
+
         let snapshot = admission.snapshot().expect("snapshot");
         assert_eq!(snapshot.reserved_bytes(), 85);
         assert_eq!(snapshot.active_reservations(), 1);
@@ -1546,6 +2553,7 @@ mod tests {
         let admission = AdmissionController::new(100).expect("controller");
         let _idle = admission.reserve("idle resources", 40).expect("idle");
         let before = admission.snapshot().expect("before");
+
         assert!(
             reserve_output_after_reclaim(&admission, 20, || {
                 Err(internal("reclamation did not complete"))
@@ -1558,24 +2566,115 @@ mod tests {
     #[test]
     fn pending_startup_can_be_finished_without_prefill() {
         let request = RequestId::new("pending-startup").expect("request");
-        let summary = Arc::new(Mutex::new(Summary::empty(true)));
-        let mut state = NativeState {
-            active: None,
-            pending: Some(request.clone()),
-            resident: None,
-            admission: AdmissionController::new(100).expect("controller"),
-            retention: RetentionPolicy {
-                retain_model: true,
-                retain_cache_buffers: true,
-            },
-            summary: Arc::clone(&summary),
-        };
+        let mut state = empty_native_state(RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: true,
+        });
+        state.pending = Some(request.clone());
+
         state.publish();
-        assert!(lock_metadata(&summary).active);
+        assert!(lock_metadata(&state.summary).active);
         state.finish(&request).expect("finish pending startup");
         state.publish();
         assert!(state.pending.is_none());
-        assert!(!lock_metadata(&summary).active);
+        assert!(!lock_metadata(&state.summary).active);
+    }
+
+    #[test]
+    fn absent_state_lookup_lease_and_release_are_honest() {
+        let mut state = empty_native_state(RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: true,
+        });
+        let id = SessionStateId::from_digest([7; 32]);
+
+        assert!(state.lookup_state(&id).expect("lookup").is_none());
+        assert!(state.lease_state(&id).expect("lease").is_none());
+        assert_eq!(
+            state.release_state(&id).expect("release"),
+            ReleaseOutcome::AlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn publication_requires_actual_completed_native_state() {
+        let mut state = empty_native_state(RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: true,
+        });
+        let request = RequestId::new("missing-completed-state").expect("request");
+
+        assert!(matches!(
+            state.retain_state(&request, b"tokenizer-prefix"),
+            Err(EngineError::NotFound { .. })
+        ));
+        assert!(state.states.is_empty());
+    }
+
+    #[test]
+    fn publication_does_not_bypass_pending_request_ownership() {
+        let mut state = empty_native_state(RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: true,
+        });
+        let request = RequestId::new("pending-publication").expect("request");
+        state.pending = Some(request.clone());
+
+        assert!(matches!(
+            state.retain_state(&request, b"tokenizer-prefix"),
+            Err(EngineError::Busy { .. })
+        ));
+    }
+
+    #[test]
+    fn publication_requires_both_retention_flags() {
+        let mut state = empty_native_state(RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: false,
+        });
+        let request = RequestId::new("no-cache-retention").expect("request");
+        assert!(state.retain_state(&request, b"prefix").is_err());
+    }
+
+    #[test]
+    fn token_history_is_accounted_and_bounded() {
+        let admission = AdmissionController::new(1024).expect("controller");
+        let mut history = TokenHistory::new(&admission, 4).expect("history");
+
+        assert!(
+            admission.snapshot().expect("snapshot").reserved_bytes()
+                >= token_storage_bytes(4).expect("bytes")
+        );
+
+        history.append(&[1, 2]).expect("first append");
+        history.append(&[3, 4]).expect("second append");
+        assert_eq!(history.tokens, [1, 2, 3, 4]);
+
+        let remaining = history.tokens.capacity() - history.tokens.len();
+        if remaining != 0 {
+            history
+                .append(&vec![0; remaining])
+                .expect("fill allocator capacity");
+        }
+        assert!(history.append(&[5]).is_err());
+
+        drop(history);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn weak_pin_observes_raii_lease_lifetime() {
+        let pin = Arc::new(());
+        let weak = Arc::downgrade(&pin);
+        assert_eq!(weak.strong_count(), 1);
+
+        let second = Arc::clone(&pin);
+        drop(pin);
+        assert_eq!(weak.strong_count(), 1);
+
+        drop(second);
+        assert_eq!(weak.strong_count(), 0);
+        assert!(weak.upgrade().is_none());
     }
 
     struct SignalWake {
@@ -1586,6 +2685,7 @@ mod tests {
         fn wake(self: Arc<Self>) {
             let _ = self.sender.send(());
         }
+
         fn wake_by_ref(self: &Arc<Self>) {
             let _ = self.sender.send(());
         }
@@ -1595,15 +2695,19 @@ mod tests {
     fn admission_completion_wakes_the_registered_consumer() {
         let (mut future, shared) = admission_channel();
         let (sender, receiver) = mpsc::channel();
-        let waker = std::task::Waker::from(Arc::new(SignalWake { sender }));
+        let waker = Waker::from(Arc::new(SignalWake { sender }));
         let mut context = Context::from_waker(&waker);
+
         assert!(Pin::new(&mut future).poll(&mut context).is_pending());
+
         let worker = thread::spawn(move || {
             complete_admission(shared, Err(internal("startup rejected")));
         });
+
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("completion wake");
+
         assert!(matches!(
             Pin::new(&mut future).poll(&mut context),
             Poll::Ready(Err(_))
@@ -1616,14 +2720,69 @@ mod tests {
     fn abandoned_admission_does_not_wait_for_consumer_acknowledgment() {
         let (future, shared) = admission_channel();
         drop(future);
+
         let (sender, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
             complete_admission(shared, Err(internal("abandoned startup")));
             sender.send(()).expect("completion signal");
         });
+
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("abandoned completion must not wait for polling");
         worker.join().expect("completion cleanup");
+    }
+
+    #[test]
+    fn state_operation_wakes_the_registered_consumer() {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let mut future = dispatch("test-state-operation", move || {
+            start_receiver.recv().expect("start");
+            Ok(42_u32)
+        })
+        .expect("dispatcher");
+
+        let (sender, receiver) = mpsc::channel();
+        let waker = Waker::from(Arc::new(SignalWake { sender }));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(Pin::new(&mut future).poll(&mut context).is_pending());
+        start_sender.send(()).expect("release operation");
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("operation wake");
+
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(Ok(42))
+        ));
+    }
+
+    #[test]
+    fn abandoned_operation_discards_owned_reply() {
+        struct DropSignal(mpsc::Sender<()>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (drop_sender, drop_receiver) = mpsc::channel();
+
+        let future = dispatch("test-abandoned-state-operation", move || {
+            start_receiver.recv().expect("start");
+            Ok(DropSignal(drop_sender))
+        })
+        .expect("dispatcher");
+
+        drop(future);
+        start_sender.send(()).expect("release operation");
+
+        drop_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("unconsumed reply must be destroyed");
     }
 }
