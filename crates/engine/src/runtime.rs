@@ -4,6 +4,12 @@
 //! and command handles. LoadedModel, FamilyCache, tokenizer decoders, and
 //! their reservations are constructed and destroyed on a dedicated worker.
 //!
+//! Startup reclaims incompatible idle resources and acquires output
+//! admission on the native worker before the event queue is allocated.
+//! A pending request claim prevents competing startup from evicting those
+//! resources before prefill. Abandoned handoffs are cleaned up by a
+//! dispatcher while scheduler ownership remains retained.
+//!
 //! Existing generation workers use a Send command proxy; no native model
 //! is moved between threads or unsafely marked Send.
 //!
@@ -34,10 +40,12 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
+    future::Future,
     num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     task::{Context, Poll},
@@ -188,6 +196,7 @@ impl FamilyRuntime {
                 };
                 let mut state = NativeState {
                     active: None,
+                    pending: None,
                     resident: None,
                     admission: worker_admission,
                     retention,
@@ -356,12 +365,6 @@ impl EngineRuntime for FamilyRuntime {
                 self.limits,
             )?;
             execution.check_cancelled()?;
-            // Acquire output admission BEFORE generation.rs allocates its queue.
-            // Both worker and stream own the same guard, not two reservations.
-            let output = Arc::new(
-                self.admission
-                    .reserve("generation output buffers", plan.output_bytes)?,
-            );
             let setup = Setup {
                 registry,
                 backend,
@@ -369,20 +372,16 @@ impl EngineRuntime for FamilyRuntime {
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
             };
-            let proxy = NativeSession {
-                worker: Arc::clone(&self.worker),
-                setup: Some(setup),
-                request_id: request.request_id().clone(),
-                options: request.options().clone(),
-                usage: Usage::default(),
-                started: false,
-                _output: Arc::clone(&output),
-            };
+            // Reclaim incompatible idle resources and reserve output on the
+            // native worker before generation.rs allocates its event queue.
+            // The handoff owns execution until accepted or fully cleaned up.
+            let admitted = self.worker.admit(setup, execution)?.await?;
+            let output = Arc::clone(&admitted.session._output);
             let generation = generation::start_generation(
-                execution,
+                admitted.execution,
                 rendered,
                 request.options().clone(),
-                Box::new(proxy),
+                Box::new(admitted.session),
                 self.limits,
             )?;
             let Generation { request_id, events } = generation;
@@ -440,6 +439,7 @@ impl GenerationEventStream for BudgetedStream {
     }
 }
 
+#[derive(Clone)]
 struct Setup {
     registry: Arc<Registry>,
     backend: Arc<dyn RuntimeBackend>,
@@ -454,6 +454,12 @@ struct Reply<T> {
 }
 
 enum Command {
+    AdmitOutput {
+        setup: Setup,
+        control: ExecutionControl,
+        abandoned: Arc<AtomicBool>,
+        reply: SyncSender<Reply<Arc<MemoryReservation>>>,
+    },
     Prepare {
         setup: Setup,
         context: RenderedContext,
@@ -481,13 +487,70 @@ struct NativeWorker {
 }
 
 impl NativeWorker {
+    fn admit(
+        self: &Arc<Self>,
+        setup: Setup,
+        execution: ExecutionContext,
+    ) -> Result<AdmissionFuture, EngineError> {
+        let (future, shared) = admission_channel();
+        let worker = Arc::clone(self);
+        let abandoned = Arc::clone(&shared.abandoned);
+        thread::Builder::new()
+            .name("engine-startup-admission".to_owned())
+            .spawn(move || {
+                // This dispatcher, not the async caller, retains execution
+                // while the native worker reclaims resources or unwinds.
+                let result = (|| {
+                    let request_id = execution.request_id().clone();
+                    let control =
+                        ExecutionControl::new(request_id.clone(), execution.cancellation_token());
+                    check_startup(&control, &abandoned)?;
+                    let output = worker
+                        .call(|reply| Command::AdmitOutput {
+                            setup: setup.clone(),
+                            control,
+                            abandoned: Arc::clone(&abandoned),
+                            reply,
+                        })?
+                        .result?;
+                    let session = NativeSession {
+                        worker: Arc::clone(&worker),
+                        options: setup.options.clone(),
+                        setup: Some(setup),
+                        request_id,
+                        usage: Usage::default(),
+                        // Admission registered pending native ownership.
+                        // Cleanup is needed even if prefill never starts.
+                        started: true,
+                        _output: output,
+                    };
+                    let admitted = AdmittedStartup { session, execution };
+                    admitted.execution.check_cancelled()?;
+                    if abandoned.load(Ordering::Acquire) {
+                        return Err(EngineError::Cancelled {
+                            request_id: admitted.execution.request_id().as_str().to_owned(),
+                        });
+                    }
+                    Ok(admitted)
+                })();
+                complete_admission(shared, result);
+            })
+            .map_err(|error| EngineError::ExecutionFailed {
+                stage: "spawn startup admission dispatcher",
+                message: error.to_string(),
+            })?;
+        Ok(future)
+    }
+
     fn call<T>(
         &self,
         command: impl FnOnce(SyncSender<Reply<T>>) -> Command,
     ) -> Result<Reply<T>, EngineError> {
         let (sender, receiver) = mpsc::sync_channel(1);
-        if self.sender.send(command(sender)).is_err() {
+        if let Err(unsent) = self.sender.send(command(sender)) {
+            // Retain command ownership until native destruction completes.
             self.exit.wait();
+            drop(unsent);
             return Err(internal("native worker exited before accepting execution"));
         }
         match receiver.recv() {
@@ -503,6 +566,142 @@ impl NativeWorker {
             }
         }
     }
+}
+
+// Field order is intentional: pending native ownership is cleaned up
+// before execution ownership is relinquished on an abandoned handoff.
+struct AdmittedStartup {
+    session: NativeSession,
+    execution: ExecutionContext,
+}
+
+struct AdmissionShared {
+    state: Mutex<AdmissionReplyState>,
+    changed: Condvar,
+    abandoned: Arc<AtomicBool>,
+}
+
+struct AdmissionReplyState {
+    result: Option<Result<AdmittedStartup, EngineError>>,
+    consumed: bool,
+    waker: Option<std::task::Waker>,
+}
+
+struct AdmissionFuture {
+    shared: Arc<AdmissionShared>,
+    finished: bool,
+}
+
+fn admission_channel() -> (AdmissionFuture, Arc<AdmissionShared>) {
+    let shared = Arc::new(AdmissionShared {
+        state: Mutex::new(AdmissionReplyState {
+            result: None,
+            consumed: false,
+            waker: None,
+        }),
+        changed: Condvar::new(),
+        abandoned: Arc::new(AtomicBool::new(false)),
+    });
+    (
+        AdmissionFuture {
+            shared: Arc::clone(&shared),
+            finished: false,
+        },
+        shared,
+    )
+}
+
+impl Future for AdmissionFuture {
+    type Output = Result<AdmittedStartup, EngineError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Err(internal("startup admission polled after completion")));
+        }
+        let mut replacement = Some(cx.waker().clone());
+        let old_waker;
+        let result;
+        {
+            let mut state = lock_metadata(&this.shared.state);
+            if let Some(reply) = state.result.take() {
+                state.consumed = true;
+                this.finished = true;
+                old_waker = state.waker.take();
+                result = Poll::Ready(reply);
+            } else {
+                old_waker = std::mem::replace(&mut state.waker, replacement.take());
+                result = Poll::Pending;
+            }
+        }
+        drop(old_waker);
+        drop(replacement);
+        if this.finished {
+            this.shared.changed.notify_all();
+        }
+        result
+    }
+}
+
+impl Drop for AdmissionFuture {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let old_waker;
+        {
+            let mut state = lock_metadata(&self.shared.state);
+            self.shared.abandoned.store(true, Ordering::Release);
+            old_waker = state.waker.take();
+        }
+        drop(old_waker);
+        self.shared.changed.notify_all();
+        // The dispatcher owns cleanup. Never block an async executor here
+        // waiting for native destruction or a Finish acknowledgment.
+    }
+}
+
+fn complete_admission(shared: Arc<AdmissionShared>, result: Result<AdmittedStartup, EngineError>) {
+    let mut unpublished = Some(result);
+    let consumer_waker;
+    {
+        let mut state = lock_metadata(&shared.state);
+        if !shared.abandoned.load(Ordering::Acquire) {
+            state.result = unpublished.take();
+        }
+        consumer_waker = state.waker.take();
+    }
+    drop(unpublished);
+    if let Some(waker) = consumer_waker {
+        waker.wake();
+    }
+    let discarded;
+    let old_waker;
+    {
+        let mut state = lock_metadata(&shared.state);
+        while !state.consumed && !shared.abandoned.load(Ordering::Acquire) {
+            state = match shared.changed.wait(state) {
+                Ok(guard) => guard,
+                Err(error) => error.into_inner(),
+            };
+        }
+        discarded = state.result.take();
+        old_waker = state.waker.take();
+    }
+    drop(old_waker);
+    // If startup was abandoned, NativeSession's Finish acknowledgment is
+    // awaited on this dispatcher before the execution permit is dropped.
+    drop(discarded);
+}
+
+fn check_startup(control: &ExecutionControl, abandoned: &AtomicBool) -> Result<(), EngineError> {
+    control.check_cancelled()?;
+    if abandoned.load(Ordering::Acquire) {
+        return Err(EngineError::Cancelled {
+            request_id: control.request_id().as_str().to_owned(),
+        });
+    }
+    Ok(())
 }
 
 struct ExitSignal {
@@ -672,6 +871,7 @@ struct Active {
 }
 struct NativeState {
     active: Option<Active>,
+    pending: Option<RequestId>,
     resident: Option<Resident>,
     admission: AdmissionController,
     retention: RetentionPolicy,
@@ -682,6 +882,27 @@ impl NativeState {
     fn run(&mut self, receiver: Receiver<Command>) {
         while let Ok(command) = receiver.recv() {
             match command {
+                Command::AdmitOutput {
+                    setup,
+                    control,
+                    abandoned,
+                    reply,
+                } => {
+                    let result = self.admit_output(&setup, &control, &abandoned);
+                    self.publish();
+                    // If the reply receiver disappeared, cancel the pending
+                    // claim before dropping the admitted output reservation.
+                    if let Err(undelivered) = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    }) {
+                        if undelivered.0.result.is_ok() {
+                            let _ = self.finish(control.request_id());
+                            self.publish();
+                        }
+                        drop(undelivered);
+                    }
+                }
                 Command::Prepare {
                     setup,
                     context,
@@ -728,6 +949,53 @@ impl NativeState {
         }
     }
 
+    fn admit_output(
+        &mut self,
+        setup: &Setup,
+        control: &ExecutionControl,
+        abandoned: &AtomicBool,
+    ) -> Result<Arc<MemoryReservation>, EngineError> {
+        if let Some(owner) = self
+            .active
+            .as_ref()
+            .map(|active| active.control.request_id())
+            .or(self.pending.as_ref())
+        {
+            return Err(EngineError::Busy {
+                active_request_id: Some(owner.as_str().to_owned()),
+                message: "native worker already owns an active or pending request".to_owned(),
+            });
+        }
+        check_startup(control, abandoned)?;
+        let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
+        setup.backend.verify_artifact(artifact, control)?;
+        check_startup(control, abandoned)?;
+        let admission = self.admission.clone();
+        let output = reserve_output_after_reclaim(&admission, setup.plan.output_bytes, || {
+            let same_model = self
+                .resident
+                .as_ref()
+                .is_some_and(|resident| resident.model.artifact_id() == artifact.id());
+            if !same_model {
+                drop(self.resident.take());
+            } else if let Some(resident) = &mut self.resident {
+                if resident
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| !cache_matches(cache, &setup.plan))
+                {
+                    drop(resident.cache.take());
+                }
+            }
+            // Publish only after actual native resources and their
+            // guards have been destroyed; estimates remain advisory.
+            self.publish();
+            check_startup(control, abandoned)
+        })?;
+        self.pending = Some(control.request_id().clone());
+        Ok(output)
+    }
+
     fn prepare(
         &mut self,
         setup: Setup,
@@ -739,6 +1007,9 @@ impl NativeState {
                 active_request_id: Some(active.control.request_id().as_str().to_owned()),
                 message: "native worker already owns an active request".to_owned(),
             });
+        }
+        if self.pending.as_ref() != Some(control.request_id()) {
+            return Err(internal("prefill has no matching admitted startup"));
         }
         control.check_cancelled()?;
         let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
@@ -899,6 +1170,7 @@ impl NativeState {
         {
             return Err(internal("invalid vocabulary or EOS configuration"));
         }
+        self.pending = None;
         self.active = Some(Active {
             decoder,
             logits: None,
@@ -1021,6 +1293,13 @@ impl NativeState {
 
     fn finish(&mut self, request: &RequestId) -> Result<(), EngineError> {
         if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending != request)
+        {
+            return Err(internal("cleanup request does not own pending startup"));
+        }
+        if self
             .active
             .as_ref()
             .is_some_and(|a| a.control.request_id() != request)
@@ -1029,6 +1308,7 @@ impl NativeState {
                 "cleanup request does not own the active execution",
             ));
         }
+        self.pending = None;
         drop(self.active.take());
         if !self.retention.retain_model {
             drop(self.resident.take());
@@ -1050,6 +1330,7 @@ impl NativeState {
             .active
             .as_ref()
             .is_some_and(|a| a.control.request_id() == request)
+            || self.pending.as_ref() == Some(request)
         {
             if let Some(resident) = &mut self.resident {
                 drop(resident.cache.take());
@@ -1066,7 +1347,7 @@ impl NativeState {
 
     fn publish(&self) {
         let mut summary = Summary::empty(true);
-        summary.active = self.active.is_some();
+        summary.active = self.active.is_some() || self.pending.is_some();
         if let Some(resident) = &self.resident {
             summary.artifact = Some(resident.model.artifact_id().clone());
             summary.weights_bytes = resident.weights.bytes();
@@ -1079,6 +1360,19 @@ impl NativeState {
         }
         *lock_metadata(&self.summary) = summary;
     }
+}
+
+/// Reclamation must finish before output admission is attempted. This is
+/// also the exact ordering exercised by the reservation regression tests.
+fn reserve_output_after_reclaim(
+    admission: &AdmissionController,
+    output_bytes: u64,
+    reclaim: impl FnOnce() -> Result<(), EngineError>,
+) -> Result<Arc<MemoryReservation>, EngineError> {
+    reclaim()?;
+    admission
+        .reserve("generation output buffers", output_bytes)
+        .map(Arc::new)
 }
 
 fn cache_matches(cache: &ResidentCache, plan: &RuntimePlan) -> bool {
@@ -1170,5 +1464,166 @@ mod tests {
         assert_send_sync::<FamilyRuntime>();
         assert_send::<NativeSession>();
         assert_send::<Command>();
+        assert_send::<AdmissionFuture>();
+        assert_send::<AdmittedStartup>();
+    }
+
+    #[test]
+    fn idle_reservations_are_reclaimed_before_output_admission() {
+        const MIB: u64 = 1024 * 1024;
+        let admission = AdmissionController::new(100 * MIB).expect("controller");
+        let idle = admission
+            .reserve("idle resources", 90 * MIB)
+            .expect("idle guard");
+        assert!(
+            admission
+                .reserve("output before reclamation", 20 * MIB)
+                .is_err()
+        );
+        let output = reserve_output_after_reclaim(&admission, 20 * MIB, || {
+            drop(idle);
+            Ok(())
+        })
+        .expect("output fits after real reservation release");
+        let snapshot = admission.snapshot().expect("snapshot");
+        assert_eq!(snapshot.reserved_bytes(), 20 * MIB);
+        assert_eq!(snapshot.active_reservations(), 1);
+        drop(output);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_reclamation_preserves_the_retained_model_reservation() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let model = admission.reserve("retained model", 60).expect("model");
+        let cache = admission.reserve("incompatible cache", 30).expect("cache");
+        let output = reserve_output_after_reclaim(&admission, 20, || {
+            drop(cache);
+            Ok(())
+        })
+        .expect("output after cache release");
+        assert_eq!(model.bytes(), 60);
+        assert_eq!(admission.snapshot().expect("snapshot").reserved_bytes(), 80);
+        drop(output);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("model remains")
+                .reserved_bytes(),
+            60
+        );
+        drop(model);
+    }
+
+    #[test]
+    fn unrelated_reservations_are_not_credited_as_reclaimable() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let unrelated = admission.reserve("unrelated owner", 85).expect("unrelated");
+        let idle = admission.reserve("idle resources", 10).expect("idle");
+        let result = reserve_output_after_reclaim(&admission, 20, || {
+            drop(idle);
+            Ok(())
+        });
+        match result {
+            Err(EngineError::MemoryLimitExceeded {
+                required_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!(required_bytes, 20);
+                assert_eq!(available_bytes, 15);
+            }
+            _ => panic!("expected output admission rejection"),
+        }
+        let snapshot = admission.snapshot().expect("snapshot");
+        assert_eq!(snapshot.reserved_bytes(), 85);
+        assert_eq!(snapshot.active_reservations(), 1);
+        drop(unrelated);
+    }
+
+    #[test]
+    fn reclamation_failure_does_not_acquire_output_budget() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let _idle = admission.reserve("idle resources", 40).expect("idle");
+        let before = admission.snapshot().expect("before");
+        assert!(
+            reserve_output_after_reclaim(&admission, 20, || {
+                Err(internal("reclamation did not complete"))
+            })
+            .is_err()
+        );
+        assert_eq!(admission.snapshot().expect("after"), before);
+    }
+
+    #[test]
+    fn pending_startup_can_be_finished_without_prefill() {
+        let request = RequestId::new("pending-startup").expect("request");
+        let summary = Arc::new(Mutex::new(Summary::empty(true)));
+        let mut state = NativeState {
+            active: None,
+            pending: Some(request.clone()),
+            resident: None,
+            admission: AdmissionController::new(100).expect("controller"),
+            retention: RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+            summary: Arc::clone(&summary),
+        };
+        state.publish();
+        assert!(lock_metadata(&summary).active);
+        state.finish(&request).expect("finish pending startup");
+        state.publish();
+        assert!(state.pending.is_none());
+        assert!(!lock_metadata(&summary).active);
+    }
+
+    struct SignalWake {
+        sender: mpsc::Sender<()>,
+    }
+
+    impl std::task::Wake for SignalWake {
+        fn wake(self: Arc<Self>) {
+            let _ = self.sender.send(());
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.sender.send(());
+        }
+    }
+
+    #[test]
+    fn admission_completion_wakes_the_registered_consumer() {
+        let (mut future, shared) = admission_channel();
+        let (sender, receiver) = mpsc::channel();
+        let waker = std::task::Waker::from(Arc::new(SignalWake { sender }));
+        let mut context = Context::from_waker(&waker);
+        assert!(Pin::new(&mut future).poll(&mut context).is_pending());
+        let worker = thread::spawn(move || {
+            complete_admission(shared, Err(internal("startup rejected")));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("completion wake");
+        assert!(matches!(
+            Pin::new(&mut future).poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        drop(future);
+        worker.join().expect("completion acknowledged");
+    }
+
+    #[test]
+    fn abandoned_admission_does_not_wait_for_consumer_acknowledgment() {
+        let (future, shared) = admission_channel();
+        drop(future);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            complete_admission(shared, Err(internal("abandoned startup")));
+            sender.send(()).expect("completion signal");
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("abandoned completion must not wait for polling");
+        worker.join().expect("completion cleanup");
     }
 }
