@@ -6,9 +6,9 @@
 //! Tests cover:
 //!
 //! - Valid pinned artifact construction and registry resolution.
-//! - Real verified loading.
-//! - Cached prefill/decode consistency against full forward execution.
-//! - Actual cache allocation reporting.
+//! - Real verified MLX CPU loading.
+//! - Bounded cached prefill/decode against host-reference full forward.
+//! - Actual cache payload reporting.
 //! - Digest and length mismatch rejection.
 //! - Verification of bytes loaded after an earlier verification pass.
 //! - Pinned metadata mutation rejection.
@@ -86,11 +86,9 @@ impl TestDirectory {
                 Ok(()) => {
                     return Self(path.canonicalize().expect("canonical test directory"));
                 }
-
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     continue;
                 }
-
                 Err(error) => {
                     panic!("create test directory: {error}");
                 }
@@ -142,7 +140,6 @@ fn block_on<F: Future>(future: F) -> F::Output {
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => return value,
-
             Poll::Pending => {
                 let now = Instant::now();
 
@@ -626,7 +623,7 @@ fn pinned_fixture_registers_the_real_family_and_profile() {
         .resolve_profile(&profile)
         .expect("resolved profile");
 
-    assert_eq!(resolved.artifact().id(), &artifact_id(),);
+    assert_eq!(resolved.artifact().id(), &artifact_id());
 
     assert_eq!(resolved.artifact().directory(), fixture.directory.path(),);
 
@@ -645,7 +642,6 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
     let registry = fixture.registry(&backend);
 
     let prompt = [65_u32, 66, 67];
-
     let plan = fixture.plan(&backend, &registry, prompt.len());
 
     let (_source, control) = control("artifact-real-execution");
@@ -659,9 +655,9 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
     let mut loaded =
         load_fixture(&backend, &registry, &plan, &control).expect("actual verified model load");
 
-    assert_eq!(loaded.artifact_id(), &artifact_id(),);
+    assert_eq!(loaded.artifact_id(), &artifact_id());
 
-    assert_eq!(loaded.capabilities().backend, ExecutionBackend::HostCpu,);
+    assert_eq!(loaded.capabilities().backend, ExecutionBackend::MlxCpu,);
 
     assert!(
         loaded
@@ -673,12 +669,12 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
     let model_memory = loaded.memory_usage().expect("resident memory report");
 
     assert!(model_memory.allocated_bytes() > 0);
-
     assert!(model_memory.used_bytes() <= model_memory.allocated_bytes(),);
+    assert!(model_memory.allocated_bytes() <= plan.load_limits.max_resident_bytes(),);
 
-    // The reference is another real model using the same deterministic
-    // weights. This checks cached/full execution consistency, not an
-    // independent external numerical conformance vector.
+    // The host-reference model uses the same deterministic weights.
+    // This compares execution paths; it is not an independent external
+    // reference-logit conformance test.
     let reference =
         Qwen3Model::from_weights(fixture.config.clone(), generate_fixture(&fixture.config))
             .expect("reference full-forward model");
@@ -693,21 +689,58 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
         .allocate_cache(&plan.cache, &control)
         .expect("actual cache allocation");
 
-    assert_eq!(cache.owner(), model.instance_id(),);
-
+    assert_eq!(cache.owner(), model.instance_id());
     assert_eq!(cache.len(), 0);
 
     let empty_memory = cache.memory_usage().expect("empty cache accounting");
 
     assert!(empty_memory.allocated_bytes() > 0);
+    assert!(empty_memory.allocated_bytes() <= plan.cache.max_cache_bytes(),);
 
-    let prefill = model
-        .prefill(&prompt, cache.as_mut(), &control)
-        .expect("actual cached prefill");
+    // The adapter's planned prefill bound is two tokens. Exercise
+    // continuation across that boundary instead of submitting all three
+    // prompt tokens in one oversized call.
+    let chunk_tokens = plan.prefill_chunk_tokens.get();
+    assert_eq!(chunk_tokens, backend_limits().prefill_chunk_tokens.get(),);
 
-    assert_eq!(prefill.processed_tokens(), prompt.len(),);
+    let mut processed_input_tokens = 0_usize;
+    let mut final_prefill = None;
 
-    assert_eq!(cache.len(), prompt.len(),);
+    for chunk in prompt.chunks(chunk_tokens) {
+        let before = cache.len();
+
+        let prefill = model
+            .prefill(chunk, cache.as_mut(), &control)
+            .expect("actual bounded MLX prefill");
+
+        assert_eq!(prefill.processed_tokens(), chunk.len());
+        assert_eq!(cache.len(), before + chunk.len());
+
+        processed_input_tokens = processed_input_tokens
+            .checked_add(chunk.len())
+            .expect("test input accounting");
+
+        assert_eq!(cache.len(), processed_input_tokens);
+
+        // Check every chunk boundary against a fresh reference forward.
+        let reference_prefix = reference
+            .forward(&prompt[..processed_input_tokens])
+            .expect("reference prompt-prefix forward");
+
+        assert_close(
+            prefill.logits().values(),
+            reference_prefix
+                .last()
+                .expect("final prefix-position logits"),
+        );
+
+        final_prefill = Some(prefill);
+    }
+
+    let prefill = final_prefill.expect("nonempty prompt produced final-position logits");
+
+    assert_eq!(processed_input_tokens, prompt.len());
+    assert_eq!(cache.len(), prompt.len());
 
     let full = reference.forward(&prompt).expect("actual full forward");
 
@@ -722,7 +755,7 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
         .decode(continuation, cache.as_mut(), &control)
         .expect("actual cached decode");
 
-    assert_eq!(cache.len(), prompt.len() + 1,);
+    assert_eq!(cache.len(), prompt.len() + 1);
 
     let full_continuation = reference
         .forward(&[65, 66, 67, continuation])
@@ -735,12 +768,16 @@ fn verified_fixture_loads_and_cached_execution_matches_full_forward() {
 
     let populated_memory = cache.memory_usage().expect("populated cache accounting");
 
+    // These values describe the cache's reported current payload,
+    // not total MLX allocator usage or transient update peaks.
     assert_eq!(
         populated_memory.allocated_bytes(),
         empty_memory.allocated_bytes(),
     );
 
     assert!(populated_memory.used_bytes() > empty_memory.used_bytes(),);
+
+    assert!(populated_memory.used_bytes() <= populated_memory.allocated_bytes(),);
 
     cache.reset().expect("actual cache reset");
 
@@ -795,7 +832,7 @@ fn changed_weight_bytes_are_rejected_after_prior_verification() {
         "loader accepted bytes changed after verification",
     );
 
-    assert_ne!(error.kind(), ErrorKind::Cancelled,);
+    assert_ne!(error.kind(), ErrorKind::Cancelled);
 
     let verification_error = backend
         .verify_artifact(artifact, &control)
@@ -864,7 +901,6 @@ fn wrong_compiled_template_pin_is_rejected() {
     let fixture = ArtifactFixture::new();
 
     let mut specification = fixture.specification.clone();
-
     specification.template_sha256 = [0; 32];
 
     let error = expect_failure(
@@ -880,7 +916,6 @@ fn missing_tokenizer_pin_is_rejected() {
     let fixture = ArtifactFixture::new();
 
     let mut specification = fixture.specification.clone();
-
     specification.files.remove("tokenizer.json");
 
     let _error = expect_failure(
@@ -901,7 +936,7 @@ fn duplicate_artifact_identity_is_rejected() {
         "duplicate artifact identity accepted",
     );
 
-    assert_eq!(error.kind(), ErrorKind::InvalidRequest,);
+    assert_eq!(error.kind(), ErrorKind::InvalidRequest);
 }
 
 #[test]
@@ -946,7 +981,7 @@ fn indexed_checkpoint_with_exact_inventory_loads() {
     let loaded =
         load_fixture(&backend, &registry, &plan, &control).expect("exact indexed checkpoint loads");
 
-    assert_eq!(loaded.artifact_id(), &artifact_id(),);
+    assert_eq!(loaded.artifact_id(), &artifact_id());
 }
 
 #[test]
@@ -986,7 +1021,6 @@ fn cancellation_reaches_verification_and_loading() {
     let plan = fixture.plan(&backend, &registry, 3);
 
     let (source, control) = control("artifact-cancelled-load");
-
     source.request_cancel();
 
     let artifact = registry.artifact(&artifact_id()).expect("artifact");
