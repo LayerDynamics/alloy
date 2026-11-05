@@ -175,9 +175,11 @@ pub struct Qwen3BackendLimits {
     /// Maximum chunk handed to family prefill. The adapter additionally
     /// checks cancellation between transformer layers and before KV commit.
     pub prefill_chunk_tokens: NonZeroUsize,
-    /// Extra allowance for loader metadata/allocator/control structures.
+    /// Applied separately to resident weight-buffer padding and loader
+    /// metadata/allocator/control overhead. Both allowances are reserved.
     pub loader_headroom_bytes: u64,
-    /// Extra request-local allowance beyond the explicit workspace formula.
+    /// Applied to request overhead and separately to each of the two
+    /// KV allocation versions. All allowances are explicitly reserved.
     pub execution_headroom_bytes: u64,
     /// Exact limits used to size output admission.
     pub generation: GenerationLimits,
@@ -313,7 +315,7 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = parse_config(&config_value)?;
-            let resident_bound = resident_bound(&config)?;
+            let resident_bound = sum(&[resident_bound(&config)?, limits.loader_headroom_bytes])?;
             let tokenizer_bytes =
                 read_metadata(&specification, "tokenizer.json", limits.max_tokenizer_bytes)?;
             let tokenizer_value = parse_json(
@@ -543,16 +545,15 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
-        let native_payload = resident_bound(&data.config)?;
         let decoded_bound = decoded_weight_bound(&data.config)?;
         let required_peak = sum(&[
             data.source_bytes,
             decoded_bound,
-            native_payload,
+            data.resident_bound,
             self.limits.loader_headroom_bytes,
         ])?;
         if request.limits().max_source_bytes() < data.source_bytes
-            || request.limits().max_resident_bytes() < native_payload
+            || request.limits().max_resident_bytes() < data.resident_bound
             || request.limits().max_load_peak_bytes() < required_peak
         {
             return Err(EngineError::MemoryLimitExceeded {
@@ -639,6 +640,16 @@ impl ModelFamily for Qwen3Backend {
         .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
         control.check_cancelled()?;
         let payload = model.weight_payload_bytes();
+        let measured = model
+            .weight_buffer_bytes()
+            .map_err(|e| mlx_model_error(e, control, "measure MLX Qwen weights"))?;
+        if measured > request.limits().max_resident_bytes() {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "measured MLX Qwen weight buffers",
+                required_bytes: measured,
+                available_bytes: request.limits().max_resident_bytes(),
+            });
+        }
         let mut capabilities = self.registration.capabilities().clone();
         capabilities.context_limit_tokens = capabilities
             .context_limit_tokens
@@ -650,7 +661,7 @@ impl ModelFamily for Qwen3Backend {
             instance: ModelInstanceId::new(),
             registration: self.registration.clone(),
             capabilities,
-            memory: BufferMemoryUsage::new(payload, payload)?,
+            memory: BufferMemoryUsage::new(measured, payload)?,
             vocabulary: data.config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
             logits_payload_bytes: logits_payload_bound(&data.config)?,
@@ -746,7 +757,10 @@ impl RuntimeBackend for Qwen3Backend {
                 cache: CacheAllocationRequest::new(
                     cache_mode()?,
                     capacity,
-                    cache_bound(&data.config, capacity)?,
+                    sum(&[
+                        cache_bound(&data.config, capacity)?,
+                        product(self.limits.execution_headroom_bytes, 2)?,
+                    ])?,
                 )?,
                 temporary_bytes: workspace_bound(
                     &data.config,
@@ -922,8 +936,12 @@ impl FamilyCache for Qwen3NativeCache {
         self.capacity
     }
     fn memory_usage(&self) -> Result<BufferMemoryUsage, EngineError> {
-        // Known full-array f32 payload. Does not claim MLX allocator RSS.
-        let allocated = self.inner.payload_plan().resident_bytes;
+        // Measured current backing buffers, not allocator cache or
+        // older external views. Used bytes remain logical KV payload.
+        let allocated = self
+            .inner
+            .buffer_bytes()
+            .map_err(|e| cache_error(e, "measure committed MLX Qwen KV buffers"))?;
         let spec = self.inner.spec();
         let used = product(
             product(
@@ -2420,3 +2438,5 @@ mod shared_rendering_wiring_tests {
         }
     }
 }
+
+// ALLOY_MEASURED_BUFFERS_V1

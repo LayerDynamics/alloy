@@ -123,7 +123,7 @@ pub enum KvCacheError {
         staged_layers: usize,
     },
 
-    /// Checked payload planning exceeds the supplied planning limit.
+    /// Payload planning or measured backing buffers exceed the allowance.
     PayloadLimit {
         /// Required old/new overlap allowance.
         required_bytes: u64,
@@ -139,6 +139,9 @@ pub enum KvCacheError {
 
     /// A native MLX call or completion operation failed.
     Mlx(MlxError),
+
+    /// Native backing-buffer measurement failed.
+    Memory(mlx_ffi::memory::MemoryError),
 }
 
 impl fmt::Display for KvCacheError {
@@ -174,6 +177,7 @@ impl fmt::Display for KvCacheError {
             }
             Self::Operation(error) => write!(formatter, "{error}"),
             Self::Mlx(error) => write!(formatter, "{error}"),
+            Self::Memory(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -183,6 +187,7 @@ impl std::error::Error for KvCacheError {
         match self {
             Self::Operation(error) => Some(error),
             Self::Mlx(error) => Some(error),
+            Self::Memory(error) => Some(error),
             _ => None,
         }
     }
@@ -337,6 +342,7 @@ pub struct MlxKvCache {
     owner: MlxModelId,
     spec: KvCacheSpec,
     plan: KvPayloadPlan,
+    max_buffer_overlap_bytes: u64,
     layers: Vec<LayerKv>,
     length: usize,
     healthy: bool,
@@ -345,7 +351,8 @@ pub struct MlxKvCache {
 impl MlxKvCache {
     /// Allocate and materialize full float32 K/V arrays.
     ///
-    /// max_payload_bytes must cover update_overlap_bytes, not merely the
+    /// max_payload_bytes must cover planned AND measured buffer overlap,
+    /// including provisioned allocator padding, not merely the
     /// committed payload. It is a planning limit, not an allocator-level
     /// hard memory limit or an engine reservation.
     ///
@@ -391,14 +398,26 @@ impl MlxKvCache {
             return Err(KvCacheError::Mlx(error));
         }
 
-        Ok(Self {
+        let cache = Self {
             owner: owner.clone(),
             spec,
             plan,
+            max_buffer_overlap_bytes: max_payload_bytes,
             layers,
             length: 0,
             healthy: true,
-        })
+        };
+        let required = cache
+            .buffer_bytes()?
+            .checked_mul(2)
+            .ok_or(KvCacheError::InvalidInput("measured KV overlap overflow"))?;
+        if required > max_payload_bytes {
+            return Err(KvCacheError::PayloadLimit {
+                required_bytes: required,
+                limit_bytes: max_payload_bytes,
+            });
+        }
+        Ok(cache)
     }
 
     /// Loaded-model identity owning this cache.
@@ -429,6 +448,17 @@ impl MlxKvCache {
     /// Whether no native execution/completion failure has invalidated it.
     pub fn is_healthy(&self) -> bool {
         self.healthy
+    }
+
+    /// Measure unique backing buffers of the currently committed K/V arrays.
+    ///
+    /// Excludes allocator cache, externally held older views, staged
+    /// transactions, and attention workspace. No payload fallback occurs.
+    pub fn buffer_bytes(&self) -> KvCacheResult<u64> {
+        if !self.healthy {
+            return Err(KvCacheError::Invalidated);
+        }
+        measure_layer_buffers(self.layers.iter(), self.layers.len())
     }
 
     fn check_owner(&self, owner: &MlxModelId) -> KvCacheResult<()> {
@@ -672,6 +702,33 @@ impl KvAppend<'_> {
             return Err(KvCacheError::Mlx(error));
         }
 
+        // Evaluation completed; publication has not. Measure old/new
+        // buffers together so native aliases are counted once.
+        let entries = self
+            .cache
+            .layers
+            .len()
+            .checked_add(self.staged.len())
+            .ok_or(KvCacheError::InvalidInput(
+                "KV overlap handle count overflow",
+            ))?;
+        let measured = match measure_layer_buffers(
+            self.cache.layers.iter().chain(self.staged.iter().flatten()),
+            entries,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.cache.healthy = false;
+                return Err(error);
+            }
+        };
+        if measured > self.cache.max_buffer_overlap_bytes {
+            return Err(KvCacheError::PayloadLimit {
+                required_bytes: measured,
+                limit_bytes: self.cache.max_buffer_overlap_bytes,
+            });
+        }
+
         // No fallible work remains. The exclusive cache borrow prevents
         // external observation of a partially replaced layer vector.
         for (committed, staged) in self.cache.layers.iter_mut().zip(self.staged.iter_mut()) {
@@ -683,6 +740,25 @@ impl KvAppend<'_> {
         self.cache.length = self.end;
         Ok(())
     }
+}
+
+fn measure_layer_buffers<'a>(
+    layers: impl IntoIterator<Item = &'a LayerKv>,
+    layer_entries: usize,
+) -> KvCacheResult<u64> {
+    let count = layer_entries
+        .checked_mul(2)
+        .ok_or(KvCacheError::InvalidInput("KV query handle count overflow"))?;
+    let mut arrays = Vec::new();
+    arrays
+        .try_reserve_exact(count)
+        .map_err(|_| KvCacheError::AllocationFailed("KV buffer query metadata"))?;
+    for layer in layers {
+        arrays.push(&layer.keys);
+        arrays.push(&layer.values);
+    }
+    let bytes = mlx_ffi::memory::array_buffer_bytes(&arrays)?;
+    u64::try_from(bytes).map_err(|_| KvCacheError::InvalidInput("measured KV bytes exceed u64"))
 }
 
 fn prefix_view(
@@ -795,7 +871,11 @@ mod tests {
         MlxKvCache::new(
             owner,
             spec,
-            spec.payload_plan().expect("plan").update_overlap_bytes,
+            spec.payload_plan()
+                .expect("plan")
+                .update_overlap_bytes
+                .checked_add(1024 * 1024)
+                .expect("test native buffer allowance"),
             stream,
         )
         .expect("native cache")
@@ -1088,3 +1168,61 @@ mod tests {
         cpu.synchronize().expect("CPU completion");
     }
 }
+
+impl From<mlx_ffi::memory::MemoryError> for KvCacheError {
+    fn from(error: mlx_ffi::memory::MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+#[cfg(test)]
+mod measured_kv_buffer_tests {
+    use super::*;
+    use mlx_ffi::{Device, DeviceType};
+    fn check(kind: DeviceType) {
+        let device = Device::new(kind, 0).expect("device");
+        assert!(device.is_available().expect("availability"));
+        let stream = Stream::new(&device).expect("stream");
+        let owner = MlxModelId::new();
+        let spec = KvCacheSpec {
+            layers: 2,
+            batch: 1,
+            kv_heads: 2,
+            capacity_tokens: 4,
+            head_dim: 2,
+        };
+        let mut cache = MlxKvCache::new(&owner, spec, 1024 * 1024, &stream).expect("cache");
+        assert!(
+            cache.buffer_bytes().expect("initial buffers") >= cache.payload_plan().resident_bytes
+        );
+        let keys = Array::from_f32_slice(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 1, 2]).expect("keys");
+        let values = Array::from_f32_slice(&[5.0, 6.0, 7.0, 8.0], &[1, 2, 1, 2]).expect("values");
+        let mut append = cache.begin_append(&owner, 1, &stream).expect("append");
+        for layer in 0..2 {
+            append.stage_layer(layer, &keys, &values).expect("stage");
+        }
+        append.commit().expect("measured commit");
+        let measured = cache.buffer_bytes().expect("committed buffers");
+        assert!(measured >= cache.payload_plan().resident_bytes);
+        assert!(measured <= cache.max_buffer_overlap_bytes);
+        cache.reset(&owner).expect("logical reset");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.buffer_bytes().expect("retained buffers"), measured);
+        cache.healthy = false;
+        assert!(matches!(
+            cache.buffer_bytes(),
+            Err(KvCacheError::Invalidated)
+        ));
+    }
+    #[test]
+    fn measured_cpu_kv_reports_buffers_not_logical_length() {
+        check(DeviceType::Cpu);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn measured_metal_kv_reports_buffers_not_logical_length() {
+        check(DeviceType::Gpu);
+    }
+}
+
+// ALLOY_MEASURED_BUFFERS_V1

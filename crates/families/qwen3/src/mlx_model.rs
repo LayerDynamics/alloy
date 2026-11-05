@@ -55,6 +55,9 @@ pub enum MlxQwenError {
     /// A native MLX completion operation failed.
     Mlx(MlxError),
 
+    /// Native backing-buffer measurement failed.
+    Memory(mlx_ffi::memory::MemoryError),
+
     /// Cooperative cancellation was observed before cache publication.
     Cancelled,
 
@@ -82,6 +85,7 @@ impl fmt::Display for MlxQwenError {
             Self::Operation(error) => write!(formatter, "{error}"),
             Self::Cache(error) => write!(formatter, "{error}"),
             Self::Mlx(error) => write!(formatter, "{error}"),
+            Self::Memory(error) => write!(formatter, "{error}"),
             Self::Cancelled => write!(formatter, "MLX Qwen execution cancelled"),
             Self::Invalidated => write!(
                 formatter,
@@ -110,6 +114,7 @@ impl std::error::Error for MlxQwenError {
             Self::Operation(error) => Some(error),
             Self::Cache(error) => Some(error),
             Self::Mlx(error) => Some(error),
+            Self::Memory(error) => Some(error),
             _ => None,
         }
     }
@@ -233,7 +238,7 @@ impl MlxLayer {
         })
     }
 
-    fn visit(&self, visitor: &mut impl FnMut(&Array)) {
+    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
         for array in [
             &self.input_layernorm,
             &self.q_proj,
@@ -260,7 +265,7 @@ struct MlxWeights {
 }
 
 impl MlxWeights {
-    fn visit(&self, mut visitor: impl FnMut(&Array)) {
+    fn visit<'a>(&'a self, mut visitor: impl FnMut(&'a Array)) {
         visitor(&self.embedding);
         for layer in &self.layers {
             layer.visit(&mut visitor);
@@ -297,7 +302,8 @@ enum OutputSelection {
 impl MlxQwen3Model {
     /// Validate and consume decoded float32 weights into MLX arrays.
     ///
-    /// max_weight_payload_bytes bounds resident tensor payload only.
+    /// max_weight_payload_bytes must cover logical payload AND measured
+    /// native backing buffers. Both are checked.
     /// The caller must separately admit source/decoded/native overlap
     /// during loading and MLX allocator overhead.
     ///
@@ -364,13 +370,22 @@ impl MlxQwen3Model {
                 return Err(MlxQwenError::Mlx(error));
             }
 
-            Ok(Self {
+            let model = Self {
                 config,
                 weights: native,
                 owner: MlxModelId::new(),
                 weight_payload_bytes: payload,
                 healthy: Cell::new(true),
-            })
+            };
+            let measured = model.weight_buffer_bytes()?;
+            if measured > max_weight_payload_bytes {
+                return Err(MlxQwenError::PayloadLimit {
+                    operation: "MLX resident weight backing buffers",
+                    required_bytes: measured,
+                    limit_bytes: max_weight_payload_bytes,
+                });
+            }
+            Ok(model)
         })();
 
         complete_stream(result, stream)
@@ -396,6 +411,31 @@ impl MlxQwen3Model {
     /// Whether no native execution/completion failure invalidated this load.
     pub fn is_healthy(&self) -> bool {
         self.healthy.get()
+    }
+
+    /// Measure unique evaluated native backing buffers of all owned weights.
+    ///
+    /// Excludes allocator cache, activations, and other loaded models.
+    /// Tied output storage is counted once. No implicit evaluation or
+    /// silent fallback to logical payload estimates occurs.
+    pub fn weight_buffer_bytes(&self) -> MlxQwenResult<u64> {
+        self.check_healthy()?;
+        let count = self
+            .weights
+            .layers
+            .len()
+            .checked_mul(11)
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(usize::from(self.weights.lm_head.is_some())))
+            .ok_or(ModelError::DimensionOverflow("weight query handle count"))?;
+        let mut arrays = Vec::new();
+        arrays
+            .try_reserve_exact(count)
+            .map_err(|_| MlxQwenError::AllocationFailed("weight buffer query metadata"))?;
+        self.weights.visit(|array| arrays.push(array));
+        let bytes = mlx_ffi::memory::array_buffer_bytes(&arrays)?;
+        Ok(u64::try_from(bytes)
+            .map_err(|_| ModelError::DimensionOverflow("measured weight bytes"))?)
     }
 
     fn check_healthy(&self) -> MlxQwenResult<()> {
@@ -752,6 +792,12 @@ fn complete_stream<T>(result: MlxQwenResult<T>, stream: &Stream) -> MlxQwenResul
 
 fn native_failure(error: &MlxQwenError) -> bool {
     match error {
+        MlxQwenError::Memory(error) | MlxQwenError::Cache(KvCacheError::Memory(error)) => matches!(
+            error,
+            mlx_ffi::memory::MemoryError::Native { .. }
+                | mlx_ffi::memory::MemoryError::Mlx(_)
+                | mlx_ffi::memory::MemoryError::StreamSynchronization { .. }
+        ),
         MlxQwenError::Mlx(_) => true,
         MlxQwenError::Operation(OperationError::Mlx(_)) => true,
         MlxQwenError::Cache(KvCacheError::Mlx(_)) => true,
@@ -1235,3 +1281,97 @@ mod tests {
         cpu.synchronize().expect("CPU completion");
     }
 }
+
+impl From<mlx_ffi::memory::MemoryError> for MlxQwenError {
+    fn from(error: mlx_ffi::memory::MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+#[cfg(test)]
+mod measured_weight_buffer_tests {
+    use super::*;
+    use crate::fixture::generate_fixture;
+    use mlx_ffi::{Device, DeviceType};
+    fn check(kind: DeviceType) {
+        let device = Device::new(kind, 0).expect("device");
+        assert!(device.is_available().expect("availability"));
+        let stream = Stream::new(&device).expect("stream");
+        for tied in [true, false] {
+            let mut config = Qwen3Config::tiny_fixture();
+            config.tie_embeddings = tied;
+            let model = MlxQwen3Model::from_weights(
+                config.clone(),
+                generate_fixture(&config),
+                16 * 1024 * 1024,
+                &stream,
+            )
+            .expect("native model");
+            let owner = model.instance_id().clone();
+            let measured = model.weight_buffer_bytes().expect("measurement");
+            assert!(measured >= model.weight_payload_bytes());
+            let mut arrays = Vec::new();
+            model.weights.visit(|array| arrays.push(array));
+            assert_eq!(
+                measured as usize,
+                mlx_ffi::memory::array_buffer_bytes(&arrays).expect("buffer set")
+            );
+            if !tied {
+                let without_head = mlx_ffi::memory::array_buffer_bytes(&arrays[..arrays.len() - 1])
+                    .expect("without output head");
+                assert!(measured as usize > without_head);
+            }
+            arrays.push(model.weights.output_head());
+            assert_eq!(
+                measured as usize,
+                mlx_ffi::memory::array_buffer_bytes(&arrays).expect("duplicate alias")
+            );
+            drop(arrays);
+            model
+                .forward(&[3, 41], 16 * 1024 * 1024, 16 * 1024 * 1024, &stream)
+                .expect("execution");
+            assert!(model.instance_id().same_instance(&owner));
+            assert_eq!(model.weight_buffer_bytes().expect("same weights"), measured);
+        }
+    }
+    #[test]
+    fn measured_cpu_weights_deduplicate_and_survive_execution() {
+        check(DeviceType::Cpu);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn measured_metal_weights_deduplicate_and_survive_execution() {
+        check(DeviceType::Gpu);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn one_weight_set_keeps_its_measurement_across_cpu_and_metal() {
+        let cpu_device = Device::new(DeviceType::Cpu, 0).expect("CPU");
+        let metal_device = Device::new(DeviceType::Gpu, 0).expect("Metal");
+        assert!(metal_device.is_available().expect("Metal availability"));
+        let cpu = Stream::new(&cpu_device).expect("CPU stream");
+        let metal = Stream::new(&metal_device).expect("Metal stream");
+        let config = Qwen3Config::tiny_fixture();
+        let model = MlxQwen3Model::from_weights(
+            config.clone(),
+            generate_fixture(&config),
+            16 * 1024 * 1024,
+            &cpu,
+        )
+        .expect("one loaded model");
+        let identity = model.instance_id().clone();
+        let before = model.weight_buffer_bytes().expect("initial weights");
+        for stream in [&cpu, &metal] {
+            model
+                .forward(&[3, 41], 16 * 1024 * 1024, 16 * 1024 * 1024, stream)
+                .expect("actual execution");
+            assert!(model.instance_id().same_instance(&identity));
+            assert_eq!(
+                model.weight_buffer_bytes().expect("same weight set"),
+                before
+            );
+        }
+    }
+}
+
+// ALLOY_MEASURED_BUFFERS_V1
