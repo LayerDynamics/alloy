@@ -63,6 +63,11 @@ use std::slice;
 
 use bindings as sys;
 
+/// Explicit-stream rotary position encoding and grouped-query attention.
+pub mod attention;
+/// Explicit-stream MLX operations used by native model implementations.
+pub mod ops;
+
 /// Errors surfaced by the mlx-c C API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
