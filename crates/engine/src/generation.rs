@@ -8,6 +8,7 @@
 //! - Cooperative cancellation.
 //! - Bounded text-event buffering.
 //! - Cancellation-aware producer backpressure.
+//! - Validated, monotonic token-usage accounting.
 //! - Terminal-event arbitration through ExecutionContext::finish.
 //! - Rust panic containment around family execution and cleanup.
 //!
@@ -109,6 +110,7 @@ pub trait GenerationSession: Send + 'static {
     /// This must remain available after an execution error so partial usage
     /// can be reported. Input usage may be partial when prefill fails.
     ///
+    /// Counts must not reset or move backward during the session.
     /// This method must not perform additional model execution.
     fn usage(&self) -> Usage;
 }
@@ -187,6 +189,128 @@ impl GenerationLimits {
     /// Maximum capacity of a single emitted or pending text delta.
     pub fn max_text_delta_bytes(&self) -> usize {
         self.max_text_delta_bytes
+    }
+}
+
+/// Last validated usage and whether accounting has become inconsistent.
+///
+/// An inconsistent report never replaces the last validated counts.
+/// Once inconsistency is detected, later reports cannot restore trust
+/// in the session's accounting for this generation.
+#[derive(Debug, Default)]
+struct UsageTracker {
+    latest: Usage,
+    inconsistent: bool,
+}
+
+impl UsageTracker {
+    fn reject(&mut self, message: &'static str) -> EngineError {
+        self.inconsistent = true;
+
+        EngineError::Internal {
+            message: message.to_owned(),
+        }
+    }
+
+    fn record_prefill(
+        &mut self,
+        reported: Usage,
+        expected_input_tokens: usize,
+    ) -> Result<(), EngineError> {
+        if self.inconsistent {
+            return Err(
+                self.reject("cannot accept prefill usage after an accounting inconsistency")
+            );
+        }
+
+        if reported.input_tokens != expected_input_tokens || reported.output_tokens != 0 {
+            return Err(self.reject("family prefill usage does not match the rendered input"));
+        }
+
+        self.latest = reported;
+        Ok(())
+    }
+
+    fn record_decode(
+        &mut self,
+        reported: Usage,
+        expected_input_tokens: usize,
+        expected_output_tokens: usize,
+    ) -> Result<(), EngineError> {
+        if self.inconsistent {
+            return Err(self.reject("cannot accept decode usage after an accounting inconsistency"));
+        }
+
+        if reported.input_tokens != expected_input_tokens
+            || reported.output_tokens != expected_output_tokens
+        {
+            return Err(self.reject("family decode usage did not advance by one token"));
+        }
+
+        let next_output_tokens = self
+            .latest
+            .output_tokens
+            .checked_add(1)
+            .ok_or_else(|| self.reject("validated output usage arithmetic overflow"))?;
+
+        if reported.input_tokens != self.latest.input_tokens
+            || reported.output_tokens != next_output_tokens
+        {
+            return Err(self.reject("family decode usage disagrees with validated progress"));
+        }
+
+        self.latest = reported;
+        Ok(())
+    }
+
+    fn validate_text_finish(&mut self, reported: Usage) -> Result<(), EngineError> {
+        if self.inconsistent {
+            return Err(
+                self.reject("cannot validate text completion after an accounting inconsistency")
+            );
+        }
+
+        if reported != self.latest {
+            return Err(self.reject("finishing text changed model token usage"));
+        }
+
+        Ok(())
+    }
+
+    /// Validate a final report without losing already validated progress.
+    ///
+    /// Failed execution may report additional bounded work completed
+    /// before the error was returned. Successful execution may not add
+    /// unobserved progress after the driver's validated completion state.
+    fn reconcile_final(
+        &mut self,
+        reported: Usage,
+        input_limit: usize,
+        output_limit: usize,
+        execution_succeeded: bool,
+    ) -> Result<(), EngineError> {
+        if self.inconsistent {
+            return Err(
+                self.reject("final usage cannot replace previously inconsistent accounting")
+            );
+        }
+
+        if reported.input_tokens > input_limit || reported.output_tokens > output_limit {
+            return Err(self.reject("family reported usage outside admitted bounds"));
+        }
+
+        if reported.input_tokens < self.latest.input_tokens
+            || reported.output_tokens < self.latest.output_tokens
+        {
+            return Err(self.reject("family final usage moved backward from validated progress"));
+        }
+
+        if execution_succeeded && reported != self.latest {
+            return Err(self.reject("successful final usage does not match validated completion"));
+        }
+
+        self.latest = reported;
+        Ok(())
     }
 }
 
@@ -336,7 +460,7 @@ fn run_worker(
         cancellation_waker,
     };
 
-    let mut latest_usage = Usage::default();
+    let mut usage = UsageTracker::default();
 
     let execution_result = catch_unwind(AssertUnwindSafe(|| {
         drive_generation(
@@ -344,7 +468,7 @@ fn run_worker(
             &rendered,
             &options,
             &mut producer,
-            &mut latest_usage,
+            &mut usage,
         )
     }));
 
@@ -356,25 +480,30 @@ fn run_worker(
         }),
     };
 
-    // Read actual partial usage even after a normal execution error.
-    // Preserve the last successfully observed usage if this method panics.
-    match catch_unwind(AssertUnwindSafe(|| session.usage())) {
-        Ok(usage) => {
-            if usage.input_tokens > rendered.token_count()
-                || usage.output_tokens > options.max_output_tokens()
-            {
-                result = Err(EngineError::Internal {
-                    message: "family reported usage outside admitted bounds".to_owned(),
-                });
-            } else {
-                latest_usage = usage;
+    // An earlier accounting inconsistency already invalidated subsequent
+    // reports. Preserve that error and the last validated counts rather
+    // than asking the same session to overwrite them.
+    if !usage.inconsistent {
+        let execution_succeeded = result.is_ok();
+
+        match catch_unwind(AssertUnwindSafe(|| session.usage())) {
+            Ok(reported) => {
+                if let Err(error) = usage.reconcile_final(
+                    reported,
+                    rendered.token_count(),
+                    options.max_output_tokens(),
+                    execution_succeeded,
+                ) {
+                    result = Err(error);
+                }
             }
-        }
-        Err(payload) => {
-            result = Err(EngineError::ExecutionFailed {
-                stage: "read generation usage",
-                message: panic_message(payload),
-            });
+            Err(payload) => {
+                // The last validated counts remain unchanged.
+                result = Err(EngineError::ExecutionFailed {
+                    stage: "read generation usage",
+                    message: panic_message(payload),
+                });
+            }
         }
     }
 
@@ -386,6 +515,8 @@ fn run_worker(
             message: panic_message(payload),
         });
     }
+
+    let latest_usage = usage.latest;
 
     let outcome = match result {
         Ok(finish_reason) => ExecutionOutcome::Completed {
@@ -416,21 +547,17 @@ fn drive_generation(
     rendered: &RenderedContext,
     options: &GenerationOptions,
     producer: &mut Producer,
-    latest_usage: &mut Usage,
+    usage: &mut UsageTracker,
 ) -> Result<FinishReason, EngineError> {
     producer.check_running()?;
 
     session.prefill(rendered, options, &producer.cancellation)?;
 
-    producer.check_running()?;
+    // Record successful prefill before checking cancellation so validated
+    // completed work remains available if cancellation arrived meanwhile.
+    usage.record_prefill(session.usage(), rendered.token_count())?;
 
-    let usage = session.usage();
-    if usage.input_tokens != rendered.token_count() || usage.output_tokens != 0 {
-        return Err(EngineError::Internal {
-            message: "family prefill usage does not match the rendered input".to_owned(),
-        });
-    }
-    *latest_usage = usage;
+    producer.check_running()?;
 
     let mut finish_reason = FinishReason::OutputLimit;
 
@@ -443,15 +570,11 @@ fn drive_generation(
             message: "generation token counter overflow".to_owned(),
         })?;
 
-        let usage = session.usage();
-        if usage.input_tokens != rendered.token_count()
-            || usage.output_tokens != expected_output_tokens
-        {
-            return Err(EngineError::Internal {
-                message: "family decode usage did not advance by one token".to_owned(),
-            });
-        }
-        *latest_usage = usage;
+        usage.record_decode(
+            session.usage(),
+            rendered.token_count(),
+            expected_output_tokens,
+        )?;
 
         producer.send_text(step.text_delta)?;
 
@@ -465,12 +588,7 @@ fn drive_generation(
 
     let remaining_text = session.finish_text()?;
 
-    let usage = session.usage();
-    if usage != *latest_usage {
-        return Err(EngineError::Internal {
-            message: "finishing text changed model token usage".to_owned(),
-        });
-    }
+    usage.validate_text_finish(session.usage())?;
 
     producer.send_text(remaining_text)?;
     producer.check_running()?;
@@ -721,5 +839,278 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorKind;
+
+    fn observed_usage(input_tokens: usize, output_tokens: usize) -> UsageTracker {
+        let mut tracker = UsageTracker::default();
+
+        tracker
+            .record_prefill(
+                Usage {
+                    input_tokens,
+                    output_tokens: 0,
+                },
+                input_tokens,
+            )
+            .expect("valid prefill accounting");
+
+        for output in 1..=output_tokens {
+            tracker
+                .record_decode(
+                    Usage {
+                        input_tokens,
+                        output_tokens: output,
+                    },
+                    input_tokens,
+                    output,
+                )
+                .expect("valid decode accounting");
+        }
+
+        tracker
+    }
+
+    #[test]
+    fn final_output_regression_preserves_validated_usage() {
+        let mut tracker = observed_usage(3, 12);
+        let before = tracker.latest;
+
+        let error = tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 0,
+                },
+                3,
+                20,
+                false,
+            )
+            .expect_err("output usage must not move backward");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn final_input_regression_preserves_validated_usage() {
+        let mut tracker = observed_usage(8, 2);
+        let before = tracker.latest;
+
+        let error = tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                },
+                8,
+                20,
+                false,
+            )
+            .expect_err("input usage must not move backward");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn successful_final_usage_must_match_completion_exactly() {
+        let mut tracker = observed_usage(3, 12);
+        let before = tracker.latest;
+
+        let error = tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 13,
+                },
+                3,
+                20,
+                true,
+            )
+            .expect_err("success cannot add unvalidated progress");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn successful_matching_final_usage_is_accepted() {
+        let mut tracker = observed_usage(3, 12);
+        let expected = tracker.latest;
+
+        tracker
+            .reconcile_final(expected, 3, 20, true)
+            .expect("matching successful report");
+
+        assert_eq!(tracker.latest, expected);
+        assert!(!tracker.inconsistent);
+    }
+
+    #[test]
+    fn failed_execution_can_report_additional_bounded_progress() {
+        let mut tracker = observed_usage(3, 12);
+
+        let reported = Usage {
+            input_tokens: 3,
+            output_tokens: 13,
+        };
+
+        tracker
+            .reconcile_final(reported, 3, 20, false)
+            .expect("additional work before failure");
+
+        assert_eq!(tracker.latest, reported);
+        assert!(!tracker.inconsistent);
+    }
+
+    #[test]
+    fn failed_prefill_can_report_partial_input_usage() {
+        let mut tracker = UsageTracker::default();
+
+        let reported = Usage {
+            input_tokens: 2,
+            output_tokens: 0,
+        };
+
+        tracker
+            .reconcile_final(reported, 8, 20, false)
+            .expect("partial failed prefill accounting");
+
+        assert_eq!(tracker.latest, reported);
+        assert!(!tracker.inconsistent);
+    }
+
+    #[test]
+    fn final_usage_outside_input_bounds_is_rejected() {
+        let mut tracker = observed_usage(3, 2);
+        let before = tracker.latest;
+
+        let error = tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                },
+                3,
+                20,
+                false,
+            )
+            .expect_err("input usage exceeds admitted input");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn final_usage_outside_output_bounds_is_rejected() {
+        let mut tracker = observed_usage(3, 2);
+        let before = tracker.latest;
+
+        let error = tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 21,
+                },
+                3,
+                20,
+                false,
+            )
+            .expect_err("output usage exceeds admitted output");
+
+        assert_eq!(error.kind(), ErrorKind::Internal);
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn inconsistent_decode_cannot_be_overwritten_by_final_report() {
+        let mut tracker = observed_usage(3, 2);
+        let before = tracker.latest;
+
+        tracker
+            .record_decode(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 7,
+                },
+                3,
+                3,
+            )
+            .expect_err("decode must advance by exactly one");
+
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+
+        tracker
+            .reconcile_final(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 7,
+                },
+                3,
+                20,
+                false,
+            )
+            .expect_err("later report cannot restore accounting trust");
+
+        assert_eq!(tracker.latest, before);
+    }
+
+    #[test]
+    fn text_finish_cannot_change_token_usage() {
+        let mut tracker = observed_usage(3, 12);
+        let before = tracker.latest;
+
+        tracker
+            .validate_text_finish(Usage {
+                input_tokens: 3,
+                output_tokens: 13,
+            })
+            .expect_err("text finish must not generate another token");
+
+        assert_eq!(tracker.latest, before);
+        assert!(tracker.inconsistent);
+    }
+
+    #[test]
+    fn matching_text_finish_preserves_validated_usage() {
+        let mut tracker = observed_usage(3, 12);
+        let before = tracker.latest;
+
+        tracker
+            .validate_text_finish(before)
+            .expect("unchanged usage");
+
+        assert_eq!(tracker.latest, before);
+        assert!(!tracker.inconsistent);
+    }
+
+    #[test]
+    fn invalid_prefill_does_not_replace_initial_usage() {
+        let mut tracker = UsageTracker::default();
+
+        tracker
+            .record_prefill(
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                },
+                3,
+            )
+            .expect_err("prefill must not report generated tokens");
+
+        assert_eq!(tracker.latest, Usage::default());
+        assert!(tracker.inconsistent);
     }
 }
