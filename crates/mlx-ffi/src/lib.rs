@@ -65,6 +65,8 @@ use bindings as sys;
 
 /// Explicit-stream rotary position encoding and grouped-query attention.
 pub mod attention;
+/// MLX allocator observations, limits, and explicit cache reclamation.
+pub mod memory;
 /// Explicit-stream MLX operations used by native model implementations.
 pub mod ops;
 
