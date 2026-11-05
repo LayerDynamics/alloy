@@ -48,11 +48,13 @@ use std::{
 pub struct TokenStep {
     /// Actual selected token ID.
     pub token_id: u32,
+
     /// Incrementally decoded text newly available after this token.
     ///
     /// Do not decode each token independently if that violates the
     /// tokenizer's byte or Unicode semantics.
     pub text_delta: String,
+
     /// Whether this token satisfies the profile's EOS condition.
     pub end_of_sequence: bool,
 }

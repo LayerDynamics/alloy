@@ -11,6 +11,7 @@
 
 pub mod admission;
 pub mod api;
+pub mod backends;
 pub mod cache;
 pub mod cancellation;
 pub mod error;
