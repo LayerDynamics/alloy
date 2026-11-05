@@ -28,10 +28,7 @@ pub enum ModelError {
     Cancelled,
 
     /// The input exceeds the configured context limit.
-    ContextTooLong {
-        maximum: usize,
-        got: usize,
-    },
+    ContextTooLong { maximum: usize, got: usize },
 
     /// An input token is outside the vocabulary.
     InvalidToken {
@@ -41,19 +38,13 @@ pub enum ModelError {
     },
 
     /// A weight tensor contains NaN or infinity.
-    NonFiniteWeight {
-        tensor: &'static str,
-        index: usize,
-    },
+    NonFiniteWeight { tensor: &'static str, index: usize },
 
     /// A computation produced NaN or infinity.
     NonFiniteActivation(&'static str),
 
     /// A configured resource budget would be exceeded.
-    MemoryLimit {
-        required: usize,
-        limit: usize,
-    },
+    MemoryLimit { required: usize, limit: usize },
 
     /// A fallible allocation failed.
     AllocationFailed,
@@ -87,10 +78,7 @@ impl fmt::Display for ModelError {
                 expected,
                 got,
             } => {
-                write!(
-                    f,
-                    "{tensor}: expected {expected} elements, got {got}"
-                )
+                write!(f, "{tensor}: expected {expected} elements, got {got}")
             }
 
             Self::InvalidConfig(message) => {
@@ -110,10 +98,7 @@ impl fmt::Display for ModelError {
             }
 
             Self::ContextTooLong { maximum, got } => {
-                write!(
-                    f,
-                    "context length {got} exceeds maximum {maximum}"
-                )
+                write!(f, "context length {got} exceeds maximum {maximum}")
             }
 
             Self::InvalidToken {
@@ -129,10 +114,7 @@ impl fmt::Display for ModelError {
             }
 
             Self::NonFiniteWeight { tensor, index } => {
-                write!(
-                    f,
-                    "{tensor}: non-finite weight at index {index}"
-                )
+                write!(f, "{tensor}: non-finite weight at index {index}")
             }
 
             Self::NonFiniteActivation(stage) => {
@@ -169,10 +151,7 @@ impl fmt::Display for ModelError {
             }
 
             Self::CheckpointFormat { format, message } => {
-                write!(
-                    f,
-                    "checkpoint {format} parse error: {message}"
-                )
+                write!(f, "checkpoint {format} parse error: {message}")
             }
 
             Self::CheckpointValidation(message) => {
@@ -219,8 +198,7 @@ impl Qwen3Model {
         path: &std::path::Path,
         options: crate::loader::LoadOptions,
     ) -> Result<Self, ModelError> {
-        let weights =
-            crate::loader::load_weights(&config, path, options)?;
+        let weights = crate::loader::load_weights(&config, path, options)?;
 
         Self::from_weights(config, weights)
     }
@@ -228,10 +206,7 @@ impl Qwen3Model {
     /// Validate in-memory weights.
     ///
     /// Supports tied and separate output projections.
-    pub fn from_weights(
-        config: Qwen3Config,
-        weights: Qwen3Weights,
-    ) -> Result<Self, ModelError> {
+    pub fn from_weights(config: Qwen3Config, weights: Qwen3Weights) -> Result<Self, ModelError> {
         let c = &config;
 
         if c.hidden_size == 0
@@ -281,27 +256,17 @@ impl Qwen3Model {
         if let Some(head) = &weights.lm_head {
             check_tensor(
                 "lm_head",
-                checked_product(
-                    c.vocab_size,
-                    c.hidden_size,
-                    "lm_head",
-                )?,
+                checked_product(c.vocab_size, c.hidden_size, "lm_head")?,
                 head,
             )?;
         }
 
-        let q_dim =
-            checked_product(c.q_heads, c.head_dim, "q_dim")?;
-        let kv_dim =
-            checked_product(c.kv_heads, c.head_dim, "kv_dim")?;
+        let q_dim = checked_product(c.q_heads, c.head_dim, "q_dim")?;
+        let kv_dim = checked_product(c.kv_heads, c.head_dim, "kv_dim")?;
 
         check_tensor(
             "embed_tokens",
-            checked_product(
-                c.vocab_size,
-                c.hidden_size,
-                "embed_tokens",
-            )?,
+            checked_product(c.vocab_size, c.hidden_size, "embed_tokens")?,
             &weights.embed_tokens,
         )?;
 
@@ -314,11 +279,7 @@ impl Qwen3Model {
         }
 
         for layer in &weights.layers {
-            check_tensor(
-                "input_layernorm",
-                c.hidden_size,
-                &layer.input_layernorm,
-            )?;
+            check_tensor("input_layernorm", c.hidden_size, &layer.input_layernorm)?;
 
             check_tensor(
                 "q_proj",
@@ -338,25 +299,13 @@ impl Qwen3Model {
                 &layer.v_proj,
             )?;
 
-            check_tensor(
-                "q_norm",
-                c.head_dim,
-                &layer.q_norm,
-            )?;
+            check_tensor("q_norm", c.head_dim, &layer.q_norm)?;
 
-            check_tensor(
-                "k_norm",
-                c.head_dim,
-                &layer.k_norm,
-            )?;
+            check_tensor("k_norm", c.head_dim, &layer.k_norm)?;
 
             check_tensor(
                 "o_proj",
-                checked_product(
-                    c.hidden_size,
-                    q_dim,
-                    "o_proj",
-                )?,
+                checked_product(c.hidden_size, q_dim, "o_proj")?,
                 &layer.o_proj,
             )?;
 
@@ -368,40 +317,24 @@ impl Qwen3Model {
 
             check_tensor(
                 "gate_proj",
-                checked_product(
-                    c.intermediate_size,
-                    c.hidden_size,
-                    "gate_proj",
-                )?,
+                checked_product(c.intermediate_size, c.hidden_size, "gate_proj")?,
                 &layer.gate_proj,
             )?;
 
             check_tensor(
                 "up_proj",
-                checked_product(
-                    c.intermediate_size,
-                    c.hidden_size,
-                    "up_proj",
-                )?,
+                checked_product(c.intermediate_size, c.hidden_size, "up_proj")?,
                 &layer.up_proj,
             )?;
 
             check_tensor(
                 "down_proj",
-                checked_product(
-                    c.hidden_size,
-                    c.intermediate_size,
-                    "down_proj",
-                )?,
+                checked_product(c.hidden_size, c.intermediate_size, "down_proj")?,
                 &layer.down_proj,
             )?;
         }
 
-        check_tensor(
-            "final_layernorm",
-            c.hidden_size,
-            &weights.final_layernorm,
-        )?;
+        check_tensor("final_layernorm", c.hidden_size, &weights.final_layernorm)?;
 
         Ok(Self {
             config,
@@ -420,14 +353,8 @@ impl Qwen3Model {
     /// projection.
     ///
     /// Positions start at zero. This method does not use a KV cache.
-    pub fn forward(
-        &self,
-        tokens: &[u32],
-    ) -> Result<Vec<Vec<f32>>, ModelError> {
-        self.forward_with_output_limit(
-            tokens,
-            DEFAULT_MAX_LOGITS_BYTES,
-        )
+    pub fn forward(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.forward_with_output_limit(tokens, DEFAULT_MAX_LOGITS_BYTES)
     }
 
     /// Full-logits prefill with an explicit peak output-memory budget.
@@ -455,47 +382,22 @@ impl Qwen3Model {
 
         let token_count = tokens.len();
 
-        check_output_budget(
-            token_count,
-            c.vocab_size,
-            max_output_bytes,
-        )?;
+        check_output_budget(token_count, c.vocab_size, max_output_bytes)?;
 
         let q_dim = c.q_heads * c.head_dim;
         let kv_dim = c.kv_heads * c.head_dim;
 
-        checked_product(
-            token_count,
-            c.hidden_size,
-            "hidden activations",
-        )?;
+        checked_product(token_count, c.hidden_size, "hidden activations")?;
 
-        checked_product(
-            token_count,
-            q_dim,
-            "query activations",
-        )?;
+        checked_product(token_count, q_dim, "query activations")?;
 
-        checked_product(
-            token_count,
-            kv_dim,
-            "key/value activations",
-        )?;
+        checked_product(token_count, kv_dim, "key/value activations")?;
 
-        checked_product(
-            token_count,
-            c.intermediate_size,
-            "MLP activations",
-        )?;
+        checked_product(token_count, c.intermediate_size, "MLP activations")?;
 
-        checked_product(
-            token_count,
-            c.vocab_size,
-            "output logits",
-        )?;
+        checked_product(token_count, c.vocab_size, "output logits")?;
 
-        let mut hidden =
-            Vec::with_capacity(token_count * c.hidden_size);
+        let mut hidden = Vec::with_capacity(token_count * c.hidden_size);
 
         for (position, &token) in tokens.iter().enumerate() {
             let id = token as usize;
@@ -511,52 +413,24 @@ impl Qwen3Model {
             let start = id * c.hidden_size;
 
             hidden.extend(
-                self.weights.embed_tokens
-                    [start..start + c.hidden_size]
+                self.weights.embed_tokens[start..start + c.hidden_size]
                     .iter()
                     .map(|&value| f64::from(value)),
             );
         }
 
         for layer in &self.weights.layers {
-            let normalized = rmsnorm_rows(
-                &hidden,
-                c.hidden_size,
-                &layer.input_layernorm,
-            );
+            let normalized = rmsnorm_rows(&hidden, c.hidden_size, &layer.input_layernorm);
 
-            let mut query = linear(
-                &normalized,
-                c.hidden_size,
-                &layer.q_proj,
-                q_dim,
-            );
+            let mut query = linear(&normalized, c.hidden_size, &layer.q_proj, q_dim);
 
-            let mut key = linear(
-                &normalized,
-                c.hidden_size,
-                &layer.k_proj,
-                kv_dim,
-            );
+            let mut key = linear(&normalized, c.hidden_size, &layer.k_proj, kv_dim);
 
-            let value = linear(
-                &normalized,
-                c.hidden_size,
-                &layer.v_proj,
-                kv_dim,
-            );
+            let value = linear(&normalized, c.hidden_size, &layer.v_proj, kv_dim);
 
-            query = rmsnorm_rows(
-                &query,
-                c.head_dim,
-                &layer.q_norm,
-            );
+            query = rmsnorm_rows(&query, c.head_dim, &layer.q_norm);
 
-            key = rmsnorm_rows(
-                &key,
-                c.head_dim,
-                &layer.k_norm,
-            );
+            key = rmsnorm_rows(&key, c.head_dim, &layer.k_norm);
 
             apply_rope(
                 &mut query,
@@ -574,15 +448,9 @@ impl Qwen3Model {
                 f64::from(c.rope_theta),
             );
 
-            ensure_finite(
-                &query,
-                "query normalization and RoPE",
-            )?;
+            ensure_finite(&query, "query normalization and RoPE")?;
 
-            ensure_finite(
-                &key,
-                "key normalization and RoPE",
-            )?;
+            ensure_finite(&key, "key normalization and RoPE")?;
 
             ensure_finite(&value, "value projection")?;
 
@@ -596,21 +464,12 @@ impl Qwen3Model {
                 c.head_dim,
             )?;
 
-            let attention_output = linear(
-                &attended,
-                q_dim,
-                &layer.o_proj,
-                c.hidden_size,
-            );
+            let attention_output = linear(&attended, q_dim, &layer.o_proj, c.hidden_size);
 
             add_residual(&mut hidden, &attention_output);
             ensure_finite(&hidden, "attention residual")?;
 
-            let normalized = rmsnorm_rows(
-                &hidden,
-                c.hidden_size,
-                &layer.post_attention_layernorm,
-            );
+            let normalized = rmsnorm_rows(&hidden, c.hidden_size, &layer.post_attention_layernorm);
 
             let mut gate = linear(
                 &normalized,
@@ -630,22 +489,13 @@ impl Qwen3Model {
                 *gate_value = silu(*gate_value) * up_value;
             }
 
-            let mlp_output = linear(
-                &gate,
-                c.intermediate_size,
-                &layer.down_proj,
-                c.hidden_size,
-            );
+            let mlp_output = linear(&gate, c.intermediate_size, &layer.down_proj, c.hidden_size);
 
             add_residual(&mut hidden, &mlp_output);
             ensure_finite(&hidden, "MLP residual")?;
         }
 
-        let normalized = rmsnorm_rows(
-            &hidden,
-            c.hidden_size,
-            &self.weights.final_layernorm,
-        );
+        let normalized = rmsnorm_rows(&hidden, c.hidden_size, &self.weights.final_layernorm);
 
         let head = if c.tie_embeddings {
             &self.weights.embed_tokens
@@ -653,9 +503,7 @@ impl Qwen3Model {
             self.weights
                 .lm_head
                 .as_ref()
-                .ok_or(ModelError::InvalidConfig(
-                    "missing lm_head",
-                ))?
+                .ok_or(ModelError::InvalidConfig("missing lm_head"))?
         };
 
         let mut result = Vec::new();
@@ -667,12 +515,7 @@ impl Qwen3Model {
         // Project one row at a time: never retain the full f64
         // logits matrix.
         for row in normalized.chunks_exact(c.hidden_size) {
-            let logits = linear(
-                row,
-                c.hidden_size,
-                head,
-                c.vocab_size,
-            );
+            let logits = linear(row, c.hidden_size, head, c.vocab_size);
 
             ensure_finite(&logits, "output projection")?;
 
@@ -686,9 +529,7 @@ impl Qwen3Model {
                 let value = value as f32;
 
                 if !value.is_finite() {
-                    return Err(ModelError::NonFiniteActivation(
-                        "f32 logit conversion",
-                    ));
+                    return Err(ModelError::NonFiniteActivation("f32 logit conversion"));
                 }
 
                 output.push(value);
@@ -701,20 +542,12 @@ impl Qwen3Model {
     }
 }
 
-fn checked_product(
-    left: usize,
-    right: usize,
-    name: &'static str,
-) -> Result<usize, ModelError> {
+fn checked_product(left: usize, right: usize, name: &'static str) -> Result<usize, ModelError> {
     left.checked_mul(right)
         .ok_or(ModelError::DimensionOverflow(name))
 }
 
-fn check_tensor(
-    tensor: &'static str,
-    expected: usize,
-    values: &[f32],
-) -> Result<(), ModelError> {
+fn check_tensor(tensor: &'static str, expected: usize, values: &[f32]) -> Result<(), ModelError> {
     if values.len() != expected {
         return Err(ModelError::ShapeMismatch {
             tensor,
@@ -723,22 +556,14 @@ fn check_tensor(
         });
     }
 
-    if let Some(index) =
-        values.iter().position(|value| !value.is_finite())
-    {
-        return Err(ModelError::NonFiniteWeight {
-            tensor,
-            index,
-        });
+    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+        return Err(ModelError::NonFiniteWeight { tensor, index });
     }
 
     Ok(())
 }
 
-fn ensure_finite(
-    values: &[f64],
-    stage: &'static str,
-) -> Result<(), ModelError> {
+fn ensure_finite(values: &[f64], stage: &'static str) -> Result<(), ModelError> {
     if values.iter().all(|value| value.is_finite()) {
         Ok(())
     } else {
@@ -747,29 +572,18 @@ fn ensure_finite(
 }
 
 /// Apply RMSNorm to contiguous rows, sharing the scale across rows.
-fn rmsnorm_rows(
-    input: &[f64],
-    width: usize,
-    weight: &[f32],
-) -> Vec<f64> {
+fn rmsnorm_rows(input: &[f64], width: usize, weight: &[f32]) -> Vec<f64> {
     let mut output = Vec::with_capacity(input.len());
 
     for row in input.chunks_exact(width) {
-        let mean_square = row
-            .iter()
-            .map(|value| value * value)
-            .sum::<f64>()
-            / width as f64;
+        let mean_square = row.iter().map(|value| value * value).sum::<f64>() / width as f64;
 
-        let denominator =
-            (mean_square + f64::from(Qwen3Config::RMS_EPS)).sqrt();
+        let denominator = (mean_square + f64::from(Qwen3Config::RMS_EPS)).sqrt();
 
         output.extend(
             row.iter()
                 .zip(weight)
-                .map(|(&value, &scale)| {
-                    value * f64::from(scale) / denominator
-                }),
+                .map(|(&value, &scale)| value * f64::from(scale) / denominator),
         );
     }
 
@@ -778,27 +592,16 @@ fn rmsnorm_rows(
 
 /// Multiply input `[rows, input_width]` by weight
 /// `[output_width, input_width]`.
-fn linear(
-    input: &[f64],
-    input_width: usize,
-    weight: &[f32],
-    output_width: usize,
-) -> Vec<f64> {
+fn linear(input: &[f64], input_width: usize, weight: &[f32], output_width: usize) -> Vec<f64> {
     let rows = input.len() / input_width;
     let mut output = vec![0.0; rows * output_width];
 
-    for (row_index, row) in
-        input.chunks_exact(input_width).enumerate()
-    {
-        for (output_index, weight_row) in
-            weight.chunks_exact(input_width).enumerate()
-        {
+    for (row_index, row) in input.chunks_exact(input_width).enumerate() {
+        for (output_index, weight_row) in weight.chunks_exact(input_width).enumerate() {
             output[row_index * output_width + output_index] = row
                 .iter()
                 .zip(weight_row)
-                .map(|(&value, &coefficient)| {
-                    value * f64::from(coefficient)
-                })
+                .map(|(&value, &coefficient)| value * f64::from(coefficient))
                 .sum();
         }
     }
@@ -807,13 +610,7 @@ fn linear(
 }
 
 /// Rotate the two halves of each head using its absolute token position.
-fn apply_rope(
-    values: &mut [f64],
-    token_count: usize,
-    heads: usize,
-    head_dim: usize,
-    theta: f64,
-) {
+fn apply_rope(values: &mut [f64], token_count: usize, heads: usize, head_dim: usize, theta: f64) {
     let half = head_dim / 2;
 
     for position in 0..token_count {
@@ -821,10 +618,7 @@ fn apply_rope(
             let base = (position * heads + head) * head_dim;
 
             for dimension in 0..half {
-                let inverse_frequency =
-                    theta.powf(
-                        -(2.0 * dimension as f64) / head_dim as f64,
-                    );
+                let inverse_frequency = theta.powf(-(2.0 * dimension as f64) / head_dim as f64);
 
                 let angle = position as f64 * inverse_frequency;
                 let (sin, cos) = angle.sin_cos();
@@ -833,8 +627,7 @@ fn apply_rope(
                 let high = values[base + half + dimension];
 
                 values[base + dimension] = low * cos - high * sin;
-                values[base + half + dimension] =
-                    low * sin + high * cos;
+                values[base + half + dimension] = low * sin + high * cos;
             }
         }
     }
@@ -862,20 +655,15 @@ fn causal_attention(
         for query_head in 0..query_heads {
             let kv_head = query_head / group_size;
 
-            let query_base =
-                (position * query_heads + query_head) * head_dim;
+            let query_base = (position * query_heads + query_head) * head_dim;
 
             scores.clear();
 
             for key_position in 0..=position {
-                let key_base =
-                    (key_position * kv_heads + kv_head) * head_dim;
+                let key_base = (key_position * kv_heads + kv_head) * head_dim;
 
                 let score = (0..head_dim)
-                    .map(|dimension| {
-                        query[query_base + dimension]
-                            * key[key_base + dimension]
-                    })
+                    .map(|dimension| query[query_base + dimension] * key[key_base + dimension])
                     .sum::<f64>()
                     * scale;
 
@@ -884,10 +672,7 @@ fn causal_attention(
 
             ensure_finite(&scores, "attention scores")?;
 
-            let maximum = scores
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
             for score in &mut scores {
                 *score = (*score - maximum).exp();
@@ -896,20 +681,16 @@ fn causal_attention(
             let denominator: f64 = scores.iter().sum();
 
             if !denominator.is_finite() || denominator <= 0.0 {
-                return Err(ModelError::NonFiniteActivation(
-                    "attention softmax",
-                ));
+                return Err(ModelError::NonFiniteActivation("attention softmax"));
             }
 
             for (key_position, &score) in scores.iter().enumerate() {
                 let probability = score / denominator;
 
-                let value_base =
-                    (key_position * kv_heads + kv_head) * head_dim;
+                let value_base = (key_position * kv_heads + kv_head) * head_dim;
 
                 for dimension in 0..head_dim {
-                    output[query_base + dimension] +=
-                        probability * value[value_base + dimension];
+                    output[query_base + dimension] += probability * value[value_base + dimension];
                 }
             }
         }
@@ -919,10 +700,7 @@ fn causal_attention(
     Ok(output)
 }
 
-fn add_residual(
-    hidden: &mut [f64],
-    residual: &[f64],
-) {
+fn add_residual(hidden: &mut [f64], residual: &[f64]) {
     for (value, &update) in hidden.iter_mut().zip(residual) {
         *value += update;
     }
@@ -941,27 +719,16 @@ fn silu(value: f64) -> f64 {
 pub const DEFAULT_MAX_LOGITS_BYTES: usize = 64 * 1024 * 1024;
 
 /// Result rows, row headers, and one temporary f64 projection row.
-pub fn full_logits_bytes(
-    tokens: usize,
-    vocabulary: usize,
-) -> Result<usize, ModelError> {
+pub fn full_logits_bytes(tokens: usize, vocabulary: usize) -> Result<usize, ModelError> {
     let output = checked_product(
         checked_product(tokens, vocabulary, "logit elements")?,
         std::mem::size_of::<f32>(),
         "f32 output bytes",
     )?;
 
-    let temporary = checked_product(
-        vocabulary,
-        std::mem::size_of::<f64>(),
-        "f64 row bytes",
-    )?;
+    let temporary = checked_product(vocabulary, std::mem::size_of::<f64>(), "f64 row bytes")?;
 
-    let headers = checked_product(
-        tokens,
-        std::mem::size_of::<Vec<f32>>(),
-        "row headers",
-    )?;
+    let headers = checked_product(tokens, std::mem::size_of::<Vec<f32>>(), "row headers")?;
 
     output
         .checked_add(temporary)
@@ -969,18 +736,11 @@ pub fn full_logits_bytes(
         .ok_or(ModelError::DimensionOverflow("logit memory"))
 }
 
-fn check_output_budget(
-    tokens: usize,
-    vocabulary: usize,
-    limit: usize,
-) -> Result<(), ModelError> {
+fn check_output_budget(tokens: usize, vocabulary: usize, limit: usize) -> Result<(), ModelError> {
     let required = full_logits_bytes(tokens, vocabulary)?;
 
     if required > limit {
-        Err(ModelError::MemoryLimit {
-            required,
-            limit,
-        })
+        Err(ModelError::MemoryLimit { required, limit })
     } else {
         Ok(())
     }
@@ -999,9 +759,7 @@ mod model_error_tests {
         assert_eq!(error.clone(), ModelError::Cancelled);
         assert_ne!(
             error,
-            ModelError::CheckpointValidation(
-                "checkpoint loading cancelled".to_owned(),
-            ),
+            ModelError::CheckpointValidation("checkpoint loading cancelled".to_owned(),),
         );
     }
 
