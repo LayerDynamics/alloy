@@ -134,6 +134,13 @@ pub trait EngineRuntime: Send + Sync + 'static {
         input_tokens: usize,
     ) -> EngineFuture<'a, MemoryEstimate>;
 
+    /// Whether startup implements bounded reclamation after an advisory
+    /// estimate fails. False preserves EngineCore's original fail-fast path.
+    /// Returning true never waives atomic admission or native cleanup.
+    fn supports_memory_reclamation(&self) -> bool {
+        false
+    }
+
     /// Reserve resources and arrange actual model execution.
     ///
     /// EngineCore has already:
@@ -373,7 +380,7 @@ impl<R: EngineRuntime> Engine for EngineCore<R> {
 
             permit.check_cancelled()?;
 
-            if !estimate.fits() {
+            if !estimate.fits() && !self.runtime.supports_memory_reclamation() {
                 return Err(EngineError::MemoryLimitExceeded {
                     operation: "generation startup estimate",
                     required_bytes: estimate.reserved_bytes(),
@@ -508,3 +515,5 @@ impl Drop for CancelOnDropStream {
         let _ = self.scheduler.cancel(&self.request_id);
     }
 }
+
+// ALLOY_PRESSURE_STARTUP_INTEGRATION_V1

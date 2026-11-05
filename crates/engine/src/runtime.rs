@@ -106,6 +106,17 @@ pub struct RuntimePlan {
     pub prefill_chunk_tokens: NonZeroUsize,
 }
 
+/// Reusable native allocations for incremental MLX peak forecasting.
+///
+/// These are native-buffer observations, not reservation totals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeResidency {
+    /// The selected artifact/implementation is already loaded and reusable.
+    pub reusable_model: bool,
+    /// Measured buffers of a compatible, reusable native cache.
+    pub reusable_cache_buffer_bytes: u64,
+}
+
 /// Actual incremental tokenizer decoder, confined to the native worker.
 pub trait TextDecoder {
     /// Decode one generated token without corrupting incremental state.
@@ -145,6 +156,22 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         registry: &Registry,
         profile: &ModelProfileId,
     ) -> Result<Box<dyn TextDecoder>, EngineError>;
+
+    /// Conservative incremental MLX allocation forecast for this plan.
+    ///
+    /// Runs on the native worker. Exclude reused active buffers and host
+    /// checkpoint/decode storage. None means unknown, not zero; allocator
+    /// pressure checking must reject an unknown forecast. Non-MLX adapters
+    /// can use an explicitly admission-only pressure policy.
+    fn incremental_mlx_bytes(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+        _plan: &RuntimePlan,
+        _residency: RuntimeResidency,
+    ) -> Result<Option<u64>, EngineError> {
+        Ok(None)
+    }
 
     /// Return the actual profile EOS token IDs.
     fn eos_tokens(
@@ -231,6 +258,7 @@ pub struct FamilyRuntime {
     admission: AdmissionController,
     limits: GenerationLimits,
     retention: RetentionPolicy,
+    pressure_policy: Option<crate::pressure::PressurePolicy>,
     worker: Arc<NativeWorker>,
 }
 
@@ -306,6 +334,7 @@ impl FamilyRuntime {
             admission,
             limits,
             retention,
+            pressure_policy: None,
             worker: Arc::new(NativeWorker {
                 sender,
                 summary,
@@ -443,6 +472,17 @@ impl FamilyRuntime {
         })
     }
 
+    /// Enable bounded startup-pressure handling for requests from this handle.
+    ///
+    /// Configure centrally before cloning/publishing the handle. This does
+    /// not change allocator limits or mutate an existing request. Execution
+    /// remains on the shared worker; policy travels with each startup setup.
+    #[must_use]
+    pub fn with_pressure_policy(mut self, policy: crate::pressure::PressurePolicy) -> Self {
+        self.pressure_policy = Some(policy);
+        self
+    }
+
     fn backend(
         &self,
         registry: &Registry,
@@ -472,6 +512,10 @@ impl FamilyRuntime {
 }
 
 impl EngineRuntime for FamilyRuntime {
+    fn supports_memory_reclamation(&self) -> bool {
+        self.pressure_policy.is_some()
+    }
+
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -617,6 +661,7 @@ impl EngineRuntime for FamilyRuntime {
                 plan,
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
+                pressure_policy: self.pressure_policy,
             };
 
             let admitted = self.worker.admit(setup, execution)?.await?;
@@ -699,6 +744,7 @@ struct Setup {
     plan: RuntimePlan,
     profile: ModelProfileId,
     options: GenerationOptions,
+    pressure_policy: Option<crate::pressure::PressurePolicy>,
 }
 
 struct Reply<T> {
@@ -1647,6 +1693,279 @@ impl NativeState {
         Ok(())
     }
 
+    fn pressure_residency(&self, setup: &Setup) -> Result<RuntimeResidency, EngineError> {
+        let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
+        let resident = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let Some(resident) = resident else {
+            return Ok(RuntimeResidency {
+                reusable_model: false,
+                reusable_cache_buffer_bytes: 0,
+            });
+        };
+        let same_model = resident.model.artifact_id() == artifact.id()
+            && resident.model.registration().implementation_version()
+                == setup.backend.registration().implementation_version()
+            && resident.model.registration().family() == artifact.family();
+        let cache_bytes = if same_model {
+            match resident
+                .cache
+                .as_ref()
+                .filter(|cache| cache_matches(cache, &setup.plan))
+            {
+                Some(cache) => cache.cache.memory_usage()?.allocated_bytes(),
+                None => 0,
+            }
+        } else {
+            0
+        };
+        Ok(RuntimeResidency {
+            reusable_model: same_model,
+            reusable_cache_buffer_bytes: cache_bytes,
+        })
+    }
+
+    fn pressure_demand(
+        &self,
+        setup: &Setup,
+    ) -> Result<crate::pressure::RequestDemand, EngineError> {
+        let residency = self.pressure_residency(setup)?;
+        let resident = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let same_cache = residency.reusable_model
+            && resident
+                .and_then(|resident| resident.cache.as_ref())
+                .is_some_and(|cache| cache_matches(cache, &setup.plan));
+        let weights = if residency.reusable_model {
+            0
+        } else {
+            setup.plan.load_limits.max_load_peak_bytes()
+        };
+        let cache = if same_cache {
+            0
+        } else {
+            setup.plan.cache.max_cache_bytes()
+        };
+        let history = if retains_contents(self.retention) {
+            token_storage_bytes(setup.plan.cache.capacity_tokens())?
+        } else {
+            0
+        };
+        // Same conservative full-startup ledger forecast as the existing
+        // estimate, without crediting reservations before their guards die.
+        let ledger = add(
+            add(add(weights, cache)?, history)?,
+            add(
+                add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?,
+                setup.plan.output_bytes,
+            )?,
+        )?;
+        let policy = setup
+            .pressure_policy
+            .ok_or_else(|| internal("pressure policy missing"))?;
+        let native = if policy.options().allocator_ceiling_bytes.is_some() {
+            setup.backend.incremental_mlx_bytes(
+                setup.registry.as_ref(), &setup.profile, &setup.plan, residency,
+            )?.ok_or_else(|| EngineError::unsupported(
+                "MLX pressure forecast",
+                "adapter has no incremental native allocation forecast; use admission-only policy or implement the hook",
+            ))?
+        } else {
+            0
+        };
+        Ok(crate::pressure::RequestDemand {
+            additional_reservation_bytes: ledger,
+            additional_mlx_bytes: native,
+        })
+    }
+
+    fn pressure_observation(
+        &self,
+        setup: &Setup,
+    ) -> Result<crate::pressure::PressureObservation, EngineError> {
+        use crate::pressure::{AllocatorObservation, ExecutionState, ReclaimableResources};
+        let policy = setup
+            .pressure_policy
+            .ok_or_else(|| internal("pressure policy missing"))?;
+        let allocator = if policy.options().allocator_ceiling_bytes.is_some() {
+            Some(
+                AllocatorObservation::from_mlx(self.mlx_memory_snapshot()?).map_err(|error| {
+                    EngineError::ExecutionFailed {
+                        stage: "convert allocator pressure observation",
+                        message: error.to_string(),
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let resident = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let leased = self.states.values().any(StateEntry::is_leased);
+        let has_state = !self.states.is_empty()
+            || resident
+                .is_some_and(|resident| resident.cache.is_some() || resident.candidate.is_some());
+        let execution = if self.active.is_some() {
+            ExecutionState::Active
+        } else if self.pending.is_some() {
+            ExecutionState::PendingStartup
+        } else {
+            ExecutionState::Idle
+        };
+        Ok(crate::pressure::PressureObservation {
+            admission: self.admission.snapshot()?,
+            allocator,
+            demand: self.pressure_demand(setup)?,
+            execution,
+            reclaimable: ReclaimableResources {
+                idle_session_states: usize::from(has_state),
+                leased_session_states: usize::from(leased),
+                can_release_state_without_model: resident.is_some() && !leased,
+                idle_model_loaded: resident.is_some(),
+                idle_model_has_live_leases: leased,
+            },
+        })
+    }
+
+    fn pressure_release_idle_state(&mut self) -> Result<(), EngineError> {
+        self.require_idle()?;
+        self.require_unleased()?;
+        // Remove canonical publication before mutation but preserve the
+        // Resident containing the model and its weight reservation.
+        self.unpublish_idle_state()?;
+        if let Some(resident) = &mut self.resident {
+            drop(resident.candidate.take());
+            drop(resident.cache.take());
+        }
+        self.publish();
+        Ok(())
+    }
+
+    fn pressure_unload_idle_model(&mut self) -> Result<(), EngineError> {
+        self.require_idle()?;
+        self.require_unleased()?;
+        self.unpublish_idle_state()?;
+        // Resident drop order destroys native resources before their guards.
+        drop(self.resident.take());
+        self.publish();
+        Ok(())
+    }
+
+    fn apply_startup_pressure(
+        &mut self,
+        setup: &Setup,
+        control: &ExecutionControl,
+        abandoned: &AtomicBool,
+    ) -> Result<(), EngineError> {
+        use crate::pressure::{ActionOutcome, PressureDecision, ReclaimAction, RejectReason};
+        let Some(policy) = setup.pressure_policy else {
+            return Ok(());
+        };
+        self.require_idle()?;
+        let mut attempt = policy.begin();
+        // Five actions plus one terminal evaluation. Never start a fresh
+        // attempt to evade an exhausted budget.
+        for _ in 0..=crate::pressure::MAX_RECLAMATION_ACTIONS {
+            check_startup(control, abandoned)?;
+            let observation = self.pressure_observation(setup)?;
+            let decision =
+                attempt
+                    .evaluate(observation)
+                    .map_err(|error| EngineError::ExecutionFailed {
+                        stage: "evaluate startup pressure policy",
+                        message: error.to_string(),
+                    })?;
+            let action = match decision {
+                PressureDecision::Proceed => return Ok(()),
+                PressureDecision::ClearAllocatorCache => ReclaimAction::ClearAllocatorCache,
+                PressureDecision::ReleaseIdleSessionState => ReclaimAction::ReleaseIdleSessionState,
+                PressureDecision::UnloadIdleModel => ReclaimAction::UnloadIdleModel,
+                PressureDecision::Reject(reason) => {
+                    if matches!(
+                        reason,
+                        RejectReason::NativeOwnerBusy | RejectReason::ProtectedResources
+                    ) {
+                        return Err(EngineError::Busy {
+                            active_request_id: self
+                                .request_owner()
+                                .map(|id| id.as_str().to_owned()),
+                            message: format!(
+                                "startup pressure policy rejected protected ownership: {reason:?}"
+                            ),
+                        });
+                    }
+                    let operation = match reason {
+                        RejectReason::ActionLimitReached => "startup pressure action limit reached",
+                        RejectReason::NoProgress => "startup pressure reclamation made no progress",
+                        RejectReason::NoReclaimableResources => {
+                            "startup pressure has no reclaimable resources"
+                        }
+                        RejectReason::ReclamationExhausted => {
+                            "startup pressure reclamation exhausted"
+                        }
+                        RejectReason::RequestExceedsAdmissionBudget => {
+                            "startup demand exceeds admission budget"
+                        }
+                        RejectReason::RequestExceedsAllocatorCeiling => {
+                            "startup native demand exceeds pressure ceiling"
+                        }
+                        _ => "startup pressure policy rejected admission",
+                    };
+                    let assessment = attempt.last_assessment();
+                    if let Some(ceiling) = policy.options().allocator_ceiling_bytes {
+                        if assessment.is_some_and(|a| a.reservation_deficit_bytes == 0) {
+                            return Err(EngineError::MemoryLimitExceeded {
+                                operation,
+                                required_bytes: assessment
+                                    .and_then(|a| a.projected_mlx_bytes)
+                                    .unwrap_or(observation.demand.additional_mlx_bytes),
+                                available_bytes: ceiling,
+                            });
+                        }
+                    }
+                    return Err(EngineError::MemoryLimitExceeded {
+                        operation,
+                        required_bytes: observation.demand.additional_reservation_bytes,
+                        available_bytes: observation.admission.available_bytes(),
+                    });
+                }
+            };
+            check_startup(control, abandoned)?;
+            let result = match action {
+                ReclaimAction::ClearAllocatorCache => {
+                    self.reclaim_mlx_allocator_cache().map(|_| ())
+                }
+                ReclaimAction::ReleaseIdleSessionState => self.pressure_release_idle_state(),
+                ReclaimAction::UnloadIdleModel => self.pressure_unload_idle_model(),
+            };
+            let outcome = if result.is_ok() {
+                ActionOutcome::Completed
+            } else {
+                ActionOutcome::Failed
+            };
+            attempt.complete_action(action, outcome).map_err(|error| {
+                EngineError::ExecutionFailed {
+                    stage: "acknowledge startup pressure action",
+                    message: error.to_string(),
+                }
+            })?;
+            // Return the actual operation error, not a synthetic retry error.
+            result?;
+            check_startup(control, abandoned)?;
+            // Fresh native counters, ledger, eligibility, and incremental
+            // demand are recomputed at the next iteration.
+        }
+        Err(internal(
+            "pressure policy did not terminate within its action bound",
+        ))
+    }
+
     fn require_unleased(&self) -> Result<(), EngineError> {
         if self.states.values().any(StateEntry::is_leased) {
             return Err(EngineError::Busy {
@@ -1722,7 +2041,8 @@ impl NativeState {
             }
 
             self.publish();
-            check_startup(control, abandoned)
+            check_startup(control, abandoned)?;
+            self.apply_startup_pressure(setup, control, abandoned)
         })?;
 
         self.pending = Some(control.request_id().clone());
@@ -3192,3 +3512,53 @@ mod mlx_allocator_runtime_tests {
         assert_eq!(admission.snapshot().expect("after"), before);
     }
 }
+
+#[cfg(test)]
+mod pressure_resource_reclamation_tests {
+    use super::*;
+    fn empty_state(admission: AdmissionController) -> NativeState {
+        NativeState {
+            active: None,
+            pending: None,
+            resident: None,
+            states: HashMap::new(),
+            admission,
+            retention: RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+            summary: Arc::new(Mutex::new(Summary::empty(true))),
+        }
+    }
+    #[test]
+    fn pressure_actions_do_not_credit_unrelated_reservation_guards() {
+        let admission = AdmissionController::new(4096).expect("admission");
+        let _unrelated = admission.reserve("unrelated owner", 512).expect("guard");
+        let before = admission.snapshot().expect("before");
+        let mut state = empty_state(admission.clone());
+        state
+            .pressure_release_idle_state()
+            .expect("empty state release");
+        state
+            .pressure_unload_idle_model()
+            .expect("empty model unload");
+        assert_eq!(admission.snapshot().expect("after"), before);
+    }
+    #[test]
+    fn pending_native_ownership_blocks_destructive_pressure_actions() {
+        let admission = AdmissionController::new(4096).expect("admission");
+        let mut state = empty_state(admission.clone());
+        state.pending = Some(RequestId::new("pending-pressure").expect("ID"));
+        assert!(matches!(
+            state.pressure_release_idle_state(),
+            Err(EngineError::Busy { .. })
+        ));
+        assert!(matches!(
+            state.pressure_unload_idle_model(),
+            Err(EngineError::Busy { .. })
+        ));
+        assert_eq!(admission.snapshot().expect("after").reserved_bytes(), 0);
+    }
+}
+
+// ALLOY_PRESSURE_STARTUP_INTEGRATION_V1

@@ -499,6 +499,26 @@ impl Qwen3Backend {
         Ok((engine, plan))
     }
 
+    /// Construct with explicit bounded startup-pressure policy.
+    ///
+    /// This does not change process-wide MLX limits. The supplied ledger
+    /// and allocator ceiling must come from centrally coordinated setup.
+    pub fn into_pressure_engine(
+        self,
+        profiles: Vec<ModelProfile>,
+        admission: AdmissionController,
+        scheduler: Scheduler,
+        retention: RetentionPolicy,
+        pressure: crate::pressure::PressurePolicy,
+    ) -> Result<EngineCore<FamilyRuntime>, EngineError> {
+        let registry = self.registry(profiles)?;
+        let limits = self.limits.generation;
+        let backend: Arc<dyn RuntimeBackend> = Arc::new(self);
+        let runtime = FamilyRuntime::new(vec![backend], admission, limits, retention)?
+            .with_pressure_policy(pressure);
+        Ok(EngineCore::new(registry, scheduler, runtime))
+    }
+
     /// Connect this real backend to FamilyRuntime and EngineCore.
     /// The caller supplies budget, scheduling, output, and retention policy.
     pub fn into_engine(
@@ -850,6 +870,44 @@ impl RuntimeBackend for Qwen3Backend {
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
         }))
+    }
+
+    fn incremental_mlx_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        plan: &RuntimePlan,
+        residency: crate::runtime::RuntimeResidency,
+    ) -> Result<Option<u64>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        self.data(resolved.artifact())?;
+        if !residency.reusable_model && residency.reusable_cache_buffer_bytes != 0 {
+            return Err(EngineError::invalid_request(
+                "residency",
+                "foreign cache cannot offset MLX demand",
+            ));
+        }
+        let weights = if residency.reusable_model {
+            0
+        } else {
+            plan.load_limits.max_resident_bytes()
+        };
+        // The cache allowance contains old/new overlap and padding. Deduct
+        // only the measured compatible storage already counted as active.
+        let cache = plan
+            .cache
+            .max_cache_bytes()
+            .saturating_sub(residency.reusable_cache_buffer_bytes);
+        // Workspace/headroom is deliberately treated as a conservative
+        // native upper allowance, even though some small components are
+        // host bookkeeping. Host checkpoint/decoded-weight loading peaks
+        // and output-queue reservations are NOT counted as native weights.
+        Ok(Some(sum(&[
+            weights,
+            cache,
+            plan.temporary_bytes,
+            plan.headroom_bytes,
+        ])?))
     }
 
     fn eos_tokens(
@@ -2343,6 +2401,13 @@ mod shared_rendering_wiring_tests {
     }
 
     fn execute_engine_path(execution: Qwen3Execution) {
+        execute_engine_path_with_pressure(execution, None);
+    }
+
+    fn execute_engine_path_with_pressure(
+        execution: Qwen3Execution,
+        pressure: Option<crate::pressure::PressurePolicy>,
+    ) {
         let fixture = executable_fixture();
         let backend = Qwen3Backend::new_with_execution(
             vec![fixture.specification.clone()],
@@ -2350,17 +2415,28 @@ mod shared_rendering_wiring_tests {
             execution,
         )
         .expect("MLX backend");
-        let engine = backend
-            .into_engine(
+        let admission = AdmissionController::new(16 * 1024 * 1024).expect("budget");
+        let scheduler = Scheduler::new(8).expect("scheduler");
+        let retention = RetentionPolicy {
+            retain_model: true,
+            retain_cache_buffers: false,
+        };
+        let engine = match pressure {
+            Some(policy) => backend.into_pressure_engine(
                 vec![fixture.profile.clone()],
-                AdmissionController::new(16 * 1024 * 1024).expect("budget"),
-                Scheduler::new(8).expect("scheduler"),
-                RetentionPolicy {
-                    retain_model: true,
-                    retain_cache_buffers: false,
-                },
-            )
-            .expect("engine");
+                admission,
+                scheduler,
+                retention,
+                policy,
+            ),
+            None => backend.into_engine(
+                vec![fixture.profile.clone()],
+                admission,
+                scheduler,
+                retention,
+            ),
+        }
+        .expect("engine");
         let rendered = block_on(engine.render_and_count(fixture.context.clone())).expect("render");
         let request = crate::types::GenerationRequest::new(
             crate::types::RequestId::new("mlx-adapter-execution").expect("ID"),
@@ -2404,6 +2480,207 @@ mod shared_rendering_wiring_tests {
     }
 
     #[test]
+    fn engine_generate_executes_with_explicit_admission_pressure_policy() {
+        execute_engine_path_with_pressure(
+            Qwen3Execution::MlxCpu,
+            Some(
+                crate::pressure::PressurePolicy::new(crate::pressure::PressureOptions {
+                    allocator_ceiling_bytes: None,
+                    allow_allocator_cache_clear: true,
+                    allow_idle_state_release: true,
+                    allow_idle_model_unload: true,
+                    max_reclamation_actions: 5,
+                })
+                .expect("explicit pressure policy"),
+            ),
+        );
+    }
+
+    #[test]
+    fn pressure_enabled_startup_reaches_worker_after_failed_advisory_estimate() {
+        let fixture = executable_fixture();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend");
+        let policy = crate::pressure::PressurePolicy::new(crate::pressure::PressureOptions {
+            allocator_ceiling_bytes: None,
+            allow_allocator_cache_clear: false,
+            allow_idle_state_release: false,
+            allow_idle_model_unload: false,
+            max_reclamation_actions: 0,
+        })
+        .expect("policy");
+        let engine = backend
+            .into_pressure_engine(
+                vec![fixture.profile.clone()],
+                AdmissionController::new(1).expect("tiny budget"),
+                Scheduler::new(8).expect("scheduler"),
+                RetentionPolicy {
+                    retain_model: false,
+                    retain_cache_buffers: false,
+                },
+                policy,
+            )
+            .expect("engine");
+        let request = crate::types::GenerationRequest::new(
+            crate::types::RequestId::new("pressure-advisory-deferral").expect("ID"),
+            fixture.context.profile_id().clone(),
+            fixture.context.clone(),
+            GenerationOptions::greedy(4).expect("options"),
+        )
+        .expect("request");
+        match block_on(engine.generate(request)) {
+            Err(EngineError::MemoryLimitExceeded { operation, .. }) => {
+                // The old API fail-fast operation is "generation startup
+                // estimate". This operation is emitted by the native policy.
+                assert_eq!(operation, "startup demand exceeds admission budget");
+            }
+            other => panic!("expected native pressure rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pressure_releases_idle_state_without_reloading_model_under_ledger_pressure() {
+        let fixture = executable_fixture();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).expect("render");
+        let plan = block_on(backend.plan(
+            &registry,
+            fixture.context.profile_id(),
+            rendered.token_count(),
+        ))
+        .expect("plan");
+        let admission = AdmissionController::new(16 * 1024 * 1024).expect("budget");
+        let scheduler = Scheduler::new(16).expect("scheduler");
+        let policy = crate::pressure::PressurePolicy::new(crate::pressure::PressureOptions {
+            allocator_ceiling_bytes: None,
+            allow_allocator_cache_clear: true,
+            allow_idle_state_release: true,
+            allow_idle_model_unload: false,
+            max_reclamation_actions: 5,
+        })
+        .expect("state-only pressure policy");
+        let backend: Arc<dyn RuntimeBackend> = Arc::new(backend);
+        let runtime = FamilyRuntime::new(
+            vec![backend],
+            admission.clone(),
+            fixture.limits.generation,
+            RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+        )
+        .expect("runtime")
+        .with_pressure_policy(policy);
+        let engine = EngineCore::new(registry, scheduler, runtime.clone());
+        let run = |name: &str| {
+            let request = crate::types::GenerationRequest::new(
+                crate::types::RequestId::new(name).expect("ID"),
+                fixture.context.profile_id().clone(),
+                fixture.context.clone(),
+                GenerationOptions::greedy(4).expect("options"),
+            )
+            .expect("request");
+            let mut events = block_on(engine.generate(request))
+                .expect("pressure-admitted execution")
+                .into_events();
+            let mut text = String::new();
+            let mut terminal = false;
+            while let Some(event) =
+                block_on(std::future::poll_fn(|cx| events.as_mut().poll_next(cx)))
+            {
+                assert!(!terminal, "event after terminal");
+                match event {
+                    crate::types::GenerationEvent::TextDelta { text: delta } => {
+                        text.push_str(&delta)
+                    }
+                    crate::types::GenerationEvent::GenerationCompleted { usage, .. } => {
+                        assert_eq!(usage.input_tokens, rendered.token_count());
+                        assert_eq!(usage.output_tokens, 4);
+                        terminal = true;
+                    }
+                    other => panic!("pressure execution failed: {other:?}"),
+                }
+            }
+            assert!(terminal);
+            assert_eq!(text, "!!!!");
+            drop(events);
+        };
+        run("pressure-retained-first");
+        let source =
+            std::fs::read(fixture.directory.0.join("tokenizer.json")).expect("tokenizer source");
+        let tokenizer = tokenizers::Tokenizer::from_bytes(&source).expect("tokenizer");
+        let mut executed = rendered.token_ids().to_vec();
+        executed.extend_from_slice(&[0, 0, 0, 0]);
+        let decoded = tokenizer
+            .decode(&executed, false)
+            .expect("lossless fixture decode");
+        assert_eq!(
+            tokenizer
+                .encode(decoded.as_str(), false)
+                .expect("roundtrip")
+                .get_ids(),
+            executed.as_slice()
+        );
+        let prefix = decoded.into_bytes();
+        let first_id = block_on(runtime.retain_session_state(
+            crate::types::RequestId::new("pressure-retained-first").expect("ID"),
+            prefix.clone(),
+        ))
+        .expect("first publication");
+        let first = block_on(runtime.lookup_session_state(first_id))
+            .expect("lookup")
+            .expect("first state");
+        let warm_required = sum(&[
+            plan.temporary_bytes,
+            plan.headroom_bytes,
+            plan.output_bytes,
+            product(as_u64(plan.cache.capacity_tokens()).expect("capacity"), 4).expect("history"),
+        ])
+        .expect("warm requirement");
+        let available = admission.snapshot().expect("idle ledger").available_bytes();
+        assert!(available >= warm_required && warm_required > 0);
+        let fill = available
+            .checked_sub(warm_required - 1)
+            .expect("fill amount");
+        let unrelated = admission
+            .reserve("pressure fixture unrelated owner", fill)
+            .expect("fill ledger");
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("pressured ledger")
+                .available_bytes(),
+            warm_required - 1
+        );
+        // A fresh advisory estimate cannot fit. The native state-only
+        // action must release real guards; model unload is forbidden.
+        run("pressure-retained-second");
+        let second_id = block_on(runtime.retain_session_state(
+            crate::types::RequestId::new("pressure-retained-second").expect("ID"),
+            prefix,
+        ))
+        .expect("second publication");
+        let second = block_on(runtime.lookup_session_state(second_id))
+            .expect("lookup")
+            .expect("second state");
+        assert_eq!(second.model_instance_id, first.model_instance_id);
+        assert_eq!(second.request_id.as_str(), "pressure-retained-second");
+        assert_eq!(second.reused_input_tokens, 0);
+        drop(unrelated);
+        assert_eq!(
+            block_on(engine.release_session_state(second_id)).expect("release"),
+            crate::types::ReleaseOutcome::Released
+        );
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+    #[test]
     fn engine_generate_executes_mlx_cpu_with_new_cache_identity() {
         execute_engine_path(Qwen3Execution::MlxCpu);
     }
@@ -2440,3 +2717,5 @@ mod shared_rendering_wiring_tests {
 }
 
 // ALLOY_MEASURED_BUFFERS_V1
+
+// ALLOY_PRESSURE_STARTUP_INTEGRATION_V1
