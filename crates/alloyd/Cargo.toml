@@ -1,0 +1,27 @@
+[package]
+name = "alloyd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Alloy daemon: UDS JSON-RPC front door over harness-core + engine"
+
+[[bin]]
+name = "alloyd"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+harness-core = { path = "../harness-core" }
+qwen3 = { path = "../families/qwen3" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+tempfile = "=3.23.0"
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+
+[lints]
+workspace = true

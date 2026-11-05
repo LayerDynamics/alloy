@@ -16,7 +16,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tempfile::tempdir;
 
@@ -179,7 +179,7 @@ impl GenerationEventStream for StaticStream {
 #[test]
 fn supervisor_turn_persists_and_isolates_telemetry() {
     let dir = tempdir().expect("tempdir");
-    let mut store = SessionStore::open(dir.path().join("s.sqlite")).expect("store");
+    let store = Mutex::new(SessionStore::open(dir.path().join("s.sqlite")).expect("store"));
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1.0",
         HardwareTier::Ram36Gb,
@@ -188,16 +188,16 @@ fn supervisor_turn_persists_and_isolates_telemetry() {
     ));
     let supervisor = Supervisor::new(ReplyEngine::new(), Arc::clone(&telemetry));
     supervisor
-        .create_session(&mut store, "sup-1", "harness-profile")
+        .create_session(&store, "sup-1", "harness-profile")
         .expect("create");
 
     let outcome = supervisor
-        .run_turn(&mut store, "sup-1", "hello", 16)
+        .run_turn(&store, "sup-1", "hello", 16)
         .expect("turn must succeed even when telemetry flush fails");
     assert_eq!(outcome.assistant_text, "hi there");
     assert!(outcome.input_tokens > 0);
 
-    let events = store.list_events("sup-1").expect("events");
+    let events = store.lock().expect("lock").list_events("sup-1").expect("events");
     let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
     assert!(kinds.contains(&EventKind::UserMessage));
     assert!(kinds.contains(&EventKind::AssistantMessage));

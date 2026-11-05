@@ -202,7 +202,7 @@ impl SessionStore {
               payload_json  TEXT NOT NULL,
               artifact_refs TEXT NOT NULL DEFAULT '[]'
             );
-            CREATE INDEX IF NOT EXISTS idx_events_session_seq
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_seq
               ON events(session_id, seq);
             "#,
         )?;
@@ -275,6 +275,59 @@ impl SessionStore {
             updated_ts: ts,
             profile_id,
         })
+    }
+
+    /// Update session lifecycle status and touch `updated_ts`.
+    pub fn set_status(
+        &mut self,
+        session_id: &str,
+        status: SessionStatus,
+    ) -> HarnessResult<SessionRecord> {
+        let ts = now_ms()?;
+        let tx = self.conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE sessions SET status = ?1, updated_ts = ?2 WHERE session_id = ?3",
+            params![status.as_str(), ts, session_id],
+        )?;
+        if updated == 0 {
+            return Err(HarnessError::Invalid(format!(
+                "unknown session_id: {session_id}"
+            )));
+        }
+        if matches!(status, SessionStatus::Paused) {
+            append_event_in_tx(
+                &tx,
+                session_id,
+                ts,
+                EventKind::RunPaused,
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )?;
+        }
+        tx.commit()?;
+        self.get_session(session_id)?
+            .ok_or_else(|| HarnessError::Store(format!("session vanished: {session_id}")))
+    }
+
+    /// Count sessions currently marked active.
+    pub fn count_active_sessions(&self) -> HarnessResult<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE status = ?1",
+            params![SessionStatus::Active.as_str()],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|_| HarnessError::Store("session count overflow".into()))
+    }
+
+    /// Return every session id currently stored.
+    pub fn list_session_ids(&self) -> HarnessResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT session_id FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
     }
 
     /// Load a session row.

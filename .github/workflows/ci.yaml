@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - 4-engine-core
+      - 6-alloyd
     tags:
       - "*"
   workflow_dispatch:
@@ -75,7 +76,7 @@ jobs:
           ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
             bash scripts/repro_check.sh --test
 
-      - name: FFI, infrastructure, Qwen3, and engine verification
+      - name: FFI, infrastructure, Qwen3, engine, harness-core, and alloyd verification
         shell: bash
         run: |
           set -euo pipefail
@@ -127,6 +128,22 @@ jobs:
               echo "::group::Engine documentation build"
               RUSTDOCFLAGS="-D warnings" \
                 cargo doc --locked -p engine --no-deps
+              echo "::endgroup::"
+
+              echo "::group::Harness-core all-target tests"
+              cargo test --locked -p harness-core --all-targets
+              echo "::endgroup::"
+
+              echo "::group::Harness-core documentation tests"
+              cargo test --locked -p harness-core --doc
+              echo "::endgroup::"
+
+              echo "::group::Alloyd all-target tests"
+              cargo test --locked -p alloyd --all-targets
+              echo "::endgroup::"
+
+              echo "::group::Alloyd documentation tests"
+              cargo test --locked -p alloyd --doc
               echo "::endgroup::"
             '
 
@@ -190,3 +207,31 @@ jobs:
           set -euo pipefail
 
           cargo doc --locked -p engine --no-deps
+
+      - name: harness-core all-target tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p harness-core --all-targets
+
+      - name: harness-core documentation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p harness-core --doc
+
+      - name: alloyd all-target tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p alloyd --all-targets
+
+      - name: alloyd documentation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p alloyd --doc

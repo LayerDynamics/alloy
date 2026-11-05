@@ -375,6 +375,11 @@ impl ReservationGrant {
         self.remaining_bytes
     }
 
+    /// Operation label supplied when the grant was reserved.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
     /// Whether this grant still owns unpartitioned bytes.
     pub fn is_empty(&self) -> bool {
         self.remaining_bytes == 0
