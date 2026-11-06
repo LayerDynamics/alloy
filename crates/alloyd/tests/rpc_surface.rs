@@ -4,22 +4,186 @@ use alloyd::{
     API_VERSION, DaemonService, ErrorKind, FixtureEngine, RpcRequest, bind_listener,
     handle_connection,
 };
+use engine::api::{Engine, EngineFuture};
+use engine::types::{
+    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, Generation, GenerationEvent,
+    GenerationEventStream, GenerationRequest, GenerationStream, MemoryEstimate, ModelProfileId,
+    ReleaseOutcome, RenderedContext, RequestId, SessionStateId,
+};
 use harness_core::{HardwareTier, TelemetryClient};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
 
-fn start_server_with_engine(
+#[derive(Default)]
+struct StreamGateState {
+    entered_profiles: BTreeSet<String>,
+    released: bool,
+}
+
+#[derive(Default)]
+struct StreamGate {
+    state: Mutex<StreamGateState>,
+    changed: Condvar,
+}
+
+impl StreamGate {
+    fn release_on_drop(self: &Arc<Self>) -> ReleaseStreamGate {
+        ReleaseStreamGate(Arc::clone(self))
+    }
+
+    fn wait_entered(&self, profiles: &[&str]) {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(
+                self.state.lock().expect("gate lock"),
+                Duration::from_secs(5),
+                |state| {
+                    profiles
+                        .iter()
+                        .any(|profile| !state.entered_profiles.contains(*profile))
+                },
+            )
+            .expect("wait for first streamed deltas");
+        let entered = state.entered_profiles.clone();
+        drop(state);
+        assert!(
+            profiles.iter().all(|profile| entered.contains(*profile)),
+            "streams did not reach the gate after their first delta: expected {profiles:?}, got {entered:?}"
+        );
+    }
+
+    fn hold_after_delta(&self, profile: &str) {
+        let mut state = self.state.lock().expect("gate lock");
+        state.entered_profiles.insert(profile.to_owned());
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.released)
+            .expect("wait for gate release");
+        let released = state.released;
+        drop(state);
+        assert!(released, "stream gate was not released for {profile}");
+    }
+}
+
+struct ReleaseStreamGate(Arc<StreamGate>);
+
+impl Drop for ReleaseStreamGate {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .released = true;
+        self.0.changed.notify_all();
+    }
+}
+
+/// Keep the real fixture cancellation behavior, but stop after its first delta
+/// until the test has issued pause. No startup/completion timing is assumed.
+struct GatedFixtureEngine {
+    inner: FixtureEngine,
+    gate: Arc<StreamGate>,
+}
+
+impl GatedFixtureEngine {
+    fn new(reply: &str, cancelled: Arc<AtomicBool>, gate: Arc<StreamGate>) -> Self {
+        Self {
+            inner: FixtureEngine::with_cancel(reply, cancelled, 0),
+            gate,
+        }
+    }
+}
+
+impl Engine for GatedFixtureEngine {
+    fn api_version(&self) -> u32 {
+        self.inner.api_version()
+    }
+
+    fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {
+        self.inner.render_and_count(context)
+    }
+
+    fn estimate_memory(
+        &self,
+        profile: ModelProfileId,
+        input_tokens: usize,
+    ) -> EngineFuture<'_, MemoryEstimate> {
+        self.inner.estimate_memory(profile, input_tokens)
+    }
+
+    fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
+        let profile = request.profile_id().as_str().to_owned();
+        let gate = Arc::clone(&self.gate);
+        let generated = self.inner.generate(request);
+        Box::pin(async move {
+            let generation = generated.await?;
+            Ok(Generation::from_stream(
+                generation.request_id().clone(),
+                Box::pin(GatedStream {
+                    inner: generation.into_events(),
+                    gate,
+                    profile,
+                    emitted_delta: false,
+                    passed_gate: false,
+                }),
+            ))
+        })
+    }
+
+    fn cancel(&self, request_id: RequestId) -> EngineFuture<'_, CancelOutcome> {
+        self.inner.cancel(request_id)
+    }
+
+    fn release_session_state(&self, state_id: SessionStateId) -> EngineFuture<'_, ReleaseOutcome> {
+        self.inner.release_session_state(state_id)
+    }
+
+    fn capabilities(&self, artifact_id: ArtifactId) -> EngineFuture<'_, Capabilities> {
+        self.inner.capabilities(artifact_id)
+    }
+}
+
+struct GatedStream {
+    inner: GenerationStream,
+    gate: Arc<StreamGate>,
+    profile: String,
+    emitted_delta: bool,
+    passed_gate: bool,
+}
+
+impl GenerationEventStream for GatedStream {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<GenerationEvent>> {
+        let this = self.get_mut();
+        if this.emitted_delta && !this.passed_gate {
+            // Supervisor writes and flushes the previous notification before
+            // polling again. The request is registered and cannot finish here.
+            this.gate.hold_after_delta(&this.profile);
+            this.passed_gate = true;
+        }
+        let next = this.inner.as_mut().poll_next(cx);
+        if matches!(&next, Poll::Ready(Some(GenerationEvent::TextDelta { .. }))) {
+            this.emitted_delta = true;
+        }
+        next
+    }
+}
+
+fn start_server_with_engine<E: Engine + 'static>(
     dir: &Path,
     socket_name: &str,
-    engine: FixtureEngine,
+    engine: E,
     models_resident: u64,
     memory_reserved: u64,
 ) -> (PathBuf, PathBuf) {
@@ -31,15 +195,8 @@ fn start_server_with_engine(
         "https://127.0.0.1:1/drop",
     ));
     let service = Arc::new(
-        DaemonService::open(
-            &db,
-            engine,
-            telemetry,
-            32,
-            models_resident,
-            memory_reserved,
-        )
-        .expect("service"),
+        DaemonService::open(&db, engine, telemetry, 32, models_resident, memory_reserved)
+            .expect("service"),
     );
     let listener = bind_listener(&socket).expect("bind");
     let mode = std::fs::metadata(&socket)
@@ -62,7 +219,13 @@ fn start_server_with_engine(
 }
 
 fn start_server(dir: &Path) -> (PathBuf, PathBuf) {
-    start_server_with_engine(dir, "alloyd.sock", FixtureEngine::new("one two three"), 0, 0)
+    start_server_with_engine(
+        dir,
+        "alloyd.sock",
+        FixtureEngine::new("one two three"),
+        0,
+        0,
+    )
 }
 
 fn call(socket: &std::path::Path, request: Value) -> Vec<Value> {
@@ -376,17 +539,26 @@ fn rpc_surface_v1() {
     );
     assert_eq!(status[0]["result"]["api_version"], API_VERSION);
     assert_eq!(status[0]["result"]["models_resident"], 1);
-    assert_eq!(status[0]["result"]["memory_reserved"], 8 * 1024 * 1024 * 1024u64);
+    assert_eq!(
+        status[0]["result"]["memory_reserved"],
+        8 * 1024 * 1024 * 1024u64
+    );
 }
 
 #[test]
 fn stream_events_order() {
     let dir = tempdir().expect("tempdir");
     let cancel = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(StreamGate::default());
+    let release_gate = gate.release_on_drop();
     let (socket, _) = start_server_with_engine(
         dir.path(),
         "stream.sock",
-        FixtureEngine::with_cancel("alpha beta gamma delta", Arc::clone(&cancel), 40),
+        GatedFixtureEngine::new(
+            "alpha beta gamma delta",
+            Arc::clone(&cancel),
+            Arc::clone(&gate),
+        ),
         0,
         0,
     );
@@ -421,7 +593,8 @@ fn stream_events_order() {
         )
     });
 
-    thread::sleep(Duration::from_millis(60));
+    gate.wait_entered(&["fixture-profile"]);
+    assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
     let paused = call(
         &socket,
         json!({
@@ -434,6 +607,11 @@ fn stream_events_order() {
     );
     assert_eq!(paused[0]["result"]["status"], "paused");
     assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !send_handle.is_finished(),
+        "cancelled send must remain held until the stream gate is released"
+    );
+    drop(release_gate);
 
     let streamed = send_handle.join().expect("join send");
     let events: Vec<&str> = streamed
@@ -450,6 +628,15 @@ fn stream_events_order() {
         events.contains(&"request_failed"),
         "pause-cancel must stream session.event request_failed: {streamed:?}"
     );
+    assert_eq!(
+        events
+            .iter()
+            .copied()
+            .filter(|event| matches!(*event, "request_failed" | "generation_completed"))
+            .collect::<Vec<_>>(),
+        vec!["request_failed"],
+        "cancelled request must have exactly one terminal event: {streamed:?}"
+    );
     let pos = events
         .iter()
         .position(|event| *event == "request_failed")
@@ -459,10 +646,7 @@ fn stream_events_order() {
         "only text_delta may precede request_failed: {events:?}"
     );
     assert!(
-        streamed
-            .last()
-            .and_then(|line| line.get("error"))
-            .is_some(),
+        streamed.last().and_then(|line| line.get("error")).is_some(),
         "cancelled send must end with an RPC error: {streamed:?}"
     );
 }
@@ -471,10 +655,16 @@ fn stream_events_order() {
 fn pause_cancels_only_target_session() {
     let dir = tempdir().expect("tempdir");
     let cancel_a = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(StreamGate::default());
+    let release_gate = gate.release_on_drop();
     let (socket, _) = start_server_with_engine(
         dir.path(),
         "multi.sock",
-        FixtureEngine::with_cancel("alpha beta gamma delta epsilon", Arc::clone(&cancel_a), 50),
+        GatedFixtureEngine::new(
+            "alpha beta gamma delta epsilon",
+            Arc::clone(&cancel_a),
+            Arc::clone(&gate),
+        ),
         0,
         0,
     );
@@ -526,7 +716,8 @@ fn pause_cancels_only_target_session() {
         )
     });
 
-    thread::sleep(Duration::from_millis(80));
+    gate.wait_entered(&["fixture-a", "fixture-b"]);
+    assert!(!cancel_a.load(std::sync::atomic::Ordering::SeqCst));
     let paused = call(
         &socket,
         json!({
@@ -539,6 +730,11 @@ fn pause_cancels_only_target_session() {
     );
     assert_eq!(paused[0]["result"]["status"], "paused");
     assert!(cancel_a.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        !send_a.is_finished() && !send_b.is_finished(),
+        "both requests must remain held until the stream gate is released"
+    );
+    drop(release_gate);
 
     let out_a = send_a.join().expect("join a");
     let out_b = send_b.join().expect("join b");
@@ -556,6 +752,15 @@ fn pause_cancels_only_target_session() {
         !events_a.contains(&"generation_completed"),
         "paused session must not complete generation: {out_a:?}"
     );
+    assert_eq!(
+        events_a
+            .iter()
+            .copied()
+            .filter(|event| matches!(*event, "request_failed" | "generation_completed"))
+            .collect::<Vec<_>>(),
+        vec!["request_failed"],
+        "paused session must have exactly one failed terminal event: {out_a:?}"
+    );
 
     let events_b: Vec<&str> = out_b
         .iter()
@@ -565,6 +770,15 @@ fn pause_cancels_only_target_session() {
     assert!(
         events_b.contains(&"generation_completed"),
         "untargeted session must complete: {out_b:?}"
+    );
+    assert_eq!(
+        events_b
+            .iter()
+            .copied()
+            .filter(|event| matches!(*event, "request_failed" | "generation_completed"))
+            .collect::<Vec<_>>(),
+        vec!["generation_completed"],
+        "untargeted session must have exactly one successful terminal event: {out_b:?}"
     );
     assert_eq!(out_b.last().expect("b final")["result"]["ok"], true);
 }
@@ -591,7 +805,10 @@ impl Write for FailNotifyWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         let text = std::str::from_utf8(data).unwrap_or("");
         if text.contains("session.event") {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "notify write failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "notify write failed",
+            ));
         }
         self.buf.extend_from_slice(data);
         Ok(data.len())
@@ -649,9 +866,10 @@ fn notify_write_failure_surfaces_engine_failed() {
     }))
     .expect("send req");
     let mut fail_writer = FailNotifyWriter { buf: Vec::new() };
-    service.handle(send, &mut fail_writer).expect("handle returns error response");
-    let response: Value =
-        serde_json::from_slice(&fail_writer.buf).expect("error response json");
+    service
+        .handle(send, &mut fail_writer)
+        .expect("handle returns error response");
+    let response: Value = serde_json::from_slice(&fail_writer.buf).expect("error response json");
     assert_eq!(
         response["error"]["data"]["kind"],
         ErrorKind::EngineFailed.as_str(),

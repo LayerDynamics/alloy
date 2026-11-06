@@ -3,6 +3,11 @@ import { formatRpcError, type JsonRpcError } from "./render.js";
 
 const API_VERSION = 1;
 
+export type RpcConnectionOptions = {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
 export type SessionEvent = {
   session_id: string;
   event: string;
@@ -36,17 +41,49 @@ export class RpcClient {
     });
   }
 
-  static connect(socketPath: string): Promise<RpcClient> {
+  static connect(socketPath: string, options: RpcConnectionOptions = {}): Promise<RpcClient> {
     return new Promise((resolve, reject) => {
+      if (options.signal?.aborted) {
+        reject(new Error("RPC connection cancelled"));
+        return;
+      }
+      if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) {
+        reject(new Error("RPC connection timeout must be positive"));
+        return;
+      }
       const socket = net.createConnection({ path: socketPath });
-      const onError = (error: Error) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        socket.off("error", onError);
+        socket.off("connect", onConnect);
+        socket.off("close", onClose);
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      const onError = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy();
         reject(error);
       };
-      socket.once("error", onError);
-      socket.once("connect", () => {
-        socket.off("error", onError);
+      const onAbort = (): void => { onError(new Error("RPC connection cancelled")); };
+      const onClose = (): void => { onError(new Error("socket closed before RPC connection was established")); };
+      const onConnect = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve(new RpcClient(socket));
-      });
+      };
+      socket.once("error", onError);
+      socket.once("connect", onConnect);
+      socket.once("close", onClose);
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options.timeoutMs !== undefined) {
+        timer = setTimeout(() => { onError(new Error(`RPC connection timed out after ${options.timeoutMs} ms`)); }, options.timeoutMs);
+      }
+      if (options.signal?.aborted) onAbort();
     });
   }
 
@@ -134,7 +171,11 @@ export class RpcClient {
   #handleLine(raw: string): void {
     let msg: Record<string, unknown>;
     try {
-      msg = JSON.parse(raw) as Record<string, unknown>;
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("malformed JSON-RPC line: expected an object");
+      }
+      msg = parsed as Record<string, unknown>;
     } catch (error) {
       this.#failAll(
         error instanceof Error

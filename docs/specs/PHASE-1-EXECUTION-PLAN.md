@@ -44,11 +44,23 @@ admission budget.
   real single-session prefix cache lands in Phase 3 with its tests.
 - Telemetry client (FR-35): in-memory anonymous-count collection, HTTPS/TLS
   flush, offline drop, failure-isolated, plus the initial event schema.
+- Read-only `alloy monitor`: live system-wide CPU, unified RAM, swap and
+  supported Apple GPU/Neural Engine measurements alongside the daemon's
+  live memory ledger, pressure and execution state. This user-requested
+  observability slice is specified in `docs/designs/live-monitor.md`.
+- User-requested first-run workflow for the existing Qwen3 starter profile:
+  standalone `alloy setup`, explicit pinned-model provisioning, foreground
+  `alloy start`, and read-only startup-readiness `alloy doctor`. The source
+  checkout builds its current daemon and validates API readiness. This narrow
+  bootstrap is specified in `docs/designs/startup.md`; it does not implement
+  the general model registry, release-binary distribution, or the full Phase-5
+  environment/wired-limit doctor report.
 
 ## Explicitly out of scope (do not build)
 
 Tool registry, policy engine, MCP client, skills, plugins, compaction,
-prefix-cache reuse logic, additional families, oMLX adapter, TUI, the TS SDK
+prefix-cache reuse logic, additional families, oMLX adapter, general-purpose
+TUI beyond the read-only live monitor, the TS SDK
 as a published package (the CLI's internal client library is the seed for
 it), the conversion CLI.
 
@@ -95,7 +107,9 @@ B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_ver
   notifications then a final response), session.pause (cancels in-flight
   generation first), session.resume (paused→active only), sessions.resume
   (historical reload after store/daemon reopen), daemon.status (sessions_active
-  from store; models_resident/memory_reserved from boot).
+  from store; models_resident/memory_reserved from boot), daemon.metrics
+  (live ledger/execution and explicitly aged native residency/pressure
+  snapshots; see `docs/designs/live-monitor.md`).
   Production `alloyd` requires `--artifact` for local corpus profile
   `qwen3-4b-4bit`; protocol tests use FixtureEngine only.
   Stream notify shape: {"jsonrpc":"2.0","method":"session.event",
@@ -107,8 +121,10 @@ B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_ver
   Informal plan prose that said sessions.* meant the B.6 session.* surface;
   wire names follow Appendix B.6 verbatim.
 ts/cli/ TypeScript CLI, Node 26.13.0 pin from DR-0001
-src/{main.ts,chat.ts,rpc-client.ts,args.ts,render.ts,settings.ts,setup.ts,daemon.ts}
-test/{args,render,settings}.test.ts
+src/{main.ts,chat.ts,rpc-client.ts,args.ts,render.ts,settings.ts,setup.ts,model.ts,daemon.ts,doctor.ts}
+src/{host-metrics.ts,powermetrics.ts,monitor.ts,monitor-types.ts,monitor-render.ts,monitor-history.ts}
+models/starter-model.json (same frozen Qwen3 identity as bench/corpus/models.json)
+test/{args,render,settings,settings-paths,setup,model,daemon,doctor,main,monitor,monitor-history,monitor-publication,host-metrics,powermetrics,rpc-client,rpc-client-malformed}.test.ts
 scripts/{qwen3_end_to_end_stream,session_restart_real_model}.sh
 package.json / bin/alloy.js
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document

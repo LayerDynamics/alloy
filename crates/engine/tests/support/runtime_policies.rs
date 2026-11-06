@@ -1329,6 +1329,10 @@ fn pool_per_model_ttl_respects_pins_and_releases_committed_weights() {
 
     successful(&environment.run("pool-ttl-b", profile_b(), "hello"));
     let b = pool_instance(&environment, &artifact_b());
+    // Keep the monitor's metadata alive through both evictions. It must not
+    // acquire a model pin, session lease, or reservation of its own.
+    let monitored = environment.runtime.residency_snapshot();
+    assert_eq!(monitored.models.len(), 2);
 
     assert!(
         block_on(
@@ -1370,6 +1374,11 @@ fn pool_per_model_ttl_respects_pins_and_releases_committed_weights() {
             .is_empty(),
     );
     environment.assert_empty();
+    assert_eq!(
+        monitored.models.len(),
+        2,
+        "cached metadata remains non-owning"
+    );
 }
 
 #[test]

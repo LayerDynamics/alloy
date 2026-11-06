@@ -11,7 +11,7 @@
     "alloy": "./bin/alloy.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-native.mjs",
     "test": "npm run build && node --test dist/test/*.test.js",
     "start": "npm run build && node bin/alloy.js"
   },

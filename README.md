@@ -29,13 +29,13 @@ Qwen3. See `docs/specs/PHASE-1-EXECUTION-PLAN.md`.
 | Engine core | `crates/engine/` | Admission, scheduler, FamilyRuntime, Qwen backend |
 | Harness core | `crates/harness-core/` | Supervisor, SQLite store, telemetry client |
 | Daemon | `crates/alloyd/` | UDS NDJSON JSON-RPC B.6 Phase-1 subset |
-| CLI | `ts/cli/` | `alloy` / `alloy chat`; Node `26.13.0` |
+| CLI | `ts/cli/` | Guided `start`, standalone `setup`, readiness `doctor`, chat and monitor; Node `26.13.0` |
 | Corpus | `bench/corpus/` | Frozen models/scenarios; telemetry schema in `docs/events/` |
 
-Open pull requests (as of 2026-11-05):
-
-- [#18](https://github.com/LayerDynamics/alloy/pull/18) — W6 `ts/cli`
-- [#19](https://github.com/LayerDynamics/alloy/pull/19) — oMLX-method memory parity (live guard, Affine4-resident weights, prefill admit). Design: `docs/designs/omlx-memory-method-parity.md` (on that branch).
+Merged foundations include the W6 CLI (#18), memory parity (#19), and M9
+residency/emergency cancellation with unified CPU/GPU validation (#22).
+M9 still requires the representative two-large-model constrained-budget
+acceptance in `docs/designs/omlx-memory-method-parity.md`.
 
 Mac E2E tests 13–14 (real Qwen3-4B-4bit stream / session restart) are not
 green yet; they need the memory-parity stack and a local artifact.
@@ -56,16 +56,70 @@ green yet; they need the memory-parity stack and a local artifact.
 | `bench/corpus/` | Frozen benchmark corpus |
 | `docs/` | Specs, designs, decision records |
 
-## Building
+## First run from a checkout
 
-Requires a pinned Rust toolchain (`rust-toolchain.toml`), CMake ≥ 3.16, and
-a C++20 compiler. The first build compiles MLX from vendored sources and is
-slow; later builds are incremental.
+Requires Node `26.13.0`, the pinned Rust toolchain (`rust-toolchain.toml`),
+CMake ≥ 3.16, and a C++20 compiler. From the repository root:
 
 ```bash
-cargo build -p alloyd
-cd ts/cli && npm ci && npm run build
+npm --prefix ts/cli ci
+npm --prefix ts/cli run build
+node ts/cli/bin/alloy.js start
 ```
+
+`start` checks for a compatible running daemon first. When a new daemon is
+needed, it checks that a launch command is available, verifies the configured
+model or looks in the known local artifact locations, and guides setup if no
+valid model is found. Enter a local directory, `download`, or `cancel` at the
+prompt. Downloading requires an explicit choice and uses the frozen
+Qwen3-4B-4bit revision and file hashes. Existing model directories are never
+overwritten. Noninteractive invocations require a valid existing model or an
+explicit `--download`; they do not wait for input.
+
+After verification, settings are saved atomically in `~/.alloy/settings.json`.
+In a source checkout, `start` builds the current daemon with Cargo, then runs
+the executable Cargo reports, including with a custom `CARGO_TARGET_DIR`.
+The first build compiles vendored MLX; later builds are incremental. An explicit
+`--alloyd-bin /path/to/alloyd` selects a prebuilt daemon instead.
+Development builds optimize the SHA-256 dependency used for model integrity
+checks, and Apple Silicon enables its ARM SHA backend. Model verification
+still checks every expected digest.
+
+Wait for **`READY — Alloy API 1`**, then keep that terminal open. In another
+terminal, from the repository root:
+
+```bash
+node ts/cli/bin/alloy.js monitor
+# Or connect a chat client:
+node ts/cli/bin/alloy.js chat
+```
+
+Ctrl+C in the `start` terminal stops its owned daemon. An already-running
+compatible daemon is reused without changing or stopping it. API readiness
+confirms the listener and protocol; real model loading and generation still
+need to succeed on the first chat request. Native Apple-Silicon builds keep
+their existing shared CPU/Metal default; no `--metal` flag is required.
+Run one `start` command for the selected socket and wait for `READY` before
+connecting clients. Chat uses a text prompt; `monitor` opens the dashboard.
+Chat reports when it is still waiting for the first response and displays
+runtime warnings on stderr; one-shot stdout remains model text.
+
+These commands handle configuration and diagnostics independently:
+
+```bash
+node ts/cli/bin/alloy.js setup --artifact /path/to/qwen3-4b-4bit
+node ts/cli/bin/alloy.js setup --download
+node ts/cli/bin/alloy.js doctor
+node ts/cli/bin/alloy.js doctor --json
+```
+
+Choose the setup command for your source: a local artifact or an explicit
+download. `setup` (also `--setup`) verifies and saves configuration, then exits;
+it does not open chat. `doctor` is read-only and reports configuration, model
+preflight, daemon API and launch readiness with a next action. It does not
+hash all weights, build the daemon, or prove generation. See
+[the startup contract](docs/designs/startup.md) for discovery paths, failure
+handling and validation limits.
 
 ### Local pre-push checks
 
@@ -98,18 +152,78 @@ Run the same checks without pushing:
 bash scripts/hooks/pre-push </dev/null
 ```
 
-Daemon (production profile, local artifact directory):
+### Live system and Alloy monitor
+
+After building the CLI, open a separate terminal while `start` is running.
+From the repository root:
 
 ```bash
-alloyd --artifact /path/to/qwen3-4b-4bit --profile qwen3-4b-4bit
+node ts/cli/bin/alloy.js monitor
 ```
 
-CLI (connects to an already-running daemon; does not spawn it):
+The monitor has a colored, responsive TUI with separate system, accelerator
+and Alloy runtime panels. Usage bars and up to 60 recent samples show CPU,
+GPU, unified RAM and reservation trends; the larger view also graphs ANE
+power. Admission pauses, emergency pressure and cancellation awaiting cleanup
+have explicit labels. A wider terminal (around 120 columns) places system and
+hardware panels side by side; an 80×24 terminal keeps the core readings visible.
+`NO_COLOR=1` disables color. Small terminals retain usage bars and history in
+a compact view; very short windows prioritize pressure, pending cleanup and
+source freshness. Full panels need at least 60 columns and 22 terminal rows.
+`TERM=dumb` prints one plain snapshot.
+
+On Apple Silicon, the default monitor reads GPU utilization, CPU/GPU/ANE
+power estimates, frequency states and thermal pressure as the current user.
+All hardware sampling is unprivileged and enabled by default. The CLI build
+compiles its bundled native sampler with the installed Xcode Command Line
+Tools; monitoring never builds or installs a helper at runtime. GPU utilization
+and native power samples keep independent status and timestamps.
+
+The runtime panel shows the live admission budget, reserved memory, pressure,
+request and cached model-residency metadata. The monitor stays usable when
+`alloyd` is unavailable and shows the next setup/start or connection-repair
+step. It periodically reloads saved configuration while disconnected, so it
+can follow setup in another terminal; an explicit `--socket` remains fixed.
+An older daemon without `daemon.metrics` must be stopped and restarted with
+the current build. Monitoring itself never starts a daemon or downloads a model.
+
+The monitor never invokes `sudo` or Apple's `powermetrics` command, installs
+a privileged service, or requests authorization. The old `--powermetrics`
+flag remains a compatibility alias for the same default native collector.
+ANE power is an estimated component reading in watts/milliwatts, distinct
+from ANE utilization or evidence that Alloy executes on ANE. Frequency
+readings are averages of reported frequency states; they are not a direct
+measurement of throttled hardware clocks. Unsupported counters remain
+explicitly unavailable with their source diagnostics.
+
+Press `q` or Ctrl+C to exit. Use `--interval 2000` for a two-second refresh
+or `--socket /path/to/alloyd.sock` for another daemon socket. Capture one
+snapshot, or record a stream of JSON snapshots for comparison:
 
 ```bash
-cd ts/cli && node bin/alloy.js -m "hello"
-# or interactive: node bin/alloy.js
+node ts/cli/bin/alloy.js monitor --once --json
+node ts/cli/bin/alloy.js monitor --json > /tmp/alloy-monitor.ndjson
 ```
 
-On the memory-parity branch, `alloyd` also accepts `--memory-guard
+Missing measurements are `null`, distinct from zero; stale readings carry
+their age and errors. CPU/GPU share one physical memory capacity. Non-free
+system RAM includes reclaimable pages and is not an app-memory total.
+The monitor keeps these samples local. See
+[`docs/designs/live-monitor.md`](docs/designs/live-monitor.md) for the sources,
+units and validation contract. CLI tests run automatically on repository
+pushes and pull requests; the Mac lane also runs them on the native host.
+
+For direct native-daemon development, the existing manual path remains:
+
+```bash
+cargo run --locked -p alloyd -- --artifact /path/to/qwen3-4b-4bit --profile qwen3-4b-4bit --corpus-models bench/corpus/models.json
+```
+
+One-shot chat connects to an already-running daemon:
+
+```bash
+node ts/cli/bin/alloy.js -m "hello"
+```
+
+`alloyd` also accepts `--memory-guard
 {safe|balanced|aggressive|custom}` (default `balanced`).

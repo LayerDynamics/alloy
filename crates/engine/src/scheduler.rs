@@ -43,6 +43,15 @@ pub enum RequestState {
     Finished,
 }
 
+/// One read-only observation of the execution slot under its scheduler lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulerSnapshot {
+    /// Current slot owner, including startup or cancellation awaiting cleanup.
+    pub active_request_id: Option<RequestId>,
+    /// Whether that exact owner has accepted a cancellation request.
+    pub cancellation_requested: bool,
+}
+
 /// Actual result supplied by the generation worker after execution stops.
 ///
 /// The scheduler converts this into one terminal GenerationEvent and
@@ -347,6 +356,24 @@ impl Scheduler {
             .active
             .as_ref()
             .map(|active| active.request_id.clone()))
+    }
+
+    /// Read owner and cancellation state together without entering the worker.
+    ///
+    /// A replacement request cannot be paired with its predecessor's state.
+    /// This observation does not acquire or release execution ownership.
+    pub fn snapshot(&self) -> Result<SchedulerSnapshot, EngineError> {
+        let state = self.shared.lock_state()?;
+        Ok(SchedulerSnapshot {
+            active_request_id: state
+                .active
+                .as_ref()
+                .map(|active| active.request_id.clone()),
+            cancellation_requested: state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.phase == ActivePhase::CancellationRequested),
+        })
     }
 
     /// Capture the exact current execution attempt for a delayed decision.

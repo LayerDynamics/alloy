@@ -35,14 +35,57 @@ test("parseArgv --setup and --socket", () => {
     "--setup",
     "--socket",
     "/tmp/x.sock",
-    "--resume",
-    "sess-9",
   ]);
   assert.equal(args.forceSetup, true);
   assert.equal(args.socket, "/tmp/x.sock");
-  assert.equal(args.resume, "sess-9");
+  assert.equal(args.command, "setup");
 });
 
 test("parseArgv rejects unknown argument", () => {
-  assert.throws(() => parseArgv(["node", "alloy", "doctor"]), /unknown argument/);
+  assert.throws(() => parseArgv(["node", "alloy", "unknown-command"]), /unknown argument/);
+});
+
+test("startup commands keep provisioning explicit and read-only commands reject it", () => {
+  const setup = parseArgv(["node", "alloy", "setup", "--download", "--artifact", "/models/qwen", "--corpus-models", "/pins.json"]);
+  assert.equal(setup.command, "setup");
+  assert.equal(setup.download, true);
+  assert.equal(setup.artifact, "/models/qwen");
+  assert.equal(setup.corpusModels, "/pins.json");
+  assert.equal(parseArgv(["node", "alloy", "start"]).command, "start");
+  assert.equal(parseArgv(["node", "alloy", "doctor", "--json"]).json, true);
+  for (const command of ["chat", "doctor", "monitor"]) {
+    assert.throws(() => parseArgv(["node", "alloy", command, "--download"]));
+  }
+  for (const command of ["setup", "start", "doctor"]) {
+    assert.throws(() => parseArgv(["node", "alloy", command, "-m", "hello"]), /chat messages/);
+  }
+});
+
+test("monitor flags select a read-only one-shot JSON capture", () => {
+  const args = parseArgv(["node", "alloy", "monitor", "--once", "--json", "--powermetrics", "--socket", "/tmp/monitor.sock", "--interval", "500"]);
+  assert.equal(args.command, "monitor");
+  assert.equal(args.once, true);
+  assert.equal(args.json, true);
+  assert.equal(args.powermetrics, true);
+  assert.equal(args.intervalMs, 500);
+  assert.equal(args.socket, "/tmp/monitor.sock");
+});
+
+test("monitor defaults and interval bounds are explicit", () => {
+  const args = parseArgv(["node", "alloy", "monitor"]);
+  assert.equal(args.intervalMs, 1000);
+  assert.equal(args.once, false);
+  assert.equal(args.json, false);
+  assert.equal(args.powermetrics, false);
+  assert.equal(parseArgv(["node", "alloy", "monitor", "--interval", "60000"]).intervalMs, 60000);
+  for (const value of ["499", "60001", "-1", "1.5", "1e3", "NaN", ""]) {
+    assert.throws(() => parseArgv(["node", "alloy", "monitor", "--interval", value]), /500 to 60000/);
+  }
+});
+
+test("monitor rejects chat/setup mutations and chat rejects monitor flags", () => {
+  for (const options of [["--setup"], ["-m", "hello"], ["--resume", "session"], ["--artifact", "model"]]) {
+    assert.throws(() => parseArgv(["node", "alloy", "monitor", ...options]), /chat\/setup options do not apply/);
+  }
+  assert.throws(() => parseArgv(["node", "alloy", "--json"]), /only valid with alloy monitor/);
 });

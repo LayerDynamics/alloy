@@ -1,2 +1,3 @@
 #!/usr/bin/env node
-import "../dist/src/main.js";
+import { main } from "../dist/src/main.js";
+await main();

@@ -279,6 +279,32 @@ pub struct ModelResidencyInfo {
     pub pinned: bool,
 }
 
+/// Non-owning metadata copied from one resident at a native-worker boundary.
+#[derive(Clone, Debug)]
+pub struct ResidentModelSnapshot {
+    /// Loaded artifact identity; this string does not retain its native model.
+    pub artifact: ArtifactId,
+    /// Weight bytes still owned by the resident's admission reservation.
+    pub weights_reserved_bytes: u64,
+    /// KV reservation bytes, not measured process or GPU memory.
+    pub kv_reserved_bytes: u64,
+    /// Whether an explicit model pin was alive when this metadata was copied.
+    pub pinned: bool,
+    /// Whether a canonical session lease protected this resident at publication.
+    pub leased: bool,
+}
+
+/// Last published native residency metadata, available while native work is busy.
+#[derive(Clone, Debug)]
+pub struct ResidencySnapshot {
+    /// Whether the native worker was alive when its metadata was published.
+    pub worker_alive: bool,
+    /// Monotonic time since the worker last published this metadata.
+    pub sample_age: Duration,
+    /// Independently owned residents, with no native objects or ownership handles.
+    pub models: Vec<ResidentModelSnapshot>,
+}
+
 /// Result of a bounded live-pressure model-reclamation attempt.
 #[derive(Clone, Debug)]
 pub enum IdleModelReclaim {
@@ -595,6 +621,19 @@ impl FamilyRuntime {
     /// Inspect the ledger without acquiring a reservation.
     pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
         self.admission.snapshot()
+    }
+
+    /// Read the latest published residents without queuing a native command.
+    ///
+    /// Long native operations leave this metadata unchanged. Its age is
+    /// explicit, and reading it acquires no pins, leases, or reservations.
+    pub fn residency_snapshot(&self) -> ResidencySnapshot {
+        let summary = lock_metadata(&self.worker.summary);
+        ResidencySnapshot {
+            worker_alive: summary.alive,
+            sample_age: summary.published_at.elapsed(),
+            models: summary.resident_models.clone(),
+        }
     }
 
     /// Clone of the shared admission controller (pause / resize from the enforcer).
@@ -1580,6 +1619,8 @@ impl Drop for NativeSession {
 
 #[derive(Clone)]
 struct Summary {
+    published_at: Instant,
+    resident_models: Vec<ResidentModelSnapshot>,
     pool_enabled: bool,
     alive: bool,
     active: bool,
@@ -1598,6 +1639,8 @@ struct Summary {
 impl Summary {
     fn empty(alive: bool) -> Self {
         Self {
+            published_at: Instant::now(),
+            resident_models: Vec::new(),
             pool_enabled: false,
             alive,
             active: false,
@@ -3821,6 +3864,27 @@ impl NativeState {
 
     fn publish(&self) {
         let mut summary = Summary::empty(true);
+        let metadata = |resident: &Resident, leased| ResidentModelSnapshot {
+            artifact: resident.model.artifact_id().clone(),
+            weights_reserved_bytes: resident.weights.bytes(),
+            kv_reserved_bytes: resident
+                .cache
+                .as_ref()
+                .map_or(0, |cache| cache.reservation.bytes()),
+            pinned: resident.pins.is_pinned(),
+            leased,
+        };
+        summary.resident_models = self
+            .pool
+            .iter()
+            .chain(self.resident.iter())
+            .map(|resident| metadata(resident, false))
+            .chain(
+                self.states
+                    .values()
+                    .map(|entry| metadata(&entry.resident, entry.is_leased())),
+            )
+            .collect();
         summary.pool_enabled = self.pool_enabled;
         summary.active = self.active.is_some() || self.pending.is_some();
         summary.model_pin = self

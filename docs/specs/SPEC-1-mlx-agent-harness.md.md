@@ -413,6 +413,7 @@ alloy skills list | show
 alloy mcp add | list
 alloy automation add | list | pause
 alloy stats
+alloy monitor [--powermetrics] [--interval 1000] [--once] [--json]
 ```
 
 **Compaction summarizer (design contract):**
@@ -489,6 +490,12 @@ alloy stats
 
 ### 3.9 Observability
 
+- `alloy monitor`: a read-only local terminal view of system-wide CPU,
+  unified memory and swap, supported Apple GPU/Neural Engine activity and
+  estimated power, and Alloy's live admission ledger, pressure and request
+  ownership. Missing counters and stale snapshots are explicit. System-wide
+  ANE activity does not imply Alloy executes on ANE. The bounded Phase-1
+  implementation and capture contract are in `docs/designs/live-monitor.md`.
 - Structured logging (tracing crate) with per-session correlation IDs.
 - Metrics: tokens/s, TTFT, cache hit rate, admission rejections, tool latencies, memory reservations vs. actuals (reconciled after load). The telemetry client (FR-35) reports these same dimensions in aggregate as anonymous counts, per the published event schema.
 - `alloy doctor`: environment report (chip, RAM, wired-limit, mlx-c/MLX versions from PINS, disk) for issue triage.
@@ -497,6 +504,7 @@ alloy stats
 ### 3.10 Infrastructure & Deployment
 
 - **Distribution:** Homebrew tap (primary) and GitHub Releases shipping the Rust daemon binary (MLX Metal kernels dominate size, ~150 MB budget); the TypeScript CLI/TUI ships as an npm package (with the TS SDK) that detects an existing daemon or bootstraps one by downloading the release binary from GitHub Releases with checksum verification (CLI/daemon compatibility per the B.6 `api_version` policy); `cargo install` from source for contributors. The optional conversion CLI is a separate download via uv (`uvx alloy-convert`) for those who need raw-checkpoint conversion. oMLX optional via its own tap.
+  - **Current source-checkout bootstrap:** the user-requested Phase-1 `alloy start` flow verifies/configures the pinned Qwen3 starter, builds the current daemon or selects an explicit installed binary, and confirms API readiness while supervising the foreground process. `alloy setup` is standalone; `alloy doctor` currently reports startup readiness only. This implementation does not complete release-binary bootstrap, the general model registry, the full Phase-5 environment/wired-limit report, or native generation/M9 acceptance. See `docs/designs/startup.md`.
 - **Environments:** dev (local Mac), CI (Linux: unit + protocol tests; self-hosted Mac runner: integration + model conformance + benchmarks).
 - **CI/CD:** GitHub Actions; Linux and self-hosted Apple-Silicon lanes run automatically on every repository branch/tag push and same-repository PR. Linux exercises portable logic and real CPU-backend MLX; the Mac lane exercises the unified CPU/GPU production path and shared-memory tests. Fork PRs run hosted Linux checks without executing on the persistent Mac runner. Manual dispatch remains available for reruns. Artifacts (benchmark tables, validation reports) are attached to releases.
 - **Rollback:** versioned artifacts and pinned dependency sets make any release reproducible; sessions are forward-compatible via event-log versioning.
@@ -867,6 +875,8 @@ skills.list → [{ name, description, source }] | skills.show { name } → SKILL
 mcp.add { name, transport, command | url } | mcp.list → [{ name, status, tool_count }]
 automation.add { name, trigger, scope, profile } | automation.list | automation.pause { job_id }
 daemon.status → { models_resident, memory_reserved, sessions_active }
+daemon.metrics → { schema_version: 1, process_id, sampled_at_unix_ms,
+                   admission, execution, residency, memory_guard }
 daemon.doctor → { chip, ram_bytes, wired_limit, mlx_version, pins_hash }
 daemon.stats { window } → { session_count, task_mix }   // backs `alloy stats` (§6.1)
 

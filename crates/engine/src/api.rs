@@ -275,6 +275,13 @@ impl<R: EngineRuntime> EngineCore<R> {
         self.scheduler.active_request_id()
     }
 
+    /// Observe the execution owner and its cancellation state atomically.
+    ///
+    /// This read never enters the native worker's command queue.
+    pub fn execution_snapshot(&self) -> Result<crate::scheduler::SchedulerSnapshot, EngineError> {
+        self.scheduler.snapshot()
+    }
+
     /// Snapshot the current execution for a delayed cancellation decision.
     ///
     /// Capture before observing the condition that may require interruption.
