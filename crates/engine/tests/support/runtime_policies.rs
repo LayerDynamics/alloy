@@ -19,6 +19,7 @@ use super::*;
 use engine::{
     admission::AdmissionSnapshot,
     backends::Qwen3Execution,
+    error::{MemoryLimitReason, ProtectedResource},
     pressure::{PressureOptions, PressurePolicy},
     types::CacheRepresentationId,
 };
@@ -1390,7 +1391,7 @@ fn pool_pinned_a_rejects_tight_switch_without_destroying_a() {
         Err(error) => assert!(
             matches!(
                 error,
-                EngineError::MemoryLimitExceeded { .. } | EngineError::Busy { .. }
+                EngineError::MemoryLimitExceeded { .. } | EngineError::ProtectedResources { .. }
             ),
             "unexpected startup error: {error:?}",
         ),
@@ -1406,7 +1407,8 @@ fn pool_pinned_a_rejects_tight_switch_without_destroying_a() {
                         assert!(
                             matches!(
                                 error,
-                                EngineError::MemoryLimitExceeded { .. } | EngineError::Busy { .. }
+                                EngineError::MemoryLimitExceeded { .. }
+                                    | EngineError::ProtectedResources { .. }
                             ),
                             "unexpected worker error: {error:?}",
                         );
@@ -1441,13 +1443,14 @@ fn pool_pinned_a_rejects_tight_switch_without_destroying_a() {
 }
 
 #[test]
-fn pool_startup_pressure_pinned_owner_returns_exact_protected_busy_then_unpin_loads_b() {
+fn pool_startup_pressure_reports_exact_pin_handles_then_unpin_loads_b() {
     let environment = PolicyEnvironment::new_pool_with_startup_pressure();
     successful(&environment.run("pressure-pin-a", profile_a(), "hello"));
     let original_a = pool_instance(&environment, &artifact_a());
     let pin = block_on(environment.runtime.pin_model(original_a.clone()))
         .unwrap()
         .expect("pin actual A instance");
+    let second_pin = pin.clone();
     let before = environment.snapshot();
     let b_startup = sum(&[
         environment.plan_b.output_bytes,
@@ -1479,20 +1482,26 @@ fn pool_startup_pressure_pinned_owner_returns_exact_protected_busy_then_unpin_lo
         "pressure policy must refuse protected ownership before B loads",
     );
     match error {
-        EngineError::Busy {
-            active_request_id,
-            message,
+        EngineError::ProtectedResources {
+            operation,
+            resources,
         } => {
-            assert!(
-                active_request_id.is_none(),
-                "this is not scheduler contention"
-            );
-            assert_eq!(
-                message,
-                "startup pressure policy rejected protected ownership: ProtectedResources",
-            );
+            assert_eq!(operation, "startup pressure reclamation");
+            assert_eq!(resources.len(), 1);
+            match &resources[0] {
+                ProtectedResource::ModelPin {
+                    artifact_id,
+                    instance_id,
+                    handles,
+                } => {
+                    assert_eq!(artifact_id, &artifact_a());
+                    assert!(instance_id.same_instance(&original_a));
+                    assert_eq!(handles.get(), 2);
+                }
+                other => panic!("expected A's explicit model pin, got {other:?}"),
+            }
         }
-        other => panic!("expected the precise protected-owner Busy rejection: {other:?}"),
+        other => panic!("expected typed pin protection, got {other:?}"),
     }
     environment.wait_idle();
     assert_eq!(
@@ -1519,6 +1528,27 @@ fn pool_startup_pressure_pinned_owner_returns_exact_protected_busy_then_unpin_lo
     );
 
     drop(pin);
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-pin-still-refused-b",
+            profile_b(),
+            "hello",
+        ))),
+        "a remaining pin must continue protecting A",
+    );
+    match error {
+        EngineError::ProtectedResources { resources, .. } => {
+            assert_eq!(resources.len(), 1);
+            assert!(
+                matches!(&resources[0], ProtectedResource::ModelPin { instance_id, handles, .. }
+                if instance_id.same_instance(&original_a) && handles.get() == 1)
+            );
+        }
+        other => panic!("remaining pin lost its typed protection: {other:?}"),
+    }
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), before);
+    drop(second_pin);
     successful(&environment.run("pressure-pin-recovery-b", profile_b(), "hello"));
     let events = environment.control.events();
     let events = &events[checkpoint..];
@@ -1573,10 +1603,17 @@ fn pool_startup_pressure_full_budget_grant_rejects_before_loading_then_release_r
     );
     match error {
         EngineError::MemoryLimitExceeded {
+            reason,
             required_bytes,
             available_bytes,
             ..
         } => {
+            assert_eq!(
+                reason,
+                MemoryLimitReason::ReservationBudget {
+                    budget_bytes: held.budget_bytes()
+                }
+            );
             assert!(required_bytes > 0 && required_bytes <= held.budget_bytes());
             assert_eq!(available_bytes, 0);
         }
@@ -1633,6 +1670,428 @@ fn pool_startup_pressure_full_budget_grant_rejects_before_loading_then_release_r
         resident[0].committed_weight_bytes
     );
     environment.drop_and_assert_unreserved();
+}
+
+#[test]
+fn pool_startup_pressure_reports_lease_and_pin_provenance_without_retaining_them() {
+    let environment = PolicyEnvironment::build_with_policy(
+        retained_policy(),
+        true,
+        true,
+        8,
+        Some(|_| {
+            PressurePolicy::new(PressureOptions {
+                allocator_ceiling_bytes: None,
+                allow_allocator_cache_clear: false,
+                allow_idle_state_release: true,
+                allow_idle_model_unload: true,
+                max_reclamation_actions: 5,
+            })
+            .unwrap()
+        }),
+    );
+    let (state_id, state) = instance_lease_publish(&environment, "pressure-lease-a", profile_a());
+    let first = block_on(environment.runtime.lease_session_state(state_id))
+        .unwrap()
+        .unwrap();
+    let second = block_on(environment.runtime.lease_session_state(state_id))
+        .unwrap()
+        .unwrap();
+    let pin = block_on(
+        environment
+            .runtime
+            .pin_model(state.model_instance_id.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-lease-refused-b",
+            profile_b(),
+            "hello",
+        ))),
+        "a leased-only publication must yield valid typed protection",
+    );
+    let EngineError::ProtectedResources { resources, .. } = &error else {
+        panic!("expected protection rather than an invalid observation: {error:?}");
+    };
+    assert_eq!(resources.len(), 2);
+    assert!(resources.iter().any(|resource| matches!(resource,
+        ProtectedResource::SessionStateLease { artifact_id, instance_id, state_id: blocked, handles }
+            if artifact_id == &artifact_a() && instance_id.same_instance(&state.model_instance_id)
+                && blocked == &state_id && handles.get() == 2)));
+    assert!(resources.iter().any(|resource| matches!(resource,
+        ProtectedResource::ModelPin { artifact_id, instance_id, handles }
+            if artifact_id == &artifact_a() && instance_id.same_instance(&state.model_instance_id)
+                && handles.get() == 1)));
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), before);
+    instance_lease_assert_unchanged(&environment, &state);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+
+    drop(pin);
+    drop(first);
+    let last_lease_error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-last-lease-refused-b",
+            profile_b(),
+            "hello",
+        ))),
+        "the last lease still owns protection",
+    );
+    assert!(matches!(&last_lease_error,
+        EngineError::ProtectedResources { resources, .. }
+        if resources.len() == 1 && matches!(&resources[0],
+            ProtectedResource::SessionStateLease { state_id: blocked, handles, .. }
+            if blocked == &state_id && handles.get() == 1)));
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), before);
+    instance_lease_assert_unchanged(&environment, &state);
+
+    // Keep both diagnostic errors alive: neither error may acquire a real
+    // pin or lease and thereby prevent recovery after the caller drops it.
+    drop(second);
+    successful(&environment.run("pressure-lease-recovery-b", profile_b(), "hello"));
+    let events = environment.control.events();
+    let events = &events[checkpoint..];
+    assert!(
+        event_index(events, "model-destroyed", &artifact_a())
+            < event_index(events, "load-entered", &artifact_b())
+    );
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+    assert!(
+        block_on(environment.runtime.lookup_session_state(state_id))
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(error, EngineError::ProtectedResources { .. }));
+    assert!(matches!(
+        last_lease_error,
+        EngineError::ProtectedResources { .. }
+    ));
+    environment.drop_and_assert_unreserved();
+}
+
+#[test]
+fn pool_startup_native_demand_over_ceiling_reports_native_numbers_before_loading() {
+    let environment = PolicyEnvironment::build_with_policy(
+        retained_policy(),
+        false,
+        true,
+        8,
+        Some(|_| {
+            PressurePolicy::new(PressureOptions {
+                allocator_ceiling_bytes: Some(1),
+                allow_allocator_cache_clear: true,
+                allow_idle_state_release: true,
+                allow_idle_model_unload: true,
+                max_reclamation_actions: 5,
+            })
+            .unwrap()
+        }),
+    );
+    let before = environment.snapshot();
+    assert!(pending_startup_reservation(&environment.plan_a) < before.available_bytes());
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-native-ceiling",
+            profile_a(),
+            "hello",
+        ))),
+        "native demand must be rejected before loading",
+    );
+    match error {
+        EngineError::MemoryLimitExceeded {
+            reason: MemoryLimitReason::AllocatorCeiling { ceiling_bytes },
+            required_bytes,
+            available_bytes,
+            ..
+        } => {
+            assert_eq!(ceiling_bytes, 1);
+            assert_eq!(available_bytes, ceiling_bytes);
+            assert!(required_bytes > available_bytes);
+            assert!(
+                required_bytes < before.available_bytes(),
+                "the ledger is not the binding constraint"
+            );
+        }
+        other => panic!("expected an explicit native-ceiling rejection: {other:?}"),
+    }
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), before);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 0);
+    environment.assert_empty();
+}
+
+#[test]
+fn pool_startup_pressure_reclaims_eligible_b_while_a_remains_leased() {
+    let environment = PolicyEnvironment::build_with_policy(
+        retained_policy(),
+        false,
+        true,
+        8,
+        Some(|_| {
+            PressurePolicy::new(PressureOptions {
+                allocator_ceiling_bytes: None,
+                allow_allocator_cache_clear: false,
+                allow_idle_state_release: true,
+                allow_idle_model_unload: true,
+                max_reclamation_actions: 5,
+            })
+            .unwrap()
+        }),
+    );
+    let (a_id, a) = instance_lease_publish(&environment, "pressure-independent-a", profile_a());
+    let lease = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let a_bytes = environment.snapshot().reserved_bytes();
+    successful(&environment.run("pressure-independent-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let c_startup = pending_startup_reservation(&environment.plan_c);
+    environment
+        .admission
+        .resize_budget(a_bytes + c_startup)
+        .unwrap();
+    let before = environment.snapshot();
+    assert!(
+        before.available_bytes() < c_startup,
+        "B must be reclaimed to admit C"
+    );
+    let checkpoint = environment.control.events().len();
+
+    successful(&environment.run("pressure-independent-c", profile_c(), "hello"));
+    instance_lease_assert_unchanged(&environment, &a);
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    assert!(
+        !residents
+            .iter()
+            .any(|resident| resident.instance.same_instance(&b))
+    );
+    assert_eq!(residents.len(), 2);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 3);
+    let events = environment.control.events();
+    let events = &events[checkpoint..];
+    assert!(
+        event_index(events, "model-destroyed", &artifact_b())
+            < event_index(events, "load-entered", &artifact_c())
+    );
+    assert!(events.iter().all(|event| event.artifact != artifact_a()
+        || !matches!(event.kind, "cache-destroyed" | "model-destroyed")));
+    drop(lease);
+    assert_eq!(
+        block_on(environment.engine.release_session_state(a_id)).unwrap(),
+        engine::types::ReleaseOutcome::Released
+    );
+    environment.drop_and_assert_unreserved();
+}
+
+#[test]
+fn pool_state_only_pressure_reports_the_lease_without_blaming_its_model_pin() {
+    let environment = PolicyEnvironment::build_with_policy(
+        retained_policy(),
+        true,
+        true,
+        8,
+        Some(|_| {
+            PressurePolicy::new(PressureOptions {
+                allocator_ceiling_bytes: None,
+                allow_allocator_cache_clear: false,
+                allow_idle_state_release: true,
+                allow_idle_model_unload: false,
+                max_reclamation_actions: 5,
+            })
+            .unwrap()
+        }),
+    );
+    let (state_id, state) =
+        instance_lease_publish(&environment, "state-only-pressure-a", profile_a());
+    let lease = block_on(environment.runtime.lease_session_state(state_id))
+        .unwrap()
+        .unwrap();
+    let pin = block_on(
+        environment
+            .runtime
+            .pin_model(state.model_instance_id.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    let before = environment.snapshot();
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "state-only-pressure-refused-b",
+            profile_b(),
+            "hello",
+        ))),
+        "the canonical lease blocks the permitted state-only action",
+    );
+    match error {
+        EngineError::ProtectedResources { resources, .. } => {
+            assert_eq!(
+                resources.len(),
+                1,
+                "whole-model eviction is disabled, so its pin is not a blocker"
+            );
+            assert!(
+                matches!(&resources[0], ProtectedResource::SessionStateLease {
+                artifact_id, instance_id, state_id: blocked, handles,
+            } if artifact_id == &artifact_a() && instance_id.same_instance(&state.model_instance_id)
+                && blocked == &state_id && handles.get() == 1)
+            );
+        }
+        other => panic!("state-only policy must retain exact lease provenance: {other:?}"),
+    }
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), before);
+    instance_lease_assert_unchanged(&environment, &state);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+    drop(lease);
+    drop(pin);
+    environment.drop_and_assert_unreserved();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn pool_startup_pressure_reclaims_pinned_pool_kv_under_native_pressure() {
+    // MLX allocator counters are process-wide. Isolate this required Metal
+    // regression from other concurrently executing native test fixtures.
+    const CHILD: &str = "ALLOY_PINNED_POOL_KV_PRESSURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_policies::pool_startup_pressure_reclaims_pinned_pool_kv_under_native_pressure",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated required Metal allocator regression");
+        assert!(
+            output.status.success(),
+            "isolated Metal allocator regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("pinned pooled KV reclaimed before Metal B load"),
+            "isolated regression did not execute its native acceptance assertions: {stdout}"
+        );
+        return;
+    }
+
+    let mut environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("native-pressure-pinned-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let pin = block_on(environment.runtime.pin_model(a.clone()))
+        .unwrap()
+        .unwrap();
+    let before = environment.snapshot();
+    let a_weights =
+        block_on(environment.runtime.model_residency()).unwrap()[0].committed_weight_bytes;
+    assert!(
+        before.reserved_bytes() > a_weights,
+        "A must retain actual KV/history alongside weights"
+    );
+    assert!(
+        before.available_bytes() > pending_startup_reservation(&environment.plan_b),
+        "this regression requires allocator-only pressure, not a ledger shortage"
+    );
+    block_on(environment.runtime.reclaim_mlx_allocator_cache()).unwrap();
+    let native = block_on(environment.runtime.mlx_memory_snapshot()).unwrap();
+    let active = u64::try_from(native.active_bytes).unwrap();
+    assert!(
+        active > 0,
+        "required Metal path must report real active native buffers"
+    );
+
+    // Qwen's cold native forecast consists of resident weights, the bounded
+    // KV allocation and execution workspace/headroom; host loading overlap
+    // and output queues remain outside this allocator domain.
+    let native_demand = sum(&[
+        environment.plan_b.load_limits.max_resident_bytes(),
+        environment.plan_b.cache.max_cache_bytes(),
+        environment.plan_b.temporary_bytes,
+        environment.plan_b.headroom_bytes,
+    ]);
+    let ceiling = active.checked_add(native_demand).unwrap() - 1;
+    assert!(
+        native_demand <= ceiling,
+        "B alone must fit after idle native KV is reclaimed"
+    );
+    let policy = PressurePolicy::new(PressureOptions {
+        allocator_ceiling_bytes: Some(ceiling),
+        allow_allocator_cache_clear: true,
+        allow_idle_state_release: true,
+        allow_idle_model_unload: false,
+        max_reclamation_actions: 5,
+    })
+    .unwrap();
+
+    // Rebuild only descriptive registry entries. Both runtime handles
+    // address the same native worker and the same pinned A allocation.
+    let mut registry = Registry::new();
+    for family in environment.engine.registry().families() {
+        registry.register_family(family.clone()).unwrap();
+    }
+    for artifact in environment.engine.registry().artifacts() {
+        registry
+            .register_artifact(artifact.id().clone(), artifact.directory())
+            .unwrap();
+    }
+    for profile in environment.engine.registry().profiles() {
+        registry.register_profile(profile.clone()).unwrap();
+    }
+    environment.runtime = environment.runtime.clone().with_pressure_policy(policy);
+    environment.engine = EngineCore::new(
+        registry,
+        environment.scheduler.clone(),
+        environment.runtime.clone(),
+    );
+    let checkpoint = environment.control.events().len();
+    successful(&environment.run("native-pressure-load-b", profile_b(), "hello"));
+
+    let events = environment.control.events();
+    let events = &events[checkpoint..];
+    let a_cache_drop = event_index(events, "cache-destroyed", &artifact_a());
+    let b_load = event_index(events, "load-entered", &artifact_b());
+    assert!(
+        a_cache_drop < b_load,
+        "pooled A's KV must be destroyed before B enters its loader"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.artifact != artifact_a() || event.kind != "model-destroyed"),
+        "KV-only pressure reclamation must preserve pinned A weights"
+    );
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    let retained_a = residents
+        .iter()
+        .find(|entry| entry.artifact == artifact_a())
+        .unwrap();
+    assert!(retained_a.instance.same_instance(&a));
+    assert!(retained_a.pinned);
+    assert_eq!(retained_a.committed_weight_bytes, a_weights);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+    let published = environment.runtime.residency_snapshot();
+    let a_snapshot = published
+        .models
+        .iter()
+        .find(|entry| entry.artifact == artifact_a())
+        .unwrap();
+    assert_eq!(a_snapshot.kv_reserved_bytes, 0);
+    assert_eq!(
+        events[b_load].snapshot.reserved_bytes(),
+        a_weights + pending_startup_reservation(&environment.plan_b)
+    );
+    drop(pin);
+    environment.drop_and_assert_unreserved();
+    println!("pinned pooled KV reclaimed before Metal B load");
 }
 
 #[test]
@@ -2060,6 +2519,19 @@ fn assert_b_destruction_after_prefill_return(events: &[PolicyEvent]) {
 fn pool_active_generation_survives_expiry_until_cleanup() {
     let (environment, generation, release, checkpoint, accounting) =
         pool_block_active_b("pool-active-normal");
+
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pool-active-contender",
+            profile_a(),
+            "hello",
+        ))),
+        "scheduler ownership must reject without waiting for blocked native work",
+    );
+    assert!(
+        matches!(error, EngineError::Busy { active_request_id: Some(id), .. }
+        if id == "pool-active-normal")
+    );
 
     // Submit a real allocator-reclamation request while the worker is
     // blocked. It cannot run concurrently with the native operation.
@@ -2499,7 +2971,10 @@ fn pool_pending_generate_drop_after_grant_releases_unconsumed_reply() {
         block_on(environment.runtime.reclaim_mlx_allocator_cache()),
         "pending startup must reject allocator reclamation",
     );
-    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert!(
+        matches!(error, EngineError::Busy { active_request_id: Some(id), .. }
+        if id == "drop-unconsumed-reply")
+    );
     assert_eq!(environment.snapshot().reserved_bytes(), expected);
     assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
     drop(startup);
@@ -3002,6 +3477,9 @@ fn pool_instance_leases_b_executes_and_publishes_while_a_is_leased() {
         .unwrap()
     );
     let (b_id, b) = instance_lease_publish(&environment, "scoped-publish-b", profile_b());
+    let b_lease = block_on(environment.runtime.lease_session_state(b_id))
+        .unwrap()
+        .unwrap();
     instance_lease_assert_unchanged(&environment, &a);
     assert_ne!(a_id, b_id);
     assert!(block_on(environment.engine.capabilities(artifact_a())).is_ok());
@@ -3022,8 +3500,25 @@ fn pool_instance_leases_b_executes_and_publishes_while_a_is_leased() {
         ))),
         "generation must not mutate leased A",
     );
-    assert_eq!(error.kind(), ErrorKind::Busy);
+    match error {
+        EngineError::ProtectedResources { resources, .. } => {
+            assert_eq!(
+                resources.len(),
+                1,
+                "unrelated B must not be reported as A's blocker"
+            );
+            assert!(
+                matches!(&resources[0], ProtectedResource::SessionStateLease {
+                artifact_id, instance_id, state_id, handles,
+            } if artifact_id == &artifact_a() && instance_id.same_instance(&a.model_instance_id)
+                && state_id == &a_id && handles.get() == 2)
+            );
+        }
+        other => panic!("expected target-specific canonical lease protection: {other:?}"),
+    }
     instance_lease_assert_unchanged(&environment, &a);
+    instance_lease_assert_unchanged(&environment, &b);
+    drop(b_lease);
     assert_eq!(
         block_on(environment.engine.release_session_state(b_id)).unwrap(),
         engine::types::ReleaseOutcome::Released

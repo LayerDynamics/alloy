@@ -16,7 +16,10 @@ use std::{
     any::Any,
     fmt,
     num::{NonZeroU64, NonZeroUsize},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Request identity and the scheduler's cancellation observation handle.
@@ -63,14 +66,34 @@ impl ExecutionControl {
 #[derive(Clone)]
 pub struct ModelInstanceId {
     identity: Arc<()>,
+    diagnostic_id: u64,
 }
+
+static NEXT_MODEL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl ModelInstanceId {
     /// Create an identity for one new loaded instance.
+    ///
+    /// # Panics
+    /// Panics if this process exhausts its u64 diagnostic identity space.
+    /// Identifiers never wrap or identify a replacement model as an old load.
     pub fn new() -> Self {
+        let diagnostic_id = NEXT_MODEL_INSTANCE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("model instance diagnostic identity space exhausted");
         Self {
             identity: Arc::new(()),
+            diagnostic_id,
         }
+    }
+
+    /// Stable identifier for diagnostics during this process's lifetime.
+    ///
+    /// Clones retain the same identifier; a replacement load receives a new
+    /// identifier even for the same artifact. This is not a pointer, a pin,
+    /// or an authorization token, and is not globally unique across restarts.
+    pub fn diagnostic_id(&self) -> u64 {
+        self.diagnostic_id
     }
 
     /// Whether both identities denote the same loaded instance.

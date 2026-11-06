@@ -6,8 +6,126 @@
 use std::{
     error::Error,
     fmt, io,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
+
+use crate::{
+    family::ModelInstanceId,
+    memory_guard::CeilingBreakdown,
+    types::{ArtifactId, SessionStateId},
+};
+
+/// The memory constraint responsible for a refusal.
+///
+/// This is captured at the origin. Handlers must not infer the constraint
+/// from the human-readable operation or assume every refusal is an OOM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryLimitReason {
+    /// The shared reservation ledger cannot grant the requested bytes.
+    /// Compare demand with the whole budget to distinguish an intrinsically
+    /// oversized request from capacity occupied by existing reservations.
+    ReservationBudget {
+        /// Complete ledger budget, not its currently available remainder.
+        budget_bytes: u64,
+    },
+    /// A fail-fast advisory estimate exceeds the reported available capacity.
+    /// The advisory interface does not provide the complete ledger budget.
+    AdvisoryEstimate,
+    /// Planned native allocations exceed the configured allocator ceiling.
+    AllocatorCeiling {
+        /// Applicable native-allocation ceiling at the observation.
+        ceiling_bytes: u64,
+    },
+    /// The enforcer paused admissions; byte availability may still suffice.
+    AdmissionsPaused,
+    /// A bounded loader, cache, output, or other buffer allowance was exceeded.
+    BufferLimit,
+    /// A fresh host observation rejected planned startup before native loading.
+    HostPreflight {
+        /// Artifact whose startup plan was rejected.
+        artifact_id: ArtifactId,
+        /// Complete observed ceiling breakdown, not measured model consumption.
+        ceiling: CeilingBreakdown,
+    },
+}
+
+impl MemoryLimitReason {
+    /// Stable diagnostic name, independent of display wording.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReservationBudget { .. } => "reservation_budget",
+            Self::AdvisoryEstimate => "advisory_estimate",
+            Self::AllocatorCeiling { .. } => "allocator_ceiling",
+            Self::AdmissionsPaused => "admissions_paused",
+            Self::BufferLimit => "buffer_limit",
+            Self::HostPreflight { .. } => "host_preflight",
+        }
+    }
+}
+
+/// One observed ownership guarantee blocking a particular operation.
+///
+/// These values contain diagnostic identities and counts only. They do not
+/// own model buffers, reservations, residency pins, or session-state leases.
+/// Counts are snapshots: a concurrent final handle drop may immediately make
+/// them stale. They never authorize release or eviction of any resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProtectedResource {
+    /// Explicit residency handles protect this exact model load.
+    ModelPin {
+        /// Human-recognizable artifact identity.
+        artifact_id: ArtifactId,
+        /// Exact loaded instance, distinct from a later load of that artifact.
+        instance_id: ModelInstanceId,
+        /// Positive number of pin handles observed without acquiring one.
+        handles: NonZeroUsize,
+    },
+    /// Live leases protect the addressed canonical state and its model owner.
+    SessionStateLease {
+        /// Human-recognizable artifact identity.
+        artifact_id: ArtifactId,
+        /// Exact model load owning the state.
+        instance_id: ModelInstanceId,
+        /// Exact canonical publication protected by the leases.
+        state_id: SessionStateId,
+        /// Positive number of lease handles observed without acquiring one.
+        handles: NonZeroUsize,
+    },
+}
+
+impl ProtectedResource {
+    /// Produce non-owning diagnostic data; never inspect the native worker.
+    pub fn diagnostic(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Self::ModelPin {
+                artifact_id,
+                instance_id,
+                handles,
+            } => json!({
+                "protection": "model_pin",
+                "artifact_id": artifact_id.as_str(),
+                "instance_id": format!("model-{}", instance_id.diagnostic_id()),
+                "handles": handles.get(),
+            }),
+            Self::SessionStateLease {
+                artifact_id,
+                instance_id,
+                state_id,
+                handles,
+            } => json!({
+                "protection": "session_state_lease",
+                "artifact_id": artifact_id.as_str(),
+                "instance_id": format!("model-{}", instance_id.diagnostic_id()),
+                "state_id": state_id.to_string(),
+                "handles": handles.get(),
+            }),
+        }
+    }
+}
 
 /// Machine-readable classification of an engine failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -19,11 +137,13 @@ pub enum ErrorKind {
     NotFound,
     /// The selected implementation does not support the requested behavior.
     Unsupported,
-    /// The requested operation conflicts with active work.
+    /// Active/pending execution or a scheduler slot prevents the operation.
     Busy,
+    /// Identified residency pins or state leases prevent the operation.
+    ProtectedResources,
     /// The request exceeds the validated model context limit.
     ContextLimitExceeded,
-    /// The request exceeds an applicable memory budget.
+    /// A typed memory constraint or admission pause prevents the request.
     MemoryLimitExceeded,
     /// A fallible allocation failed.
     AllocationFailed,
@@ -39,6 +159,28 @@ pub enum ErrorKind {
     ExecutionFailed,
     /// An internal invariant or arithmetic constraint failed.
     Internal,
+}
+
+impl ErrorKind {
+    /// Stable machine-readable diagnostic name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::NotFound => "not_found",
+            Self::Unsupported => "unsupported",
+            Self::Busy => "busy",
+            Self::ProtectedResources => "protected_resources",
+            Self::ContextLimitExceeded => "context_limit_exceeded",
+            Self::MemoryLimitExceeded => "memory_limit_exceeded",
+            Self::AllocationFailed => "allocation_failed",
+            Self::ArtifactValidationFailed => "artifact_validation_failed",
+            Self::CheckpointIo => "checkpoint_io",
+            Self::CheckpointFormat => "checkpoint_format",
+            Self::Cancelled => "cancelled",
+            Self::ExecutionFailed => "execution_failed",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 /// The engine's structured error type.
@@ -72,12 +214,25 @@ pub enum EngineError {
         message: String,
     },
 
-    /// An operation conflicts with active work.
+    /// Active/pending execution or scheduler ownership prevents an operation.
+    /// Idle residency pins and canonical state leases use ProtectedResources.
     Busy {
         /// Identifier of the conflicting request, if known.
         active_request_id: Option<String>,
         /// Explanation of the conflict.
         message: String,
+    },
+
+    /// Existing ownership guarantees prevent the requested operation.
+    ///
+    /// Resources are operation-specific observed blockers, not a list of all
+    /// residents. A model pin alone does not prevent reclaiming its idle KV.
+    /// The runtime supplies at least one blocker and preserves all ownership.
+    ProtectedResources {
+        /// Operation name, such as `startup pressure reclamation`.
+        operation: &'static str,
+        /// Exact observed pin/lease blockers; none of these values is a lease.
+        resources: Vec<ProtectedResource>,
     },
 
     /// The requested context reservation exceeds the validated limit.
@@ -92,8 +247,10 @@ pub enum EngineError {
         limit_tokens: usize,
     },
 
-    /// A required reservation exceeds the applicable memory budget.
+    /// A typed memory constraint or admission pause prevents the operation.
     MemoryLimitExceeded {
+        /// Typed constraint; distinguishes a pause from inadequate bytes.
+        reason: MemoryLimitReason,
         /// Operation or reservation category.
         operation: &'static str,
         /// Required bytes.
@@ -167,6 +324,7 @@ impl EngineError {
             Self::NotFound { .. } => ErrorKind::NotFound,
             Self::Unsupported { .. } => ErrorKind::Unsupported,
             Self::Busy { .. } => ErrorKind::Busy,
+            Self::ProtectedResources { .. } => ErrorKind::ProtectedResources,
             Self::ContextLimitExceeded { .. } => ErrorKind::ContextLimitExceeded,
             Self::MemoryLimitExceeded { .. } => ErrorKind::MemoryLimitExceeded,
             Self::AllocationFailed { .. } => ErrorKind::AllocationFailed,
@@ -177,6 +335,72 @@ impl EngineError {
             Self::ExecutionFailed { .. } => ErrorKind::ExecutionFailed,
             Self::Internal { .. } => ErrorKind::Internal,
         }
+    }
+
+    /// Serialize a captured engine cause for evidence and RPC handlers.
+    ///
+    /// This performs no native queries and acquires no ownership. The
+    /// human-readable message may evolve; `kind`, `reason`, and structured
+    /// fields are the machine-readable contract. Instance identifiers are
+    /// process-local diagnostic tokens, never release/eviction capabilities.
+    pub fn diagnostic(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mut report = json!({"kind": self.kind().as_str(), "message": self.to_string()});
+        match self {
+            Self::Busy {
+                active_request_id, ..
+            } => {
+                report["active_request_id"] = json!(active_request_id);
+            }
+            Self::ProtectedResources {
+                operation,
+                resources,
+            } => {
+                report["operation"] = json!(operation);
+                report["resources"] = resources
+                    .iter()
+                    .map(ProtectedResource::diagnostic)
+                    .collect();
+            }
+            Self::MemoryLimitExceeded {
+                reason,
+                operation,
+                required_bytes,
+                available_bytes,
+            } => {
+                report["reason"] = json!(reason.as_str());
+                report["operation"] = json!(operation);
+                report["required_bytes"] = json!(required_bytes);
+                report["available_bytes"] = json!(available_bytes);
+                match reason {
+                    MemoryLimitReason::ReservationBudget { budget_bytes } => {
+                        report["budget_bytes"] = json!(budget_bytes);
+                    }
+                    MemoryLimitReason::AllocatorCeiling { ceiling_bytes } => {
+                        report["ceiling_bytes"] = json!(ceiling_bytes);
+                    }
+                    MemoryLimitReason::HostPreflight {
+                        artifact_id,
+                        ceiling,
+                    } => {
+                        report["artifact_id"] = json!(artifact_id.as_str());
+                        report["ceiling"] = json!({
+                            "reserve_bytes": ceiling.reserve_bytes,
+                            "static_bytes": ceiling.static_bytes,
+                            "dynamic_bytes": ceiling.dynamic_bytes,
+                            "metal_cap_bytes": ceiling.metal_cap_bytes,
+                            "hard_limit_bytes": ceiling.hard_limit_bytes,
+                            "binding": ceiling.binding.map(|binding| binding.as_str()),
+                        });
+                    }
+                    MemoryLimitReason::AdmissionsPaused
+                    | MemoryLimitReason::AdvisoryEstimate
+                    | MemoryLimitReason::BufferLimit => {}
+                }
+            }
+            _ => {}
+        }
+        report
     }
 
     /// Construct an invalid-request error.
@@ -267,6 +491,43 @@ impl fmt::Display for EngineError {
                 }
             }
 
+            Self::ProtectedResources {
+                operation,
+                resources,
+            } => {
+                write!(f, "{operation} blocked by protected resources")?;
+                for resource in resources {
+                    match resource {
+                        ProtectedResource::ModelPin {
+                            artifact_id,
+                            instance_id,
+                            handles,
+                        } => {
+                            write!(
+                                f,
+                                "; {artifact_id} model-{} has {} residency pin handle(s)",
+                                instance_id.diagnostic_id(),
+                                handles
+                            )?;
+                        }
+                        ProtectedResource::SessionStateLease {
+                            artifact_id,
+                            instance_id,
+                            state_id,
+                            handles,
+                        } => {
+                            write!(
+                                f,
+                                "; {artifact_id} model-{} state {state_id} has {} lease handle(s)",
+                                instance_id.diagnostic_id(),
+                                handles
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+
             Self::ContextLimitExceeded {
                 input_tokens,
                 output_reserve_tokens,
@@ -283,10 +544,31 @@ impl fmt::Display for EngineError {
             }
 
             Self::MemoryLimitExceeded {
+                reason,
                 operation,
                 required_bytes,
                 available_bytes,
             } => {
+                if matches!(reason, MemoryLimitReason::AdmissionsPaused) {
+                    return write!(
+                        f,
+                        "admissions paused by memory pressure during {operation}; requested {required_bytes} bytes, {available_bytes} reservation bytes currently available"
+                    );
+                }
+                if let MemoryLimitReason::HostPreflight {
+                    artifact_id,
+                    ceiling,
+                } = reason
+                {
+                    return write!(
+                        f,
+                        "startup preflight rejected {artifact_id}: planned {required_bytes} bytes exceeds observed safe ceiling {available_bytes} bytes (binding {}); native loading did not start",
+                        ceiling
+                            .binding
+                            .map(|binding| binding.as_str())
+                            .unwrap_or("none")
+                    );
+                }
                 write!(
                     f,
                     "{operation} requires {required_bytes} bytes; \
@@ -370,5 +652,119 @@ impl Error for EngineError {
             Self::CheckpointFormat { source, .. } => Some(source.as_ref()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{memory_guard::CeilingBinding, residency_pin::ModelPinOwner};
+
+    #[test]
+    fn retained_protection_diagnostics_do_not_retain_pin_or_address_replacement() {
+        let original = ModelInstanceId::new();
+        let mut owner = ModelPinOwner::new(original.clone());
+        let pin = owner.try_pin(&original, false).expect("pin original");
+        let error = EngineError::ProtectedResources {
+            operation: "generation_startup",
+            resources: vec![ProtectedResource::ModelPin {
+                artifact_id: ArtifactId::new("model-a").expect("artifact"),
+                instance_id: original.clone(),
+                handles: NonZeroUsize::new(owner.protection_observer().strong_count())
+                    .expect("observed positive count"),
+            }],
+        };
+        drop(pin);
+        assert!(!owner.is_pinned(), "diagnostics must not extend protection");
+        let replacement = ModelInstanceId::new();
+        assert!(!original.same_instance(&replacement));
+        assert_ne!(original.diagnostic_id(), replacement.diagnostic_id());
+        assert_eq!(original.diagnostic_id(), original.clone().diagnostic_id());
+        let report = error.diagnostic();
+        assert_eq!(error.kind(), ErrorKind::ProtectedResources);
+        assert_eq!(report["kind"], "protected_resources");
+        assert_eq!(report["resources"][0]["protection"], "model_pin");
+        assert_eq!(report["resources"][0]["handles"], 1);
+        assert_eq!(
+            report["resources"][0]["instance_id"],
+            format!("model-{}", original.diagnostic_id())
+        );
+        assert!(report.get("active_request_id").is_none());
+    }
+
+    #[test]
+    fn busy_and_leased_publication_have_distinct_machine_readable_owners() {
+        let busy = EngineError::Busy {
+            active_request_id: Some("request-a".into()),
+            message: "native startup owns the slot".into(),
+        }
+        .diagnostic();
+        assert_eq!(busy["kind"], "busy");
+        assert_eq!(busy["active_request_id"], "request-a");
+        assert!(busy.get("resources").is_none());
+
+        let state_id = SessionStateId::from_digest([9; 32]);
+        let leased = EngineError::ProtectedResources {
+            operation: "release_state",
+            resources: vec![ProtectedResource::SessionStateLease {
+                artifact_id: ArtifactId::new("model-a").expect("artifact"),
+                instance_id: ModelInstanceId::new(),
+                state_id,
+                handles: NonZeroUsize::new(2).expect("leases"),
+            }],
+        }
+        .diagnostic();
+        assert_eq!(leased["kind"], "protected_resources");
+        assert_eq!(leased["resources"][0]["state_id"], state_id.to_string());
+        assert_eq!(leased["resources"][0]["protection"], "session_state_lease");
+        assert_eq!(leased["resources"][0]["handles"], 2);
+    }
+
+    #[test]
+    fn host_preflight_records_plan_and_full_observed_ceiling() {
+        let error = EngineError::MemoryLimitExceeded {
+            reason: MemoryLimitReason::HostPreflight {
+                artifact_id: ArtifactId::new("large-model").expect("artifact"),
+                ceiling: CeilingBreakdown {
+                    reserve_bytes: 10,
+                    static_bytes: 90,
+                    dynamic_bytes: 40,
+                    metal_cap_bytes: 70,
+                    hard_limit_bytes: 40,
+                    binding: Some(CeilingBinding::Dynamic),
+                },
+            },
+            operation: "startup preflight",
+            required_bytes: 60,
+            available_bytes: 40,
+        };
+        let report = error.diagnostic();
+        assert_eq!(report["kind"], "memory_limit_exceeded");
+        assert_eq!(report["reason"], "host_preflight");
+        assert_eq!(report["required_bytes"], 60);
+        assert_eq!(report["available_bytes"], 40);
+        assert_eq!(report["ceiling"]["binding"], "dynamic");
+        assert_eq!(report["ceiling"]["metal_cap_bytes"], 70);
+        assert!(error.to_string().contains("planned 60 bytes"));
+        assert!(error.to_string().contains("native loading did not start"));
+    }
+
+    #[test]
+    fn paused_admission_is_not_misreported_as_insufficient_available_bytes() {
+        let error = EngineError::MemoryLimitExceeded {
+            reason: MemoryLimitReason::AdmissionsPaused,
+            operation: "request startup",
+            required_bytes: 10,
+            available_bytes: 100,
+        };
+        let report = error.diagnostic();
+        assert_eq!(report["reason"], "admissions_paused");
+        assert_eq!(report["available_bytes"], 100);
+        assert!(
+            error
+                .to_string()
+                .starts_with("admissions paused by memory pressure")
+        );
+        assert!(report.get("budget_bytes").is_none());
     }
 }

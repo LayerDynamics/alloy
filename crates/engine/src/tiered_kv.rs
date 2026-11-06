@@ -9,7 +9,7 @@
 
 use crate::{
     admission::{AdmissionController, MemoryReservation},
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     family::{ExecutionControl, FamilyCache},
 };
 use inference_infra::kv_cache::{KvBlock, KvBlockLayer, KvCacheSpec};
@@ -406,6 +406,7 @@ impl TieredKvStore {
                 operation: "tiered KV block transfer",
                 required_bytes: bound,
                 available_bytes: self.config.transfer_bytes,
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         Ok(())

@@ -26,7 +26,7 @@
 use crate::{
     admission::AdmissionController,
     api::{EngineCore, EngineFuture},
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     family::{
         AutoregressiveModel, BufferMemoryUsage, CacheAllocationRequest, ExecutionControl,
         FamilyCache, LoadedModel, ModelFamily, ModelInstanceId, ModelLoadLimits, ModelLoadRequest,
@@ -612,6 +612,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "MLX Qwen loading overlap",
                 required_bytes: required_peak,
                 available_bytes: request.limits().max_load_peak_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
 
@@ -684,6 +685,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "decoded MLX Qwen weight buffers",
                 required_bytes: decoded.allocated_bytes(),
                 available_bytes: weight_charge_limit,
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let model = MlxQwen3Model::from_weights(
@@ -703,6 +705,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "measured MLX Qwen weight buffers",
                 required_bytes: measured,
                 available_bytes: request.limits().max_resident_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let mut capabilities = self.registration.capabilities().clone();
@@ -1160,6 +1163,7 @@ impl AutoregressiveModel for Qwen3Loaded {
                 operation: "MLX Qwen KV update overlap",
                 required_bytes: required,
                 available_bytes: request.max_cache_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let inner = self
@@ -1421,6 +1425,7 @@ fn read_metadata(spec: &Qwen3Artifact, name: &str, limit: usize) -> Result<Vec<u
             operation: "read Qwen3 metadata",
             required_bytes: pin.bytes,
             available_bytes: as_u64(limit)?,
+            reason: MemoryLimitReason::BufferLimit,
         });
     }
     let path = component_path(spec, name)?;
@@ -2013,6 +2018,7 @@ fn cache_error(error: KvCacheError, stage: &'static str) -> EngineError {
             operation: stage,
             required_bytes,
             available_bytes: limit_bytes,
+            reason: MemoryLimitReason::BufferLimit,
         },
         KvCacheError::ForeignModel => {
             EngineError::invalid_request("cache", "native cache belongs to another model")
@@ -2040,6 +2046,7 @@ fn mlx_model_error(
             operation,
             required_bytes,
             available_bytes: limit_bytes,
+            reason: MemoryLimitReason::BufferLimit,
         },
         MlxQwenError::AllocationFailed(_) => allocation(stage, None),
         MlxQwenError::Operation(OperationError::AllocationFailed(_)) => allocation(stage, None),
@@ -2060,6 +2067,7 @@ fn model_error(error: ModelError, stage: &'static str) -> EngineError {
                     operation: stage,
                     required_bytes,
                     available_bytes,
+                    reason: MemoryLimitReason::BufferLimit,
                 },
                 _ => internal("model memory sizes exceed u64"),
             }
@@ -2660,10 +2668,12 @@ mod shared_rendering_wiring_tests {
                 operation,
                 required_bytes,
                 available_bytes,
+                reason,
             } => {
                 assert_eq!(operation, "render chat template output");
                 assert!(required_bytes > 1);
                 assert_eq!(available_bytes, 1);
+                assert_eq!(reason, MemoryLimitReason::BufferLimit);
             }
             other => panic!("expected shared writer error, got {other:?}"),
         }

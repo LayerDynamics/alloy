@@ -28,7 +28,7 @@
 //! Do not substitute a render hash for cache_identity's session-state key.
 
 use crate::{
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     types::{
         ArtifactId, ContextSnapshot, ModelProfileId, RenderedContext, RendererIdentity, TokenizerId,
     },
@@ -636,6 +636,7 @@ fn memory_limit(
         operation,
         required_bytes: as_u64(required)?,
         available_bytes: as_u64(available)?,
+        reason: MemoryLimitReason::BufferLimit,
     })
 }
 

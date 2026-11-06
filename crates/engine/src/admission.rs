@@ -36,7 +36,10 @@
 //! without changing shared accounting. Dropping the grant releases only
 //! its unclaimed remainder.
 
-use crate::{error::EngineError, types::MemoryEstimate};
+use crate::{
+    error::{EngineError, MemoryLimitReason},
+    types::MemoryEstimate,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -224,6 +227,7 @@ impl AdmissionController {
                 operation: "resize admission budget",
                 required_bytes: state.reserved_bytes,
                 available_bytes: budget_bytes,
+                reason: MemoryLimitReason::ReservationBudget { budget_bytes },
             });
         }
         state.budget_bytes = budget_bytes;
@@ -269,6 +273,9 @@ impl AdmissionController {
                     operation,
                     required_bytes,
                     available_bytes,
+                    reason: MemoryLimitReason::ReservationBudget {
+                        budget_bytes: state.budget_bytes,
+                    },
                 });
             }
 
@@ -343,6 +350,9 @@ impl AdmissionController {
                     operation,
                     required_bytes: total,
                     available_bytes,
+                    reason: MemoryLimitReason::ReservationBudget {
+                        budget_bytes: state.budget_bytes,
+                    },
                 });
             }
 
@@ -586,6 +596,9 @@ impl MemoryReservation {
                     operation: self.operation,
                     required_bytes: additional_bytes,
                     available_bytes,
+                    reason: MemoryLimitReason::ReservationBudget {
+                        budget_bytes: state.budget_bytes,
+                    },
                 });
             }
         }
@@ -657,6 +670,7 @@ impl AdmissionController {
             operation: "admission paused (memory pressure)",
             required_bytes,
             available_bytes,
+            reason: MemoryLimitReason::AdmissionsPaused,
         })
     }
 }
@@ -756,10 +770,15 @@ mod tests {
             EngineError::MemoryLimitExceeded {
                 required_bytes,
                 available_bytes,
+                reason,
                 ..
             } => {
                 assert_eq!(required_bytes, 1);
                 assert_eq!(available_bytes, 0);
+                assert_eq!(
+                    reason,
+                    MemoryLimitReason::ReservationBudget { budget_bytes: 100 }
+                );
             }
             other => panic!("expected memory limit error, got {other:?}"),
         }
@@ -781,6 +800,43 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::MemoryLimitExceeded);
         assert_eq!(admission.snapshot().expect("after"), before);
+    }
+
+    #[test]
+    fn paused_admissions_report_guard_cause_while_bytes_remain_available() {
+        let admission = AdmissionController::new(100).expect("controller");
+        let _retained = admission
+            .reserve("retained owner", 40)
+            .expect("reservation");
+        let before = admission.snapshot().expect("snapshot");
+        admission.set_admissions_paused(true);
+
+        let failures = [
+            admission
+                .reserve("small allocation", 1)
+                .expect_err("paused allocation"),
+            admission
+                .reserve_grant("small startup", &[1, 1])
+                .expect_err("paused grant"),
+        ];
+        for error in failures {
+            assert!(matches!(
+                error,
+                EngineError::MemoryLimitExceeded {
+                    required_bytes: 1 | 2,
+                    available_bytes: 60,
+                    reason: MemoryLimitReason::AdmissionsPaused,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(admission.snapshot().expect("snapshot"), before);
+        admission.set_admissions_paused(false);
+        let resumed = admission
+            .reserve("resumed allocation", 1)
+            .expect("unpaused");
+        drop(resumed);
+        assert_eq!(admission.snapshot().expect("snapshot"), before);
     }
 
     #[test]

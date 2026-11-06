@@ -1,6 +1,6 @@
 # Phase 1 exit review
 
-**Decision: pending.** The candidate has acceptance tooling and an automatic macOS lane. Phase 1 is not signed off until the required results below are linked and reviewed for the candidate commit.
+**Decision: pending for the resource-error follow-up.** The completed candidate `75a960c` passed all automatic jobs, including real 4B/14B acceptance. The next candidate separates execution contention, protected ownership, and typed memory refusals; its changed runtime and error paths require fresh validation. Phase 1 is not signed off by carrying forward evidence from a different commit.
 
 This review implements the exit mapping in the [Phase 1 execution plan](../specs/PHASE-1-EXECUTION-PLAN.md) and [SPEC-1 Phase 1](../specs/SPEC-1-mlx-agent-harness.md.md#phase-1-vertical-slice-mlx-c-ffi--first-family--harness-skeleton). The memory-parity pull-forward is governed by the [oMLX memory design](../designs/omlx-memory-method-parity.md). The next-phase draft is the [Phase 2 execution plan](../specs/PHASE-2-EXECUTION-PLAN.md).
 
@@ -9,12 +9,14 @@ This review implements the exit mapping in the [Phase 1 execution plan](../specs
 | Field | Value |
 | --- | --- |
 | Candidate branch | `feat/phase1-memory-closeout` |
-| First tested implementation | `14b471598ad60b6906e24169113c27da0033c83f`; follow-up loader/telemetry repairs require fresh acceptance. |
+| First tested implementation | `14b471598ad60b6906e24169113c27da0033c83f`; failed M9 preflight and subsequent repairs are recorded below. |
 | Pull request | [#25 — native tensor ops, tiered KV storage, and Phase 1 acceptance](https://github.com/LayerDynamics/alloy/pull/25). |
-| First candidate CI run | [42289710014](https://github.com/LayerDynamics/alloy/actions/runs/42289710014): Linux and CLI passed; Mac failed only the M9 large-model preflight. Follow-up acceptance is pending. |
+| First candidate CI run | [42289710014](https://github.com/LayerDynamics/alloy/actions/runs/42289710014): Linux and CLI passed; Mac failed only the M9 large-model preflight. |
 | First Mac acceptance artifact | [phase-1-acceptance-42289710014-1](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/artifacts/13539817427); ZIP SHA-256 `77ec8a31bb30289fcfa7466038ec007f43fe11e5f8c9ef4a7c097bb7684a5bd8`. |
 | First Linux native/infrastructure job | [128139616905](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139616905), passed. |
 | First CLI job | [128139617362](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139617362), passed, including all 20 acceptance-helper tests. |
+| Completed acceptance candidate | `75a960cad88062bb3b5eae6484ef706dfc9a61c5`; [push run 42299723238](https://github.com/LayerDynamics/alloy/actions/runs/42299723238) and [PR run 42299729975](https://github.com/LayerDynamics/alloy/actions/runs/42299729975), all jobs completed successfully. |
+| Completed Mac acceptance artifact | [phase-1-acceptance-42299723238-1](https://github.com/LayerDynamics/alloy/actions/runs/42299723238/artifacts/13543413413); downloaded and verified ZIP SHA-256 `8f26857e14512b6346d79e5ca921d80f9ee85743a6a3fcc14e6222a50c3d30ee`. |
 | Two post-freeze reproducible native builds | **Passed:** [run 42276463422](https://github.com/LayerDynamics/alloy/actions/runs/42276463422/job/128093939290) at `5b3b08dd219763e14c2c097c227ed71857903c54`, and [run 42279057333](https://github.com/LayerDynamics/alloy/actions/runs/42279057333/job/128102908050) at `a76d97bd2d91ffb75074fea9641d9b38992b5da8`. Logs inspected 2026-11-06. |
 | Reviewer and date | ChatGPT, 2026-11-06: implementation/requirements review and first-run evidence inspection; final acceptance decision pending. |
 
@@ -62,9 +64,33 @@ The [repair run at `d09fdd1ff0900633eb800b50d97bab1484eae3cf`](https://github.co
 
 The repaired 14B startup plan is **14,104,910,369 bytes**, below the freshly measured **15,682,454,248-byte** balanced ceiling. Real 4B Metal generation completed with 28 input and 8 output tokens. Its retained weight reservation was 2,660,373,249 bytes. M9 then stopped at an acceptance-driver classification mismatch, before 14B loading: the configured startup pressure policy correctly returned `Busy` with `ProtectedResources` and no active request, while the driver incorrectly required `MemoryLimitExceeded` for that pinned-owner case. Artifact sequence 62 records the exact cause; A remained pinned and charged, the guard reported acceptable pressure/open admission, and B's loader was never entered.
 
-The corrected driver retains the full error and requires that specific protected-pin rejection. Generic scheduler Busy, paused admission, and unrelated memory failures cannot satisfy it. It separately holds the ledger's budget before any model is loaded and requires a real `MemoryLimitExceeded` response, no native loader entry, no leaked scheduler/grant ownership, and release of that explicit test reservation. This budget hold is not represented as a physical memory allocation. The subsequent pinned/unpinned sequence still requires real 4B/14B generation, A's actual destruction before B enters its loader, and an empty shutdown ledger. A new successful hardware run is required before the final exit decision.
+At `75a960c`, the corrected driver retained the full error and required that specific protected-pin rejection. Generic scheduler Busy, paused admission, and unrelated memory failures could not satisfy it. It separately held the ledger's budget before any model was loaded and required a real `MemoryLimitExceeded` response, no native loader entry, no leaked scheduler/grant ownership, and release of that explicit test reservation. This budget hold was not represented as a physical memory allocation. The subsequent pinned/unpinned sequence required real 4B/14B generation, A's actual destruction before B entered its loader, and an empty shutdown ledger. The successful hardware result is recorded below.
 
-The independent full-budget regression exposed a production observation bug: an empty model pool was marked protected solely because it had no eligible eviction victim. The runtime now requires an actual resident model before reporting protected model ownership. Genuine pins still produce the specific protected-owner Busy response; an empty runtime with an exhausted ledger produces `MemoryLimitExceeded`. Both rejection paths are checked for native ownership, reservation cleanup, and successful recovery.
+The independent full-budget regression exposed a production observation bug: an empty model pool was marked protected solely because it had no eligible eviction victim. The runtime was changed to require an actual resident model before reporting protected model ownership. At `75a960c`, genuine pins still produced the historical protected-owner Busy response; an empty runtime with an exhausted ledger produced `MemoryLimitExceeded`. Both rejection paths were checked for native ownership, reservation cleanup, and successful recovery. The follow-up deliberately replaces that overloaded Busy classification as described below.
+
+## Completed hardware acceptance at `75a960c`
+
+The [Mac job](https://github.com/LayerDynamics/alloy/actions/runs/42299723238/job/128174049467) and its downloaded artifact identify the exact clean checkout and compiled commit `75a960cad88062bb3b5eae6484ef706dfc9a61c5`. The machine remains the Apple M4 Max, Mac16,6, with 36 GiB unified RAM. All native CPU/Metal/shared-memory, engine, harness, and daemon suites passed. The real daemon binary SHA-256 was `a9a0cfb98d60c8b2b4532684ad823220fb51824dfeb5e2a0af68b39f0ad3cc18`.
+
+| Observed gate | Recorded result at `75a960c` |
+| --- | --- |
+| Test 13 incremental streaming | 12 nonempty deltas and 12 visible stdout chunks before one successful terminal result; 39 input tokens and 13 output tokens. |
+| Test 14 durable history | PID 19839 stopped and PID 19864 restarted; all 5 prior events recovered, with 9 total events after resumed generation. |
+| Test 14 actual SSD KV | One successful restore and 37 restored tokens in the new process; zero hot/protected KV at completion, 67,108,864 transfer bytes still reserved, and no cache error. |
+| M9 host and plan | Planned 14B startup 14,104,910,369 bytes; freshly measured balanced ceiling 16,045,425,384 bytes. Both frozen artifacts verified. |
+| M9 protected refusal | The original pinned 4B instance and its 2,660,373,249-byte weight reservation survived; the 14B loader was not entered. |
+| M9 exhausted ledger | A separate full-budget hold produced the expected refusal, no loader call, no leaked grant/scheduler ownership, and successful recovery after releasing the hold. |
+| M9 real replacement | Both models performed real Metal prefill/decode. A's actual destruction at sequence 77 preceded B's loader entry at sequence 81; maximum native model handles was one. |
+| M9 measured native memory | MLX reported peak 9,371,885,656 bytes, active 9,233,276,928 bytes at the B-idle observation, and 268,457,540 cached bytes. The peak is a native allocator measurement, distinct from the 14,104,910,369-byte startup plan. |
+| M9 shutdown | Zero native model handles, zero reserved bytes, zero active reservations, and zero MLX active bytes. Allocator cache remained separately reported. Final sequence 108 was `acceptance_passed`. |
+
+These results resolve the original preflight failure and subsequent driver classification failure for this commit. They do not independently validate the new resource-error implementation.
+
+## Typed resource-error follow-up
+
+The [resource-error design](../designs/engine-resource-errors.md) defines the next production contract. `Busy` denotes active/pending execution or scheduler ownership. `ProtectedResources` carries operation-scoped model pins and session-state leases with exact artifact/instance/state identities and positive observed handle counts. A retained diagnostic does not retain a protection handle. `MemoryLimitExceeded` records a typed reason, including the difference between unavailable capacity and a pressure-driven admission pause.
+
+The M9 preflight now emits an actual `HostPreflight` engine cause with the planned startup and complete observed ceiling breakdown in failure evidence. Its pin assertion matches the original instance and typed pin directly; its full-ledger assertion specifically requires `ReservationBudget`. Session RPC responses and streamed failures preserve the captured engine cause, and CLI handling reports one terminal failure. These changes require fresh engine, daemon, CLI, and real-model acceptance before the final review decision.
 
 ## Existing reproducibility evidence
 

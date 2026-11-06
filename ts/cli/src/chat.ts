@@ -3,7 +3,7 @@ import type { Readable, Writable } from "node:stream";
 import type { CliArgs } from "./args.js";
 import type { AlloySettings } from "./settings.js";
 import { RpcClient, type SessionEvent } from "./rpc-client.js";
-import { textFromEvent } from "./render.js";
+import { formatRequestFailed, textFromEvent } from "./render.js";
 
 type CreateResult = { session_id: string };
 type ResumeResult = { session_id: string; event_count?: number };
@@ -71,7 +71,7 @@ export async function sendChatTurn(
       if (event.event === "request_failed") {
         failed = true;
         stopWaiting();
-        report(`request_failed: ${JSON.stringify(event.body)}`);
+        report(formatRequestFailed(event.body));
         return;
       }
       if (event.event === "runtime_warning") {
@@ -101,6 +101,9 @@ export async function sendChatTurn(
     output.write("\n");
     return 0;
   } catch (error) {
+    // A request_failed notification is terminal and already reported. Its
+    // matching final RPC rejection must not print the same failure again.
+    if (failed) return 3;
     report(error instanceof Error ? error.message : String(error));
     return 2;
   } finally {

@@ -126,7 +126,13 @@ pub struct ReclaimableResources {
     /// Whether an idle model is loaded.
     pub idle_model_loaded: bool,
 
-    /// Whether live leases protect the idle model or state depending on it.
+    /// Number of independently owned idle models currently eligible for
+    /// whole-model eviction. A lease on another instance does not protect
+    /// these candidates. The runtime revalidates each selected victim.
+    pub eligible_idle_models: usize,
+
+    /// Whether explicit model pins or canonical leases protect any idle
+    /// model. Protected and eligible instances may coexist in a pool.
     pub idle_model_has_live_leases: bool,
 }
 
@@ -135,6 +141,11 @@ impl ReclaimableResources {
         if self.leased_session_states > self.idle_session_states {
             return Err(PressureError::InvalidObservation(
                 "leased state count exceeds idle state count",
+            ));
+        }
+        if !self.idle_model_loaded && self.eligible_idle_models != 0 {
+            return Err(PressureError::InvalidObservation(
+                "eligible model count is nonzero without a loaded model",
             ));
         }
         Ok(())
@@ -146,13 +157,22 @@ impl ReclaimableResources {
     }
 
     fn can_unload_model(self) -> bool {
-        self.idle_model_loaded
-            && !self.idle_model_has_live_leases
-            && self.leased_session_states == 0
+        self.idle_model_loaded && self.eligible_idle_models != 0
     }
 
-    fn has_protected_resources(self) -> bool {
-        self.leased_session_states > 0 || self.idle_model_has_live_leases
+    fn protection_blocks_reclamation(self, options: PressureOptions) -> bool {
+        // An eligible candidate remaining after its bounded stage is an
+        // exhausted-action case. An unrelated pin must not be blamed for
+        // that bound, or for an operation the policy does not permit.
+        if (options.allow_idle_state_release && self.can_release_state())
+            || (options.allow_idle_model_unload && self.can_unload_model())
+        {
+            return false;
+        }
+        (options.allow_idle_state_release
+            && self.can_release_state_without_model
+            && self.leased_session_states != 0)
+            || (options.allow_idle_model_unload && self.idle_model_has_live_leases)
     }
 }
 
@@ -305,7 +325,8 @@ pub enum RejectReason {
     /// The configured action budget has been consumed.
     ActionLimitReached,
 
-    /// Leases protect resources needed for further reclamation.
+    /// Explicit model pins or canonical leases protect resources needed
+    /// for further reclamation.
     ProtectedResources,
 
     /// No permitted eligible action is available.
@@ -610,7 +631,10 @@ impl PressureAttempt {
             return Ok(self.issue(ReclaimAction::UnloadIdleModel, assessment));
         }
 
-        let reason = if observation.reclaimable.has_protected_resources() {
+        let reason = if observation
+            .reclaimable
+            .protection_blocks_reclamation(options)
+        {
             RejectReason::ProtectedResources
         } else if self.last_action_made_progress == Some(false) {
             RejectReason::NoProgress
@@ -756,6 +780,7 @@ mod tests {
             leased_session_states: 0,
             can_release_state_without_model: true,
             idle_model_loaded: true,
+            eligible_idle_models: 1,
             idle_model_has_live_leases: false,
         }
     }
@@ -912,6 +937,7 @@ mod tests {
 
         let mut replanned = observation(0, 0, 0);
         replanned.reclaimable.idle_model_loaded = false;
+        replanned.reclaimable.eligible_idle_models = 0;
         replanned.reclaimable.idle_session_states = 0;
         replanned.demand.additional_reservation_bytes = 110;
 
@@ -941,6 +967,7 @@ mod tests {
         let mut attempt = policy().begin();
         let mut observed = observation(95, 90, 0);
         observed.reclaimable.leased_session_states = 1;
+        observed.reclaimable.eligible_idle_models = 0;
         observed.reclaimable.idle_model_has_live_leases = true;
 
         assert_eq!(
@@ -948,6 +975,73 @@ mod tests {
             PressureDecision::Reject(RejectReason::ProtectedResources),
         );
         assert_eq!(attempt.actions_issued(), 0);
+    }
+
+    #[test]
+    fn a_leased_publication_does_not_block_an_unrelated_eligible_model() {
+        let mut attempt = policy().begin();
+        let mut observed = observation(95, 90, 0);
+        observed.reclaimable.leased_session_states = 1;
+        observed.reclaimable.idle_model_has_live_leases = true;
+        observed.reclaimable.eligible_idle_models = 1;
+
+        assert_eq!(
+            attempt
+                .evaluate(observed)
+                .expect("independent eligible model"),
+            PressureDecision::UnloadIdleModel,
+        );
+        acknowledge(&mut attempt, ReclaimAction::UnloadIdleModel);
+        observed.reclaimable.eligible_idle_models = 0;
+        assert_eq!(
+            attempt
+                .evaluate(observed)
+                .expect("only protected owners remain"),
+            PressureDecision::Reject(RejectReason::ProtectedResources),
+        );
+        assert_eq!(attempt.actions_issued(), 1);
+    }
+
+    #[test]
+    fn disabled_reclamation_does_not_blame_existing_protection() {
+        let mut options = policy().options();
+        options.allow_idle_state_release = false;
+        options.allow_idle_model_unload = false;
+        let mut attempt = PressurePolicy::new(options).unwrap().begin();
+        let mut observed = observation(95, 90, 0);
+        observed.reclaimable.leased_session_states = 1;
+        observed.reclaimable.eligible_idle_models = 0;
+        observed.reclaimable.idle_model_has_live_leases = true;
+
+        assert_eq!(
+            attempt.evaluate(observed).unwrap(),
+            PressureDecision::Reject(RejectReason::NoReclaimableResources)
+        );
+        assert_eq!(attempt.actions_issued(), 0);
+    }
+
+    #[test]
+    fn exhausted_model_stage_does_not_blame_an_unrelated_protected_owner() {
+        let mut options = policy().options();
+        options.allow_idle_state_release = false;
+        let mut attempt = PressurePolicy::new(options).unwrap().begin();
+        let mut observed = observation(95, 90, 0);
+        observed.reclaimable.leased_session_states = 1;
+        observed.reclaimable.eligible_idle_models = 2;
+        observed.reclaimable.idle_model_has_live_leases = true;
+
+        assert_eq!(
+            attempt.evaluate(observed).unwrap(),
+            PressureDecision::UnloadIdleModel
+        );
+        acknowledge(&mut attempt, ReclaimAction::UnloadIdleModel);
+        observed.admission = ledger(100, 94);
+        observed.reclaimable.eligible_idle_models = 1;
+        assert_eq!(
+            attempt.evaluate(observed).unwrap(),
+            PressureDecision::Reject(RejectReason::ReclamationExhausted)
+        );
+        assert_eq!(attempt.actions_issued(), 1);
     }
 
     #[test]
@@ -1051,6 +1145,7 @@ mod tests {
         let mut observed = observation(20, 60, 30);
         observed.reclaimable.idle_session_states = 0;
         observed.reclaimable.idle_model_loaded = false;
+        observed.reclaimable.eligible_idle_models = 0;
 
         assert_eq!(
             attempt.evaluate(observed).expect("clear"),
@@ -1104,6 +1199,7 @@ mod tests {
                 }
                 ReclaimAction::UnloadIdleModel => {
                     observed.reclaimable.idle_model_loaded = false;
+                    observed.reclaimable.eligible_idle_models = 0;
                 }
                 ReclaimAction::ClearAllocatorCache => {}
             }

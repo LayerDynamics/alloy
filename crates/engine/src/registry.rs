@@ -12,7 +12,7 @@
 //! protect this registry with their chosen synchronization mechanism.
 
 use crate::{
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     types::{
         ArtifactId, Capabilities, DecodingCapability, DecodingMode, GenerationOptions,
         ModelProfileId,
@@ -812,6 +812,7 @@ fn read_config(path: &Path) -> Result<Vec<u8>, EngineError> {
             operation: "read artifact config",
             required_bytes: metadata.len(),
             available_bytes: MAX_CONFIG_BYTES as u64,
+            reason: MemoryLimitReason::BufferLimit,
         });
     }
 

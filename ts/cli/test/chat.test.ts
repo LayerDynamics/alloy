@@ -5,7 +5,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { runChat, sendChatTurn, type ChatRpcClient } from "../src/chat.js";
 import { parseArgv } from "../src/args.js";
 import { defaultSettings } from "../src/settings.js";
-import type { SessionEvent } from "../src/rpc-client.js";
+import { RpcError, type SessionEvent } from "../src/rpc-client.js";
 
 const SESSION = "sess-test";
 const final = (text: string) => ({ ok: true, session_id: SESSION, assistant_text: text, input_tokens: 3 });
@@ -112,6 +112,33 @@ test("request_failed stops notices before RPC settlement and suppresses later te
   assert.equal(await pending, 3);
   assert.equal(output.text(), "");
   assert.match(errors.text(), /request_failed.*execution cancelled/);
+});
+
+test("a structured terminal event and matching final RPC failure are reported once without retry", async () => {
+  const turn = new PendingTurn();
+  const output = capture(), errors = capture();
+  const diagnostic = { kind: "protected_resources", message: "model A remains pinned", operation: "generation_startup", resources: [{ protection: "model_pin", artifact_id: "model-a", instance_id: "9", handles: 1 }] };
+  const pending = sendChatTurn(turn, SESSION, "hello", { output: output.stream, errorOutput: errors.stream });
+  turn.emit("text_delta", { text: "partial" });
+  turn.emit("request_failed", { message: diagnostic.message, engine_error: diagnostic, partial_usage: { input_tokens: 1, output_tokens: 1 } });
+  turn.reject(new RpcError({ code: -32000, message: diagnostic.message, data: { kind: "engine_failed", engine_error: diagnostic } }));
+  assert.equal(await pending, 3);
+  assert.equal(output.text(), "partial");
+  assert.equal(errors.text().match(/model A remains pinned/g)?.length, 1);
+  assert.equal(errors.text().match(/caller holding these model pins/g)?.length, 1);
+  assert.doesNotMatch(errors.text(), /Wait for the active request/);
+});
+
+test("an immediate startup rejection keeps its typed guidance and cannot produce a successful answer", async () => {
+  const turn = new PendingTurn();
+  const output = capture(), errors = capture();
+  const pending = sendChatTurn(turn, SESSION, "hello", { output: output.stream, errorOutput: errors.stream });
+  const diagnostic = { kind: "memory_limit_exceeded", message: "startup requires 200 bytes; 100 available", reason: "host_preflight", required_bytes: 200, available_bytes: 100 };
+  turn.reject(new RpcError({ code: -32000, message: diagnostic.message, data: { kind: "engine_failed", engine_error: diagnostic } }));
+  assert.equal(await pending, 2);
+  assert.equal(output.text(), "");
+  assert.match(errors.text(), /planned startup exceeds the current safe memory ceiling/);
+  assert.match(errors.text(), /requires 200 bytes; 100 available/);
 });
 
 test("generation completion stops waiting and a valid final-only answer is shown once with an explanatory notice", async (t) => {

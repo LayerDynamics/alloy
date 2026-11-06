@@ -72,8 +72,7 @@ impl<E: Engine> Supervisor<E> {
         inflight_request: Option<&RequestId>,
     ) -> HarnessResult<()> {
         if let Some(request_id) = inflight_request {
-            block_on(self.engine.cancel(request_id.clone()))?
-                .map_err(|error| HarnessError::Engine(error.to_string()))?;
+            block_on(self.engine.cancel(request_id.clone()))?.map_err(HarnessError::from)?;
         }
         let mut guard = lock_store(store)?;
         let session = guard
@@ -117,8 +116,7 @@ impl<E: Engine> Supervisor<E> {
 
     /// Request cancellation of an active generation.
     pub fn cancel(&self, request_id: RequestId) -> HarnessResult<CancelOutcome> {
-        block_on(self.engine.cancel(request_id))?
-            .map_err(|error| HarnessError::Engine(error.to_string()))
+        block_on(self.engine.cancel(request_id))?.map_err(HarnessError::from)
     }
 
     /// Run one user turn, buffering the assistant text until completion.
@@ -203,48 +201,31 @@ impl<E: Engine> Supervisor<E> {
         ensure_session_active(store, session_id)?;
         let profile = ModelProfileId::new(profile_id.clone())
             .map_err(|error| HarnessError::Invalid(format!("profile_id: {error}")))?;
-        let options = GenerationOptions::greedy(max_output_tokens)
-            .map_err(|error| HarnessError::Engine(error.to_string()))?;
+        let options = GenerationOptions::greedy(max_output_tokens).map_err(HarnessError::from)?;
         let request_id = RequestId::new(format!("{session_id}-req-{}", rendered.token_count()))
             .map_err(|error| HarnessError::Invalid(format!("request_id: {error}")))?;
         on_started(&request_id)?;
         // Pause may have raced between ensure and on_started; re-check once registered.
         ensure_session_active(store, session_id)?;
         let request = GenerationRequest::new(request_id.clone(), profile, snapshot, options)
-            .map_err(|error| HarnessError::Engine(error.to_string()))?;
+            .map_err(HarnessError::from)?;
 
-        let generation = block_on(self.engine.generate(request))?
-            .map_err(|error| HarnessError::Engine(error.to_string()))?;
+        let generation = block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;
         let mut stream = generation.into_events();
         let mut assistant = String::new();
-        let mut failed: Option<String> = None;
-        let mut cancelled = false;
 
         while let Some(event) = next_event(&mut stream)? {
             on_event(&event)?;
-            match &event {
-                GenerationEvent::TextDelta { text } => assistant.push_str(text),
+            match event {
+                GenerationEvent::TextDelta { text } => assistant.push_str(&text),
                 GenerationEvent::GenerationCompleted { .. } => break,
                 GenerationEvent::RequestFailed { error, .. } => {
-                    let message = error.to_string();
-                    if message.to_ascii_lowercase().contains("cancel") {
-                        cancelled = true;
-                    }
-                    failed = Some(message);
-                    break;
+                    return Err(error.into());
                 }
                 GenerationEvent::ToolCallDelta { .. } | GenerationEvent::RuntimeWarning { .. } => {}
             }
         }
 
-        if cancelled {
-            return Err(HarnessError::Engine(
-                failed.unwrap_or_else(|| "generation cancelled".into()),
-            ));
-        }
-        if let Some(message) = failed {
-            return Err(HarnessError::Engine(message));
-        }
         if assistant.is_empty() {
             return Err(HarnessError::Engine(
                 "generation completed without assistant text".into(),

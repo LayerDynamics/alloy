@@ -24,7 +24,7 @@
 
 use crate::{
     api::ENGINE_API_VERSION,
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     types::{ArtifactId, ModelProfileId, RenderedContext, RendererIdentity, TokenizerId},
 };
 use qwen3::{
@@ -456,6 +456,7 @@ fn map_model_error(error: ModelError, stage: &'static str) -> EngineError {
                     operation: stage,
                     required_bytes,
                     available_bytes,
+                    reason: MemoryLimitReason::BufferLimit,
                 },
                 _ => EngineError::Internal {
                     message: "model memory sizes cannot be represented as u64".to_owned(),
