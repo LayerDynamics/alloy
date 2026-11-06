@@ -498,7 +498,7 @@ alloy stats
 
 - **Distribution:** Homebrew tap (primary) and GitHub Releases shipping the Rust daemon binary (MLX Metal kernels dominate size, ~150 MB budget); the TypeScript CLI/TUI ships as an npm package (with the TS SDK) that detects an existing daemon or bootstraps one by downloading the release binary from GitHub Releases with checksum verification (CLI/daemon compatibility per the B.6 `api_version` policy); `cargo install` from source for contributors. The optional conversion CLI is a separate download via uv (`uvx alloy-convert`) for those who need raw-checkpoint conversion. oMLX optional via its own tap.
 - **Environments:** dev (local Mac), CI (Linux: unit + protocol tests; self-hosted Mac runner: integration + model conformance + benchmarks).
-- **CI/CD:** GitHub Actions; Linux fast lane on every PR (no MLX needed — engine mocked); self-hosted Mac lane on merge-to-main and release tags; artifacts (benchmark tables, validation reports) attached to releases.
+- **CI/CD:** GitHub Actions; Linux and self-hosted Apple-Silicon lanes run automatically on every repository branch/tag push and same-repository PR. Linux exercises portable logic and real CPU-backend MLX; the Mac lane exercises the unified CPU/GPU production path and shared-memory tests. Fork PRs run hosted Linux checks without executing on the persistent Mac runner. Manual dispatch remains available for reruns. Artifacts (benchmark tables, validation reports) are attached to releases.
 - **Rollback:** versioned artifacts and pinned dependency sets make any release reproducible; sessions are forward-compatible via event-log versioning.
 
 ---

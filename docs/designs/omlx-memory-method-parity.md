@@ -180,8 +180,10 @@ Required evidence at the candidate commit:
    constrained unified-memory budget, including eligible idle eviction and no
    double admission.
 
-The existing Mac workflow runs the FFI, Qwen3, and engine suites containing these
-checks. Record its result for the candidate commit separately from Linux results;
+The Mac job automatically runs the FFI, Qwen3, and engine suites containing these
+checks on every repository branch/tag push and same-repository pull request.
+Fork pull requests run the hosted Linux checks without using the persistent Mac
+runner. Record the Mac result for the candidate commit separately from Linux results;
 a skipped Mac job is not unified CPU/GPU validation. This does not require a new
 tensor-placement policy or changes to the residency ownership model.
 

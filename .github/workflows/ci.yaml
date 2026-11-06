@@ -3,12 +3,6 @@ name: ci
 on:
   pull_request:
   push:
-    branches:
-      - main
-      - 4-engine-core
-      - 6-alloyd
-    tags:
-      - "*"
   workflow_dispatch:
 
 permissions:
@@ -150,9 +144,11 @@ jobs:
   mac:
     name: mac-metal
 
-    # Keep self-hosted execution explicitly requested by a maintainer.
-    # Ordinary branch pushes and pull requests run the Linux lane only.
-    if: github.event_name == 'workflow_dispatch'
+    # Every repository push and same-repository PR validates the unified
+    # CPU/GPU path. Fork PRs do not execute on the persistent Mac runner.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 60

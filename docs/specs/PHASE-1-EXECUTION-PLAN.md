@@ -113,7 +113,7 @@ scripts/{qwen3_end_to_end_stream,session_restart_real_model}.sh
 package.json / bin/alloy.js
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document
 docs/events/telemetry-v1.json initial event schema
-.github/workflows/ci.yaml Linux + Mac lanes run `harness-core` and `alloyd` (`--all-targets` / `--doc`); Mac E2E tests 13–14 remain workflow_dispatch / W7
+.github/workflows/ci.yaml Linux + Mac lanes run automatically on every repository branch/tag push and same-repository PR, including `harness-core` and `alloyd` (`--all-targets` / `--doc`). Fork PRs use hosted Linux checks only. Mac E2E tests 13–14 remain W7 work; automatic execution of the existing suites does not establish those E2E results.
 
 ## Named tests
 
