@@ -154,25 +154,33 @@ function systemBody(snapshot: MonitorSnapshot, width: number, capacity: number, 
   return body;
 }
 
+function gpuFrequency(a: HostMetricsSnapshot["accelerators"] | undefined): string {
+  if (a?.gpu_frequency_mhz != null) {
+    return `${a.source === "ioreport" ? "GPU state avg" : "GPU"} ${a.gpu_frequency_mhz.toFixed(0)} MHz`;
+  }
+  return a?.source === "ioreport" && a.gpu_active_percent === 0 ? "GPU idle" : "GPU frequency unavailable";
+}
+
 function acceleratorsBody(host: HostMetricsSnapshot | null, width: number, capacity: number, history: readonly MonitorHistorySample[]): Line[] {
   if (host === null) return [line("Hardware sample unavailable", "amber")];
   const a = host.accelerators;
   const reading = monitorGpuReading(host);
-  const frequency = a.gpu_frequency_mhz === null ? "frequency unavailable" : `${a.gpu_frequency_mhz.toFixed(0)} MHz`;
+  const frequency = gpuFrequency(a);
   const thermal: Line = [s("Thermal ", "muted"), s(a.thermal_pressure ?? "unavailable", /serious|critical/i.test(a.thermal_pressure ?? "") ? "red" : "text")];
+  const source = a.source === "ioreport" ? "IOReport" : "recorded powermetrics";
   const note = a.error
     ? `Power ${a.status} · ${age(a.age_ms)} · ${a.error}`
-    : a.status === "disabled" ? "Power optional · enable --powermetrics"
-      : `Power ${a.status} · ${age(a.age_ms)} · powermetrics`;
+    : `Power ${a.status} · ${age(a.age_ms)} · ${source}${a.warnings?.length ? ` · ${a.warnings.join("; ")}` : ""}`;
   const gpu = meter(reading.label, reading.percent, percent(reading.percent), width, "violet");
   const gpuNote = reading.error ? `GPU ${reading.status} · ${reading.error}` : reading.description;
   if (capacity < 8) {
-    const body = [gpu, line(`Est. power  CPU ${power(a.cpu_power_mw)} · GPU ${power(a.gpu_power_mw)} · ANE ${power(a.ane_power_mw)}`, "blue"),
-      line(reading.error && host.gpu ? gpuNote : note, reading.error || a.error ? "amber" : "muted")];
+    const body = [gpu, line(`Est. power  CPU ${power(a.cpu_power_mw)} · GPU ${power(a.gpu_power_mw)} · ANE ${power(a.ane_power_mw)}`, "blue")];
+    if (capacity >= 4 && !(reading.error && host.gpu)) body.push([...thermal, s(` · ${frequency}`, "muted")]);
+    body.push(line(reading.error && host.gpu ? gpuNote : note, reading.error || a.error || a.warnings?.length ? "amber" : "muted"));
     if (reading.error && host.gpu && capacity > body.length) body.push(line(note, a.error ? "amber" : "muted"));
     if (capacity > body.length) body.push(trend("GPU", history.map((item) => item.gpu_percent), width, "violet"));
     if (capacity > body.length && !(reading.error && host.gpu)) body.push(line(gpuNote, reading.error ? "amber" : "muted"));
-    if (capacity > body.length) body.push([...thermal, s(` · ${frequency}`, "muted")]);
+    if (capacity > body.length && (capacity < 4 || reading.error && host.gpu)) body.push([...thermal, s(` · ${frequency}`, "muted")]);
     if (capacity > body.length) body.push(line("ANE = estimated power, not occupancy", "muted"));
     return body;
   }
@@ -185,7 +193,7 @@ function acceleratorsBody(host: HostMetricsSnapshot | null, width: number, capac
     meter("CPU", ratio(a.cpu_power_mw, scale), power(a.cpu_power_mw), width, "cyan"),
     meter("GPU", ratio(a.gpu_power_mw, scale), power(a.gpu_power_mw), width, "blue"),
     meter("ANE", ratio(a.ane_power_mw, scale), power(a.ane_power_mw), width, "violet"),
-    line(note, a.error ? "amber" : "muted"),
+    line(note, a.error || a.warnings?.length ? "amber" : "muted"),
   ];
   const aneHistory = history.map((item) => item.ane_power_mw);
   const aneValues = aneHistory.filter((value): value is number => value !== null && Number.isFinite(value) && value >= 0);
@@ -197,7 +205,10 @@ function acceleratorsBody(host: HostMetricsSnapshot | null, width: number, capac
   if (capacity > body.length) body.push([...thermal, s(` · ${frequency}`, "muted")]);
   for (const cluster of a.cpu_clusters) {
     if (capacity <= body.length) break;
-    body.push(meter(cluster.name, cluster.active_percent, `${percent(cluster.active_percent)}${cluster.frequency_mhz === null ? "" : ` · ${cluster.frequency_mhz.toFixed(0)} MHz`}`, width, "cyan"));
+    const frequency = cluster.frequency_mhz === null
+      ? a.source === "ioreport" ? ` · ${cluster.active_percent === 0 ? "idle" : "frequency unavailable"}` : ""
+      : ` · ${cluster.frequency_mhz.toFixed(0)} MHz${a.source === "ioreport" ? " state avg" : ""}`;
+    body.push(meter(cluster.name, cluster.active_percent, `${percent(cluster.active_percent)}${frequency}`, width, "cyan"));
   }
   const rate = (value: number | null): string => value === null ? "unavailable" : `${formatBytes(value)}/s`;
   if (capacity > body.length && (a.disk_read_bytes_per_second !== null || a.disk_write_bytes_per_second !== null)) {
@@ -278,6 +289,7 @@ function compact(snapshot: MonitorSnapshot, width: number, height: number, histo
     add(line(`Power ${a?.status ?? "unavailable"} · ${age(a?.age_ms ?? null)}`, a?.status === "ready" ? "muted" : "amber"), 106);
   }
   if (a?.error) add(line(`Power: ${a.error}`, "amber"), host?.gpu ? 103 : 190);
+  if (a?.warnings?.length) add(line(`Counters: ${a.warnings.join("; ")}`, "amber"), 102);
   if (snapshot.host_error || host?.errors.length) add(line(`Host error: ${snapshot.host_error ?? host?.errors.join("; ")}`, "amber"), 190);
   add(line(`ALLOY ${snapshot.alloy.status}${snapshot.alloy.status === "unavailable" && metrics ? " (stale)" : ""} · ${age(snapshot.alloy.sample_age_ms)}`, snapshot.alloy.status === "connected" ? "green" : "amber"), 240);
   if (metrics) {
@@ -290,7 +302,7 @@ function compact(snapshot: MonitorSnapshot, width: number, height: number, histo
   if (snapshot.alloy.error) add(line(`Connection: ${snapshot.alloy.error}`, "amber"), 200);
   if (nextStep) add(line(nextStep), 205);
   add(line(`Swap ${formatBytes(host?.swap_used_bytes ?? null)} · Wired ${formatBytes(host?.wired_bytes ?? null)} · Compressed ${formatBytes(host?.compressed_bytes ?? null)}`, "muted"), 75);
-  add(line(`Thermal ${a?.thermal_pressure ?? "unavailable"}${a?.gpu_frequency_mhz == null ? "" : ` · GPU ${a.gpu_frequency_mhz.toFixed(0)} MHz`}`, "muted"), 70);
+  add(line(`Thermal ${a?.thermal_pressure ?? "unavailable"} · ${gpuFrequency(a)}`, "muted"), 70);
   add(line("Full panels: 60 columns × 22 terminal rows", "muted"), 1);
   const budget = Math.max(0, height - (framed ? 3 : 2));
   const visible = rows.map((row, index) => ({ ...row, index }))

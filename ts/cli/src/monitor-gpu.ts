@@ -3,7 +3,7 @@ import type { PowerMetricsSnapshot } from "./powermetrics.js";
 
 /** The GPU graph has its own source and clock, independent of optional power. */
 export type MonitorGpuReading = {
-  source: "ioreg" | "powermetrics" | null;
+  source: "ioreg" | "powermetrics" | "ioreport" | null;
   history_key: string;
   label: string;
   description: string;
@@ -29,13 +29,13 @@ export function monitorGpuReading(host: HostMetricsSnapshot | null): MonitorGpuR
       age_ms: gpu.age_ms, percent: gpu.utilization_percent, error: gpu.error,
     };
   }
-  // Older schema-1 captures only have powermetrics. Preserve their original
-  // meaning; never replace a present but failed IORegistry sample with power.
+  // Older captures may omit the independent registry sample. Preserve the
+  // source and residency meaning; never replace a present failed GPU source.
   const power = host?.accelerators;
   return {
-    source: power ? "powermetrics" : null,
-    history_key: "powermetrics:active-residency",
-    label: "GPU active", description: "powermetrics · active residency",
+    source: power?.source ?? null,
+    history_key: `${power?.source ?? "unavailable"}:active-residency`,
+    label: "GPU active", description: `${power?.source === "ioreport" ? "IOReport" : "recorded powermetrics"} · active residency`,
     status: power?.status ?? "unavailable",
     sampled_at_unix_ms: power?.sampled_at_unix_ms ?? null,
     age_ms: power?.age_ms ?? null, percent: power?.gpu_active_percent ?? null,

@@ -192,7 +192,7 @@ export async function runMonitor(settings: AlloySettings, args: CliArgs, options
   configurationError?: string;
   reloadSettings?: () => AlloySettings | null;
 } = {}): Promise<number> {
-  const collector = createHostMetricsCollector({ powermetrics: args.powermetrics, intervalMs: args.intervalMs });
+  const collector = createHostMetricsCollector({ intervalMs: args.intervalMs });
   const timeoutMs = Math.min(2000, Math.max(500, args.intervalMs));
   let activeSettings = settings;
   let reader = new DaemonMetricsReader(settings.socket, timeoutMs);

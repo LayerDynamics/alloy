@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import {
   emptyPowerMetrics,
+  NATIVE_METRICS_HELPER,
   PowerMetricsCollector,
+  parseNativeMetricsOutput,
   parsePowerMetricsOutput,
   parsePowerMetricsPlist,
   runMetricCommand,
-  supportedPowerSamplers,
 } from "../src/powermetrics.js";
 
 // Synthetic values in the schema emitted by Apple's tool, checked against the
@@ -131,49 +132,106 @@ test("bounded plist reader rejects malformed nesting, duplicate keys and custom 
   assert.throws(() => parsePowerMetricsPlist(wrap("<key>a</key><integer>1</integer>") + "oops"), /trailing/);
 });
 
-test("sampler selection adapts to the Mac and does not assume ANE sampler support", () => {
-  const older = "The following samplers are supported:\n    cpu_power cpu power\n    gpu_power gpu power\n    thermal pressure\n    all tasks,cpu_power,gpu_power\n";
-  assert.deepEqual(supportedPowerSamplers(older), ["cpu_power", "gpu_power", "thermal"]);
-  assert.deepEqual(supportedPowerSamplers(`${older}\nane_power neural engine\n network usage\n disk usage`),
-    ["cpu_power", "gpu_power", "ane_power", "thermal", "disk", "network"]);
-  assert.deepEqual(supportedPowerSamplers("sampler cpu_power is not supported"), []);
+const nativeFrame = () => ({
+  schema_version: 1, source: "ioreport", effective_uid: 501,
+  sampled_at_unix_ms: 1000, sample_duration_ms: 1008.25,
+  cpu_power_mw: 2500.5, gpu_power_mw: 825.25, ane_power_mw: 0,
+  gpu_active_percent: 12.5, gpu_frequency_mhz: 900,
+  cpu_clusters: [{ name: "E-CPU", active_percent: 24.5, frequency_mhz: 1800 },
+    { name: "P-CPU", active_percent: 16, frequency_mhz: 3500 }],
+  thermal_pressure: "Nominal",
+  disk_read_bytes_per_second: 4096, disk_write_bytes_per_second: 0,
+  network_in_bytes_per_second: 8192, network_out_bytes_per_second: 512,
+  power_sources: { cpu: "CLPC", gpu: "CLPC", ane: "Energy Model" }, warnings: [],
 });
 
-test("hardware collector returns unavailable without running helpers on unsupported platforms", async () => {
-  let commands = 0;
-  const collector = new PowerMetricsCollector({ enabled: true }, {
-    platform: () => "linux",
-    runCommand: async () => { commands++; return ""; },
-  });
-  const result = await collector.sample(new AbortController().signal);
-  assert.equal(commands, 0);
-  assert.equal(result.status, "unavailable");
+test("native hardware JSON preserves measured units, idle zero, source identity and actual elapsed time", () => {
+  const metrics = parseNativeMetricsOutput(JSON.stringify(nativeFrame()), 1250);
+  assert.equal(metrics.status, "ready");
+  assert.equal(metrics.source, "ioreport");
+  assert.equal(metrics.effective_uid, 501);
+  assert.equal(metrics.cpu_power_mw, 2500.5);
+  assert.equal(metrics.gpu_power_mw, 825.25);
+  assert.equal(metrics.ane_power_mw, 0);
+  assert.equal(metrics.gpu_frequency_mhz, 900);
+  assert.equal(metrics.gpu_active_percent, 12.5);
+  assert.equal(metrics.sample_duration_ms, 1008.25);
+  assert.equal(metrics.sampled_at_unix_ms, 1000);
+  assert.equal(metrics.age_ms, 250);
+  assert.equal(metrics.cpu_clusters[1]!.frequency_mhz, 3500);
+  assert.equal(metrics.thermal_pressure, "Nominal");
+  assert.equal(metrics.disk_write_bytes_per_second, 0);
+  assert.deepEqual(metrics.power_sources, nativeFrame().power_sources);
+  assert.deepEqual(metrics.warnings, []);
+});
+
+test("missing native counters remain null and partial warnings do not invalidate measured power history", () => {
+  const frame = { ...nativeFrame(), ane_power_mw: null,
+    power_sources: { ...nativeFrame().power_sources, ane: null },
+    warnings: ["ANE energy channel is unavailable"], network_in_bytes_per_second: null };
+  const result = parseNativeMetricsOutput(JSON.stringify(frame), 1000);
+  assert.equal(result.status, "ready");
+  assert.equal(result.error, null);
+  assert.equal(result.cpu_power_mw, 2500.5);
   assert.equal(result.ane_power_mw, null);
+  assert.equal(result.network_in_bytes_per_second, null);
+  assert.equal(result.power_sources!.ane, null);
+  assert.deepEqual(result.warnings, ["ANE energy channel is unavailable"]);
 });
 
-test("failed sampler discovery never caches a partial set or starts a privileged helper", async () => {
-  const commands: string[] = [];
-  const collector = new PowerMetricsCollector({ enabled: true }, {
-    platform: () => "darwin",
-    runCommand: async (file) => { commands.push(file); return " cpu_power power\n ane_power power"; },
-  });
-  assert.equal((await collector.sample(new AbortController().signal)).status, "unavailable");
-  assert.equal((await collector.sample(new AbortController().signal)).status, "unavailable");
-  assert.deepEqual(commands, ["/usr/bin/powermetrics", "/usr/bin/powermetrics"]);
+test("native schema rejects malformed, missing or inconsistent fields instead of inventing valid readings", () => {
+  for (const [field, value] of [
+    ["schema_version", 2], ["source", "powermetrics"], ["effective_uid", -1],
+    ["sampled_at_unix_ms", -1], ["sampled_at_unix_ms", 999_999],
+    ["sample_duration_ms", 0], ["sample_duration_ms", null],
+    ["cpu_power_mw", "3"], ["gpu_power_mw", -1], ["ane_power_mw", false],
+    ["gpu_active_percent", 101], ["gpu_frequency_mhz", undefined],
+    ["cpu_clusters", {}], ["cpu_clusters", [{ name: "CPU", active_percent: -1, frequency_mhz: 2000 }]],
+    ["thermal_pressure", "maybe"], ["warnings", "warning"], ["warnings", [null]],
+    ["power_sources", { cpu: null, gpu: "CLPC", ane: "Energy Model" }],
+  ] as const) {
+    const frame: Record<string, unknown> = nativeFrame();
+    frame[field] = value;
+    assert.throws(() => parseNativeMetricsOutput(JSON.stringify(frame), 1000), Error, String(field));
+  }
+  assert.throws(() => parseNativeMetricsOutput("null"), /sample/);
+  assert.throws(() => parseNativeMetricsOutput("[]"), /sample/);
+  assert.throws(() => parseNativeMetricsOutput(JSON.stringify(nativeFrame()).replace('"cpu_power_mw":2500.5', '"cpu_power_mw":1e999')), /cpu_power_mw/);
+  assert.throws(() => parseNativeMetricsOutput("x".repeat(1024 * 1024 + 1)), /too large/);
+  assert.throws(() => parseNativeMetricsOutput(sample), /JSON|Unexpected/);
 });
 
-test("privileged sampler is noninteractive and finite; malformed later samples stay stale", async () => {
+test("unsupported platforms and already stopped native collection invoke no helper", async () => {
+  let commands = 0;
+  const runCommand = async () => { commands++; return JSON.stringify(nativeFrame()); };
+  for (const [platform, architecture] of [["linux", "arm64"], ["darwin", "x64"]]) {
+    const result = await new PowerMetricsCollector({ enabled: true }, {
+      platform: () => platform!, architecture: () => architecture!, runCommand,
+    }).sample(new AbortController().signal);
+    assert.equal(result.status, "unavailable");
+    assert.equal(result.source, "ioreport");
+    assert.equal(result.ane_power_mw, null);
+  }
+  const stopped = new AbortController();
+  stopped.abort();
+  const result = await new PowerMetricsCollector({ enabled: true }, {
+    platform: () => "darwin", architecture: () => "arm64", runCommand,
+  }).sample(stopped.signal);
+  assert.equal(result.status, "stopped");
+  assert.equal(commands, 0);
+});
+
+test("native collection launches only its colocated finite helper and retains stale measurements after failure", async () => {
   let now = 1000;
   let nativeSamples = 0;
   const collector = new PowerMetricsCollector({ enabled: true, intervalMs: 60_000 }, {
-    platform: () => "darwin", now: () => now,
-    runCommand: async (file, args) => {
-      if (file === "/usr/bin/powermetrics") return " cpu_power cpu\n gpu_power gpu\n ane_power ane\n thermal pressure";
-      assert.equal(file, "/usr/bin/sudo");
-      assert.deepEqual(args.slice(0, 2), ["-n", "/usr/bin/powermetrics"]);
-      assert.deepEqual(args.slice(6, 10), ["-n", "1", "-i", "1000"]);
-      assert.equal(args[args.length - 1], "cpu_power,gpu_power,ane_power,thermal");
-      return ++nativeSamples === 1 ? sample : "malformed data";
+    platform: () => "darwin", architecture: () => "arm64", now: () => now,
+    runCommand: async (file, args, _signal, timeout) => {
+      assert.equal(file, NATIVE_METRICS_HELPER);
+      assert.match(file, /\/dist\/native\/alloy-metrics$/);
+      assert.deepEqual(args, ["--interval-ms", "1000"]);
+      assert.equal(timeout, 3500);
+      return ++nativeSamples === 2 ? "malformed data" : JSON.stringify({ ...nativeFrame(), sampled_at_unix_ms: now });
     },
   });
   const first = await collector.sample(new AbortController().signal);
@@ -185,22 +243,97 @@ test("privileged sampler is noninteractive and finite; malformed later samples s
   assert.equal(stale.age_ms, 2500);
   assert.equal(stale.sampled_at_unix_ms, 1000);
   assert.equal(stale.ane_power_mw, 0);
-  assert.match(stale.error!, /header/);
+  assert.match(stale.error!, /JSON|Unexpected/);
+  now = 5000;
+  const recovered = await collector.sample(new AbortController().signal);
+  assert.equal(recovered.status, "ready");
+  assert.equal(recovered.sampled_at_unix_ms, now);
+  assert.equal(recovered.error, null);
 });
 
-test("authorization failures are actionable and never manufacture an idle ANE", async () => {
+test("a missing native helper requests a CLI rebuild and never launches an alternate backend", async () => {
+  const commands: string[] = [];
   const collector = new PowerMetricsCollector({ enabled: true }, {
-    platform: () => "darwin",
+    platform: () => "darwin", architecture: () => "arm64",
     runCommand: async (file) => {
-      if (file === "/usr/bin/powermetrics") return "cpu_power cpu\ngpu_power gpu\n";
-      throw new Error("sudo: a password is required");
+      commands.push(file);
+      throw new Error("Metric helper failed (ENOENT).");
     },
   });
   const result = await collector.sample(new AbortController().signal);
   assert.equal(result.status, "unavailable");
   assert.equal(result.ane_power_mw, null);
   assert.equal(result.sampled_at_unix_ms, null);
-  assert.match(result.error!, /sudo -v/);
+  assert.match(result.error!, /Rebuild.*npm --prefix ts\/cli run build/);
+  assert.doesNotMatch(result.error!, /sudo|authoriz|password/i);
+  assert.deepEqual(commands, [NATIVE_METRICS_HELPER]);
+});
+
+test("native samples share ownership and a result arriving after cancellation cannot become fresh", async () => {
+  const controller = new AbortController();
+  let release!: (output: string) => void;
+  let calls = 0;
+  const collector = new PowerMetricsCollector({ enabled: true, intervalMs: 1 }, {
+    platform: () => "darwin", architecture: () => "arm64", now: () => 1000,
+    runCommand: async (file, args, signal) => {
+      calls++;
+      assert.equal(file, NATIVE_METRICS_HELPER);
+      assert.deepEqual(args, ["--interval-ms", "500"]);
+      assert.equal(signal, controller.signal);
+      return new Promise<string>((resolve) => { release = resolve; });
+    },
+  });
+  const first = collector.sample(controller.signal);
+  assert.equal(collector.sample(controller.signal), first);
+  controller.abort();
+  release(JSON.stringify(nativeFrame()));
+  const result = await first;
+  assert.equal(calls, 1);
+  assert.equal(result.status, "stopped");
+  assert.equal(result.sampled_at_unix_ms, null);
+  assert.equal(result.cpu_power_mw, null);
+});
+
+test("Apple Silicon reports real CPU GPU ANE power frequency and thermal state without elevation", {
+  skip: process.platform !== "darwin" || process.arch !== "arm64",
+  timeout: 7000,
+}, async (t) => {
+  assert.equal(typeof process.geteuid, "function");
+  assert.notEqual(process.geteuid!(), 0, "Run native hardware acceptance as a normal user.");
+  const selfTest = await runMetricCommand(NATIVE_METRICS_HELPER, ["--self-test"], new AbortController().signal, 1500);
+  assert.deepEqual(JSON.parse(selfTest), { self_test: true }, "Native unit conversion and frequency-state checks must pass.");
+  const result = await new PowerMetricsCollector({ enabled: true, intervalMs: 500 }).sample(new AbortController().signal);
+  assert.equal(result.status, "ready", result.error ?? "No native hardware sample.");
+  assert.equal(result.source, "ioreport");
+  assert.equal(result.effective_uid, process.geteuid!());
+  assert.equal(result.error, null);
+  for (const key of ["cpu", "gpu", "ane"] as const) {
+    const value = result[`${key}_power_mw`];
+    assert.ok(value !== null && Number.isFinite(value) && value >= 0, `${key} power missing: ${result.warnings?.join("; ")}`);
+    assert.equal(typeof result.power_sources?.[key], "string", `${key} needs a real measured source, including idle zero`);
+  }
+  assert.ok(!(result.cpu_power_mw === 0 && result.warnings?.some((warning) =>
+    /\bCPU\b/i.test(warning) && /macOS 27/i.test(warning) && /legacy|stall|frozen/i.test(warning))),
+  `A potentially frozen legacy CPU energy counter cannot verify live power: ${result.warnings?.join("; ")}`);
+  assert.ok(result.sample_duration_ms !== null && result.sample_duration_ms > 0);
+  assert.ok(result.gpu_active_percent !== null, `GPU residency counter missing: ${result.warnings?.join("; ")}`);
+  if (result.gpu_active_percent > 0) {
+    assert.ok(result.gpu_frequency_mhz !== null && Number.isFinite(result.gpu_frequency_mhz) && result.gpu_frequency_mhz > 0,
+      `Active GPU frequency missing: ${result.warnings?.join("; ")}`);
+  }
+  assert.ok(result.cpu_clusters.length > 0, "CPU frequency-state counters are missing.");
+  for (const cluster of result.cpu_clusters) {
+    assert.ok(cluster.active_percent !== null, `${cluster.name} residency counter missing: ${result.warnings?.join("; ")}`);
+    if (cluster.active_percent > 0) {
+      assert.ok(cluster.frequency_mhz !== null && Number.isFinite(cluster.frequency_mhz) && cluster.frequency_mhz > 0,
+        `Active ${cluster.name} frequency missing: ${result.warnings?.join("; ")}`);
+    }
+  }
+  assert.ok(result.thermal_pressure !== null, "Thermal pressure must be read from Foundation.");
+  t.diagnostic(JSON.stringify({ effective_uid: result.effective_uid, cpu_power_mw: result.cpu_power_mw,
+    gpu_power_mw: result.gpu_power_mw, ane_power_mw: result.ane_power_mw, power_sources: result.power_sources,
+    gpu_active_percent: result.gpu_active_percent, gpu_frequency_state_average_mhz: result.gpu_frequency_mhz, cpu_frequency_states: result.cpu_clusters,
+    thermal_pressure: result.thermal_pressure, sample_duration_ms: result.sample_duration_ms, warnings: result.warnings }));
 });
 
 test("bounded helper timeout terminates even a child ignoring SIGTERM", async () => {

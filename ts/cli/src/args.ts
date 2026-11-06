@@ -13,6 +13,7 @@ export type CliArgs = {
   once: boolean;
   json: boolean;
   intervalMs: number;
+  /** Accepted for older commands; monitor hardware sampling is always enabled. */
   powermetrics: boolean;
   download: boolean;
 };

@@ -85,20 +85,23 @@ export interface HostMetricsCollector {
 }
 
 export function createHostMetricsCollector(options: {
-  powermetrics: boolean;
+  /** Compatibility option only; hardware sampling is always unprivileged. */
+  powermetrics?: boolean;
   intervalMs?: number;
 }, dependencies: {
   platform?: () => string;
+  architecture?: () => string;
   runCommand?: typeof runMetricCommand;
   now?: () => number;
 } = {}): HostMetricsCollector {
   const abort = new AbortController();
   const platformName = dependencies.platform ?? os.platform;
+  const architectureName = dependencies.architecture ?? os.arch;
   const command = dependencies.runCommand ?? runMetricCommand;
   const timestamp = dependencies.now ?? Date.now;
-  const probes = { platform: platformName, runCommand: command, now: timestamp };
+  const probes = { platform: platformName, architecture: architectureName, runCommand: command, now: timestamp };
   const power = new PowerMetricsCollector({
-    enabled: options.powermetrics,
+    enabled: true,
     ...(options.intervalMs === undefined ? {} : { intervalMs: options.intervalMs }),
   }, probes);
   const gpu = new GpuMetricsCollector(probes);
@@ -174,7 +177,7 @@ export function createHostMetricsCollector(options: {
     // TypeScript cannot follow assignments inside an awaited callback.
     const sampledSwap = swap as { total: number; used: number; free: number } | null;
     return {
-      sampled_at_unix_ms: timestamp(), platform, architecture: os.arch(), hostname: os.hostname(),
+      sampled_at_unix_ms: timestamp(), platform, architecture: architectureName(), hostname: os.hostname(),
       logical_cpu_count: currentCpu.count,
       cpu_utilization_percent: utilization, cpu_sample_ms: cpuSampleMs,
       load_average: os.loadavg(), uptime_seconds: os.uptime(),

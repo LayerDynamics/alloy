@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 export type PowerMetricsSnapshot = {
-  source: "powermetrics";
+  source: "powermetrics" | "ioreport";
   status: "disabled" | "starting" | "ready" | "stale" | "unavailable" | "stopped";
   sampled_at_unix_ms: number | null;
   age_ms: number | null;
@@ -24,6 +25,10 @@ export type PowerMetricsSnapshot = {
   disk_write_bytes_per_second: number | null;
   network_in_bytes_per_second: number | null;
   network_out_bytes_per_second: number | null;
+  /** Present for native snapshots; legacy recorded samples predate these fields. */
+  effective_uid?: number;
+  power_sources?: { cpu: string | null; gpu: string | null; ane: string | null };
+  warnings?: string[];
   error: string | null;
 };
 
@@ -63,8 +68,8 @@ export function runMetricCommand(
     const stop = (reason: string): void => {
       if (stopReason !== null) return;
       stopReason = reason;
-      // sudo forwards SIGTERM to its command. The power command additionally
-      // has -n 1, bounding its lifetime even if the UI exits abruptly.
+      // Each owned helper is finite. Kill escalation also bounds shutdown if
+      // a native probe stops responding to the initial termination signal.
       child.kill("SIGTERM");
       escalation = setTimeout(() => { child.kill("SIGKILL"); }, 250);
     };
@@ -78,9 +83,10 @@ export function runMetricCommand(
 export function emptyPowerMetrics(
   status: PowerMetricsSnapshot["status"],
   error: string | null = null,
+  source: PowerMetricsSnapshot["source"] = "powermetrics",
 ): PowerMetricsSnapshot {
   return {
-    source: "powermetrics", status, error,
+    source, status, error,
     sampled_at_unix_ms: null, age_ms: null, sample_duration_ms: null,
     cpu_power_mw: null, gpu_power_mw: null, ane_power_mw: null,
     gpu_active_percent: null, gpu_frequency_mhz: null, cpu_clusters: [],
@@ -269,27 +275,97 @@ export function parsePowerMetricsOutput(output: string, sampledAt = Date.now()):
   return snapshot;
 }
 
-/** Discover samplers from this Mac; ANE is included only when it is advertised. */
-export function supportedPowerSamplers(help: string): string[] {
-  const wanted = ["cpu_power", "gpu_power", "ane_power", "thermal", "disk", "network"];
-  const names = new Set<string>();
-  for (const line of help.split(/\r?\n/)) {
-    const match = /^\s*([a-z_]+)\s+/.exec(line);
-    if (match) names.add(match[1]!);
+/** The colocated helper is prepared during the CLI build, never at monitor runtime. */
+export const NATIVE_METRICS_HELPER = fileURLToPath(new URL("../native/alloy-metrics", import.meta.url));
+
+/** Validate the native wire contract without treating absent counters as idle. */
+export function parseNativeMetricsOutput(output: string, now = Date.now()): PowerMetricsSnapshot {
+  if (Buffer.byteLength(output) > MAX_OUTPUT_BYTES) throw new Error("Native hardware sample is too large.");
+  const parsed: unknown = JSON.parse(output);
+  const object = (value: unknown, field: string): Record<string, unknown> => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid native hardware ${field}.`);
+    return value as Record<string, unknown>;
+  };
+  const root = object(parsed, "sample");
+  if (root.schema_version !== 1 || root.source !== "ioreport") throw new Error("Unsupported native hardware schema or source.");
+  const counter = (value: unknown, field: string, maximum = Number.MAX_VALUE): number | null => {
+    if (value === null) return null;
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > maximum) {
+      throw new Error(`Invalid native hardware ${field}.`);
+    }
+    return value;
+  };
+  const integer = (value: unknown, field: string): number => {
+    if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`Invalid native hardware ${field}.`);
+    return value as number;
+  };
+  const label = (value: unknown, field: string, maximum = 128): string => {
+    if (typeof value !== "string" || !value.trim() || value.length > maximum) throw new Error(`Invalid native hardware ${field}.`);
+    return value;
+  };
+  const sampledAt = integer(root.sampled_at_unix_ms, "sampled_at_unix_ms");
+  if (sampledAt > now + 1000) throw new Error("Native hardware sample timestamp is in the future.");
+  const elapsed = counter(root.sample_duration_ms, "sample_duration_ms", 60_000);
+  if (elapsed === null || elapsed === 0) throw new Error("Native hardware sample duration must be positive.");
+  if (!Array.isArray(root.cpu_clusters) || root.cpu_clusters.length > 64) throw new Error("Invalid native hardware cpu_clusters.");
+  const clusters = root.cpu_clusters.map((value: unknown, index: number) => {
+    const cluster = object(value, `cpu_clusters[${index}]`);
+    return {
+      name: label(cluster.name, "cluster name"),
+      active_percent: counter(cluster.active_percent, "cluster active_percent", 100),
+      frequency_mhz: counter(cluster.frequency_mhz, "cluster frequency_mhz"),
+    };
+  });
+  const thermal = root.thermal_pressure;
+  if (thermal !== null && !["Nominal", "Fair", "Serious", "Critical"].includes(thermal as string)) {
+    throw new Error("Invalid native hardware thermal_pressure.");
   }
-  return wanted.filter((name) => names.has(name));
+  if (!Array.isArray(root.warnings) || root.warnings.length > 32) throw new Error("Invalid native hardware warnings.");
+  const warnings = root.warnings.map((value: unknown) => label(value, "warning", 400));
+  const sourceFields = object(root.power_sources, "power_sources");
+  const source = (key: string): string | null => sourceFields[key] === null ? null : label(sourceFields[key], `power_sources.${key}`);
+  const sources = { cpu: source("cpu"), gpu: source("gpu"), ane: source("ane") };
+  const snapshot: PowerMetricsSnapshot = {
+    ...emptyPowerMetrics("ready", null, "ioreport"),
+    sampled_at_unix_ms: sampledAt,
+    age_ms: Math.max(0, now - sampledAt),
+    sample_duration_ms: elapsed,
+    effective_uid: integer(root.effective_uid, "effective_uid"),
+    cpu_power_mw: counter(root.cpu_power_mw, "cpu_power_mw"),
+    gpu_power_mw: counter(root.gpu_power_mw, "gpu_power_mw"),
+    ane_power_mw: counter(root.ane_power_mw, "ane_power_mw"),
+    gpu_active_percent: counter(root.gpu_active_percent, "gpu_active_percent", 100),
+    gpu_frequency_mhz: counter(root.gpu_frequency_mhz, "gpu_frequency_mhz"),
+    cpu_clusters: clusters,
+    thermal_pressure: thermal as string | null,
+    disk_read_bytes_per_second: counter(root.disk_read_bytes_per_second, "disk_read_bytes_per_second"),
+    disk_write_bytes_per_second: counter(root.disk_write_bytes_per_second, "disk_write_bytes_per_second"),
+    network_in_bytes_per_second: counter(root.network_in_bytes_per_second, "network_in_bytes_per_second"),
+    network_out_bytes_per_second: counter(root.network_out_bytes_per_second, "network_out_bytes_per_second"),
+    power_sources: sources,
+    warnings,
+  };
+  for (const key of ["cpu", "gpu", "ane"] as const) {
+    if (snapshot[`${key}_power_mw`] !== null && sources[key] === null) {
+      throw new Error(`Native ${key.toUpperCase()} power has no measured source.`);
+    }
+  }
+  if (snapshot.cpu_power_mw === null && snapshot.gpu_power_mw === null && snapshot.ane_power_mw === null
+      && snapshot.gpu_active_percent === null && snapshot.gpu_frequency_mhz === null
+      && snapshot.cpu_clusters.length === 0 && snapshot.thermal_pressure === null) {
+    throw new Error("Native sampler reported no hardware readings.");
+  }
+  return snapshot;
 }
 
-/**
- * An explicit opt-in sampler. Every privileged invocation has a positive sample
- * count, so closing a monitor cannot leave an infinite root sampling process.
- */
+/** Direct, unprivileged native sampling. No external diagnostic-tool fallback. */
 export class PowerMetricsCollector {
   #enabled: boolean;
   #intervalMs: number;
-  #samplers: string[] | null = null;
   #last: PowerMetricsSnapshot;
+  #pending: Promise<PowerMetricsSnapshot> | null = null;
   #platform: () => string;
+  #architecture: () => string;
   #runCommand: typeof runMetricCommand;
   #now: () => number;
 
@@ -297,6 +373,7 @@ export class PowerMetricsCollector {
     options: { enabled: boolean; intervalMs?: number },
     dependencies: {
       platform?: () => string;
+      architecture?: () => string;
       runCommand?: typeof runMetricCommand;
       now?: () => number;
     } = {},
@@ -304,42 +381,46 @@ export class PowerMetricsCollector {
     this.#enabled = options.enabled;
     // Hardware measurement windows stay short even when the display is slow.
     this.#intervalMs = Math.min(1000, Math.max(500, options.intervalMs ?? 1000));
-    this.#last = emptyPowerMetrics(options.enabled ? "starting" : "disabled");
+    this.#last = emptyPowerMetrics(options.enabled ? "starting" : "disabled", null, "ioreport");
     this.#platform = dependencies.platform ?? os.platform;
+    this.#architecture = dependencies.architecture ?? os.arch;
     this.#runCommand = dependencies.runCommand ?? runMetricCommand;
     this.#now = dependencies.now ?? Date.now;
   }
 
-  async sample(signal: AbortSignal): Promise<PowerMetricsSnapshot> {
+  sample(signal: AbortSignal): Promise<PowerMetricsSnapshot> {
+    if (this.#pending === null) {
+      this.#pending = this.#collect(signal).finally(() => { this.#pending = null; });
+    }
+    return this.#pending;
+  }
+
+  #failed(detail: string, stopped: boolean): PowerMetricsSnapshot {
+    this.#last = {
+      ...this.#last,
+      status: stopped ? "stopped" : this.#last.sampled_at_unix_ms === null ? "unavailable" : "stale",
+      age_ms: this.#last.sampled_at_unix_ms === null ? null : Math.max(0, this.#now() - this.#last.sampled_at_unix_ms),
+      error: detail.slice(0, 400),
+    };
+    return this.#last;
+  }
+
+  async #collect(signal: AbortSignal): Promise<PowerMetricsSnapshot> {
     if (!this.#enabled) return this.#last;
-    if (this.#platform() !== "darwin") {
-      return emptyPowerMetrics("unavailable", "Apple powermetrics is available only on macOS.");
+    if (signal.aborted) return this.#failed("Native hardware sampling was stopped.", true);
+    if (this.#platform() !== "darwin" || this.#architecture() !== "arm64") {
+      return emptyPowerMetrics("unavailable", "Native hardware counters require Apple Silicon macOS.", "ioreport");
     }
     try {
-      if (this.#samplers === null) {
-        const help = await this.#runCommand("/usr/bin/powermetrics", ["-h"], signal);
-        const samplers = supportedPowerSamplers(help);
-        if (!samplers.includes("cpu_power") || !samplers.includes("gpu_power")) {
-          throw new Error("This Mac does not advertise the cpu_power and gpu_power samplers.");
-        }
-        this.#samplers = samplers;
-      }
-      const output = await this.#runCommand("/usr/bin/sudo", [
-        "-n", "/usr/bin/powermetrics", "-f", "plist", "-b", "0",
-        "-n", "1", "-i", String(this.#intervalMs), "-s", this.#samplers.join(","),
-      ], signal, this.#intervalMs + 2500);
-      this.#last = parsePowerMetricsOutput(output, this.#now());
+      const output = await this.#runCommand(NATIVE_METRICS_HELPER,
+        ["--interval-ms", String(this.#intervalMs)], signal, this.#intervalMs + 2500);
+      if (signal.aborted) return this.#failed("Native hardware sampling was stopped.", true);
+      this.#last = parseNativeMetricsOutput(output, this.#now());
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      const status = this.#last.sampled_at_unix_ms === null ? "unavailable" : "stale";
-      this.#last = {
-        ...this.#last,
-        status: signal.aborted ? "stopped" : status,
-        age_ms: this.#last.sampled_at_unix_ms === null ? null : Math.max(0, this.#now() - this.#last.sampled_at_unix_ms),
-        error: /password|sudo:.*(?:terminal|tty|authentication)/i.test(detail)
-          ? "Optional power metrics need authorization. Run sudo -v for --powermetrics."
-          : detail.slice(0, 400),
-      };
+      return this.#failed(/ENOENT/.test(detail)
+        ? "Native hardware sampler is missing. Rebuild with npm --prefix ts/cli run build."
+        : detail, signal.aborted);
     }
     return this.#last;
   }

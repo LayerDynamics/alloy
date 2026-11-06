@@ -93,8 +93,8 @@ and does not add fields to the monitor JSON schema.
 | --- | --- | --- |
 | Host | CPU utilization across logical cores, load averages, installed/free/non-free RAM, uptime | Node OS counters; CPU is a delta between observations; non-free RAM includes reclaimable pages and is not Activity Monitor's app-memory total |
 | macOS memory | Wired and compressed memory, swap usage | Bounded `vm_stat` and `sysctl` reads; missing probes remain unavailable |
-| macOS GPU | Driver-reported device utilization, per-device identity and counters | Unprivileged IORegistry snapshot through `ioreg`; sampled by default, independent of power authorization; driver-dependent availability |
-| Optional Apple power | CPU/GPU/ANE estimated component power, GPU active residency, available frequency/thermal counters | Opt-in Apple `powermetrics` samples; platform-dependent fields; component estimates are not whole-machine power |
+| macOS GPU | Driver-reported device utilization, per-device identity and counters | Unprivileged IORegistry snapshot through `ioreg`; sampled by default, independently of native power collection; driver-dependent availability |
+| Apple Silicon hardware | CPU/GPU/ANE estimated component power, GPU active residency, CPU/GPU frequency-state averages and thermal pressure | Bundled unprivileged native sampler; IOReport counters, IORegistry frequency tables and Foundation thermal state; component estimates are not whole-machine power |
 | Alloy | Reserved/available bytes, current budget, reservation count, admission pause, request/cancellation state | Read-only daemon metadata, without dispatching a native-worker command |
 | Residency and pressure | Last published model metadata, pressure classification and ceiling breakdown | Explicit observation age and errors; ownership survives cancellation until actual cleanup |
 
@@ -113,11 +113,22 @@ and the [Stats GPU reader](https://github.com/exelban/stats/blob/master/Modules/
 ANE power is measured in watts/milliwatts, not percent occupancy. A missing
 ANE field is unavailable, not zero. GPU active residency is the fraction of
 the sampling interval in an active state, not a count of saturated GPU cores.
-GPU frequency accepts both observed `freq_hz` encodings: actual Hz and the
-MHz values emitted under that name by some macOS versions. GPU values below
-100,000 are interpreted as MHz; larger values are converted from Hz. CPU
-cluster Hz conversion is separate. This covers the recorded 749.789 MHz
-[macOS capture and regression](https://github.com/gavi/monmon/blob/main/tests/test_power.py).
+Native power uses actual monotonic sample duration and explicitly supported
+energy units. A measured zero retains its source; a missing channel, invalid
+delta or unknown unit stays unavailable. Valid CLPC energy counters take
+precedence over legacy Energy Model readings, with supported PMP ANE counters
+as an independent fallback. These sources must never be summed as duplicate
+measurements of the same component.
+
+Frequency values are residency-weighted averages of active frequency states,
+using the machine's IORegistry DVFS tables. Inactive states are excluded from
+that average; hardware with no active residency is labeled idle. Table/state
+mismatches remain unavailable. On M4, these reported
+CPU states can represent requested frequency rather than the throttled hardware
+clock; the display therefore labels them as state averages. Thermal pressure
+comes independently from Foundation's public process thermal-state API.
+The retained legacy plist parser still accepts both observed GPU `freq_hz`
+encodings for old captures; it is not used to launch a power sampler.
 System RAM, allocator activity, daemon footprint and reserved bytes overlap;
 they must not be summed as independent CPU and GPU memory pools.
 
@@ -145,32 +156,46 @@ bounded lifetime and are both settled before collector shutdown completes.
 
 Monitor JSON adds an independent `host.gpu` source with its own status,
 timestamp, age, utilization and device entries. The existing
-`host.accelerators` fields retain their powermetrics meanings. Readers still
+`host.accelerators` fields retain their units and now identify the native
+source as `ioreport`, including per-component power provenance and warnings.
+Readers still
 accept older version-1 captures without `host.gpu`; their GPU line remains
 explicitly labeled active residency. Changing measurement sources clears
 the GPU trend rather than joining different definitions. GPU and ANE history
 deduplicate their own source timestamps; failed power sampling cannot erase
 a fresh registry reading or make a stale GPU reading current.
 
-## macOS power permissions
+## Unprivileged macOS hardware collection
 
-Basic CPU/RAM/swap and GPU utilization monitoring need no administrator access.
-GPU registry sampling runs by default without a shell or privileged helper.
-The optional
-`--powermetrics` mode runs only `/usr/bin/powermetrics` through non-interactive
-`sudo -n`; authenticate with `sudo -v` in the same terminal first. The monitor
-does not collect passwords, install a privileged service, change sudoers or
-run the Node application as root. Without authorization or supported
-counters, the rest of the monitor remains usable, including GPU utilization.
-The accelerator panel scopes status and authorization messages to the power
-source. This is a requirement of the selected powermetrics backend, not a
-general permission requirement for displaying a GPU utilization graph.
+The ordinary `monitor` command samples all supported hardware fields without
+administrator access. No path invokes `sudo`, requests a password, installs a
+privileged service, or falls back to Apple's `powermetrics` command. The old
+`--powermetrics` argument is accepted only as a compatibility alias; it cannot
+select a different permission level or disable the default collector.
 
-Supported samplers are discovered from the installed tool. Samples use its
-NUL-separated plist format, with bounded parsing and command execution.
-Apple documents component power as an estimate, intended for comparing work
-on the same system rather than comparing machines:
-[powermetrics manual](https://keith.github.io/xcode-man-pages/powermetrics.1.html).
+`npm --prefix ts/cli run build` compiles the bundled Objective-C source at
+`ts/cli/native/macos-metrics.m` into `ts/cli/dist/native/alloy-metrics` on Apple
+Silicon, using the installed Xcode Command Line Tools. Compilation is bounded,
+publishes the executable atomically, and fails the build on error. Other
+platforms skip the native build. The runtime resolves this executable relative
+to the installed CLI, not the current directory, and never compiles, downloads
+or installs tools. A missing executable is an explicit build error in the
+sample rather than an authorization request.
+
+Each native invocation collects one finite sampling window and exits. The
+client validates its JSON before publication and stops its owned child during
+shutdown. Subscription discovery, supported units, real elapsed duration and
+per-component source metadata distinguish actual idle zero from unsupported
+measurements. Partial warnings stay separate from fatal collection errors so
+one missing counter does not suppress other valid readings or history.
+
+The sampler uses private IOReport channels through the system library and
+public IORegistry/Foundation APIs. Channel availability and DVFS layouts can
+change with OS or hardware versions; unsupported data stays null. Native API
+references include the pinned [macmon source](https://github.com/vladkens/macmon/tree/880f641ed67628ae92713928cd6806afa3c51d04)
+and [Stats declarations](https://github.com/exelban/stats/blob/482da327d4b19d54a55dfc34b2a316f359e68f41/Modules/Sensors/bridge.h).
+These are references for the bundled sampler, not separately installed runtime
+applications.
 
 ## Capture and acceptance
 
@@ -198,13 +223,18 @@ Required checks for this feature:
    GPU registry parsing preserves zero utilization and device identities,
    rejects invalid percentages, and never invokes a privileged helper.
    The Apple-Silicon CI host must provide a real GPU utilization reading
-   while the test process is unprivileged. Power-disabled and authorization-
-   denied fixtures must retain independent GPU readings and history.
+   while the test process is unprivileged. Native telemetry failures must retain
+   independent GPU readings and history, without requesting authorization.
+   Default host sampling and the compatibility flag must both use only the
+   colocated unprivileged helper for power, frequency and thermal data.
 3. Live daemon metadata remains readable while the native worker is blocked;
    cancellation leaves reservations and the execution slot intact until cleanup.
-4. Stale observations, lost connections and missing permission remain visible;
+4. Stale observations, lost connections and unsupported counters remain visible;
    reconnects do not retain an old daemon's values as current.
 5. One-shot JSON is valid, continuous polling does not overlap, and terminal
    exit/resize restores a usable terminal without leaving an unbounded sampler.
 6. Mac hardware collection is validated separately from fixture/parser tests.
-   Unprivileged CI cannot establish live ANE power collection.
+   The Apple-Silicon lane must compile and run the bundled helper as a normal
+   user, obtaining real CPU/GPU/ANE energy counters, frequency-state readings
+   and thermal data. Missing or fabricated values cannot pass that acceptance
+   check. Linux runs the portable parser, ownership and integration checks.

@@ -39,8 +39,7 @@ Usage: alloy monitor [--socket PATH] [--interval MS] [--powermetrics]
   alloy monitor --once --json   capture one JSON snapshot
   alloy monitor --json          continuous newline-delimited JSON
   --interval MS                 refresh interval, 500–60000 ms (default 1000)
-  --powermetrics                optional macOS CPU/GPU/ANE power via sudo -n
-                                authorize sudo separately before use
+  --powermetrics                compatibility alias; native hardware is sampled by default
   q / Ctrl+C                    exit the live dashboard
 
 The monitor remains useful when alloyd is offline. Redirected text output takes

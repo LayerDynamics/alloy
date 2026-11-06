@@ -105,13 +105,13 @@ test("small terminals retain hardware freshness and failures next to cached valu
   const sample = snapshot();
   Object.assign(sample.host!.accelerators, {
     status: "stale", age_ms: 30_000, gpu_active_percent: 25, ane_power_mw: 0,
-    error: "sudo authorization expired",
+    error: "native sampling failed",
   });
   const text = renderMonitorSnapshot(sample, { columns: 50, rows: 18 });
   assert.match(text, /ACCELERATORS stale.*30\.0s old/);
   assert.match(text, /GPU active.*25\.0%/);
   assert.match(text, /ANE power 0 mW/);
-  assert.match(text, /sudo authorization expired/);
+  assert.match(text, /native sampling failed/);
 });
 
 test("short and narrow windows retain bars and history with a refused daemon connection", () => {
@@ -299,7 +299,7 @@ test("polls cannot overlap and closing cancels an in-flight read", async () => {
 });
 
 
-test("IORegistry GPU utilization remains visible when optional power sampling is disabled or unauthorized", () => {
+test("IORegistry GPU utilization remains visible when recorded power sampling is disabled or failed", () => {
   for (const powerStatus of ["disabled", "unavailable"] as const) {
     const sample = snapshot();
     sample.host!.gpu = {
@@ -308,17 +308,86 @@ test("IORegistry GPU utilization remains visible when optional power sampling is
       devices: [{ id: "42", name: "Apple GPU", utilization_percent: 37.5 }], error: null,
     };
     sample.host!.accelerators = emptyPowerMetrics(powerStatus,
-      powerStatus === "unavailable" ? "Power sampling needs authorization" : null);
+      powerStatus === "unavailable" ? "Native sampling unavailable" : null);
     for (const [columns, rows] of [[80, 24], [120, 35], [50, 18]] as const) {
       const text = renderMonitorSnapshot(sample, { columns, rows });
       assert.match(text, /GPU use.*37\.5%/);
       assert.match(text, /GPU ready.*0\.0s old/);
-      assert.match(text, powerStatus === "disabled" ? /Power (?:optional|disabled)/ : /Power unavailable/);
+      assert.match(text, powerStatus === "disabled" ? /Power disabled/ : /Power unavailable/);
       assert.doesNotMatch(text, /ACCELERATORS unavailable|Hardware.*authorization/);
       assert.ok(text.split("\n").length <= rows);
       assert.ok(text.split("\n").every((row) => monitorTextWidth(row) <= columns));
     }
   }
+});
+
+test("native CPU GPU ANE power and thermal readings render together without enabling another sampler", () => {
+  const sample = snapshot();
+  sample.host!.gpu = {
+    source: "ioreg", status: "ready", sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, utilization_percent: 37.5,
+    devices: [{ id: "42", name: "Apple GPU", utilization_percent: 37.5 }], error: null,
+  };
+  sample.host!.accelerators = {
+    ...emptyPowerMetrics("ready", null, "ioreport"), sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, sample_duration_ms: 1008, effective_uid: 501,
+    cpu_power_mw: 3500, gpu_power_mw: 850, ane_power_mw: 0,
+    gpu_active_percent: 31, gpu_frequency_mhz: 900, thermal_pressure: "Nominal",
+    cpu_clusters: [{ name: "E-CPU", active_percent: 20, frequency_mhz: 1800 },
+      { name: "P-CPU", active_percent: 12, frequency_mhz: 3500 }],
+    power_sources: { cpu: "CLPC", gpu: "CLPC", ane: "Energy Model" }, warnings: [],
+  };
+  for (const [columns, rows] of [[80, 24], [140, 35], [50, 18]] as const) {
+    const text = renderMonitorSnapshot(sample, { columns, rows });
+    assert.match(text, /GPU use.*37\.5%/);
+    assert.match(text, /3\.50 W/);
+    assert.match(text, /850 mW/);
+    assert.match(text, /ANE(?: power)? .*0 mW|ANE 0 mW/);
+    assert.doesNotMatch(text, /sudo|authoriz|enable --powermetrics|Power optional/i);
+    if (columns >= 80) {
+      assert.match(text, /IOReport/);
+      assert.match(text, /Thermal Nominal/);
+      assert.match(text, /GPU state avg 900 MHz/);
+    }
+    assert.ok(text.split("\n").length <= rows);
+    assert.ok(text.split("\n").every((row) => monitorTextWidth(row) <= columns));
+  }
+});
+
+test("partial native counters retain measured power and explain the missing field without an authorization request", () => {
+  const sample = snapshot();
+  sample.host!.accelerators = {
+    ...emptyPowerMetrics("ready", null, "ioreport"), sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, cpu_power_mw: 3500, gpu_power_mw: 850, ane_power_mw: null,
+    gpu_active_percent: 31, gpu_frequency_mhz: 900, thermal_pressure: "Nominal",
+    power_sources: { cpu: "CLPC", gpu: "CLPC", ane: null }, warnings: ["ANE channel absent"],
+  };
+  const text = renderMonitorSnapshot(sample, { columns: 160, rows: 35 });
+  assert.match(text, /CPU .*3\.50 W/);
+  assert.match(text, /GPU .*850 mW/);
+  assert.match(text, /ANE .*unavailable/);
+  assert.match(text, /ANE channel absent/);
+  assert.match(text, /IOReport · active residency/);
+  assert.doesNotMatch(text, /sudo|authoriz|enable --powermetrics|Power optional|powermetrics/i);
+});
+
+test("zero active residency displays idle without inventing a frequency", () => {
+  const sample = snapshot();
+  sample.host!.accelerators = {
+    ...emptyPowerMetrics("ready", null, "ioreport"), sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, cpu_power_mw: 1100, gpu_power_mw: 0, ane_power_mw: 0,
+    gpu_active_percent: 0, gpu_frequency_mhz: null, thermal_pressure: "Nominal",
+    cpu_clusters: [{ name: "E-CPU", active_percent: 0, frequency_mhz: null }],
+    power_sources: { cpu: "CLPC", gpu: "CLPC", ane: "Energy Model" }, warnings: [],
+  };
+  for (const [columns, rows] of [[80, 24], [140, 35], [50, 24]] as const) {
+    const text = renderMonitorSnapshot(sample, { columns, rows });
+    assert.match(text, /GPU idle/);
+    assert.doesNotMatch(text, /0 MHz|GPU frequency unavailable|sudo|authoriz/i);
+    if (columns === 140) assert.match(text, /E-CPU.*0\.0% · idle/);
+  }
+  sample.host!.accelerators.gpu_active_percent = null;
+  assert.match(renderMonitorSnapshot(sample, { columns: 140, rows: 35 }), /GPU frequency unavailable/);
 });
 
 test("a stale IORegistry GPU reading keeps its own error and age while power remains fresh", () => {
