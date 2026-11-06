@@ -2,7 +2,7 @@
 //!
 //! Predict the peak of `usage + chunk_workspace`. When that exceeds the
 //! live admit line, shrink the prefill chunk down to
-//! [`DEFAULT_PREFILL_MIN_CHUNK_TOKENS`] (or a caller floor). If the floor
+//! [`crate::prefill_admit::DEFAULT_PREFILL_MIN_CHUNK_TOKENS`] (or a caller floor). If the floor
 //! still does not fit, reject with a typed memory error that names the
 //! binding component when known.
 

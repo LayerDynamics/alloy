@@ -220,6 +220,7 @@ struct ArtifactData {
     eos: Vec<u32>,
     source_bytes: u64,
     resident_bound: u64,
+    decoded_bound: u64,
     checksums: BTreeMap<PathBuf, [u8; 32]>,
 }
 
@@ -315,7 +316,20 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = parse_config(&config_value)?;
-            let resident_bound = sum(&[resident_bound(&config)?, limits.loader_headroom_bytes])?;
+            // Undeclared representation uses the conservative dense path.
+            // Quantized declarations retain the existing packed estimates.
+            let declares_quantization = ["quantization", "quantization_config"]
+                .iter()
+                .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
+            let (decoded_bound, resident_payload_bound) = if declares_quantization {
+                (decoded_weight_bound(&config)?, resident_bound(&config)?)
+            } else {
+                (
+                    dense_decoded_weight_bound(&config)?,
+                    dense_weight_payload_bound(&config)?,
+                )
+            };
+            let resident_bound = sum(&[resident_payload_bound, limits.loader_headroom_bytes])?;
             let tokenizer_bytes =
                 read_metadata(&specification, "tokenizer.json", limits.max_tokenizer_bytes)?;
             let tokenizer_value = parse_json(
@@ -428,6 +442,7 @@ impl Qwen3Backend {
                 eos,
                 source_bytes,
                 resident_bound,
+                decoded_bound,
                 checksums,
             };
             artifacts.insert(data.specification.id.clone(), data);
@@ -582,7 +597,7 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
-        let decoded_bound = decoded_weight_bound(&data.config)?;
+        let decoded_bound = data.decoded_bound;
         // Headroom covers group-size variance (planning assumes 64; some
         // fixtures/checkpoints use smaller groups with larger scale tables).
         let weight_charge_limit = sum(&[decoded_bound, self.limits.loader_headroom_bytes])?;
@@ -784,7 +799,7 @@ impl RuntimeBackend for Qwen3Backend {
                 .ok_or_else(|| internal("Qwen3 context arithmetic overflow"))?;
             let load_peak = sum(&[
                 data.source_bytes,
-                decoded_weight_bound(&data.config)?,
+                data.decoded_bound,
                 data.resident_bound,
                 self.limits.loader_headroom_bytes,
             ])?;
@@ -1644,7 +1659,10 @@ fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
     let v = as_u64(config.vocab_size)?;
     let matrix_elements = sum(&[
         product(v, h)?, // embed
-        product(as_u64(config.num_layers)?, layer_projection_elements(config)?)?,
+        product(
+            as_u64(config.num_layers)?,
+            layer_projection_elements(config)?,
+        )?,
         if config.tie_embeddings {
             0
         } else {
@@ -1661,8 +1679,10 @@ fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
 fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
     let h = as_u64(config.hidden_size)?;
     let v = as_u64(config.vocab_size)?;
-    let proj_elements =
-        product(as_u64(config.num_layers)?, layer_projection_elements(config)?)?;
+    let proj_elements = product(
+        as_u64(config.num_layers)?,
+        layer_projection_elements(config)?,
+    )?;
     let proj_bytes = affine4_matrix_bytes(proj_elements, AFFINE4_GROUP_SIZE)?;
     let embed_bytes = product(product(v, h)?, 4)?;
     let lm_head_bytes = if config.tie_embeddings {
@@ -1692,6 +1712,31 @@ fn affine4_matrix_bytes(elements: u64, group_size: u64) -> Result<u64, EngineErr
     // scales + biases: 2 * (elements / group_size) * 4 bytes
     let params = product(elements / group_size, 8)?;
     sum(&[packed, params])
+}
+
+// Dense matrix payload, shared by host decoding and MLX residency.
+fn dense_weight_payload_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    let embedding = product(as_u64(config.vocab_size)?, as_u64(config.hidden_size)?)?;
+    let projections = product(
+        as_u64(config.num_layers)?,
+        layer_projection_elements(config)?,
+    )?;
+    let elements = sum(&[
+        embedding,
+        projections,
+        if config.tie_embeddings { 0 } else { embedding },
+    ])?;
+    sum(&[product(elements, 4)?, norm_bytes(config)?])
+}
+
+fn dense_decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    sum(&[
+        dense_weight_payload_bound(config)?,
+        product(
+            as_u64(config.num_layers)?,
+            as_u64(std::mem::size_of::<LayerWeights>())?,
+        )?,
+    ])
 }
 
 fn decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
@@ -2159,8 +2204,7 @@ mod shared_rendering_wiring_tests {
         cols: usize,
         values: &[f32],
     ) {
-        let (packed, scales, biases) =
-            quantize_affine4(values, rows, cols, WIRING_AFFINE4_GROUP);
+        let (packed, scales, biases) = quantize_affine4(values, rows, cols, WIRING_AFFINE4_GROUP);
         let groups = cols / WIRING_AFFINE4_GROUP;
         let base = weight_name
             .strip_suffix(".weight")
@@ -2947,7 +2991,10 @@ mod shared_rendering_wiring_tests {
             // MLX dequants embed/lm_head to f32, so resident ≥ host Affine4.
             assert!(resident >= host, "resident={resident} host={host}");
             // Still well under dense when projections dominate.
-            assert!(resident < dense_matrices, "resident={resident} dense={dense_matrices}");
+            assert!(
+                resident < dense_matrices,
+                "resident={resident} dense={dense_matrices}"
+            );
             let plan = cache_spec(&config, 16).payload_plan().expect("cache plan");
             assert_eq!(
                 cache_bound(&config, 16).expect("cache allowance"),
@@ -2964,3 +3011,35 @@ mod shared_rendering_wiring_tests {
 // ALLOY_MEASURED_BUFFERS_V1
 
 // ALLOY_PRESSURE_STARTUP_INTEGRATION_V1
+
+#[cfg(test)]
+mod dense_weight_planning_regressions {
+    use super::*;
+
+    #[test]
+    fn dense_fixture_payload_and_host_storage_fit_the_dense_bounds() {
+        for tied in [true, false] {
+            let mut config = Qwen3Config::tiny_fixture();
+            config.vocab_size = 258;
+            config.tie_embeddings = tied;
+
+            let weights = qwen3::fixture::generate_fixture(&config);
+            let measured = weight_memory(&weights).expect("fixture accounting");
+            let headers = product(
+                as_u64(weights.layers.len()).expect("layer count"),
+                as_u64(std::mem::size_of::<LayerWeights>()).expect("layer size"),
+            )
+            .expect("headers");
+            let payload = measured.used_bytes() - headers;
+
+            assert_eq!(
+                dense_weight_payload_bound(&config).expect("dense payload"),
+                payload,
+            );
+            assert!(
+                dense_decoded_weight_bound(&config).expect("dense host bound")
+                    >= measured.allocated_bytes(),
+            );
+        }
+    }
+}

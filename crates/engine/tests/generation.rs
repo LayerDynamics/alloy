@@ -253,7 +253,10 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
         &mut records,
         "model.embed_tokens.weight".to_owned(),
         vec![config.vocab_size, config.hidden_size],
-        &weights.embed_tokens,
+        weights
+            .embed_tokens
+            .as_f32()
+            .expect("dense fixture embedding"),
     );
 
     for (index, layer) in weights.layers.iter().enumerate() {
@@ -268,17 +271,17 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
             (
                 "self_attn.q_proj.weight",
                 vec![config.q_dim(), config.hidden_size],
-                layer.q_proj.as_slice(),
+                layer.q_proj.as_f32().expect("dense fixture q_proj"),
             ),
             (
                 "self_attn.k_proj.weight",
                 vec![config.kv_dim(), config.hidden_size],
-                layer.k_proj.as_slice(),
+                layer.k_proj.as_f32().expect("dense fixture k_proj"),
             ),
             (
                 "self_attn.v_proj.weight",
                 vec![config.kv_dim(), config.hidden_size],
-                layer.v_proj.as_slice(),
+                layer.v_proj.as_f32().expect("dense fixture v_proj"),
             ),
             (
                 "self_attn.q_norm.weight",
@@ -293,7 +296,7 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
             (
                 "self_attn.o_proj.weight",
                 vec![config.hidden_size, config.q_dim()],
-                layer.o_proj.as_slice(),
+                layer.o_proj.as_f32().expect("dense fixture o_proj"),
             ),
             (
                 "post_attention_layernorm.weight",
@@ -303,17 +306,17 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
             (
                 "mlp.gate_proj.weight",
                 vec![config.intermediate_size, config.hidden_size],
-                layer.gate_proj.as_slice(),
+                layer.gate_proj.as_f32().expect("dense fixture gate_proj"),
             ),
             (
                 "mlp.up_proj.weight",
                 vec![config.intermediate_size, config.hidden_size],
-                layer.up_proj.as_slice(),
+                layer.up_proj.as_f32().expect("dense fixture up_proj"),
             ),
             (
                 "mlp.down_proj.weight",
                 vec![config.hidden_size, config.intermediate_size],
-                layer.down_proj.as_slice(),
+                layer.down_proj.as_f32().expect("dense fixture down_proj"),
             ),
         ] {
             push_tensor(&mut records, format!("{prefix}.{suffix}"), shape, values);
@@ -331,7 +334,12 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
         &mut records,
         "lm_head.weight".to_owned(),
         vec![config.vocab_size, config.hidden_size],
-        weights.lm_head.as_ref().expect("untied fixture head"),
+        weights
+            .lm_head
+            .as_ref()
+            .expect("untied fixture head")
+            .as_f32()
+            .expect("dense fixture head"),
     );
 
     let views: Vec<_> = records
@@ -735,7 +743,12 @@ impl TestEnvironment {
         config.tie_embeddings = false;
 
         let mut weights = generate_fixture(&config);
-        let head = weights.lm_head.as_mut().expect("untied output head");
+        let head = weights
+            .lm_head
+            .as_mut()
+            .expect("untied output head")
+            .as_f32_mut()
+            .expect("dense fixture head");
 
         if prefix_fixture {
             let row = head[..config.hidden_size].to_vec();

@@ -1,19 +1,48 @@
 #!/usr/bin/env bash
-# Mirror of the mac-metal CI lane. Runs before every push so a red Mac
-# test never reaches GitHub. Skip once with: SKIP_HOOKS=1 git push
+# Local Mac verification before every push.
+# Skip explicitly with: SKIP_HOOKS=1 git push
 set -euo pipefail
 
 if [ -n "${SKIP_HOOKS:-}" ]; then
   exit 0
 fi
 
-# Git passes pushed refs on stdin; drain it so the pipe never blocks.
+# Drain the pushed-ref information supplied by Git.
 cat >/dev/null
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-echo "==> pre-push: mac-lane tests on ${BRANCH}"
+cd "$(git rev-parse --show-toplevel)"
 
-cargo test --locked -p mlx-ffi --no-fail-fast -- --test-threads=1
+BRANCH="$(git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD)"
+echo "==> pre-push: local Mac verification on ${BRANCH}"
+
+echo "==> MLX FFI tests"
+cargo test --locked -p mlx-ffi \
+  --no-fail-fast -- --test-threads=1
+
+echo "==> Inference infrastructure tests"
 cargo test --locked -p inference-infra --test infra_cpu_ops
+
+echo "==> Qwen3 tests"
+cargo test --locked -p qwen3 --all-targets
+cargo test --locked -p qwen3 --doc
+
+echo "==> Engine all-target check"
+cargo check --locked -p engine --all-targets
+
+echo "==> Engine tests"
+cargo test --locked -p engine --all-targets
+cargo test --locked -p engine --doc
+
+echo "==> Engine documentation (warnings are errors)"
+RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings" \
+  cargo doc --locked -p engine --no-deps
+
+echo "==> Harness-core tests"
+cargo test --locked -p harness-core --all-targets
+cargo test --locked -p harness-core --doc
+
+echo "==> Alloyd tests"
+cargo test --locked -p alloyd --all-targets
+cargo test --locked -p alloyd --doc
 
 echo "==> pre-push: green"
