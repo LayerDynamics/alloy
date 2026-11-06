@@ -5,6 +5,9 @@ import { createHostMetricsCollector, type HostMetricsCollector, type HostMetrics
 import { parseDaemonMetrics, type AlloyMetricsSnapshot, type DaemonMetrics, type MonitorSnapshot } from "./monitor-types.js";
 import { RpcClient, type RpcConnectionOptions } from "./rpc-client.js";
 import type { AlloySettings } from "./settings.js";
+import { MonitorHistory } from "./monitor-history.js";
+import { renderMonitorSnapshot } from "./monitor-render.js";
+export { formatBytes, renderMonitorSnapshot } from "./monitor-render.js";
 
 export interface MetricsRpcClient {
   call(method: string): Promise<unknown>;
@@ -154,119 +157,12 @@ function brokenPipe(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "EPIPE";
 }
 
-export function formatBytes(bytes: number | null): string {
-  if (bytes === null || !Number.isFinite(bytes)) return "unavailable";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
-  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
-function percent(value: number | null): string {
-  return value === null || !Number.isFinite(value) ? "unavailable" : `${value.toFixed(1)}%`;
-}
-
-function power(value: number | null): string {
-  return value === null ? "unavailable" : `${value.toFixed(0)} mW`;
-}
-
-function age(value: number | null): string {
-  return value === null ? "no sample" : `${(value / 1000).toFixed(1)}s old`;
-}
-
-function uptime(seconds: number): string {
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  return `${hours >= 24 ? `${Math.floor(hours / 24)}d ` : ""}${hours % 24}h ${minutes % 60}m`;
-}
-
-function meter(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return "";
-  const fill = Math.round(Math.min(100, Math.max(0, value)) / 100 * 12);
-  return "█".repeat(fill) + "░".repeat(12 - fill);
-}
-
-function clean(text: string): string {
-  // IDs, hostnames and error messages must not inject terminal control sequences.
-  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
-}
-
-function fit(text: string, width: number): string {
-  const chars = Array.from(clean(text));
-  return chars.length <= width ? chars.join("") : chars.slice(0, Math.max(0, width - 1)).join("") + "…";
-}
-
-export function renderMonitorSnapshot(
-  snapshot: MonitorSnapshot,
-  options: { columns?: number; rows?: number; intervalMs?: number; interactive?: boolean } = {},
-): string {
-  const width = Math.max(20, options.columns ?? 80);
-  const height = Math.max(8, options.rows ?? 24);
-  const lines = [`ALLOY MONITOR  ${new Date(snapshot.sampled_at_unix_ms).toISOString()}  read-only`];
-  const host = snapshot.host;
-  if (host !== null) {
-    lines.push(`HOST  ${host.hostname}  ${host.platform}/${host.architecture}  ${age(snapshot.host_sample_age_ms)}`);
-    lines.push(` CPU  ${meter(host.cpu_utilization_percent)} ${percent(host.cpu_utilization_percent)}  ${host.logical_cpu_count} logical cores`);
-    lines.push(` Load 1/5/15m ${host.load_average.map((value) => value.toFixed(2)).join(" / ")}  Uptime ${uptime(host.uptime_seconds)}`);
-    lines.push(` ${host.platform === "darwin" ? "Unified RAM" : "RAM"} non-free  ${formatBytes(host.memory_used_bytes)} / ${formatBytes(host.memory_total_bytes)} (incl. caches)`);
-    lines.push(` Swap ${formatBytes(host.swap_used_bytes)} / ${formatBytes(host.swap_total_bytes)}  Wired ${formatBytes(host.wired_bytes)}  Compressed ${formatBytes(host.compressed_bytes)}`);
-    if (snapshot.host_error || host.errors.length) lines.push(` Host error: ${snapshot.host_error ?? host.errors.join("; ")}`);
-    const accelerator = host.accelerators;
-    lines.push(`ACCELERATORS  ${accelerator.status}  ${age(accelerator.age_ms)}`);
-    lines.push(` GPU active ${percent(accelerator.gpu_active_percent)}  Est. power ${power(accelerator.gpu_power_mw)}  ${accelerator.gpu_frequency_mhz === null ? "frequency unavailable" : `${accelerator.gpu_frequency_mhz.toFixed(0)} MHz`}`);
-    lines.push(` Estimated power: ANE ${power(accelerator.ane_power_mw)}  CPU ${power(accelerator.cpu_power_mw)}`);
-    lines.push(` Thermal ${accelerator.thermal_pressure ?? "unavailable"}  ${accelerator.error ?? (accelerator.status === "disabled" ? "Use --powermetrics for hardware sampling" : "source: powermetrics")}`);
-  } else {
-    lines.push("HOST  unavailable", ` ${snapshot.host_error ?? "No host sample"}`, "ACCELERATORS  unavailable");
-  }
-  const alloy = snapshot.alloy;
-  const metrics = alloy.metrics;
-  lines.push(`ALLOY  ${alloy.status}${metrics === null ? "" : `  PID ${metrics.process_id}`}  ${age(alloy.sample_age_ms)}${alloy.status === "unavailable" && metrics !== null ? " (stale)" : ""}`);
-  if (alloy.error) lines.push(` Connection: ${alloy.error}`);
-  if (metrics !== null) {
-    const { admission, execution, residency, memory_guard: guard } = metrics;
-    lines.push(` Ledger ${formatBytes(admission.reserved_bytes)} / ${formatBytes(admission.budget_bytes)}  Available ${formatBytes(admission.available_bytes)}`);
-    lines.push(` Admission ${admission.admissions_paused ? "PAUSED" : "open"}  Reservations ${admission.active_reservations}  Pressure ${guard.pressure}${guard.emergency ? " EMERGENCY" : ""}`);
-    const elapsed = alloy.sample_age_ms ?? 0;
-    lines.push(` Guard ${guard.tier}: ${formatBytes(guard.usage_bytes)} / ${formatBytes(guard.hard_limit_bytes)}  ${guard.binding ?? "binding unavailable"}  ${age(guard.sample_age_ms === null ? null : guard.sample_age_ms + elapsed)}`);
-    lines.push(` Request ${execution.active_request_id ?? "idle"}  Cancellation ${execution.cancellation_requested ? "requested; cleanup pending" : "not requested"}`);
-    lines.push(` Models ${residency.models_resident}  Worker ${residency.worker_alive ? "alive" : "stopped"}  Residency ${age(residency.sample_age_ms + elapsed)}`);
-    if (guard.last_error) lines.push(` Guard error: ${guard.last_error}`);
-    if (guard.cache_reclaim_requested) lines.push(" Cache reclaim requested");
-  } else {
-    lines.push(" Host monitoring continues; reconnecting to the configured alloyd socket.");
-  }
-  const details: string[] = [];
-  if (metrics !== null) {
-    for (const model of metrics.residency.models) {
-      details.push(` ${model.artifact_id}  weights ${formatBytes(model.weights_reserved_bytes)}  KV ${formatBytes(model.kv_reserved_bytes)}${model.pinned ? "  pinned" : ""}${model.leased ? "  leased" : ""}`);
-    }
-  }
-  if (host !== null) {
-    for (const cluster of host.accelerators.cpu_clusters) {
-      details.push(` ${cluster.name} active ${percent(cluster.active_percent)}  ${cluster.frequency_mhz === null ? "frequency unavailable" : `${cluster.frequency_mhz.toFixed(0)} MHz`}`);
-    }
-    const a = host.accelerators;
-    details.push(` Disk R/W ${formatBytes(a.disk_read_bytes_per_second)}/s / ${formatBytes(a.disk_write_bytes_per_second)}/s`);
-    details.push(` Network in/out ${formatBytes(a.network_in_bytes_per_second)}/s / ${formatBytes(a.network_out_bytes_per_second)}/s`);
-  }
-  const footer = options.interactive === false
-    ? "Read-only snapshot; unavailable values are not zero."
-    : `q quit | Ctrl+C exit | refresh ${(options.intervalMs ?? 1000) / 1000}s | unavailable ≠ zero`;
-  const budget = Math.max(0, height - 1);
-  const visible = lines.slice(0, budget);
-  visible.push(...details.slice(0, Math.max(0, budget - visible.length)));
-  visible.push(footer);
-  return visible.map((line) => fit(line, width)).join("\n");
-}
-
 /** Read-only monitor: no session creation, daemon launch, or runtime mutation. */
 export async function runMonitor(settings: AlloySettings, args: CliArgs): Promise<number> {
   const collector = createHostMetricsCollector({ powermetrics: args.powermetrics, intervalMs: args.intervalMs });
   const reader = new DaemonMetricsReader(settings.socket, Math.min(2000, Math.max(500, args.intervalMs)));
   const abort = new AbortController();
-  const interactive = !args.once && !args.json && Boolean(process.stdout.isTTY && process.stdin.isTTY);
+  const interactive = !args.once && !args.json && process.env.TERM !== "dumb" && Boolean(process.stdout.isTTY && process.stdin.isTTY);
   const once = args.once || (!args.json && !interactive);
   const wasRaw = process.stdin.isRaw;
   const wasFlowing = process.stdin.readableFlowing === true;
@@ -274,6 +170,7 @@ export async function runMonitor(settings: AlloySettings, args: CliArgs): Promis
   let exitCode = 0;
   let previousHost: HostMetricsSnapshot | null = null;
   let lastSnapshot: MonitorSnapshot | null = null;
+  const history = new MonitorHistory();
   const stop = (code: number): void => {
     exitCode = code;
     abort.abort();
@@ -305,16 +202,22 @@ export async function runMonitor(settings: AlloySettings, args: CliArgs): Promis
       if (abort.signal.aborted) break;
       previousHost = snapshot.host;
       lastSnapshot = snapshot;
+      if (!args.json) history.push(snapshot);
       if (args.json) {
         await writeMonitorOutput(process.stdout, JSON.stringify(snapshot) + "\n", abort.signal);
       } else {
         const text = renderMonitorSnapshot(snapshot, {
           columns: process.stdout.columns ?? 100,
-          rows: interactive ? Math.max(8, (process.stdout.rows ?? 24) - 1) : 1000,
+          rows: interactive ? Math.max(1, (process.stdout.rows ?? 24) - 1) : 1000,
           intervalMs: args.intervalMs,
           interactive,
+          color: interactive && process.env.NO_COLOR === undefined && process.env.TERM !== "dumb",
+          history: history.snapshot(),
         });
-        await writeMonitorOutput(process.stdout, (interactive ? "\u001b[H\u001b[2J" : "") + text + (interactive ? "" : "\n"), abort.signal);
+        // Clear each row's old tail and any removed rows without blanking the
+        // whole screen first. Shorter errors and terminal resizes leave no debris.
+        const frame = interactive ? `\u001b[H${text.replace(/\n/g, "\u001b[K\n")}\u001b[J` : `${text}\n`;
+        await writeMonitorOutput(process.stdout, frame, abort.signal);
       }
       if (once) break;
       try {

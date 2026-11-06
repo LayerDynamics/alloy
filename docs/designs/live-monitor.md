@@ -16,6 +16,64 @@ Alloy.
 This observability slice supports M9 investigation. It does not replace the
 representative two-large-model acceptance or mark M9 complete.
 
+## Terminal layout
+
+The interactive view uses colored, bordered system, accelerator and runtime
+panels. Wide terminals place system and hardware measurements side by side;
+80×24 terminals stack the panels and retain connection state, admission,
+pressure, cancellation and exit controls. Smaller windows use a compact text
+view that retains hardware freshness. Resizing takes effect on the next
+sampling frame. `q` and Ctrl+C restore the previous terminal input mode,
+cursor and screen. The renderer clears old row tails when text shrinks without
+blanking the whole screen between frames.
+
+Usage bars have a fixed 0–100% scale for CPU, GPU active residency, non-free
+RAM, swap and reservations. A reservation exceeding a reduced budget fills
+its bar while retaining the actual byte counts. System RAM bars do not infer
+pressure or change color to claim an emergency. Only the daemon's pressure
+classification drives its pressure indicator.
+
+At most 60 recent frames are retained in memory for the history graphs.
+Each source has independent timestamps: failed, repeated or more than
+five-second-old readings become gaps, never fabricated zeros. `·` indicates
+a gap; `▁` indicates the bottom of the scale, including reported zero.
+Host changes reset history, and a changed daemon PID clears only the old
+reservation history. Graphs represent successive samples, not an interpolated
+time axis; the header shows the retained observation span.
+
+Estimated CPU/GPU/ANE power bars share a labeled scale for the current sample.
+The ANE history has its own power scale printed on the graph's line. Neither
+view converts ANE power into an occupancy percentage. Hardware freshness and
+collection errors remain visible, including in the compact view. Daemon
+unavailability does not imply that the process is absent, and cached runtime
+values remain explicitly stale.
+
+Color is enabled only for the interactive terminal and can be disabled with
+`NO_COLOR=1`. `TERM=dumb` and redirected text produce one plain snapshot.
+The JSON capture schema is unchanged and never includes terminal escapes or
+the local rendering history. Names and errors are sanitized before display;
+layout uses terminal cell widths for CJK, emoji and combining characters.
+
+## Execution defaults
+
+A native Apple-Silicon `alloyd` build already selects the shared CPU/Metal
+path by default; `--metal` repeats that default. CPU work includes artifact
+loading, tokenization, request scheduling and token selection. Transformer
+operations run through an explicit Metal stream, with one model weight set,
+shared KV storage and one admission ledger. The current backend chooses a
+transformer stream; it does not automatically split transformer operations
+across CPU and Metal streams.
+
+`--cpu` explicitly selects MLX CPU transformer operations for portability or
+testing, and CPU is the default for other build targets. Requested Metal
+execution fails if the device is unavailable; it never silently falls back
+to CPU. See the [daemon defaults](../../crates/alloyd/src/main.rs) and
+[backend stream selection](../../crates/engine/src/backends/qwen.rs).
+
+The monitor connects to the selected daemon socket. It does not start the
+daemon or change its placement, and system GPU activity alone does not
+identify which execution path that daemon uses.
+
 ## Measurements and their meaning
 
 | Section | Measurements | Source and limits |

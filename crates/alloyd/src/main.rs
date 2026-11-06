@@ -310,7 +310,9 @@ OPTIONS:
   --memory-guard TIER          safe|balanced|aggressive|custom (default: balanced)
   --memory-guard-gb N          Custom ceiling in GiB (implies --memory-guard custom)
   --admission-budget-bytes N   Test override for the admission ledger (optional)
-  --metal / --cpu              Execution placement (default: metal on Apple Silicon, else cpu)
+  --metal                     Metal transformer operations with shared CPU/Metal memory
+                              Default on native Apple Silicon; no silent CPU fallback
+  --cpu                       MLX CPU transformer operations (default on other platforms)
   --telemetry-endpoint URL     FR-35 flush URL
   -h, --help                   Show this help"
     );

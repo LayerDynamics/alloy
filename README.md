@@ -109,9 +109,18 @@ npm run build
 node bin/alloy.js monitor
 ```
 
-The monitor shows system-wide CPU utilization, RAM, load and swap alongside
-Alloy's live admission budget, reserved memory, pressure, request and cached
-model-residency metadata. It stays usable when `alloyd` is offline. Rebuild
+The monitor has a colored, responsive TUI with separate system, accelerator
+and Alloy runtime panels. Usage bars and up to 60 recent samples show CPU,
+GPU, unified RAM and reservation trends; the larger view also graphs ANE
+power. Admission pauses, emergency pressure and cancellation awaiting cleanup
+have explicit labels. A wider terminal (around 120 columns) places system and
+hardware panels side by side; an 80×24 terminal keeps the core readings visible.
+`NO_COLOR=1` disables color. Small terminals use a compact view, and `TERM=dumb`
+prints one plain snapshot.
+
+The runtime panel shows the live admission budget, reserved memory, pressure,
+request and cached model-residency metadata. The monitor stays usable when
+`alloyd` is unavailable. Rebuild
 and restart `alloyd` to expose the new `daemon.metrics` method; a running
 older daemon will report that the method is unavailable.
 

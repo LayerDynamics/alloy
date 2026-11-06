@@ -6,6 +6,8 @@ import { DaemonMetricsReader, collectMonitorSnapshot, renderMonitorSnapshot, wri
 import { parseDaemonMetrics, type DaemonMetrics, type MonitorSnapshot } from "../src/monitor-types.js";
 import type { HostMetricsSnapshot } from "../src/host-metrics.js";
 import { emptyPowerMetrics } from "../src/powermetrics.js";
+import { monitorTextWidth, renderMonitorSparkline } from "../src/monitor-render.js";
+import { stripVTControlCharacters } from "node:util";
 
 function metrics(): DaemonMetrics {
   return {
@@ -50,7 +52,7 @@ test("80x24 rendering keeps host, accelerators, runtime and exit instructions vi
   sample.host!.errors.push("sample warning");
   sample.alloy.metrics!.memory_guard.last_error = "latest host probe failed";
   const text = renderMonitorSnapshot(sample, { columns: 80, rows: 23 });
-  for (const label of ["HOST", "ACCELERATORS", "ALLOY  connected", "q quit", "Host error", "Guard error", "cleanup pending"]) {
+  for (const label of ["HOST", "ACCELERATORS", "ALLOY RUNTIME", "connected", "q quit", "Host error", "Guard error", "cleanup pending"]) {
     assert.ok(text.includes(label), label);
   }
   assert.ok(text.split("\n").length <= 23);
@@ -60,13 +62,13 @@ test("80x24 rendering keeps host, accelerators, runtime and exit instructions vi
 test("unavailable accelerator readings are distinct from reported zero", () => {
   const sample = snapshot();
   const unavailable = renderMonitorSnapshot(sample);
-  assert.match(unavailable, /GPU active unavailable/);
-  assert.match(unavailable, /Estimated power: ANE unavailable/);
+  assert.match(unavailable, /GPU active.*unavailable/);
+  assert.match(unavailable, /Est\. power.*ANE unavailable/);
   sample.host!.accelerators.gpu_active_percent = 0;
   sample.host!.accelerators.ane_power_mw = 0;
   const zero = renderMonitorSnapshot(sample);
-  assert.match(zero, /GPU active 0\.0%/);
-  assert.match(zero, /Estimated power: ANE 0 mW/);
+  assert.match(zero, /GPU active.*0\.0%/);
+  assert.match(zero, /Est\. power.*ANE 0 mW/);
 });
 
 test("cached daemon data is visibly stale, and rendered values cannot inject terminal controls", () => {
@@ -76,8 +78,64 @@ test("cached daemon data is visibly stale, and rendered values cannot inject ter
   sample.alloy.sample_age_ms = 5100;
   sample.alloy.metrics!.execution.active_request_id = "request\u001b[?25l";
   const text = renderMonitorSnapshot(sample);
-  assert.match(text, /5\.1s old \(stale\)/);
+  assert.match(text, /unavailable \(stale\).*5\.1s old/);
   assert.equal(text.includes("\u001b"), false);
+});
+
+test("responsive colored panels stay within terminal cells and preserve emergency state", () => {
+  const sample = snapshot();
+  sample.host!.hostname = "Mac-東京-🖥️-e\u0301".repeat(8);
+  sample.alloy.metrics!.execution.active_request_id = "request-東京-\u001b[2J".repeat(20);
+  sample.alloy.metrics!.residency.models[0]!.artifact_id = "model-\u001b]52;c;clipboard\u0007-東京".repeat(8);
+  for (const [columns, rows] of [[60, 21], [80, 23], [108, 24], [120, 35], [50, 18], [20, 8], [1, 1]] as const) {
+    const color = renderMonitorSnapshot(sample, { columns, rows, color: true });
+    const text = stripVTControlCharacters(color);
+    assert.ok(text.split("\n").length <= rows!, `${columns}x${rows}: height`);
+    assert.ok(text.split("\n").every((row) => monitorTextWidth(row) <= columns!), `${columns}x${rows}: width`);
+    // Only the renderer's SGR colors may reach the terminal, never caller escapes.
+    assert.equal(color.replace(/\u001b\[[\d;]*m/g, "").includes("\u001b"), false);
+    assert.equal(text, renderMonitorSnapshot(sample, { columns, rows, color: false }));
+    if (columns! >= 60 && rows! >= 21) {
+      for (const label of ["PAUSED", "EMERGENCY", "cleanup pending", "q quit"]) assert.ok(text.includes(label), label);
+    }
+  }
+});
+
+test("small terminals retain hardware freshness and failures next to cached values", () => {
+  const sample = snapshot();
+  Object.assign(sample.host!.accelerators, {
+    status: "stale", age_ms: 30_000, gpu_active_percent: 25, ane_power_mw: 0,
+    error: "sudo authorization expired",
+  });
+  const text = renderMonitorSnapshot(sample, { columns: 50, rows: 18 });
+  assert.match(text, /ACCELERATORS stale.*30\.0s old/);
+  assert.match(text, /GPU active 25\.0%/);
+  assert.match(text, /ANE power 0 mW/);
+  assert.match(text, /sudo authorization expired/);
+});
+
+test("history graphs preserve unknown samples, real zero, and a fixed percentage scale", () => {
+  assert.equal(renderMonitorSparkline([null, 0, 50, 100], 4), "·▁▄█");
+  assert.equal(renderMonitorSparkline([Number.NaN, -1, 250], 3), "··█");
+  assert.equal(renderMonitorSparkline([0, 100], 0), "");
+  const sample = snapshot();
+  sample.alloy.metrics!.admission.reserved_bytes = 10 * 1024 ** 3;
+  const text = renderMonitorSnapshot(sample, { columns: 120, rows: 35 });
+  assert.match(text, /10\.0 GiB \/ 8\.0 GiB reserved/);
+  assert.match(text, /RAM = non-free, including caches; not memory pressure/);
+  assert.match(text, /ANE trend.*power, not occupancy/);
+});
+
+test("ANE history keeps its own power scale even when a shorter panel omits details", () => {
+  const sample = snapshot();
+  sample.host!.accelerators.cpu_power_mw = 5435;
+  sample.host!.accelerators.ane_power_mw = 200;
+  const text = renderMonitorSnapshot(sample, { columns: 120, rows: 24, history: [{
+    at_unix_ms: sample.sampled_at_unix_ms, cpu_percent: 25, memory_percent: 70,
+    gpu_percent: 20, ane_power_mw: 200, reserved_percent: 25,
+  }] });
+  assert.match(text, /ESTIMATED POWER.*full bar 5\.43 W/);
+  assert.match(text, /ANE 0–200 mW.*█/);
 });
 
 test("host snapshots remain available when daemon metrics fail", async () => {
