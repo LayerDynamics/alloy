@@ -160,6 +160,7 @@ struct PolicyControl {
     admission: AdmissionController,
     events: Mutex<Vec<PolicyEvent>>,
     instance_lease_tokens: Mutex<BTreeMap<RequestId, Vec<u32>>>,
+    execution_controls: Mutex<BTreeMap<RequestId, ExecutionControl>>,
     fail_verification_once: AtomicBool,
     fail_loading_once: AtomicBool,
     startup_gate: Arc<StartupGate>,
@@ -174,6 +175,7 @@ impl PolicyControl {
             admission,
             events: Mutex::new(Vec::new()),
             instance_lease_tokens: Mutex::new(BTreeMap::new()),
+            execution_controls: Mutex::new(BTreeMap::new()),
             fail_verification_once: AtomicBool::new(false),
             fail_loading_once: AtomicBool::new(false),
             startup_gate: Arc::new(StartupGate::default()),
@@ -195,6 +197,15 @@ impl PolicyControl {
 
     fn events(&self) -> Vec<PolicyEvent> {
         self.events.lock().expect("policy events").clone()
+    }
+
+    fn execution_control(&self, request_id: &RequestId) -> ExecutionControl {
+        self.execution_controls
+            .lock()
+            .expect("execution controls")
+            .get(request_id)
+            .expect("native execution received this request's control")
+            .clone()
     }
 }
 
@@ -463,6 +474,11 @@ impl RuntimeBackend for PolicyBackend {
         artifact: &ArtifactRegistration,
         execution: &ExecutionControl,
     ) -> Result<(), EngineError> {
+        self.control
+            .execution_controls
+            .lock()
+            .expect("execution controls")
+            .insert(execution.request_id().clone(), execution.clone());
         if self.control.startup_gate_stage.load(Ordering::Acquire) == 0 {
             self.control.startup_gate.enter_if_armed();
         }
@@ -2858,7 +2874,7 @@ fn pool_pressure_pump_keeps_polling_while_native_worker_is_blocked() {
     let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
     let pressured = *source.0.lock().unwrap();
     source.set_normal();
-    let mut pump = MemoryEnforcementPump::new(environment.runtime.clone(), enforcer);
+    let mut pump = MemoryEnforcementPump::new(environment.engine.clone(), enforcer);
     let waker = Waker::from(Arc::new(ThreadWake {
         thread: thread::current(),
     }));
@@ -2867,6 +2883,8 @@ fn pool_pressure_pump_keeps_polling_while_native_worker_is_blocked() {
     assert_eq!(first.tick.status.pressure, PressureLevel::Ok);
     assert!(!environment.admission.admissions_paused());
     assert!(first.completed.is_none());
+    assert!(first.tick.request_execution_cancellation.is_none());
+    assert!(first.cancellation.is_none());
     assert!(pump.has_pending());
     *source.0.lock().unwrap() = pressured;
     for index in 0..=PRESSURE_RECLAIM_GRACE_POLLS_MAX {
@@ -2881,11 +2899,41 @@ fn pool_pressure_pump_keeps_polling_while_native_worker_is_blocked() {
             index < PRESSURE_RECLAIM_GRACE_POLLS_MAX
         );
         assert!(poll.completed.is_none());
+        assert!(poll.tick.request_execution_cancellation.is_none());
+        assert!(poll.cancellation.is_none());
         assert!(
             pump.has_pending(),
             "one pending action must be retained, not replaced"
         );
     }
+    // Repeated ordinary hard pressure also keeps the active request running,
+    // even after allocator grace and the emergency consecutive-poll count.
+    {
+        let mut observation = source.0.lock().unwrap();
+        observation.host.phys_footprint_bytes = 32 * 1024 * 1024 * 1024;
+        observation.mlx_active_bytes = observation.host.phys_footprint_bytes;
+    }
+    for _ in 0..=PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        let poll = pump.poll_tick(&mut cx).unwrap();
+        assert_eq!(poll.tick.status.pressure, PressureLevel::Hard);
+        assert!(!poll.tick.status.emergency);
+        assert!(environment.admission.admissions_paused());
+        assert!(poll.tick.request_execution_cancellation.is_none());
+        assert!(poll.cancellation.is_none());
+        assert!(poll.completed.is_none());
+        assert!(pump.has_pending());
+    }
+    let request_id = RequestId::new("pump-observe-active-b").unwrap();
+    assert_eq!(
+        environment.scheduler.request_state(&request_id).unwrap(),
+        engine::scheduler::RequestState::Running,
+    );
+    assert!(
+        !environment
+            .control
+            .execution_control(&request_id)
+            .is_cancelled()
+    );
     source.set_normal();
     let recovery = pump.poll_tick(&mut cx).unwrap();
     assert_eq!(recovery.tick.status.pressure, PressureLevel::Ok);
@@ -2918,6 +2966,9 @@ fn pool_pressure_pump_keeps_polling_while_native_worker_is_blocked() {
             .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
     );
 }
+
+#[path = "emergency_pressure.rs"]
+mod emergency_pressure;
 
 #[derive(Debug)]
 struct PoolDrainRecoverySource {

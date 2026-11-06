@@ -1,18 +1,19 @@
-//! Live oMLX-method memory enforcer (poll tick + soft/hard ladder).
+//! Live oMLX-method memory enforcer (poll tick + emergency cancellation).
 //!
 //! Recomputes the hard ceiling every tick, classifies pressure against soft
-//! and hard watermarks, prefers non-destructive MLX pool drain for a bounded
-//! grace window, then pauses admissions under soft/hard pressure.
+//! and hard watermarks, and pauses admissions immediately under pressure,
+//! including the bounded grace window for non-destructive MLX pool drain.
 //!
 //! This module does **not** call Metal or clear the MLX cache itself. The
-//! poll thread only sets `cache_reclaim_requested`; the native worker /
-//! generation path must honor that flag at a safe boundary (same rule as
-//! oMLX: the enforcer never touches Metal directly).
+//! poll thread publishes allocator-drain requests and idle-model eviction
+//! authorization; FamilyRuntime revalidates them on the native worker.
 //!
-//! Worker-owned idle LRU unload is dispatched through FamilyRuntime.
-//! In-flight abort remains separate. Prefill chunk
-//! shrink helpers live in [`crate::prefill_admit`] (M5–M6); this enforcer
-//! publishes the admit line those helpers consume.
+//! Only emergency pressure requests cooperative execution cancellation.
+//! The polling bridge captures the request and scheduler lease before the
+//! observation, then signals that target without waiting on the native
+//! command queue. Execution retains all ownership until native cleanup.
+//! Prefill chunk shrink helpers live in [`crate::prefill_admit`] (M5–M6);
+//! this enforcer publishes the admit line those helpers consume.
 
 use crate::admission::AdmissionController;
 use crate::error::EngineError;
@@ -20,6 +21,7 @@ use crate::memory_guard::{
     self, CeilingBreakdown, HostMemorySnapshot, MemoryGuardConfig, PressureLevel, WatermarkBytes,
 };
 use crate::platform;
+use crate::scheduler::ExecutionCancellationTarget;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -86,6 +88,12 @@ pub struct EnforcementTick {
     pub request_cache_reclaim: bool,
     /// Persistent pressure authorizes at most one idle-model eviction.
     pub request_model_eviction: bool,
+    /// Emergency interruption of the execution captured before observation.
+    ///
+    /// Signal this target through the scheduler, never the native command
+    /// queue. Requesting cancellation neither completes cleanup nor releases
+    /// reservations or the execution slot. None also covers an idle scheduler.
+    pub request_execution_cancellation: Option<ExecutionCancellationTarget>,
     /// True when soft/hard destructive steps were deferred for grace.
     pub deferred_for_pool_drain: bool,
     /// Previous pressure level (for logging transitions).
@@ -302,8 +310,19 @@ impl MemoryEnforcer {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = mlx_pool;
     }
 
-    /// One enforcement tick (oMLX `_check_and_enforce`).
+    /// Observe pressure and update reclamation/admission without an execution
+    /// target. Use the live polling bridge for emergency cancellation.
     pub fn tick(&self) -> Result<EnforcementTick, EnforcerError> {
+        self.tick_for_execution(None)
+    }
+
+    /// One enforcement tick bound to a scheduler snapshot taken before the
+    /// memory observation. Ordinary soft/hard pressure never requests
+    /// cancellation; emergency pressure bypasses allocator-drain grace.
+    pub fn tick_for_execution(
+        &self,
+        execution: Option<ExecutionCancellationTarget>,
+    ) -> Result<EnforcementTick, EnforcerError> {
         // Revoke old authority while obtaining a new observation. Probe
         // failure must not leave a stale destructive request authorized.
         self.inner
@@ -345,6 +364,7 @@ impl MemoryEnforcer {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: false,
                 request_model_eviction: false,
+                request_execution_cancellation: None,
                 deferred_for_pool_drain: false,
                 previous_pressure: previous,
             });
@@ -382,6 +402,7 @@ impl MemoryEnforcer {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: true,
                 request_model_eviction: false,
+                request_execution_cancellation: None,
                 deferred_for_pool_drain: true,
                 previous_pressure: previous,
             });
@@ -408,6 +429,7 @@ impl MemoryEnforcer {
         Ok(EnforcementTick {
             status: self.status_with_binding(ceiling),
             request_model_eviction: new_level != PressureLevel::Ok,
+            request_execution_cancellation: execution.filter(|_| emergency),
             request_cache_reclaim: new_level == PressureLevel::Hard
                 || self.cache_reclaim_requested(),
             deferred_for_pool_drain: false,
@@ -564,6 +586,8 @@ impl MemoryEnforcer {
 mod tests {
     use super::*;
     use crate::memory_guard::{HostMemorySnapshot, MemoryGuardTier};
+    use crate::scheduler::{RequestState, Scheduler};
+    use crate::types::RequestId;
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -642,6 +666,148 @@ mod tests {
         assert!(enforcer.admission().admissions_paused());
         assert!(tick.request_cache_reclaim);
         assert!(!tick.deferred_for_pool_drain);
+    }
+
+    fn fixed_ceiling_host(usage: u64) -> HostMemorySnapshot {
+        HostMemorySnapshot {
+            // Balanced static ceiling is 33 GiB; dynamic and Metal ceilings
+            // exceed it, so these tests exercise the abort classifier itself.
+            free_bytes: 10 * GIB,
+            phys_footprint_bytes: usage,
+            graphics_footprint_bytes: 0,
+            ..host_busy()
+        }
+    }
+
+    #[test]
+    fn ordinary_soft_and_hard_pressure_never_request_cancellation() {
+        let scheduler = Scheduler::new(1).expect("scheduler");
+        let request = RequestId::new("ordinary-pressure").expect("request");
+        let _permit = scheduler.try_acquire(request.clone()).expect("permit");
+        let target = scheduler.active_cancellation_target().expect("target");
+        for usage in [30 * GIB, 32 * GIB] {
+            let enforcer = enforcer_with(fixed_ceiling_host(usage), usage, 3 * GIB);
+            // Cover both grace and post-grace policy, with the real target.
+            for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX + 2 {
+                let tick = enforcer.tick_for_execution(target.clone()).expect("tick");
+                assert_ne!(tick.status.pressure, PressureLevel::Ok);
+                assert!(tick.status.admissions_paused);
+                assert!(!tick.status.emergency);
+                assert!(tick.request_execution_cancellation.is_none());
+            }
+        }
+        assert_eq!(
+            scheduler.request_state(&request).expect("state"),
+            RequestState::Running
+        );
+    }
+
+    #[test]
+    fn consecutive_over_ceiling_polls_interrupt_the_captured_execution() {
+        let scheduler = Scheduler::new(1).expect("scheduler");
+        let _permit = scheduler
+            .try_acquire(RequestId::new("consecutive-pressure").expect("request"))
+            .expect("permit");
+        let target = scheduler.active_cancellation_target().expect("target");
+        let enforcer = enforcer_with(fixed_ceiling_host(33 * GIB), 33 * GIB, 3 * GIB);
+
+        let first = enforcer
+            .tick_for_execution(target.clone())
+            .expect("first tick");
+        assert!(first.deferred_for_pool_drain);
+        assert!(!first.status.emergency);
+        assert!(first.request_execution_cancellation.is_none());
+
+        let emergency = enforcer
+            .tick_for_execution(target.clone())
+            .expect("second tick");
+        assert!(emergency.status.emergency);
+        assert!(emergency.status.admissions_paused);
+        assert!(!emergency.deferred_for_pool_drain);
+        assert!(emergency.request_cache_reclaim);
+        assert!(emergency.request_model_eviction);
+        assert_eq!(emergency.request_execution_cancellation, target);
+    }
+
+    #[test]
+    fn emergency_margin_requests_cancellation_on_the_first_poll() {
+        let scheduler = Scheduler::new(1).expect("scheduler");
+        let _permit = scheduler
+            .try_acquire(RequestId::new("margin-pressure").expect("request"))
+            .expect("permit");
+        let target = scheduler.active_cancellation_target().expect("target");
+        let enforcer = enforcer_with(fixed_ceiling_host(35 * GIB), 35 * GIB, 3 * GIB);
+        let tick = enforcer.tick_for_execution(target.clone()).expect("tick");
+        assert!(tick.status.emergency);
+        assert!(!tick.deferred_for_pool_drain);
+        assert_eq!(tick.request_execution_cancellation, target);
+
+        // Emergency pressure while idle still pauses admission and reclaims,
+        // but must not manufacture a target for a request that starts later.
+        let idle = enforcer.tick().expect("idle tick");
+        assert!(idle.status.emergency);
+        assert!(idle.status.admissions_paused);
+        assert!(idle.request_execution_cancellation.is_none());
+    }
+
+    #[test]
+    fn acceptable_observation_resets_emergency_history_and_action() {
+        let scheduler = Scheduler::new(1).expect("scheduler");
+        let _permit = scheduler
+            .try_acquire(RequestId::new("recovered-pressure").expect("request"))
+            .expect("permit");
+        let target = scheduler.active_cancellation_target().expect("target");
+        let enforcer = enforcer_with(fixed_ceiling_host(35 * GIB), 35 * GIB, 0);
+        assert!(
+            enforcer
+                .tick_for_execution(target.clone())
+                .expect("emergency")
+                .status
+                .emergency
+        );
+
+        enforcer.set_observation_overrides(Some(fixed_ceiling_host(GIB)), Some(GIB), Some(0));
+        let recovery = enforcer
+            .tick_for_execution(target.clone())
+            .expect("recovery");
+        assert_eq!(recovery.status.pressure, PressureLevel::Ok);
+        assert!(!recovery.status.admissions_paused);
+        assert!(!recovery.status.emergency);
+        assert!(recovery.request_execution_cancellation.is_none());
+
+        enforcer.set_observation_overrides(
+            Some(fixed_ceiling_host(33 * GIB)),
+            Some(33 * GIB),
+            Some(0),
+        );
+        let first = enforcer.tick_for_execution(target).expect("new first poll");
+        assert!(!first.status.emergency);
+        assert!(first.request_execution_cancellation.is_none());
+    }
+
+    #[test]
+    fn disabled_guard_never_interrupts_an_execution() {
+        let scheduler = Scheduler::new(1).expect("scheduler");
+        let _permit = scheduler
+            .try_acquire(RequestId::new("disabled-pressure").expect("request"))
+            .expect("permit");
+        let mut config = MemoryGuardConfig::balanced();
+        config.enabled = false;
+        let enforcer = MemoryEnforcer::new(
+            config,
+            AdmissionController::new(32 * GIB).expect("admission"),
+        );
+        enforcer.set_observation_overrides(
+            Some(fixed_ceiling_host(35 * GIB)),
+            Some(35 * GIB),
+            Some(0),
+        );
+        let tick = enforcer
+            .tick_for_execution(scheduler.active_cancellation_target().expect("target"))
+            .expect("tick");
+        assert!(!tick.status.emergency);
+        assert!(!tick.status.admissions_paused);
+        assert!(tick.request_execution_cancellation.is_none());
     }
 
     #[test]

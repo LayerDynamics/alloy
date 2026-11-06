@@ -34,7 +34,7 @@
 use crate::residency_pin::{ModelPinOwner, ModelResidencyPin};
 use crate::{
     admission::{AdmissionController, AdmissionSnapshot, MemoryReservation, ReservationGrant},
-    api::{ENGINE_API_VERSION, EngineFuture, EngineRuntime, ExecutionContext},
+    api::{ENGINE_API_VERSION, EngineCore, EngineFuture, EngineRuntime, ExecutionContext},
     cache_identity::{CacheIdentityInputs, compute_session_state_id},
     cancellation::CancellationToken,
     error::EngineError,
@@ -45,11 +45,11 @@ use crate::{
     generation::{self, GenerationLimits, GenerationSession, TokenStep},
     registry::{ArtifactRegistration, FamilyVersion, Registry},
     types::{
-        ArtifactId, CacheKind, CacheMode, Capabilities, ContextSnapshot, DecodingCapability,
-        DecodingMode, Generation, GenerationEvent, GenerationEventStream, GenerationOptions,
-        GenerationRequest, GenerationStream, MemoryBreakdown, MemoryEstimate, ModelProfileId,
-        ReleaseOutcome, RenderedContext, RendererIdentity, RequestId, SessionStateId, TokenizerId,
-        Usage,
+        ArtifactId, CacheKind, CacheMode, CancelOutcome, Capabilities, ContextSnapshot,
+        DecodingCapability, DecodingMode, Generation, GenerationEvent, GenerationEventStream,
+        GenerationOptions, GenerationRequest, GenerationStream, MemoryBreakdown, MemoryEstimate,
+        ModelProfileId, ReleaseOutcome, RenderedContext, RendererIdentity, RequestId,
+        SessionStateId, TokenizerId, Usage,
     },
 };
 use std::{
@@ -308,8 +308,10 @@ pub struct MemoryEnforcementReport {
 ///
 /// Poll observations continue while the worker is busy. At most one native
 /// enforcement future is retained; no dispatcher is spawned for extra polls.
+/// Emergency cancellation is signalled directly through the engine scheduler
+/// before advancing that future, including when native work is blocked.
 pub struct MemoryEnforcementPump {
-    runtime: FamilyRuntime,
+    engine: EngineCore<FamilyRuntime>,
     enforcer: crate::memory_enforcer::MemoryEnforcer,
     pending: Option<EngineFuture<'static, MemoryEnforcementReport>>,
 }
@@ -318,15 +320,22 @@ pub struct MemoryEnforcementPump {
 pub struct MemoryEnforcementPoll {
     /// Current poll-thread pressure; admission pausing has already occurred.
     pub tick: crate::memory_enforcer::EnforcementTick,
+    /// Result of signalling the tick's exact execution target, if requested.
+    /// Requested means the signal was accepted, not that cleanup completed.
+    /// AlreadyFinished means the captured execution no longer owns the slot.
+    pub cancellation: Option<Result<CancelOutcome, EngineError>>,
     /// Completion of the one outstanding worker call, when available.
     pub completed: Option<Result<MemoryEnforcementReport, EngineError>>,
 }
 
 impl MemoryEnforcementPump {
-    /// Connect one runtime to its shared live enforcer.
-    pub fn new(runtime: FamilyRuntime, enforcer: crate::memory_enforcer::MemoryEnforcer) -> Self {
+    /// Connect the engine's scheduler and runtime to their shared enforcer.
+    pub fn new(
+        engine: EngineCore<FamilyRuntime>,
+        enforcer: crate::memory_enforcer::MemoryEnforcer,
+    ) -> Self {
         Self {
-            runtime,
+            engine,
             enforcer,
             pending: None,
         }
@@ -337,21 +346,28 @@ impl MemoryEnforcementPump {
         self.pending.is_some()
     }
 
-    /// Observe pressure, immediately update admission, and nonblockingly
-    /// advance at most one native reclamation request.
+    /// Capture the execution owner, observe pressure, update admission, signal
+    /// emergency cancellation, and advance at most one native reclamation call.
     pub fn poll_tick(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Result<MemoryEnforcementPoll, EngineError> {
+        // Capture before probing memory: A may finish and B may start while
+        // an observation is in progress. A decision about A must stay on A.
+        let execution = self.engine.active_cancellation_target()?;
         let tick = self
             .enforcer
-            .tick()
+            .tick_for_execution(execution)
             .map_err(|error| EngineError::ExecutionFailed {
                 stage: "poll live memory pressure",
                 message: error.to_string(),
             })?;
+        let cancellation = tick
+            .request_execution_cancellation
+            .as_ref()
+            .map(|target| target.request_cancel());
         if self.pending.is_none() {
-            let runtime = self.runtime.clone();
+            let runtime = self.engine.runtime().clone();
             let enforcer = self.enforcer.clone();
             let decision = tick.clone();
             self.pending = Some(Box::pin(async move {
@@ -368,16 +384,21 @@ impl MemoryEnforcementPump {
         if completed.is_some() {
             self.pending = None;
         }
-        Ok(MemoryEnforcementPoll { tick, completed })
+        Ok(MemoryEnforcementPoll {
+            tick,
+            cancellation,
+            completed,
+        })
     }
 }
 
 impl FamilyRuntime {
-    /// Observe live pressure and apply one bounded enforcement step.
+    /// Observe live pressure and apply one bounded native reclamation step.
     ///
     /// Call serially from the polling loop. Observations and eligibility are
     /// recomputed on the native worker, not captured before a queued call.
-    /// Native objects never leave that worker. This does not abort work.
+    /// Native objects never leave that worker. This does not signal execution
+    /// cancellation; use MemoryEnforcementPump to include the scheduler path.
     pub fn enforce_memory_tick(
         &self,
         enforcer: crate::memory_enforcer::MemoryEnforcer,
@@ -395,8 +416,9 @@ impl FamilyRuntime {
 
     /// Dispatch an already-polled decision without advancing grace twice.
     ///
-    /// Prefer MemoryEnforcementPump for a background loop. Native execution
-    /// refreshes pressure and authorization before any destructive action.
+    /// Prefer MemoryEnforcementPump for a background loop and out-of-band
+    /// emergency cancellation. This worker path only reclaims idle resources,
+    /// refreshing pressure and authorization before any destructive action.
     pub fn apply_memory_tick(
         &self,
         enforcer: crate::memory_enforcer::MemoryEnforcer,
@@ -2112,6 +2134,9 @@ impl NativeState {
         enforcer: &crate::memory_enforcer::MemoryEnforcer,
         mut tick: crate::memory_enforcer::EnforcementTick,
     ) -> Result<MemoryEnforcementReport, EngineError> {
+        // Cancellation belongs to the poll-thread scheduler path. Never
+        // replay an interruption decision after waiting in the native queue.
+        tick.request_execution_cancellation = None;
         let refresh = || {
             enforcer
                 .refresh_pressure()
