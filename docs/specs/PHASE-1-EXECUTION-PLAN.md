@@ -106,9 +106,11 @@ B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_ver
   session_not_active, invalid_params, engine_failed, unsupported_in_phase1}.
   Informal plan prose that said sessions.* meant the B.6 session.* surface;
   wire names follow Appendix B.6 verbatim.
-ts/cli/ TypeScript CLI, Node LTS pin from DR-0001
-src/{main.ts,chat.ts,rpc-client.ts}
-package.json
+ts/cli/ TypeScript CLI, Node 26.13.0 pin from DR-0001
+src/{main.ts,chat.ts,rpc-client.ts,args.ts,render.ts,settings.ts,setup.ts,daemon.ts}
+test/{args,render,settings}.test.ts
+scripts/{qwen3_end_to_end_stream,session_restart_real_model}.sh
+package.json / bin/alloy.js
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document
 docs/events/telemetry-v1.json initial event schema
 .github/workflows/ci.yaml Linux + Mac lanes run `harness-core` and `alloyd` (`--all-targets` / `--doc`); Mac E2E tests 13–14 remain workflow_dispatch / W7
