@@ -95,9 +95,8 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         template_sha256: Sha256::digest(CHAT_TEMPLATE.as_bytes()).into(),
     };
 
-    let config_bytes = fs::read(request.artifact_dir.join("config.json")).map_err(|error| {
-        RpcError::internal(format!("read config.json: {error}"))
-    })?;
+    let config_bytes = fs::read(request.artifact_dir.join("config.json"))
+        .map_err(|error| RpcError::internal(format!("read config.json: {error}")))?;
     let config: Value = serde_json::from_slice(&config_bytes)
         .map_err(|error| RpcError::internal(format!("parse config.json: {error}")))?;
     let context_limit = config
@@ -115,8 +114,9 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         max_token_bytes: 512 * 1024,
         verification_chunk_bytes: 1024 * 1024,
         context_limit_tokens: context_limit,
-        // Start above the adaptive floor (256) so M5–M6 can shrink under pressure.
-        prefill_chunk_tokens: NonZeroUsize::new(1024).expect("chunk"),
+        // Start at the adaptive floor so cold-start admission does not
+        // reserve workspace for a 1024-token chunk before shrinking can run.
+        prefill_chunk_tokens: NonZeroUsize::new(256).expect("chunk"),
         loader_headroom_bytes: 64 * 1024 * 1024,
         execution_headroom_bytes: 64 * 1024 * 1024,
         generation: GenerationLimits::new(64, 64 * 1024, 16 * 1024)
@@ -149,8 +149,7 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
     let admission = AdmissionController::new(budget_bytes)
         .map_err(|error| RpcError::internal(error.to_string()))?;
     let memory_enforcer = MemoryEnforcer::new(guard_config, admission.clone());
-    let scheduler =
-        Scheduler::new(32).map_err(|error| RpcError::internal(error.to_string()))?;
+    let scheduler = Scheduler::new(32).map_err(|error| RpcError::internal(error.to_string()))?;
     let engine = backend
         .into_engine_with_memory_enforcer(
             vec![profile],
@@ -182,8 +181,8 @@ fn resolve_admission_budget(
     if let Some(override_bytes) = request.admission_budget_override_bytes {
         let config = MemoryGuardConfig::custom(override_bytes)
             .map_err(|error| RpcError::internal(error.to_string()))?;
-        let host = platform::discover_host_memory_snapshot().unwrap_or(
-            memory_guard::HostMemorySnapshot {
+        let host =
+            platform::discover_host_memory_snapshot().unwrap_or(memory_guard::HostMemorySnapshot {
                 physical_memory_bytes: override_bytes.saturating_add(2 * 1024 * 1024 * 1024),
                 free_bytes: 0,
                 inactive_bytes: 0,
@@ -194,8 +193,7 @@ fn resolve_admission_budget(
                 iogpu_wired_limit_bytes: 0,
                 recommended_working_set_bytes: override_bytes,
                 release_credit_bytes: 0,
-            },
-        );
+            });
         let ceiling = memory_guard::ceiling_breakdown(config, host, 0)
             .map_err(|error| RpcError::internal(error.to_string()))?;
         // Test override wins as the ledger budget even when metal binds lower;
@@ -225,10 +223,8 @@ fn maybe_apply_wired_limit(
         return Ok(());
     };
     if !should_apply_wired_limit(host) {
-        let suggestion = wired_limit_suggestion_bytes(
-            ceiling.static_bytes,
-            host.physical_memory_bytes,
-        );
+        let suggestion =
+            wired_limit_suggestion_bytes(ceiling.static_bytes, host.physical_memory_bytes);
         eprintln!(
             "alloyd: iogpu.wired_limit_mb unset; leaving Apple Metal cap active. \
              To raise: sudo sysctl iogpu.wired_limit_mb={}",
@@ -236,19 +232,13 @@ fn maybe_apply_wired_limit(
         );
         return Ok(());
     }
-    let desired = wired_limit_suggestion_bytes(
-        ceiling.static_bytes,
-        host.physical_memory_bytes,
-    );
+    let desired = wired_limit_suggestion_bytes(ceiling.static_bytes, host.physical_memory_bytes);
     let applied = desired.min(host.iogpu_wired_limit_bytes);
     match mlx_memory::set_wired_limit_bytes(applied as usize) {
         Ok(previous) => {
             eprintln!(
                 "alloyd: Metal wired limit {} -> {} (target {}, sysctl cap {})",
-                previous,
-                applied,
-                desired,
-                host.iogpu_wired_limit_bytes
+                previous, applied, desired, host.iogpu_wired_limit_bytes
             );
         }
         Err(error) => {
@@ -265,9 +255,9 @@ fn pin_artifact_files(
 ) -> Result<BTreeMap<String, FilePin>, RpcError> {
     let expected = load_expected_hashes(corpus_models_json)?;
     let mut files = BTreeMap::new();
-    for entry in fs::read_dir(directory).map_err(|error| {
-        RpcError::internal(format!("read artifact dir: {error}"))
-    })? {
+    for entry in fs::read_dir(directory)
+        .map_err(|error| RpcError::internal(format!("read artifact dir: {error}")))?
+    {
         let entry = entry.map_err(|error| RpcError::internal(error.to_string()))?;
         let path = entry.path();
         if !path.is_file() {
@@ -278,9 +268,8 @@ fn pin_artifact_files(
         if name.starts_with('.') || name == "README.md" {
             continue;
         }
-        let (byte_len, digest) = hash_file(&path).map_err(|error| {
-            RpcError::internal(format!("hash {}: {error}", path.display()))
-        })?;
+        let (byte_len, digest) = hash_file(&path)
+            .map_err(|error| RpcError::internal(format!("hash {}: {error}", path.display())))?;
         if let Some(expected_hex) = expected.get(&name) {
             let actual_hex = hex_encode(&digest);
             if &actual_hex != expected_hex {
@@ -314,9 +303,8 @@ fn load_expected_hashes(
     let Some(path) = corpus_models_json else {
         return Ok(BTreeMap::new());
     };
-    let bytes = fs::read(path).map_err(|error| {
-        RpcError::internal(format!("read corpus models.json: {error}"))
-    })?;
+    let bytes = fs::read(path)
+        .map_err(|error| RpcError::internal(format!("read corpus models.json: {error}")))?;
     let root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| RpcError::internal(format!("parse models.json: {error}")))?;
     let profiles = root
@@ -337,10 +325,9 @@ fn load_expected_hashes(
                 .get("path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::internal("artifact file missing path"))?;
-            let hash = file
-                .get("sha256")
-                .and_then(Value::as_str)
-                .ok_or_else(|| RpcError::internal(format!("artifact file {name} missing sha256")))?;
+            let hash = file.get("sha256").and_then(Value::as_str).ok_or_else(|| {
+                RpcError::internal(format!("artifact file {name} missing sha256"))
+            })?;
             // Only leaf filenames are pinned by Qwen3Artifact.
             let leaf = Path::new(name)
                 .file_name()
