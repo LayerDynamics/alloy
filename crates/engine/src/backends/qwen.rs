@@ -817,10 +817,15 @@ impl RuntimeBackend for Qwen3Backend {
                         product(self.limits.execution_headroom_bytes, 2)?,
                     ])?,
                 )?,
+                // Prefill cannot process more tokens than this request
+                // supplies. Keep a one-token allowance for decode work.
                 temporary_bytes: workspace_bound(
                     &data.config,
                     capacity,
-                    self.limits.prefill_chunk_tokens.get(),
+                    self.limits
+                        .prefill_chunk_tokens
+                        .get()
+                        .min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
                 )?,
                 output_bytes: output_bytes(self.limits.generation)?,
