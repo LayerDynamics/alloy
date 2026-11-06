@@ -274,6 +274,11 @@ impl<R: EngineRuntime> EngineCore<R> {
     pub fn active_request_id(&self) -> Result<Option<RequestId>, EngineError> {
         self.scheduler.active_request_id()
     }
+
+    /// Borrow the concrete runtime (memory reclaim, admission controller).
+    pub fn runtime(&self) -> &R {
+        self.runtime.as_ref()
+    }
 }
 
 impl<R: EngineRuntime> Clone for EngineCore<R> {

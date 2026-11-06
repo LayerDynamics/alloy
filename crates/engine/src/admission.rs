@@ -37,6 +37,7 @@
 //! its unclaimed remainder.
 
 use crate::{error::EngineError, types::MemoryEstimate};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A consistent observation of the controller's reservation accounting.
@@ -86,7 +87,8 @@ impl AdmissionSnapshot {
 /// Clones share the same budget and accounting state. Use the same
 /// controller for allocations that compete for the same engine budget.
 ///
-/// The budget is fixed for this controller's lifetime.
+/// The live memory enforcer may resize the budget when the hard ceiling
+/// moves, and may pause new admissions under soft/hard pressure.
 #[derive(Clone, Debug)]
 pub struct AdmissionController {
     shared: Arc<Shared>,
@@ -95,6 +97,9 @@ pub struct AdmissionController {
 #[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
+    /// When true, new `reserve` / `reserve_grant` calls fail closed.
+    /// In-flight reservations remain valid.
+    admissions_paused: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -166,6 +171,7 @@ impl AdmissionController {
                     reserved_bytes: 0,
                     active_reservations: 0,
                 }),
+                admissions_paused: AtomicBool::new(false),
             }),
         })
     }
@@ -189,6 +195,41 @@ impl AdmissionController {
         })
     }
 
+    /// Whether new admissions are paused by the live memory enforcer.
+    pub fn admissions_paused(&self) -> bool {
+        self.shared.admissions_paused.load(Ordering::Acquire)
+    }
+
+    /// Pause or unpause new admissions. In-flight reservations are unchanged.
+    pub fn set_admissions_paused(&self, paused: bool) {
+        self.shared
+            .admissions_paused
+            .store(paused, Ordering::Release);
+    }
+
+    /// Replace the ledger budget with a new positive hard ceiling.
+    ///
+    /// Fails if the new budget is zero or below currently reserved bytes.
+    /// Used when the live enforcer recomputes the hard ceiling.
+    pub fn resize_budget(&self, budget_bytes: u64) -> Result<(), EngineError> {
+        if budget_bytes == 0 {
+            return Err(EngineError::invalid_request(
+                "budget_bytes",
+                "admission budget must be greater than zero",
+            ));
+        }
+        let mut state = self.shared.lock_state()?;
+        if budget_bytes < state.reserved_bytes {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "resize admission budget",
+                required_bytes: state.reserved_bytes,
+                available_bytes: budget_bytes,
+            });
+        }
+        state.budget_bytes = budget_bytes;
+        Ok(())
+    }
+
     /// Atomically reserve a positive number of bytes.
     ///
     /// The fit check and accounting update occur under the same mutex.
@@ -210,6 +251,8 @@ impl AdmissionController {
                 "memory reservation must be greater than zero",
             ));
         }
+
+        self.reject_if_paused(operation, required_bytes)?;
 
         {
             let mut state = self.shared.lock_state()?;
@@ -282,6 +325,8 @@ impl AdmissionController {
                 "startup grant total must be positive",
             ));
         }
+
+        self.reject_if_paused(operation, total)?;
 
         {
             let mut state = self.shared.lock_state()?;
@@ -595,6 +640,24 @@ impl Drop for MemoryReservation {
         if self.shared.release(self.bytes).is_ok() {
             self.active = false;
         }
+    }
+}
+
+impl AdmissionController {
+    fn reject_if_paused(
+        &self,
+        _operation: &'static str,
+        required_bytes: u64,
+    ) -> Result<(), EngineError> {
+        if !self.admissions_paused() {
+            return Ok(());
+        }
+        let available_bytes = self.snapshot()?.available_bytes();
+        Err(EngineError::MemoryLimitExceeded {
+            operation: "admission paused (memory pressure)",
+            required_bytes,
+            available_bytes,
+        })
     }
 }
 

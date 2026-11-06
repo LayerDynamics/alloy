@@ -208,6 +208,21 @@ impl Array {
         Array::from_raw(raw)
     }
 
+    /// New array from a buffer of `u32` elements (copied) with `shape`.
+    pub fn from_u32_slice(data: &[u32], shape: &[i32]) -> Result<Self> {
+        // SAFETY: `data`/`shape` are valid for the call and mlx-c copies
+        // the buffer synchronously.
+        let raw = unsafe {
+            sys::mlx_array_new_data(
+                data.as_ptr() as *const c_void,
+                shape.as_ptr(),
+                shape.len() as c_int,
+                DType::Uint32 as u32,
+            )
+        };
+        Array::from_raw(raw)
+    }
+
     /// New scalar `f32` array.
     pub fn from_f32(value: f32) -> Result<Self> {
         // SAFETY: plain constructor call.

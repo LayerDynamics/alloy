@@ -6,7 +6,8 @@
 //! The caller selects execution streams explicitly. Arrays are not
 //! duplicated into separate CPU-model and GPU-model representations.
 //!
-//! This initial operation surface supports float32 model tensors.
+//! Dense linears use float32 weights. Affine4 linears use packed uint32
+//! weights with `quantized_matmul` (scales/biases stay float32).
 //! Token IDs supplied to embedding_lookup are uploaded as uint32 metadata.
 //!
 //! Cache helpers use:
@@ -19,6 +20,7 @@
 
 use crate::{Array, DType, Error, Stream, bindings as sys};
 use std::{
+    ffi::CString,
     fmt,
     os::raw::{c_int, c_void},
     ptr,
@@ -220,6 +222,146 @@ pub fn linear(input: &Array, weight: &Array, stream: &Stream) -> OperationResult
         )
     };
 
+    output.finish(status)
+}
+
+/// Compute `input @ quantized(weight)^T` for affine packed weights.
+///
+/// `input`: `[rows, input_width]` float32.
+/// `weight`: packed uint32 `[output_width, input_width * bits / 32]`.
+/// `scales` / `biases`: `[output_width, groups]` float32.
+/// `transpose`: true for the usual checkpoint layout `[out, in]`.
+pub fn quantized_matmul(
+    input: &Array,
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    transpose: bool,
+    group_size: i32,
+    bits: i32,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    require_f32(input)?;
+    if weight.dtype() != DType::Uint32 {
+        return Err(OperationError::InvalidInput(
+            "quantized_matmul weight must be uint32",
+        ));
+    }
+    require_f32(scales)?;
+    require_f32(biases)?;
+
+    let input_shape = input.shape();
+    let weight_shape = weight.shape();
+    let scales_shape = scales.shape();
+    let biases_shape = biases.shape();
+
+    if input_shape.len() != 2 || weight_shape.len() != 2 {
+        return Err(OperationError::InvalidInput(
+            "quantized_matmul requires rank-two input and weight",
+        ));
+    }
+    if scales_shape != biases_shape || scales_shape.len() != 2 {
+        return Err(OperationError::InvalidInput(
+            "quantized_matmul scales/biases must be rank-two and matching",
+        ));
+    }
+    if group_size <= 0 || bits <= 0 {
+        return Err(OperationError::InvalidInput(
+            "quantized_matmul group_size and bits must be positive",
+        ));
+    }
+    require_positive_shape(&input_shape)?;
+    require_positive_shape(&weight_shape)?;
+    require_positive_shape(&scales_shape)?;
+
+    let mode = CString::new("affine").map_err(|_| {
+        OperationError::InvalidInput("quantized_matmul mode string")
+    })?;
+    let group = sys::mlx_optional_int {
+        value: group_size,
+        has_value: true,
+    };
+    let bit_opt = sys::mlx_optional_int {
+        value: bits,
+        has_value: true,
+    };
+
+    let mut output = PendingArray::new();
+    // SAFETY: valid handles; mode NUL-terminated and lives for the call.
+    let status = unsafe {
+        sys::mlx_quantized_matmul(
+            &mut output.raw,
+            input.as_raw(),
+            weight.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            transpose,
+            group,
+            bit_opt,
+            mode.as_ptr(),
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
+/// Dequantize an affine packed weight matrix to float32.
+pub fn dequantize(
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if weight.dtype() != DType::Uint32 {
+        return Err(OperationError::InvalidInput(
+            "dequantize weight must be uint32",
+        ));
+    }
+    require_f32(scales)?;
+    require_f32(biases)?;
+    if group_size <= 0 || bits <= 0 {
+        return Err(OperationError::InvalidInput(
+            "dequantize group_size and bits must be positive",
+        ));
+    }
+
+    let mode = CString::new("affine").map_err(|_| {
+        OperationError::InvalidInput("dequantize mode string")
+    })?;
+    let group = sys::mlx_optional_int {
+        value: group_size,
+        has_value: true,
+    };
+    let bit_opt = sys::mlx_optional_int {
+        value: bits,
+        has_value: true,
+    };
+    let null_global = sys::mlx_array {
+        ctx: ptr::null_mut(),
+    };
+    let null_dtype = sys::mlx_optional_dtype {
+        value: DType::Float32 as u32,
+        has_value: false,
+    };
+
+    let mut output = PendingArray::new();
+    // SAFETY: valid handles; null global_scale / dtype are documented allowed.
+    let status = unsafe {
+        sys::mlx_dequantize(
+            &mut output.raw,
+            weight.as_raw(),
+            scales.as_raw(),
+            biases.as_raw(),
+            group,
+            bit_opt,
+            mode.as_ptr(),
+            null_global,
+            null_dtype,
+            stream.as_raw(),
+        )
+    };
     output.finish(status)
 }
 

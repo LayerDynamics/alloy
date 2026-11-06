@@ -1,6 +1,6 @@
 # Phase 1 Execution Plan — Vertical Slice
 
-Spec: SPEC-1 v1.9, 4.1 Phase 1
+Spec: SPEC-1 v1.10, 4.1 Phase 1
 Duration: weeks 2–4 of M1, 2026-11-10 → 2026-12-03 (M1 target)
 Owner: solo
 Fallback: none for this phase. The Q2 binding decision is closed (DR-0001);
@@ -11,6 +11,19 @@ mlx-ffi, the vendored build, and CI all exist from Phase 0.
 One model family, one session, streamed chat end to end: `alloy chat` (TS
 client) → daemon local JSON-RPC API → engine → quantized Qwen3 generating
 tokens in-process from an mlx-community artifact.
+
+## Memory-parity pull-forward (SPEC-1 v1.10)
+
+oMLX-method memory parity is REQUIRED and blocks Mac E2E 13–14 until green:
+
+- Live memory guard (tiers, soft/hard watermarks, wired policy)
+- Quantized-resident Affine4 weights (no full-model f32 decode peak)
+- Multi-model pin / TTL / LRU
+- Hot RAM + cold SSD KV
+
+Design and PR stack: `docs/designs/omlx-memory-method-parity.md`.
+`alloyd` defaults to `--memory-guard balanced` rather than a fixed 8 GiB
+admission budget.
 
 ## Scope (from the spec)
 

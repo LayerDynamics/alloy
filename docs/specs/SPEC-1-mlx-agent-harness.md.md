@@ -4,15 +4,16 @@
 
 **Naming (decided, v1.6):** the project is **alloy** — binaries `alloy` (TS CLI) and `alloyd` (Rust daemon), npm package `alloyml`, Homebrew tap formula `alloy`, config dir `~/.alloy/` (bare `alloy` is taken on crates.io and npm, hence the suffixed names).
 
-**Date:** 2026-11-03 (revised same day — v1.1: pure-Rust mlx-c engine; v1.2: TypeScript clients + Apple RAM tiers; v1.3: consistency fixes; v1.4: Goldfish round-1 confirmed fixes, 4 isolated reviewers; v1.5: Goldfish round-2 structural fixes; v1.6: Phase 0 questions resolved — project named "alloy", own-bindgen decision, benchmark corpus adopted; v1.7: all remaining open questions resolved — conversion via uv, telemetry required, speculative decoding promoted to SHOULD, Kokoro-82M TTS; v1.8: post-decision consistency pass — 9 fixes; v1.9: Goldfish round-3 fixes — all 4 lenses, 26 findings applied)
+**Date:** 2026-11-03 (revised same day through v1.9; v1.10 2026-04-10 — oMLX-method memory parity)
 **Author:** User (with Perplexity Computer)
 **Status:** Draft
-**Version:** 1.9
+**Version:** 1.10
 
 ## Revision History
 
 | Version | Date | Change |
 |---------|------|--------|
+| 1.10 | 2026-04-10 | oMLX-method memory parity REQUIRED for the native engine: live tiered memory guard (safe/balanced/aggressive/custom), soft/hard watermarks, Metal wired-limit policy matching oMLX, quantized-resident weights, multi-model pin/TTL/LRU, and hot RAM + cold SSD KV (amends v1.4 “KV persistence dropped from V1”). Live ceiling formula supersedes Appendix D’s 25%-headroom rule as the runtime controller; Appendix D rows remain profile/benchmark defaults. Design: `docs/designs/omlx-memory-method-parity.md`. |
 | 1.0 | 2026-11-03 | Initial spec: Rust control plane + Python MLX-LM inference worker |
 | 1.1 | 2026-11-03 | Runtime changed to pure-Rust mlx-c engine (per-family model crates, vendored mlx-c, single process); IPC gateway component removed; Python demoted to optional build-time conversion CLI; architecture, phases, risks, and appendices revised accordingly |
 | 1.2 | 2026-11-03 | User-facing layer opened to TypeScript: CLI and TUI are thin TS clients over the Rust daemon's local API; harness and engine remain pure Rust; distribution, security, and API contracts updated |
@@ -124,8 +125,8 @@ What V1 delivers — the consolidated counterpart to §2.4's Non-Goals:
 | FR-15 | WONT | The system WILL NOT support training or fine-tuning in V1. |
 | FR-16 | WONT | The system WILL NOT run a Python interpreter at inference time. |
 | FR-17 | MUST | The engine MUST exploit MLX unified-memory features as the primary optimization path: shared CPU/GPU arrays with zero-copy weight residency (no host-device duplication of loaded weights), Metal memory-limit and cache-limit control, MLX allocator cache reclamation under pressure, and lazy/compiled graphs to bound temporary allocations. |
-| FR-18 | MUST | The admission controller MUST work in actual installed RAM units, not power-of-two classes — Apple's RAM sizes are not uniformly power-of-two (8, 16, 18, 24, 32, 36, 48, 64, 96, and 128 GB configurations), and budgets MUST derive from the detected physical memory and measured wired-memory headroom. |
-| FR-19 | MUST | The engine MUST expose and respect per-process Metal memory limits and wired-limit guidance (with `alloy doctor` reporting both), and MUST reclaim MLX allocator caches before evicting models under pressure. |
+| FR-18 | MUST | The admission controller MUST work in actual installed RAM units, not power-of-two classes — Apple's RAM sizes are not uniformly power-of-two (8, 16, 18, 24, 32, 36, 48, 64, 96, and 128 GB configurations). The live hard ceiling MUST match oMLX memory-guard methods: tiers `safe` / `balanced` / `aggressive` / `custom` (memory left free for other apps), `hard_ceiling = min(static, dynamic, metal_cap + cpu_footprint)` from detected physical RAM, `host_statistics64` free/inactive/active, and `iogpu.wired_limit_mb` or Metal recommended working set. Appendix D profile rows are defaults for model profiles and benchmarks; they are not the live controller formula. Design: `docs/designs/omlx-memory-method-parity.md`. |
+| FR-19 | MUST | The engine MUST expose and respect per-process Metal memory limits and wired-limit guidance (with `alloy doctor` / daemon status reporting both and naming the binding ceiling component). It MUST call `mlx_set_wired_limit` only when `iogpu.wired_limit_mb` is explicitly set (> 0); when unset, leave Apple’s default Metal cap and surface the exact `sysctl` raise recipe. It MUST reclaim MLX allocator / Metal buffer pools before evicting models under pressure (oMLX soft/hard watermark ladder). |
 
 **Agent harness**
 
@@ -143,7 +144,7 @@ What V1 delivers — the consolidated counterpart to §2.4's Non-Goals:
 | FR-29 | MUST | The system MUST provide durable automations (schedule and event triggers) that create agent runs under explicit permission scopes, with overlap policy, deadlines, retries, and approval pauses. |
 | FR-30a | MUST | The system MUST expose a CLI as a thin client (TypeScript) over the Rust daemon's local API; the daemon runs harness and engine in one process. |
 | FR-30b | SHOULD | The system SHOULD ship a TUI in V1 (cuttable to v1.1 per the descope ladder — the B.6 API makes late addition cheap) and publish the TS SDK (it is the JSON-RPC client library, published as a byproduct). |
-| FR-31 | MUST | The system MUST implement an admission controller that estimates and reserves memory (weights, KV state, prefill/decode temporaries, draft models, headroom) before loading a model or admitting a session, with graceful degradation (evict, reduce chunk size, reject with explanation). |
+| FR-31 | MUST | The system MUST implement an admission controller that estimates and reserves memory (weights, KV state, prefill/decode temporaries, draft models, headroom) before loading a model or admitting a session. Estimates MUST assume quantized-resident weights where the artifact is quantized (no full-model host f32 decode peak). Graceful degradation MUST follow the oMLX ladder: drain Metal/allocator pools → soft pause + LRU unload of unpinned idle models → hard abort/evict → shrink prefill chunks → reject/abort with an explanation that names the binding limit. Multi-model pin / per-model TTL / LRU and hot RAM + cold SSD KV are in V1 scope (see FR-18 design note). |
 | FR-32 | SHOULD | The system SHOULD support multiple concurrent sessions sharing one loaded model, with isolated per-session state. |
 | FR-33 | COULD | The system COULD support a GGUF/llama.cpp fallback backend in a later minor version (not V1-blocking). |
 | FR-34 | COULD | The system COULD support inference-time LoRA adapters applied over a base model artifact (justifies the `lora_id` term in the B.1 cache-identity key; not V1-blocking). If unimplemented in V1, `lora_id` is null in the key. |
@@ -314,7 +315,7 @@ One Rust daemon (`alloyd`) — harness and engine share the address space; the i
 - **Dependencies:** Agent supervisor, session store, policy engine.
 
 #### Component: Engine Core (Rust, in-process)
-- **Responsibility:** Model lifecycle (load/unload/evict), multi-session scheduling over shared weights, KV-cache management (retention, prefix reuse, idle policy — no disk persistence in V1; KV state is in-process only, §3.8), memory admission control, prefill chunking, and backend selection (native mlx-c engine vs oMLX adapter). Owns the unified-memory optimization program: zero-copy weight residency via MLX shared CPU/GPU arrays, Metal memory-limit/cache-limit configuration, allocator-cache reclamation under pressure, and compiled/lazy graphs to bound temporaries.
+- **Responsibility:** Model lifecycle (load/unload/evict with pin / TTL / LRU), multi-session scheduling over shared weights, KV-cache management (retention, prefix reuse, idle policy, and oMLX-method tiered cache: hot RAM + cold SSD safetensors blocks that may restore across daemon restart — §3.8), memory admission control (live oMLX-method guard + inner reservation ledger), prefill chunking, and backend selection (native mlx-c engine vs oMLX adapter). Owns the unified-memory optimization program: zero-copy quantized-resident weights via MLX shared CPU/GPU arrays, Metal memory-limit/cache-limit/wired-limit configuration per FR-19, allocator-cache reclamation under pressure before model eviction, and compiled/lazy graphs to bound temporaries.
 - **Technology:** Rust; direct ownership of mlx-c arrays/streams in the engine's memory domain.
 - **Interfaces:** Async engine API: render_and_count, estimate_memory, generate (streaming), cancel, release_session_state, capabilities (contract in Appendix B.1).
 - **Dependencies:** mlx-c FFI layer, model-family crates, oMLX adapter.
@@ -479,11 +480,11 @@ alloy stats
 
 ### 3.8 Resilience Design
 
-- **Process model:** one process — a crash pauses inference and sessions resume from durable history (the KV cache is lost; correctness never depends on it). This is the accepted trade-off of the single-process design vs. v1.0's worker isolation.
+- **Process model:** one process — a crash pauses inference and sessions resume from durable history. Hot (RAM) KV is lost on crash; cold SSD KV blocks MAY restore matching prefixes after restart. Correctness never depends on cache state (miss → re-prefill). This remains the accepted trade-off of the single-process design vs. worker isolation.
 - **Retries/backpressure:** generation and tool calls cancellable; MCP calls have deadlines; scheduler applies admission backpressure instead of OOM.
-- **Cache failure modes:** KV cache is an optimization — any prefix mismatch invalidates reuse and falls back to re-prefill; correctness never depends on cache state.
+- **Cache failure modes:** KV cache is an optimization — any prefix mismatch invalidates reuse and falls back to re-prefill; corrupt or version-mismatched cold blocks are ignored and rebuilt; correctness never depends on cache state.
 - **Validation failures:** artifact never marked usable without a passing validation report; failed downloads/conversions leave existing artifacts untouched.
-- **Degradation ladder under memory pressure:** evict idle cache → unload idle models → reduce concurrency → shrink prefill chunks → reject with explanation.
+- **Degradation ladder under memory pressure (oMLX-method):** drain MLX/Metal allocator pools → soft pause + LRU unload of unpinned idle models (and spill hot KV to cold SSD when configured) → hard abort/evict → shrink prefill chunks → reject/abort with explanation naming the binding ceiling component.
 - **Graph-compilation safety:** `mlx_compile`'d decode paths must produce bit-identical outputs to eager paths in the conformance suite before being enabled per family.
 
 ### 3.9 Observability
@@ -555,7 +556,8 @@ repo/
 
 #### Phase 5: Scheduling, caching, admission
 - **Goal:** Multi-session shared-model operation within memory budgets.
-- **Scope:** Engine scheduler (prefill/decode, session concurrency), KV-cache manager (generalizing Phase 3's basic prefix cache to retention modes, multi-session prefix sharing, idle policy), memory admission controller, prefill chunking control; `mlx_compile`d decode path behind conformance gates — enabled per family only if eager-mode benchmarks show a > 10% decode-speed gap (conditional feature, not a default assumption); speculative decoding with draft models (FR-12, committed v1.7 — default pairing Qwen3-0.6B drafting Qwen3-4B, profile-declared) behind per-family conformance gates; `alloy doctor` (FR-19): environment report with per-process Metal memory limits and wired-limit guidance.
+- **Scope:** Engine scheduler (prefill/decode, session concurrency), KV-cache manager (generalizing Phase 3's basic prefix cache to retention modes, multi-session prefix sharing, idle policy, and completing hot/cold SSD KV polish), memory admission calibration and multi-session pressure policy; `mlx_compile`d decode path behind conformance gates — enabled per family only if eager-mode benchmarks show a > 10% decode-speed gap (conditional feature, not a default assumption); speculative decoding with draft models (FR-12, committed v1.7 — default pairing Qwen3-0.6B drafting Qwen3-4B, profile-declared) behind per-family conformance gates; `alloy doctor` (FR-19): environment report with per-process Metal memory limits and wired-limit guidance.
+- **Pull-forward (v1.10):** The oMLX-method live memory guard (tiers, soft/hard watermarks, wired policy), quantized-resident weights, multi-model pin/TTL/LRU, and hot+cold SSD KV are REQUIRED earlier than this phase’s original schedule — see `docs/designs/omlx-memory-method-parity.md`. Phase 5 keeps calibration, concurrency scale-out, and draft-enabled exit criteria.
 - **Exit criteria:** Concurrent sessions share one loaded model; an over-budget request is rejected with an explanation rather than OOM-crashing; measured memory within 20% of estimates (reconciled and calibrated); compiled decode is bit-identical to eager on enabled families; at least one family ships draft-enabled speculative decoding with its conformance suite passing (SHOULD-level: cuttable per the descope ladder without blocking v1.0).
 
 #### Phase 6: Automations and oMLX backend
@@ -913,9 +915,9 @@ A user who approves a malicious action bypasses the policy engine by definition 
 
 ### Appendix D: Capacity Model
 
-Apple's RAM sizes are not uniformly power-of-two (8, 16, 18, 24, 32, 36, 48, 64, 96, 128 GB and up). Budgets are computed from **detected physical RAM** at runtime — the tiers below are defaults for model profiles and benchmark scenarios, not classes the admission controller assumes. The author's 36 GB MacBook is a first-class benchmark and CI target.
+Apple's RAM sizes are not uniformly power-of-two (8, 16, 18, 24, 32, 36, 48, 64, 96, 128 GB and up). The **live** admission ceiling is computed at runtime by the oMLX-method memory guard (FR-18; `docs/designs/omlx-memory-method-parity.md`) from detected physical RAM, live vm stats, and Metal/wired caps — not from the table below. The rows below remain defaults for **model profiles and benchmark scenarios**. The author's 36 GB MacBook is a first-class benchmark and CI target.
 
-Initial per-tier budgets (calibrated by measurement in Phase 5; headroom = 25% of unified memory reserved for OS + app). Budget derivation rule: budgets for tiers without a dedicated row are linearly interpolated between the nearest listed tiers and clamped to the 25%-headroom rule (weights + KV ≤ 75% of RAM). Non-8/36-GB rows are extrapolated defaults pending Phase 5 calibration — only the 8 GB and 36 GB tiers are measured first-class targets.
+Initial per-tier **profile** budgets (calibrated by measurement in Phase 5). Historical planning used ~25% OS/app headroom (weights + KV ≤ 75% of RAM) to size these defaults; that percentage is **not** the live controller. Live tiers are oMLX `safe` / `balanced` / `aggressive` / `custom` reserves. Budget derivation for missing profile rows: linearly interpolate between the nearest listed rows. Non-8/36-GB rows are extrapolated defaults pending Phase 5 calibration — only the 8 GB and 36 GB tiers are measured first-class targets.
 
 | Tier | Weights budget | KV/context budget | Target model class (V1) | Prefill chunk | Notes |
 |------|----------------|-------------------|-------------------------|---------------|-------|
@@ -927,7 +929,7 @@ Initial per-tier budgets (calibrated by measurement in Phase 5; headroom = 25% o
 | **36 GB** | **≤ 20 GB** | **≤ 7 GB** | **16-20B @ 4-bit or 14B @ 6-bit, 32-64k context** | **1024** | **Author's MacBook — first-class benchmark tier; full cache + concurrent sessions + STT resident** |
 | 48 GB | ≤ 26 GB | ≤ 10 GB | 30B-class @ 4-bit, 64k context | 2048 | Full cache + concurrent sessions (weights+KV+headroom = 48 GB exactly) |
 | 64 GB | ≤ 36 GB | ≤ 12 GB | 30B-class @ 4-bit, 64k context | 2048 | Multiple models resident |
-| 96 GB | ≤ 54 GB | ≤ 18 GB | 70B-class @ 4-bit or MoE, 128k context | 2048 | Multiple models + SSD cold tier via oMLX backend |
+| 96 GB | ≤ 54 GB | ≤ 18 GB | 70B-class @ 4-bit or MoE, 128k context | 2048 | Multiple models + native hot/cold SSD KV (oMLX-method; oMLX adapter remains optional) |
 | 128 GB+ | ≤ 72 GB | ≤ 24 GB | 70B-class @ 4-bit or MoE, 128k context | 2048 | Same, with headroom for draft models |
 
 #### Unified-Memory Feature Usage (per FR-17/FR-19)
@@ -935,9 +937,9 @@ Initial per-tier budgets (calibrated by measurement in Phase 5; headroom = 25% o
 | MLX capability | Engine usage |
 |---------------|--------------|
 | Shared CPU/GPU arrays | Weights loaded once; CPU and GPU views alias the same unified memory (zero-copy) — no host-side duplicate of any resident tensor |
-| Metal memory limit | Per-process limit configured from admission budget; generation that would exceed it fails cleanly, never OOMs the OS |
-| MLX allocator cache limit + reclamation | Idle KV/activation caches reclaimed first under pressure; model eviction is the next step, OS OOM never |
-| Wired-limit guidance | `alloy doctor` reports the macOS wired limit and recommends a per-process value below it for large-model profiles |
+| Metal memory limit | Per-process graph-eval guideline configured from the live hard ceiling; generation that would exceed the admit line fails cleanly, never OOMs the OS |
+| MLX allocator cache limit + reclamation | Idle KV/activation / Metal buffer pools reclaimed first under soft pressure; model eviction is the next step, OS OOM never |
+| Wired-limit guidance | Raise `mlx_set_wired_limit` only when `iogpu.wired_limit_mb` is set; otherwise `alloy doctor` / daemon status recommends the exact `sysctl` value (≤ 95% of RAM, whole MiB) |
 | Lazy evaluation / `mlx_compile` | Temporaries bounded via graph compilation of decode steps; peak-memory-aware prefill chunking bounds prompt-processing peaks |
 | Quantized KV (where family supports) | Cache budget halved per FR-11 capability flags — gated per family by conformance |
 
@@ -949,8 +951,8 @@ M_KV ≈ 2 · L · B · T · H_KV · D_head · s
 
 (2 = keys+values; L layers, B batch, T tokens, H_KV KV heads, D_head head dim, s bytes per element — halved for 8-bit KV where the family supports it.)
 
-Admission flow: inspect → estimate (formula + calibration table, scaled by detected RAM) → reserve → load → measure → reconcile (update calibration table). The 8 GB and 36 GB tier profiles are first-class CI targets (simulated budgets) — the harshest correctness environment and the author's daily driver, respectively. In-process admission benefits from direct allocator visibility: reserved-vs-actual reconciliation reads real memory pressure rather than a foreign process's self-report.
+Admission flow: inspect live ceiling → estimate (formula + calibration table; quantized-resident sizes) → reserve on the inner ledger → load → measure → reconcile (update calibration table). Soft/hard enforcer runs continuously. The 8 GB and 36 GB tier profiles are first-class CI targets (simulated budgets and real Mac) — the harshest correctness environment and the author's daily driver, respectively. In-process admission benefits from direct allocator visibility: reserved-vs-actual reconciliation reads real memory pressure rather than a foreign process's self-report.
 
 ---
 
-*End of SPEC-1. Status: Draft v1.9 — consistency-reviewed (v1.3, v1.8), Goldfish-reviewed (v1.4/v1.5/v1.9, all 4 lenses), and all decisions resolved (v1.6: name = alloy, own-bindgen decision, benchmark corpus; v1.7: conversion via uv, telemetry required, speculative decoding committed, Kokoro-82M TTS; v1.9: multimodal artifacts, draft pairing, job schema/trigger vocabulary pinned). Zero open decisions — the spec is ready for Phase 0 execution.*
+*End of SPEC-1. Status: Draft v1.10 — v1.9 baseline plus oMLX-method memory parity (live guard, quantized-resident weights, multi-model reclaim, hot/cold SSD KV). Zero open decisions for that amend — design in `docs/designs/omlx-memory-method-parity.md`.*

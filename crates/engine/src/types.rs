@@ -765,8 +765,9 @@ pub enum ExecutionBackend {
 
 /// Representation actually retained for model weights.
 ///
-/// An affine four-bit artifact decoded into f32 storage is reported as
-/// `F32`, not as resident affine four-bit storage.
+/// Affine4 means packed uint32 codes + scales/biases stay resident and
+/// execute via `mlx_quantized_matmul`. An artifact that is expanded to
+/// host/device f32 storage is reported as `F32`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRepresentation {
     /// IEEE 754 single-precision storage.

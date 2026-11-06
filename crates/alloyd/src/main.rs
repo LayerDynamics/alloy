@@ -3,11 +3,17 @@
 use alloyd::{
     BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener,
 };
+use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
+use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
 use harness_core::{HardwareTier, TelemetryClient};
 use std::env;
+use std::future::Future;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::thread;
+use std::time::Duration;
+use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match run() {
@@ -27,7 +33,9 @@ fn run() -> Result<(), String> {
     let mut corpus_models = None;
     let mut profile = "qwen3-4b-4bit".to_owned();
     let mut max_output_tokens = 512usize;
-    let mut admission_budget = 8 * 1024 * 1024 * 1024u64;
+    let mut memory_guard_tier = MemoryGuardTier::Balanced;
+    let mut memory_guard_gb: Option<f64> = None;
+    let mut admission_budget_override: Option<u64> = None;
     let mut prefer_metal = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     let mut endpoint = "https://telemetry.invalid/v1".to_owned();
 
@@ -61,12 +69,28 @@ fn run() -> Result<(), String> {
                     .parse()
                     .map_err(|_| format!("invalid --max-output-tokens: {raw}"))?;
             }
+            "--memory-guard" => {
+                index += 1;
+                let raw = require_value(&args, index, "--memory-guard")?;
+                memory_guard_tier = MemoryGuardTier::parse(&raw)
+                    .map_err(|error| error.to_string())?;
+            }
+            "--memory-guard-gb" => {
+                index += 1;
+                let raw = require_value(&args, index, "--memory-guard-gb")?;
+                memory_guard_gb = Some(
+                    raw.parse()
+                        .map_err(|_| format!("invalid --memory-guard-gb: {raw}"))?,
+                );
+                memory_guard_tier = MemoryGuardTier::Custom;
+            }
             "--admission-budget-bytes" => {
                 index += 1;
                 let raw = require_value(&args, index, "--admission-budget-bytes")?;
-                admission_budget = raw
-                    .parse()
-                    .map_err(|_| format!("invalid --admission-budget-bytes: {raw}"))?;
+                admission_budget_override = Some(
+                    raw.parse()
+                        .map_err(|_| format!("invalid --admission-budget-bytes: {raw}"))?,
+                );
             }
             "--cpu" => prefer_metal = false,
             "--metal" => prefer_metal = true,
@@ -95,11 +119,34 @@ fn run() -> Result<(), String> {
         db_path: db.map(PathBuf::from).unwrap_or(defaults.db_path),
     };
 
+    let memory_guard = if memory_guard_tier == MemoryGuardTier::Custom {
+        let bytes = if let Some(override_bytes) = admission_budget_override {
+            override_bytes
+        } else {
+            let gb = memory_guard_gb.ok_or_else(|| {
+                "--memory-guard custom requires --memory-guard-gb N (or --admission-budget-bytes)"
+                    .to_owned()
+            })?;
+            if gb <= 0.0 {
+                return Err("--memory-guard-gb must be positive".to_owned());
+            }
+            (gb * 1024.0 * 1024.0 * 1024.0) as u64
+        };
+        MemoryGuardConfig::custom(bytes).map_err(|error| error.to_string())?
+    } else {
+        MemoryGuardConfig {
+            tier: memory_guard_tier,
+            custom_ceiling_bytes: 0,
+            enabled: true,
+        }
+    };
+
     let booted = boot_qwen3(BootRequest {
         artifact_dir: PathBuf::from(artifact),
         profile_id: profile.clone(),
         corpus_models_json: corpus_models.map(PathBuf::from),
-        admission_budget_bytes: admission_budget,
+        memory_guard,
+        admission_budget_override_bytes: admission_budget_override,
         prefer_metal,
     })
     .map_err(|error| error.message)?;
@@ -109,6 +156,8 @@ fn run() -> Result<(), String> {
         HardwareTier::Unknown,
         endpoint,
     ));
+    let engine_for_enforcer = booted.engine.clone();
+    let memory_enforcer = booted.memory_enforcer.clone();
     let service = Arc::new(
         DaemonService::open(
             &config.db_path,
@@ -121,14 +170,109 @@ fn run() -> Result<(), String> {
         .map_err(|error| error.message)?,
     );
 
+    thread::Builder::new()
+        .name("alloyd-memory-enforcer".to_owned())
+        .spawn(move || {
+            run_memory_enforcer_loop(memory_enforcer, engine_for_enforcer);
+        })
+        .map_err(|error| format!("spawn memory enforcer: {error}"))?;
+
     let listener = bind_listener(&config.socket_path).map_err(|error| error.message)?;
     eprintln!(
-        "alloyd listening on {} (db {}, profile {}, api_version 1, real Qwen3)",
+        "alloyd listening on {} (db {}, profile {}, api_version 1, real Qwen3, \
+         memory-guard {} hard={} GiB binding={})",
         config.socket_path.display(),
         config.db_path.display(),
-        booted.profile_id
+        booted.profile_id,
+        booted.memory_guard_tier,
+        booted.memory_reserved as f64 / (1024.0 * 1024.0 * 1024.0),
+        booted.ceiling_binding.as_deref().unwrap_or("none"),
     );
     serve_listener(listener, service).map_err(|error| error.message)
+}
+
+fn run_memory_enforcer_loop(
+    enforcer: engine::memory_enforcer::MemoryEnforcer,
+    engine: engine::api::EngineCore<engine::runtime::FamilyRuntime>,
+) {
+    let mut previous = PressureLevel::Ok;
+    loop {
+        match enforcer.tick() {
+            Ok(tick) => {
+                if tick.status.pressure != previous {
+                    eprintln!(
+                        "alloyd: memory pressure {} -> {} (usage={:.2} GiB soft={:.2} hard={:.2} \
+                         ceiling={:.2} GiB binding={} paused={} reclaim={} deferred={})",
+                        previous.as_str(),
+                        tick.status.pressure.as_str(),
+                        tick.status.usage_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        tick.status.soft_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        tick.status.hard_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        tick.status.hard_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        tick.status.binding.unwrap_or("none"),
+                        tick.status.admissions_paused,
+                        tick.request_cache_reclaim,
+                        tick.deferred_for_pool_drain,
+                    );
+                    previous = tick.status.pressure;
+                }
+                if tick.request_cache_reclaim {
+                    // Drain on the native worker when idle. Busy generation
+                    // leaves the flag set for a later tick (oMLX also waits
+                    // for a safe boundary rather than touching Metal here).
+                    let future = engine.runtime().reclaim_mlx_allocator_cache();
+                    match block_on(future) {
+                        Ok(report) => {
+                            enforcer.clear_cache_reclaim_request();
+                            let before = report.before.cache_bytes;
+                            let after = report.after.cache_bytes;
+                            if before > after {
+                                eprintln!(
+                                    "alloyd: MLX pool drain {} -> {} MiB",
+                                    before / (1024 * 1024),
+                                    after / (1024 * 1024)
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            // Worker busy or reclaim unavailable this tick.
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("alloyd: memory enforcer tick failed: {error}");
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        }
+        thread::sleep(ACTIVE_POLL_INTERVAL);
+    }
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    let mut future = Box::pin(future);
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => thread::yield_now(),
+        }
+    }
+}
+
+fn noop_waker() -> Waker {
+    use std::task::{RawWaker, RawWakerVTable};
+    fn clone(pointer: *const ()) -> RawWaker {
+        RawWaker::new(pointer, &VTABLE)
+    }
+    fn wake(_: *const ()) {}
+    fn wake_by_ref(_: *const ()) {}
+    fn drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    // SAFETY: vtable methods are no-ops; the null data pointer is never read.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
 fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
@@ -152,7 +296,9 @@ OPTIONS:
   --socket PATH                UDS path (default: ~/.alloy/alloyd.sock)
   --db PATH                    SQLite session store (default: ~/.alloy/sessions.sqlite)
   --max-output-tokens N        Greedy decode cap (default: 512)
-  --admission-budget-bytes N   Engine admission ceiling (default: 8 GiB)
+  --memory-guard TIER          safe|balanced|aggressive|custom (default: balanced)
+  --memory-guard-gb N          Custom ceiling in GiB (implies --memory-guard custom)
+  --admission-budget-bytes N   Test override for the admission ledger (optional)
   --metal / --cpu              Execution placement (default: metal on Apple Silicon, else cpu)
   --telemetry-endpoint URL     FR-35 flush URL
   -h, --help                   Show this help"

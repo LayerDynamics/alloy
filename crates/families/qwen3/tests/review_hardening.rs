@@ -5,7 +5,7 @@ use qwen3::{
     model::{ModelError, Qwen3Model},
     template::{TemplateError, render_chat},
 };
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
 use std::{collections::BTreeMap, path::PathBuf};
 
 type Tensors = BTreeMap<String, (Dtype, Vec<usize>, Vec<u8>)>;
@@ -62,53 +62,57 @@ fn tensors(c: &Qwen3Config) -> Tensors {
     add(
         "model.embed_tokens.weight".into(),
         vec![c.vocab_size, c.hidden_size],
-        &w.embed_tokens,
+        w.embed_tokens.as_f32().expect("fixture f32"),
     );
     for (index, l) in w.layers.iter().enumerate() {
         let p = format!("model.layers.{index}");
         for (name, shape, values) in [
-            ("input_layernorm", vec![c.hidden_size], &l.input_layernorm),
+            (
+                "input_layernorm",
+                vec![c.hidden_size],
+                l.input_layernorm.as_slice(),
+            ),
             (
                 "self_attn.q_proj",
                 vec![c.q_dim(), c.hidden_size],
-                &l.q_proj,
+                l.q_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "self_attn.k_proj",
                 vec![c.kv_dim(), c.hidden_size],
-                &l.k_proj,
+                l.k_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "self_attn.v_proj",
                 vec![c.kv_dim(), c.hidden_size],
-                &l.v_proj,
+                l.v_proj.as_f32().expect("fixture f32"),
             ),
-            ("self_attn.q_norm", vec![c.head_dim], &l.q_norm),
-            ("self_attn.k_norm", vec![c.head_dim], &l.k_norm),
+            ("self_attn.q_norm", vec![c.head_dim], l.q_norm.as_slice()),
+            ("self_attn.k_norm", vec![c.head_dim], l.k_norm.as_slice()),
             (
                 "self_attn.o_proj",
                 vec![c.hidden_size, c.q_dim()],
-                &l.o_proj,
+                l.o_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "post_attention_layernorm",
                 vec![c.hidden_size],
-                &l.post_attention_layernorm,
+                l.post_attention_layernorm.as_slice(),
             ),
             (
                 "mlp.gate_proj",
                 vec![c.intermediate_size, c.hidden_size],
-                &l.gate_proj,
+                l.gate_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "mlp.up_proj",
                 vec![c.intermediate_size, c.hidden_size],
-                &l.up_proj,
+                l.up_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "mlp.down_proj",
                 vec![c.hidden_size, c.intermediate_size],
-                &l.down_proj,
+                l.down_proj.as_f32().expect("fixture f32"),
             ),
         ] {
             add(format!("{p}.{name}.weight"), shape, values);
@@ -390,34 +394,39 @@ fn standalone_quantized_group_is_inferred() {
     );
     let quantized = encode(&data);
     std::fs::write(s.0.join("model.safetensors"), quantized).expect("quantized");
-    let actual = Qwen3Model::load(c.clone(), s.0.as_path())
-        .expect("infer group size four")
-        .forward(&[1, 2])
-        .expect("forward");
-    let weights = (0..rows)
-        .flat_map(|_| (0..width).map(|col| col as f32 * 0.5 - 1.0))
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
-    data.insert(
-        "model.embed_tokens.weight".into(),
-        (Dtype::F32, vec![rows, width], weights),
-    );
-    data.remove("model.embed_tokens.scales");
-    data.remove("model.embed_tokens.biases");
-    std::fs::write(s.0.join("model.safetensors"), encode(&data)).expect("float");
-    let expected = Qwen3Model::load(c, s.0.as_path())
-        .expect("float load")
-        .forward(&[1, 2])
-        .expect("forward");
-    for (a, b) in actual.iter().zip(expected) {
-        assert_close(a, &b);
+    // Affine4 stays packed for MLX; CPU Qwen3Model rejects it. Verify the
+    // loader keeps resident Affine4 with the inferred group size.
+    let loaded = qwen3::loader::load_weights(&c, s.0.as_path(), qwen3::loader::LoadOptions::default())
+        .expect("infer group size four");
+    match &loaded.embed_tokens {
+        qwen3::fixture::MatrixWeight::Affine4 {
+            rows: r,
+            cols,
+            group_size,
+            packed,
+            scales,
+            biases,
+        } => {
+            assert_eq!((*r, *cols, *group_size), (rows, width, 4));
+            assert_eq!(packed.len(), rows);
+            assert_eq!(scales.len(), rows * 2);
+            assert_eq!(biases.len(), rows * 2);
+        }
+        qwen3::fixture::MatrixWeight::F32(_) => panic!("expected Affine4 embed"),
     }
+    assert!(
+        Qwen3Model::from_weights(c.clone(), loaded).is_err(),
+        "CPU reference path must reject Affine4"
+    );
 }
 #[test]
 fn tied_memory_and_disk_heads_are_rejected() {
     let c = config();
     let mut w = generate_fixture(&c);
-    w.lm_head = Some(vec![0.0; c.vocab_size * c.hidden_size]);
+    w.lm_head = Some(qwen3::fixture::MatrixWeight::f32(vec![
+        0.0;
+        c.vocab_size * c.hidden_size
+    ]));
     assert!(Qwen3Model::load(c.clone(), w).is_err());
     let s = Scratch::new();
     let mut data = tensors(&c);
