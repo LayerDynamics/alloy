@@ -36,6 +36,14 @@ fn profile_b() -> ModelProfileId {
     ModelProfileId::new("policy-profile-b").expect("profile B")
 }
 
+fn artifact_c() -> ArtifactId {
+    ArtifactId::new("policy-artifact-c").expect("artifact C")
+}
+
+fn profile_c() -> ModelProfileId {
+    ModelProfileId::new("policy-profile-c").expect("profile C")
+}
+
 fn profile_large_cache() -> ModelProfileId {
     ModelProfileId::new("policy-profile-large-cache").expect("large-cache profile")
 }
@@ -467,6 +475,7 @@ struct PolicyEnvironment {
     observations: Arc<Observations>,
     plan_a: RuntimePlan,
     plan_b: RuntimePlan,
+    plan_c: RuntimePlan,
     plan_large: RuntimePlan,
 
     // The parent fixtures create real pinned checkpoint directories.
@@ -572,6 +581,7 @@ impl PolicyEnvironment {
     fn build(retention: RetentionPolicy, tight_budget: bool, pooling: bool) -> Self {
         let fixture_a = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let fixture_b = TestEnvironment::new(POLICY_OUTPUT, 8, false);
+        let fixture_c = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let context_limit = Qwen3Config::tiny_fixture().max_context;
         let generation_limits = GenerationLimits::new(8, 4096, 1024).expect("generation limits");
 
@@ -579,6 +589,7 @@ impl PolicyEnvironment {
             vec![
                 fixture_specification(&fixture_a, artifact_a()),
                 fixture_specification(&fixture_b, artifact_b()),
+                fixture_specification(&fixture_c, artifact_c()),
             ],
             Qwen3BackendLimits {
                 max_files: 16,
@@ -614,6 +625,7 @@ impl PolicyEnvironment {
             .registry(vec![
                 make_profile(profile_a(), artifact_a(), POLICY_OUTPUT),
                 make_profile(profile_b(), artifact_b(), POLICY_OUTPUT),
+                make_profile(profile_c(), artifact_c(), POLICY_OUTPUT),
                 make_profile(profile_large_cache(), artifact_a(), POLICY_OUTPUT + 4),
             ])
             .expect("policy registry");
@@ -629,11 +641,13 @@ impl PolicyEnvironment {
 
         let plan_a = plan_for(profile_a());
         let plan_b = plan_for(profile_b());
+        let plan_c = plan_for(profile_c());
         let plan_large = plan_for(profile_large_cache());
 
         let budget = if tight_budget {
             startup_budget(&plan_a)
                 .max(startup_budget(&plan_b))
+                .max(startup_budget(&plan_c))
                 .max(startup_budget(&plan_large))
         } else {
             BUDGET_BYTES
@@ -674,8 +688,9 @@ impl PolicyEnvironment {
             observations,
             plan_a,
             plan_b,
+            plan_c,
             plan_large,
-            _fixtures: vec![fixture_a, fixture_b],
+            _fixtures: vec![fixture_a, fixture_b, fixture_c],
         }
     }
 
@@ -1272,4 +1287,272 @@ fn pool_per_model_ttl_respects_pins_and_releases_committed_weights() {
             .is_empty(),
     );
     environment.assert_empty();
+}
+
+#[test]
+fn pool_three_artifacts_evict_lru_not_fifo() {
+    let environment = PolicyEnvironment::new_pool(false);
+
+    successful(&environment.run("pool-lru-a-first", profile_a(), "hello"));
+    let original_a = pool_instance(&environment, &artifact_a());
+    let retained_a = environment.snapshot().reserved_bytes();
+
+    successful(&environment.run("pool-lru-b-first", profile_b(), "hello"));
+    let original_b = pool_instance(&environment, &artifact_b());
+    let after_b = environment.snapshot().reserved_bytes();
+    let retained_b = after_b
+        .checked_sub(retained_a)
+        .expect("B adds committed resident resources");
+    assert!(retained_b > 0);
+
+    // A was inserted first, but is now more recently used than B.
+    successful(&environment.run("pool-lru-a-touch", profile_a(), "hello"));
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&original_a),);
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&original_b),);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        after_b,
+        "touching A must not introduce an additional resident allocation",
+    );
+
+    // Reserve unrelated bytes to leave C short by B's retained footprint.
+    // This guard remains alive throughout C's loading. The runtime must
+    // release a real model's resources, not credit unrelated reservations.
+    let cold_c = startup_budget(&environment.plan_c);
+    let desired_available = cold_c
+        .checked_sub(retained_b)
+        .expect("C cold-start demand exceeds one idle resident");
+    assert!(desired_available < pending_startup_reservation(&environment.plan_c));
+
+    let available = environment.snapshot().available_bytes();
+    let blocking_bytes = available
+        .checked_sub(desired_available)
+        .expect("fixture has enough budget before forcing pressure");
+    assert!(blocking_bytes > 0);
+
+    let blocker = environment
+        .admission
+        .reserve("three-artifact unrelated allocation", blocking_bytes)
+        .expect("reserve pressure fixture");
+
+    assert_eq!(environment.snapshot().available_bytes(), desired_available,);
+
+    let checkpoint = environment.control.events().len();
+    successful(&environment.run("pool-lru-c-first", profile_c(), "hello"));
+
+    let all_events = environment.control.events();
+    let events = &all_events[checkpoint..];
+
+    let b_cache_drop = event_index(events, "cache-destroyed", &artifact_b());
+    let b_model_drop = event_index(events, "model-destroyed", &artifact_b());
+    let c_load = event_index(events, "load-entered", &artifact_c());
+
+    assert!(b_cache_drop < b_model_drop);
+    assert!(b_model_drop < c_load);
+
+    let destroyed: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == "model-destroyed")
+        .map(|event| event.artifact.clone())
+        .collect();
+    assert_eq!(
+        destroyed,
+        vec![artifact_b()],
+        "evict only B: FIFO would incorrectly evict A",
+    );
+
+    assert_eq!(
+        events[c_load].snapshot.reserved_bytes(),
+        sum(&[
+            blocking_bytes,
+            retained_a,
+            load_entry_reservation(&environment.plan_c),
+        ]),
+        "B must be unreserved before loading C; A and the unrelated guard remain",
+    );
+
+    let entries = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| entry.artifact == artifact_a()));
+    assert!(entries.iter().any(|entry| entry.artifact == artifact_c()));
+    assert!(!entries.iter().any(|entry| entry.artifact == artifact_b()));
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 3);
+
+    assert!(
+        pool_instance(&environment, &artifact_a()).same_instance(&original_a),
+        "LRU eviction must preserve A's original native instance",
+    );
+
+    drop(blocker);
+
+    successful(&environment.run("pool-lru-a-after-c", profile_a(), "hello"));
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&original_a),);
+    assert_eq!(
+        environment.observations.loads.load(Ordering::Relaxed),
+        3,
+        "using surviving A again must not reload it",
+    );
+}
+
+fn pool_advisory(
+    environment: &PolicyEnvironment,
+    profile: ModelProfileId,
+) -> engine::types::MemoryEstimate {
+    let rendered = block_on(
+        environment
+            .engine
+            .render_and_count(request_context(profile.clone(), "hello")),
+    )
+    .expect("render estimate input");
+    block_on(
+        environment
+            .engine
+            .estimate_memory(profile, rendered.token_count()),
+    )
+    .expect("pool-aware advisory estimate")
+}
+
+#[test]
+fn pool_advisory_parked_reuse_fits_when_cold_load_does_not() {
+    use engine::api::EngineRuntime;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("advisory-reuse-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    successful(&environment.run("advisory-reuse-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let _pin_b = block_on(environment.runtime.pin_model(b)).unwrap().unwrap();
+
+    assert!(environment.runtime.supports_memory_reclamation());
+    let initial = pool_advisory(&environment, profile_a());
+    assert_eq!(initial.breakdown().weights_bytes, 0);
+    assert_eq!(initial.breakdown().kv_bytes, 0);
+    let free_for_reuse = initial
+        .reserved_bytes()
+        .checked_add(258 * 4)
+        .expect("retained logits allowance");
+    assert!(pending_startup_reservation(&environment.plan_a) > free_for_reuse);
+    let blocking = environment
+        .snapshot()
+        .available_bytes()
+        .checked_sub(free_for_reuse)
+        .expect("room to constrain fixture");
+    let _blocker = environment
+        .admission
+        .reserve("advisory reuse blocker", blocking)
+        .expect("blocker");
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let estimate = pool_advisory(&environment, profile_a());
+    assert!(estimate.fits());
+    assert_eq!(estimate.breakdown().weights_bytes, 0);
+    assert_eq!(estimate.breakdown().kv_bytes, 0);
+    assert_eq!(
+        environment.snapshot(),
+        before,
+        "estimation must not reserve or reclaim"
+    );
+    assert_eq!(environment.control.events().len(), checkpoint);
+
+    successful(&environment.run("advisory-reuse-a-again", profile_a(), "hello"));
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&a));
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+    let events = environment.control.events();
+    assert!(
+        !events[checkpoint..]
+            .iter()
+            .any(|event| event.kind == "model-destroyed")
+    );
+}
+
+#[test]
+fn pool_advisory_credits_only_eligible_eviction_before_cold_c_load() {
+    use engine::api::EngineRuntime;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("advisory-evict-a", profile_a(), "hello"));
+    let retained_a = environment.snapshot().reserved_bytes();
+    successful(&environment.run("advisory-evict-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let _pin_b = block_on(environment.runtime.pin_model(b.clone()))
+        .unwrap()
+        .unwrap();
+    let free = startup_budget(&environment.plan_c)
+        .checked_sub(retained_a)
+        .unwrap();
+    assert!(free < pending_startup_reservation(&environment.plan_c));
+    let blocking = environment
+        .snapshot()
+        .available_bytes()
+        .checked_sub(free)
+        .unwrap();
+    let _blocker = environment
+        .admission
+        .reserve("advisory eviction blocker", blocking)
+        .unwrap();
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+
+    let estimate = pool_advisory(&environment, profile_c());
+    assert!(environment.runtime.supports_memory_reclamation());
+    assert!(
+        estimate.reserved_bytes() > before.available_bytes(),
+        "reclamation is necessary"
+    );
+    assert_eq!(
+        estimate.available_bytes(),
+        before.available_bytes() + retained_a
+    );
+    assert!(
+        estimate.fits(),
+        "eligible A makes C fit; pinned B contributes no credit"
+    );
+    assert_eq!(environment.snapshot(), before);
+    assert_eq!(environment.control.events().len(), checkpoint);
+
+    successful(&environment.run("advisory-evict-c", profile_c(), "hello"));
+    let all_events = environment.control.events();
+    let events = &all_events[checkpoint..];
+    assert!(
+        event_index(events, "model-destroyed", &artifact_a())
+            < event_index(events, "load-entered", &artifact_c())
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "model-destroyed" && event.artifact == artifact_b())
+    );
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn pool_advisory_does_not_credit_any_pinned_model() {
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("advisory-protect-a", profile_a(), "hello"));
+    let retained_a = environment.snapshot().reserved_bytes();
+    let a = pool_instance(&environment, &artifact_a());
+    let _pin_a = block_on(environment.runtime.pin_model(a)).unwrap().unwrap();
+    successful(&environment.run("advisory-protect-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let _pin_b = block_on(environment.runtime.pin_model(b)).unwrap().unwrap();
+    let free = startup_budget(&environment.plan_c)
+        .checked_sub(retained_a)
+        .unwrap();
+    assert!(free < pending_startup_reservation(&environment.plan_c));
+    let blocking = environment
+        .snapshot()
+        .available_bytes()
+        .checked_sub(free)
+        .unwrap();
+    let _blocker = environment
+        .admission
+        .reserve("all pinned blocker", blocking)
+        .unwrap();
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let estimate = pool_advisory(&environment, profile_c());
+    assert!(!estimate.fits());
+    assert_eq!(estimate.available_bytes(), before.available_bytes());
+    assert_eq!(environment.snapshot(), before);
+    assert_eq!(environment.control.events().len(), checkpoint);
 }

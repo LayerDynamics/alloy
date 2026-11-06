@@ -626,7 +626,7 @@ impl FamilyRuntime {
 
 impl EngineRuntime for FamilyRuntime {
     fn supports_memory_reclamation(&self) -> bool {
-        self.pressure_policy.is_some()
+        self.pressure_policy.is_some() || lock_metadata(&self.worker.summary).pool_enabled
     }
 
     fn render_and_count<'a>(
@@ -653,6 +653,26 @@ impl EngineRuntime for FamilyRuntime {
             let backend = self.backend(registry, resolved.artifact())?;
             let plan = backend.plan(registry, &profile, input_tokens).await?;
             validate_plan(registry, &profile, input_tokens, &plan, self.limits)?;
+
+            let pooling = lock_metadata(&self.worker.summary).pool_enabled;
+            if pooling {
+                let artifact = resolved.artifact().id().clone();
+                let family = resolved.artifact().family().to_owned();
+                let version = backend.registration().implementation_version();
+                let worker = Arc::clone(&self.worker);
+                return dispatch("engine-pool-advisory-estimate", move || {
+                    worker
+                        .call(|reply| Command::AdvisoryPoolEstimate {
+                            artifact,
+                            family,
+                            version,
+                            plan,
+                            reply,
+                        })?
+                        .result
+                })?
+                .await;
+            }
 
             let summary = lock_metadata(&self.worker.summary).clone();
             if !summary.alive {
@@ -878,6 +898,13 @@ struct Reply<T> {
 }
 
 enum Command {
+    AdvisoryPoolEstimate {
+        artifact: ArtifactId,
+        family: String,
+        version: FamilyVersion,
+        plan: RuntimePlan,
+        reply: SyncSender<Reply<MemoryEstimate>>,
+    },
     ConfigureModelPool {
         ttl: Option<Duration>,
         reply: SyncSender<Reply<()>>,
@@ -1391,6 +1418,7 @@ impl Drop for NativeSession {
 
 #[derive(Clone)]
 struct Summary {
+    pool_enabled: bool,
     alive: bool,
     active: bool,
     pin: Weak<()>,
@@ -1408,6 +1436,7 @@ struct Summary {
 impl Summary {
     fn empty(alive: bool) -> Self {
         Self {
+            pool_enabled: false,
             alive,
             active: false,
             pin: Weak::new(),
@@ -1642,6 +1671,99 @@ struct NativeState {
 }
 
 impl NativeState {
+    fn estimate_pool_memory(
+        &self,
+        artifact: &ArtifactId,
+        family: &str,
+        version: FamilyVersion,
+        plan: &RuntimePlan,
+    ) -> Result<MemoryEstimate, EngineError> {
+        let matches = |resident: &&Resident| {
+            resident.model.artifact_id() == artifact
+                && resident.model.registration().family() == family
+                && resident.model.registration().implementation_version() == version
+        };
+        let reusable = self
+            .resident
+            .iter()
+            .chain(self.states.values().map(|entry| &entry.resident))
+            .chain(self.pool.iter())
+            .find(matches);
+        let same_cache = reusable
+            .and_then(|resident| resident.cache.as_ref())
+            .is_some_and(|cache| cache_matches(cache, plan));
+        let mut available = self.admission.snapshot()?.available_bytes();
+        let idle = self.active.is_none() && self.pending.is_none();
+        let reusable_instance = reusable.map(|resident| resident.model.instance_id());
+
+        // These are forecast credits only. No reservation is changed here.
+        if idle {
+            for resident in &self.pool {
+                let is_target = reusable_instance
+                    .is_some_and(|id| resident.model.instance_id().same_instance(id));
+                if !is_target && !resident.pins.is_pinned() {
+                    available = add(available, resident_reserved_bytes(resident)?)?;
+                }
+            }
+            if !self.states.values().any(StateEntry::is_leased) {
+                for resident in self
+                    .resident
+                    .iter()
+                    .chain(self.states.values().map(|entry| &entry.resident))
+                {
+                    let is_target = reusable_instance
+                        .is_some_and(|id| resident.model.instance_id().same_instance(id));
+                    if !is_target && !resident.pins.is_pinned() {
+                        available = add(available, resident_reserved_bytes(resident)?)?;
+                    }
+                }
+                if !same_cache {
+                    if let Some(resident) = reusable {
+                        // Compatible model weights remain owned. Startup may
+                        // replace incompatible KV and its associated history.
+                        let replaceable = resident_reserved_bytes(resident)?
+                            .checked_sub(resident.weights.bytes())
+                            .ok_or_else(|| internal("invalid resident accounting"))?;
+                        available = add(available, replaceable)?;
+                    }
+                }
+            }
+        }
+
+        let loading_extra = if reusable.is_some() {
+            0
+        } else {
+            plan.load_limits
+                .max_load_peak_bytes()
+                .checked_sub(plan.load_limits.max_resident_bytes())
+                .ok_or_else(|| internal("invalid loader overlap bounds"))?
+        };
+        let history = if retains_contents(self.retention) {
+            token_storage_bytes(plan.cache.capacity_tokens())?
+        } else {
+            0
+        };
+        MemoryEstimate::new(
+            MemoryBreakdown {
+                weights_bytes: if reusable.is_some() {
+                    0
+                } else {
+                    plan.load_limits.max_resident_bytes()
+                },
+                kv_bytes: if same_cache {
+                    0
+                } else {
+                    plan.cache.max_cache_bytes()
+                },
+                temporary_bytes: add(add(plan.temporary_bytes, loading_extra)?, history)?,
+                output_bytes: plan.output_bytes,
+                draft_bytes: 0,
+                headroom_bytes: plan.headroom_bytes,
+            },
+            available,
+            Vec::new(),
+        )
+    }
     fn residency_info(&self) -> Vec<ModelResidencyInfo> {
         self.pool
             .iter()
@@ -1784,6 +1906,19 @@ impl NativeState {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match command {
+                Command::AdvisoryPoolEstimate {
+                    artifact,
+                    family,
+                    version,
+                    plan,
+                    reply,
+                } => {
+                    let result = self.estimate_pool_memory(&artifact, &family, version, &plan);
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
                 Command::ConfigureModelPool { ttl, reply } => {
                     let result = self.require_idle().map(|()| {
                         self.pool_enabled = true;
@@ -1797,6 +1932,7 @@ impl NativeState {
                             resident.idle_ttl = ttl;
                         }
                     });
+                    self.publish();
                     let _ = reply.send(Reply {
                         result,
                         usage: Usage::default(),
@@ -3265,6 +3401,7 @@ impl NativeState {
 
     fn publish(&self) {
         let mut summary = Summary::empty(true);
+        summary.pool_enabled = self.pool_enabled;
         summary.active = self.active.is_some() || self.pending.is_some();
         summary.model_pin = self
             .resident
@@ -3312,6 +3449,22 @@ impl NativeState {
 
         *lock_metadata(&self.summary) = summary;
     }
+}
+
+// Sum only guards actually owned by this resident. Native usage observations
+// and logical tensor lengths must never be treated as released ledger bytes.
+fn resident_reserved_bytes(resident: &Resident) -> Result<u64, EngineError> {
+    let mut total = resident.weights.bytes();
+    if let Some(cache) = &resident.cache {
+        total = add(total, cache.reservation.bytes())?;
+    }
+    if let Some(candidate) = &resident.candidate {
+        total = add(total, candidate.history.reservation.bytes())?;
+        if let Some(logits) = &candidate.last_logits {
+            total = add(total, logits.reservation.bytes())?;
+        }
+    }
+    Ok(total)
 }
 
 fn model_ttl_expired(resident: &Resident, now: Instant) -> bool {
