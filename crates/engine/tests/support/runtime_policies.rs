@@ -3,6 +3,11 @@
 //! Loaded models, caches, verification, prefill, and decode delegate to
 //! the actual Qwen backend.
 //!
+//! Apple Silicon uses the production CPU host work and Metal transformer
+//! placement. CPU and GPU share each model's MLX weights and KV buffers,
+//! and all residents use one admission ledger. Other hosts run the same
+//! ownership checks through MLX CPU. Metal unavailability fails loading.
+//!
 //! Instrumentation records native destruction and reservation snapshots.
 //! Deliberate verification/loading errors exercise cleanup boundaries;
 //! they do not provide synthetic model outputs.
@@ -11,7 +16,9 @@
 //! that file's actual safetensors/tokenizer fixtures.
 
 use super::*;
-use engine::{admission::AdmissionSnapshot, types::CacheRepresentationId};
+use engine::{
+    admission::AdmissionSnapshot, backends::Qwen3Execution, types::CacheRepresentationId,
+};
 use std::{
     any::Any,
     sync::{Condvar, atomic::AtomicBool, mpsc},
@@ -422,6 +429,12 @@ impl ModelFamily for PolicyBackend {
         }
 
         let model = self.inner.load(request)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(
+            model.capabilities().backend,
+            engine::types::ExecutionBackend::MlxMetal,
+            "policy tests must load the unified Apple Silicon production path",
+        );
         self.control.record("load-constructed", &artifact, None);
 
         if gate_stage == 2 {
@@ -648,7 +661,13 @@ impl PolicyEnvironment {
         let generation_limits =
             GenerationLimits::new(event_capacity, 4096, 1024).expect("generation limits");
 
-        let inner = Qwen3Backend::new(
+        // Match alloyd's platform default; load checks Metal availability.
+        let execution = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Qwen3Execution::MlxMetal
+        } else {
+            Qwen3Execution::MlxCpu
+        };
+        let inner = Qwen3Backend::new_with_execution(
             vec![
                 fixture_specification(&fixture_a, artifact_a()),
                 fixture_specification(&fixture_b, artifact_b()),
@@ -669,6 +688,7 @@ impl PolicyEnvironment {
                 execution_headroom_bytes: 64 * 1024,
                 generation: generation_limits,
             },
+            execution,
         )
         .expect("policy Qwen backend");
 

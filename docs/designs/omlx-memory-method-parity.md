@@ -151,6 +151,40 @@ Idle reclamation, lease isolation, and emergency cancellation are separate M9
 acceptance areas. Implementing these paths does not by itself mark M9 complete;
 completion requires the milestone's remaining production validation.
 
+### Unified CPU/GPU acceptance
+
+The Apple-Silicon production path uses CPU and GPU together: CPU artifact
+verification, loading, token processing, and control surround Metal transformer
+execution over one resident MLX weight set and shared KV representation. All of
+these resources use the same admission ledger and unified-memory ceiling.
+`Qwen3Execution::MlxMetal` selects the transformer stream within this path; it
+does not create separate CPU and GPU models or a second memory budget.
+
+M9 acceptance must exercise that production path. The runtime policy fixtures
+select it on Apple Silicon and fail if Metal is unavailable. CPU-only runs on
+other hosts provide portable regression coverage; they cannot close the unified
+CPU/GPU acceptance requirement.
+
+Required evidence at the candidate commit:
+
+1. The real-runtime pin, TTL, LRU, lease-isolation, and emergency-cancellation
+   scenarios pass on Apple Silicon. Cancellation must retain the shared native
+   resources, reservations, and scheduler ownership until cleanup, with admission
+   recovery requiring a fresh acceptable observation.
+2. The shared-array and cross-device tests pass: `cpu_gpu_views_alias_memory`,
+   `one_model_and_cache_continue_from_cpu_to_metal`, and
+   `one_weight_set_keeps_its_measurement_across_cpu_and_metal`. These exercise both
+   processors against shared storage and preserve model identity, KV ownership,
+   and weight accounting.
+3. The representative two-large-model acceptance below is demonstrated under a
+   constrained unified-memory budget, including eligible idle eviction and no
+   double admission.
+
+The existing Mac workflow runs the FFI, Qwen3, and engine suites containing these
+checks. Record its result for the candidate commit separately from Linux results;
+a skipped Mac job is not unified CPU/GPU validation. This does not require a new
+tensor-placement policy or changes to the residency ownership model.
+
 ## Tiered KV (M10)
 
 - Fixed-size blocks, prefix hash / CoW as needed for correctness
@@ -177,7 +211,7 @@ completion requires the milestone's remaining production validation.
 | PR1 | M1–M7 live ceiling + enforcer + alloyd boot — **landed in tree** (`memory_guard`, `memory_enforcer`, alloyd `--memory-guard*`, 1s poll, pool-drain grace, admission pause). Multi-model LRU unload still PR4. |
 | PR2 | M8 quantized-resident Qwen3 — **landed in tree** (`MatrixWeight::Affine4`, `mlx_quantized_matmul`, host vs MLX resident bounds, Affine4 wiring checkpoints). |
 | PR3 | M5–M6 prefill admit line + chunking — **in tree** (`prefill_admit`, enforcer `admit_line_bytes`, `FamilyRuntime::with_memory_enforcer`, alloyd chunk 1024 → floor 256). |
-| PR4 | M9 multi-model pool |
+| PR4 | M9 multi-model pool, lease isolation, and cooperative emergency cancellation — **implemented in the M9 branch**; unified CPU/GPU production validation and integration to `main` remain completion gates. |
 | PR5 | M10 SSD KV |
 | PR6 | W6 E2E 13–14 resume |
 
@@ -191,6 +225,7 @@ completion requires the milestone's remaining production validation.
 | Emergency ownership | Blocked execution receives the signal before native return; grants, reservations, and the scheduler slot survive until cleanup |
 | Emergency isolation | Stale decisions cannot cancel replacements; unrelated leased publications survive; each request has one terminal outcome |
 | Pressure recovery | Cancellation and cleanup do not unpause admission without a fresh acceptable pressure observation |
+| Unified CPU/GPU M9 | The production CPU/Metal path passes residency and cancellation scenarios with one weight set, shared KV, and one ledger; shared-array and cross-device identity/accounting tests pass on the same candidate commit |
 | Binding errors | Over-budget names component + raise recipe |
 | Wired policy | Raised iff sysctl set; else doctor/sysctl warning |
 | Multi-model | Second large model evicts unpinned idle; accumulator prevents double-admit |

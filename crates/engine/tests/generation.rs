@@ -5,7 +5,7 @@
 //! Prefix-reuse tests use:
 //!
 //! - A real locally written safetensors checkpoint.
-//! - The actual Qwen3 loader and host-reference model.
+//! - The actual Qwen3 loader and MLX model.
 //! - Actual family-owned KV allocations.
 //! - The shared pinned-template renderer and HF ByteLevel tokenizer.
 //! - EngineCore::generate, FamilyRuntime, Scheduler, and admission.
@@ -24,8 +24,10 @@
 //! Prefix fixtures use a nonzero two-row output head. Their generated
 //! tokens remain printable ASCII while their logits depend on execution.
 //!
-//! These are synthetic host-reference integration tests, not trained-model
-//! conformance tests or MLX/Metal execution tests.
+//! These synthetic-checkpoint tests execute real MLX operations. Prefix and
+//! lifecycle fixtures use MLX CPU. Runtime-policy fixtures cover the unified
+//! CPU/Metal production path on Apple Silicon and MLX CPU on other hosts.
+//! They do not establish trained-model conformance.
 
 use engine::{
     admission::AdmissionController,
