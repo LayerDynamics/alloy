@@ -26,7 +26,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default poll interval while pressure is elevated or work is active.
 pub const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -68,6 +68,32 @@ pub struct EnforcerStatus {
     pub binding: Option<&'static str>,
     /// Whether the last tick classified emergency pressure.
     pub emergency: bool,
+}
+
+/// One successful pressure observation retained for read-only monitoring.
+#[derive(Clone, Debug)]
+pub struct EnforcerMetricsSample {
+    /// Classification and watermarks belonging to this observation.
+    pub status: EnforcerStatus,
+    /// Full ceiling breakdown computed from the same observation.
+    pub ceiling: CeilingBreakdown,
+}
+
+/// Cached pressure information; obtaining it never probes or enforces memory.
+#[derive(Clone, Debug)]
+pub struct EnforcerMetricsSnapshot {
+    /// Latest successful observation, or None before one has completed.
+    pub sample: Option<EnforcerMetricsSample>,
+    /// Monotonic age of the successful observation, when available.
+    pub sample_age: Option<Duration>,
+    /// Latest failed observation or ceiling calculation, cleared on success.
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PublishedMetrics {
+    sample: Option<(Instant, EnforcerMetricsSample)>,
+    last_error: Option<String>,
 }
 
 fn binding_from_code(code: u64) -> Option<&'static str> {
@@ -154,6 +180,7 @@ struct Inner {
     /// Encoded ceiling binding: 0=none, 1=static, 2=dynamic, 3=metal_cap.
     binding_code: AtomicU64,
     emergency: AtomicBool,
+    metrics: Mutex<PublishedMetrics>,
 }
 
 /// One host and allocator observation supplied to the enforcer.
@@ -213,6 +240,7 @@ impl MemoryEnforcer {
                 usage_bytes: AtomicU64::new(0),
                 binding_code: AtomicU64::new(0),
                 emergency: AtomicBool::new(false),
+                metrics: Mutex::new(PublishedMetrics::default()),
             }),
         }
     }
@@ -264,6 +292,26 @@ impl MemoryEnforcer {
             usage_bytes: self.inner.usage_bytes.load(Ordering::Relaxed),
             binding: binding_from_code(self.inner.binding_code.load(Ordering::Relaxed)),
             emergency: self.inner.emergency.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Read cached observation data without advancing grace or pressure polls.
+    ///
+    /// A failed probe preserves the previous sample and its age. Reading this
+    /// snapshot never resumes admission, changes ownership, or enters a worker.
+    pub fn metrics_snapshot(&self) -> EnforcerMetricsSnapshot {
+        let metrics = self
+            .inner
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        EnforcerMetricsSnapshot {
+            sample: metrics.sample.as_ref().map(|(_, sample)| sample.clone()),
+            sample_age: metrics
+                .sample
+                .as_ref()
+                .map(|(observed_at, _)| observed_at.elapsed()),
+            last_error: metrics.last_error.clone(),
         }
     }
 
@@ -334,7 +382,7 @@ impl MemoryEnforcer {
         let pool_bytes = observation.mlx_pool_bytes;
         let usage = memory_guard::usage_bytes(mlx_active, host);
         let ceiling = memory_guard::ceiling_breakdown(self.inner.config, host, usage)
-            .map_err(EnforcerError::Guard)?;
+            .map_err(|error| self.record_observation_error(EnforcerError::Guard(error)))?;
         let marks = memory_guard::watermark_bytes(self.inner.config.tier, ceiling);
 
         self.publish_ceiling(ceiling, marks, usage);
@@ -360,6 +408,7 @@ impl MemoryEnforcer {
             self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
             self.inner.reclaim_grace_polls.store(0, Ordering::Relaxed);
             self.inner.emergency.store(false, Ordering::Relaxed);
+            self.publish_metrics(ceiling, marks, usage, PressureLevel::Ok, false);
             return Ok(EnforcementTick {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: false,
@@ -398,6 +447,7 @@ impl MemoryEnforcer {
             self.inner
                 .admission
                 .set_admissions_paused(new_level != PressureLevel::Ok);
+            self.publish_metrics(ceiling, marks, usage, new_level, emergency);
             return Ok(EnforcementTick {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: true,
@@ -426,6 +476,7 @@ impl MemoryEnforcer {
         self.inner
             .model_eviction_requested
             .store(new_level != PressureLevel::Ok, Ordering::Release);
+        self.publish_metrics(ceiling, marks, usage, new_level, emergency);
         Ok(EnforcementTick {
             status: self.status_with_binding(ceiling),
             request_model_eviction: new_level != PressureLevel::Ok,
@@ -440,19 +491,21 @@ impl MemoryEnforcer {
     fn observe_memory(&self) -> Result<MemoryObservation, EnforcerError> {
         match &self.inner.observation_source {
             Some(source) => source.observe(),
-            None => Ok(MemoryObservation {
-                host: self.observe_host()?,
+            None => self.observe_host().map(|host| MemoryObservation {
+                host,
                 mlx_active_bytes: self.observe_mlx_active(),
                 mlx_pool_bytes: self.observe_mlx_pool(),
             }),
         }
+        .map_err(|error| self.record_observation_error(error))
     }
 
     pub(crate) fn refresh_pressure(&self) -> Result<EnforcerStatus, EnforcerError> {
         let observation = self.observe_memory()?;
         let usage = memory_guard::usage_bytes(observation.mlx_active_bytes, observation.host);
-        let ceiling = memory_guard::ceiling_breakdown(self.inner.config, observation.host, usage)
-            .map_err(EnforcerError::Guard)?;
+        let ceiling =
+            memory_guard::ceiling_breakdown(self.inner.config, observation.host, usage)
+                .map_err(|error| self.record_observation_error(EnforcerError::Guard(error)))?;
         let marks = memory_guard::watermark_bytes(self.inner.config.tier, ceiling);
         self.publish_ceiling(ceiling, marks, usage);
         if ceiling.hard_limit_bytes > 0 {
@@ -476,7 +529,56 @@ impl MemoryEnforcer {
             self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
             self.inner.emergency.store(false, Ordering::Relaxed);
         }
+        self.publish_metrics(
+            ceiling,
+            marks,
+            usage,
+            level,
+            self.inner.emergency.load(Ordering::Relaxed),
+        );
         Ok(self.status())
+    }
+
+    fn record_observation_error(&self, error: EnforcerError) -> EnforcerError {
+        self.inner
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_error = Some(error.to_string());
+        error
+    }
+
+    fn publish_metrics(
+        &self,
+        ceiling: CeilingBreakdown,
+        marks: WatermarkBytes,
+        usage_bytes: u64,
+        pressure: PressureLevel,
+        emergency: bool,
+    ) {
+        let sample = EnforcerMetricsSample {
+            status: EnforcerStatus {
+                pressure,
+                admissions_paused: self.inner.admission.admissions_paused(),
+                cache_reclaim_requested: self.cache_reclaim_requested(),
+                hard_limit_bytes: ceiling.hard_limit_bytes,
+                soft_bytes: marks.soft_bytes,
+                hard_bytes: marks.hard_bytes,
+                abort_limit_bytes: marks.abort_limit_bytes,
+                admit_line_bytes: marks.admit_line_bytes,
+                usage_bytes,
+                binding: ceiling.binding.map(|binding| binding.as_str()),
+                emergency,
+            },
+            ceiling,
+        };
+        let mut metrics = self
+            .inner
+            .metrics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics.sample = Some((Instant::now(), sample));
+        metrics.last_error = None;
     }
 
     fn status_with_binding(&self, _ceiling: CeilingBreakdown) -> EnforcerStatus {

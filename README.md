@@ -32,10 +32,10 @@ Qwen3. See `docs/specs/PHASE-1-EXECUTION-PLAN.md`.
 | CLI | `ts/cli/` | `alloy` / `alloy chat`; Node `26.13.0` |
 | Corpus | `bench/corpus/` | Frozen models/scenarios; telemetry schema in `docs/events/` |
 
-Open pull requests (as of 2026-11-05):
-
-- [#18](https://github.com/LayerDynamics/alloy/pull/18) — W6 `ts/cli`
-- [#19](https://github.com/LayerDynamics/alloy/pull/19) — oMLX-method memory parity (live guard, Affine4-resident weights, prefill admit). Design: `docs/designs/omlx-memory-method-parity.md` (on that branch).
+Merged foundations include the W6 CLI (#18), memory parity (#19), and M9
+residency/emergency cancellation with unified CPU/GPU validation (#22).
+M9 still requires the representative two-large-model constrained-budget
+acceptance in `docs/designs/omlx-memory-method-parity.md`.
 
 Mac E2E tests 13–14 (real Qwen3-4B-4bit stream / session restart) are not
 green yet; they need the memory-parity stack and a local artifact.
@@ -97,6 +97,55 @@ Run the same checks without pushing:
 ```bash
 bash scripts/hooks/pre-push </dev/null
 ```
+
+### Live system and Alloy monitor
+
+Build the CLI, then open a separate terminal while running Alloy:
+
+```bash
+cd ts/cli
+npm ci
+npm run build
+node bin/alloy.js monitor
+```
+
+The monitor shows system-wide CPU utilization, RAM, load and swap alongside
+Alloy's live admission budget, reserved memory, pressure, request and cached
+model-residency metadata. It stays usable when `alloyd` is offline. Rebuild
+and restart `alloyd` to expose the new `daemon.metrics` method; a running
+older daemon will report that the method is unavailable.
+
+For supported Apple CPU/GPU/Neural Engine power and GPU activity counters,
+authorize Apple's sampler in the same terminal, then enable it:
+
+```bash
+sudo -v
+node bin/alloy.js monitor --powermetrics
+```
+
+Only the bounded `powermetrics` child uses `sudo -n`. The CLI remains a normal
+user process and does not collect a password or change sudoers. Without
+permission, the monitor explains the unavailable accelerator measurements
+and continues showing the other data. ANE power is an estimated component
+power reading, not ANE utilization percentage or proof that Alloy is using
+ANE. Alloy retains its existing unified CPU/Metal execution path.
+
+Press `q` or Ctrl+C to exit. Use `--interval 2000` for a two-second refresh
+or `--socket /path/to/alloyd.sock` for another daemon socket. Capture one
+snapshot, or record a stream of JSON snapshots for comparison:
+
+```bash
+node bin/alloy.js monitor --once --json
+node bin/alloy.js monitor --powermetrics --json > /tmp/alloy-monitor.ndjson
+```
+
+Missing measurements are `null`, distinct from zero; stale readings carry
+their age and errors. CPU/GPU share one physical memory capacity. Non-free
+system RAM includes reclaimable pages and is not an app-memory total.
+The monitor keeps these samples local. See
+[`docs/designs/live-monitor.md`](docs/designs/live-monitor.md) for the sources,
+units and validation contract. CLI tests run automatically on repository
+pushes and pull requests; the Mac lane also runs them on the native host.
 
 Daemon (production profile, local artifact directory):
 

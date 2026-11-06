@@ -44,11 +44,16 @@ admission budget.
   real single-session prefix cache lands in Phase 3 with its tests.
 - Telemetry client (FR-35): in-memory anonymous-count collection, HTTPS/TLS
   flush, offline drop, failure-isolated, plus the initial event schema.
+- Read-only `alloy monitor`: live system-wide CPU, unified RAM, swap and
+  supported Apple GPU/Neural Engine measurements alongside the daemon's
+  live memory ledger, pressure and execution state. This user-requested
+  observability slice is specified in `docs/designs/live-monitor.md`.
 
 ## Explicitly out of scope (do not build)
 
 Tool registry, policy engine, MCP client, skills, plugins, compaction,
-prefix-cache reuse logic, additional families, oMLX adapter, TUI, the TS SDK
+prefix-cache reuse logic, additional families, oMLX adapter, general-purpose
+TUI beyond the read-only live monitor, the TS SDK
 as a published package (the CLI's internal client library is the seed for
 it), the conversion CLI.
 
@@ -95,7 +100,9 @@ B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_ver
   notifications then a final response), session.pause (cancels in-flight
   generation first), session.resume (paused→active only), sessions.resume
   (historical reload after store/daemon reopen), daemon.status (sessions_active
-  from store; models_resident/memory_reserved from boot).
+  from store; models_resident/memory_reserved from boot), daemon.metrics
+  (live ledger/execution and explicitly aged native residency/pressure
+  snapshots; see `docs/designs/live-monitor.md`).
   Production `alloyd` requires `--artifact` for local corpus profile
   `qwen3-4b-4bit`; protocol tests use FixtureEngine only.
   Stream notify shape: {"jsonrpc":"2.0","method":"session.event",

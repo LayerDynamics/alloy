@@ -413,6 +413,7 @@ alloy skills list | show
 alloy mcp add | list
 alloy automation add | list | pause
 alloy stats
+alloy monitor [--powermetrics] [--interval 1000] [--once] [--json]
 ```
 
 **Compaction summarizer (design contract):**
@@ -489,6 +490,12 @@ alloy stats
 
 ### 3.9 Observability
 
+- `alloy monitor`: a read-only local terminal view of system-wide CPU,
+  unified memory and swap, supported Apple GPU/Neural Engine activity and
+  estimated power, and Alloy's live admission ledger, pressure and request
+  ownership. Missing counters and stale snapshots are explicit. System-wide
+  ANE activity does not imply Alloy executes on ANE. The bounded Phase-1
+  implementation and capture contract are in `docs/designs/live-monitor.md`.
 - Structured logging (tracing crate) with per-session correlation IDs.
 - Metrics: tokens/s, TTFT, cache hit rate, admission rejections, tool latencies, memory reservations vs. actuals (reconciled after load). The telemetry client (FR-35) reports these same dimensions in aggregate as anonymous counts, per the published event schema.
 - `alloy doctor`: environment report (chip, RAM, wired-limit, mlx-c/MLX versions from PINS, disk) for issue triage.
@@ -867,6 +874,8 @@ skills.list → [{ name, description, source }] | skills.show { name } → SKILL
 mcp.add { name, transport, command | url } | mcp.list → [{ name, status, tool_count }]
 automation.add { name, trigger, scope, profile } | automation.list | automation.pause { job_id }
 daemon.status → { models_resident, memory_reserved, sessions_active }
+daemon.metrics → { schema_version: 1, process_id, sampled_at_unix_ms,
+                   admission, execution, residency, memory_guard }
 daemon.doctor → { chip, ram_bytes, wired_limit, mlx_version, pins_hash }
 daemon.stats { window } → { session_count, task_mix }   // backs `alloy stats` (§6.1)
 

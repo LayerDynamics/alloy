@@ -1,6 +1,9 @@
 //! `alloyd` binary entrypoint.
 
-use alloyd::{BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener};
+use alloyd::{
+    BootRequest, DaemonConfig, DaemonService, LiveEngineMetrics, bind_listener, boot_qwen3,
+    serve_listener,
+};
 use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
 use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
 use harness_core::{HardwareTier, TelemetryClient};
@@ -152,6 +155,10 @@ fn run() -> Result<(), String> {
     ));
     let engine_for_enforcer = booted.engine.clone();
     let memory_enforcer = booted.memory_enforcer.clone();
+    let metrics = Arc::new(LiveEngineMetrics::new(
+        booted.engine.clone(),
+        booted.memory_enforcer.clone(),
+    ));
     let service = Arc::new(
         DaemonService::open(
             &config.db_path,
@@ -161,7 +168,8 @@ fn run() -> Result<(), String> {
             booted.models_resident,
             booted.memory_reserved,
         )
-        .map_err(|error| error.message)?,
+        .map_err(|error| error.message)?
+        .with_metrics_source(metrics),
     );
 
     thread::Builder::new()

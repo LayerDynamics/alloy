@@ -4,6 +4,7 @@ use crate::rpc::{
     API_VERSION, ErrorKind, RpcError, RpcNotification, RpcRequest, RpcResponse, encode_line,
     validate_request, wire_event_body, wire_event_name,
 };
+use crate::metrics::MetricsSource;
 use engine::api::{ENGINE_API_VERSION, Engine, EngineFuture};
 use engine::error::EngineError;
 use engine::rendering::{
@@ -43,6 +44,7 @@ pub struct DaemonService<E: Engine> {
     inflight: Mutex<HashMap<String, InflightSlot>>,
     models_resident: u64,
     memory_reserved: u64,
+    metrics: Option<Arc<dyn MetricsSource>>,
 }
 
 impl<E: Engine> DaemonService<E> {
@@ -67,7 +69,14 @@ impl<E: Engine> DaemonService<E> {
             inflight: Mutex::new(HashMap::new()),
             models_resident,
             memory_reserved,
+            metrics: None,
         })
+    }
+
+    /// Attach read-only runtime metrics without changing legacy status fields.
+    pub fn with_metrics_source(mut self, metrics: Arc<dyn MetricsSource>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Handle one JSON-RPC request, writing stream notifications to `writer` as needed.
@@ -105,6 +114,7 @@ impl<E: Engine> DaemonService<E> {
             "session.resume" => self.session_resume(&request.params),
             "sessions.resume" => self.sessions_resume(&request.params),
             "daemon.status" => self.daemon_status(),
+            "daemon.metrics" => self.daemon_metrics(),
             "session.approve"
             | "models.list"
             | "models.pull"
@@ -331,6 +341,13 @@ impl<E: Engine> DaemonService<E> {
             "memory_reserved": self.memory_reserved,
             "sessions_active": sessions_active,
         }))
+    }
+
+    fn daemon_metrics(&self) -> Result<Value, RpcError> {
+        self.metrics
+            .as_ref()
+            .ok_or_else(|| RpcError::internal("live runtime metrics are not configured"))?
+            .snapshot()
     }
 }
 
