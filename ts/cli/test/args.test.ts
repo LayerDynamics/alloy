@@ -6,7 +6,17 @@ test("parseArgv bare alloy defaults", () => {
   const args = parseArgv(["node", "alloy"]);
   assert.equal(args.forceSetup, false);
   assert.equal(args.help, false);
+  assert.equal(args.version, false);
   assert.equal(args.message, undefined);
+});
+
+test("help and version flags are available without a subcommand", () => {
+  for (const flag of ["--help", "-h"]) {
+    assert.equal(parseArgv(["node", "alloy", flag]).help, true);
+  }
+  for (const flag of ["--version", "-V"]) {
+    assert.equal(parseArgv(["node", "alloy", flag]).version, true);
+  }
 });
 
 test("parseArgv one-shot message", () => {

@@ -419,7 +419,7 @@ export class PowerMetricsCollector {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       return this.#failed(/ENOENT/.test(detail)
-        ? "Native hardware sampler is missing. Rebuild with npm --prefix ts/cli run build."
+        ? "Native hardware sampler is missing. Reinstall Alloy using your installation method; source checkout users can rebuild the CLI."
         : detail, signal.aborted);
     }
     return this.#last;

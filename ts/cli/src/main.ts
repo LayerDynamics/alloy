@@ -11,10 +11,11 @@ import { runChat } from "./chat.js";
 import { runMonitor } from "./monitor.js";
 import { runDoctor } from "./doctor.js";
 import { STARTER_MODEL } from "./model.js";
+import { cliVersion } from "./version.js";
 
 function printHelp(): void {
   console.log(`Get started:
-  alloy start                   guided setup, verify model, build/start alloyd
+  alloy start                   guided setup, verify model, start alloyd
                                 stays in this terminal; Ctrl+C stops owned daemon
   alloy setup                   configure a verified local model, then exit
   alloy setup --download        download and verify the pinned starter model
@@ -26,8 +27,14 @@ Setup/start options:
   --artifact PATH               existing model, or destination with --download
   --download                    explicitly download the pinned starter model
   --socket PATH --db PATH       override saved daemon paths
-  --alloyd-bin PATH             use a specific daemon instead of this checkout
+  --alloyd-bin PATH             use a specific daemon executable
   --corpus-models PATH          use an explicit corpus pin file
+
+General options:
+  -h, --help                   show this help
+  -V, --version                show the installed CLI version
+  ALLOY_CONFIG_DIR             settings and default socket/database directory
+                               (default: ~/.alloy)
 
 Usage: alloy [-m TEXT] [--profile NAME] [--socket PATH] [--resume ID]
   alloy           interactive chat (connects to existing alloyd)
@@ -96,6 +103,10 @@ export async function runCli(argv: string[], overrides: Partial<CliDependencies>
 
   if (args.help) {
     printHelp();
+    return 0;
+  }
+  if (args.version) {
+    console.log(`alloy ${cliVersion()}`);
     return 0;
   }
 

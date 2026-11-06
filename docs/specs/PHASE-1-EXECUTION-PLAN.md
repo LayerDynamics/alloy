@@ -1,5 +1,9 @@
 # Phase 1 Execution Plan — Vertical Slice
 
+**Status:** accepted 2026-11-06 at merged main `a4a17df`, with the final
+candidate evidence and review recorded in [issue #9](https://github.com/LayerDynamics/alloy/issues/9)
+and [the exit review](../acceptance/phase-1-exit-review.md). Epic #1 is closed.
+
 Spec: SPEC-1 v1.10, 4.1 Phase 1
 Duration: weeks 2–4 of M1, 2026-11-10 → 2026-12-03 (M1 target)
 Owner: solo
@@ -174,6 +178,13 @@ native KV spill/restore evidence, distinct from the SQLite history assertion.
 The [exit review](../acceptance/phase-1-exit-review.md) binds each gate to its
 commit and run. The [Phase 2 plan](PHASE-2-EXECUTION-PLAN.md) records the next
 scope, exact file set, named tests, and sequencing.
+
+The following distribution slice makes Homebrew the primary install path:
+one commit-pinned source formula packages the existing CLI, matching daemon,
+Metal kernels and unprivileged monitor with managed toolchains. It is tracked
+in [the Homebrew design](../designs/homebrew.md), separate from this completed
+runtime acceptance. It does not publish npm/Cargo packages or complete
+release-binary automation, Phase 2 tools, or the telemetry release prerequisites.
 
 ## Work items
 

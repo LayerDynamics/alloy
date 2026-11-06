@@ -1,5 +1,7 @@
 //! `alloyd` binary entrypoint.
 
+mod native_check;
+
 use alloyd::{
     BootRequest, DaemonConfig, DaemonService, LiveEngineMetrics, bind_listener, boot_qwen3,
     serve_listener,
@@ -27,6 +29,33 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // Installation diagnostics must not enter model, configuration, session,
+    // telemetry, or socket setup. Keep them standalone so startup options
+    // cannot accidentally change what a successful check promises.
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "--version" | "-V" => {
+                println!("alloyd {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--check-native" => {
+                let (passed, report) = native_check::run();
+                println!("{report}");
+                return if passed {
+                    Ok(())
+                } else {
+                    Err("native check failed; see the JSON diagnostic".to_owned())
+                };
+            }
+            _ => {}
+        }
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--version" | "-V" | "--check-native"))
+    {
+        return Err("--version and --check-native must each be used alone".to_owned());
+    }
     let mut socket = None;
     let mut db = None;
     let mut artifact = None;
@@ -333,6 +362,8 @@ alloyd — Alloy local daemon (Phase-1 B.6 subset)
 
 USAGE:
   alloyd --artifact PATH [--profile qwen3-4b-4bit] [--socket PATH] [--db PATH]
+  alloyd --version
+  alloyd --check-native
 
 OPTIONS:
   --artifact PATH              Required local Qwen3-4B-4bit mlx-community artifact directory
@@ -351,6 +382,9 @@ OPTIONS:
                               Default on native Apple Silicon; no silent CPU fallback
   --cpu                       MLX CPU transformer operations (default on other platforms)
   --telemetry-endpoint URL     FR-35 flush URL
+  -V, --version               Show the daemon version without starting it
+  --check-native              Check native CPU operations; on Apple Silicon also
+                              require Metal and shared arrays (JSON; no model needed)
   -h, --help                   Show this help"
     );
 }

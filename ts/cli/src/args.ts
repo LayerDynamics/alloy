@@ -10,6 +10,7 @@ export type CliArgs = {
   message?: string;
   resume?: string;
   help: boolean;
+  version: boolean;
   once: boolean;
   json: boolean;
   intervalMs: number;
@@ -31,6 +32,7 @@ export function parseArgv(argv: string[]): CliArgs {
     command,
     forceSetup: command === "setup",
     help: false,
+    version: false,
     once: false,
     json: false,
     intervalMs: 1000,
@@ -57,6 +59,10 @@ export function parseArgv(argv: string[]): CliArgs {
       case "-h":
       case "--help":
         out.help = true;
+        break;
+      case "-V":
+      case "--version":
+        out.version = true;
         break;
       case "--setup":
         out.forceSetup = true;

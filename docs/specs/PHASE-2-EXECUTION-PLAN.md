@@ -1,6 +1,6 @@
 # Phase 2 execution plan — tools and policy
 
-**Status:** Requirements review completed 2026-11-06 against the current SPEC-1 Phase 2 scope and exit criteria. Phase 1 exit review remains pending; Phase 2 implementation starts after that gate. This document is the implementation plan, not a claim that Phase 2 code exists.
+**Status:** Requirements review completed 2026-11-06 against the current SPEC-1 Phase 2 scope and exit criteria. Phase 1 was accepted at merged main `a4a17df` in [issue #9](https://github.com/LayerDynamics/alloy/issues/9); its entry gate is satisfied. This document is the implementation plan, not a claim that Phase 2 code exists. The first [Homebrew source installation](../designs/homebrew.md) is a separate distribution slice before this tool-loop work.
 
 **Source of scope:** [SPEC-1](SPEC-1-mlx-agent-harness.md.md), §4.1 **Phase 2: Tools and policy**, FR-20/21/24, §3.2 tool registry and plugin host, §3.4 builtin tool set, and Appendices B.2/B.4/B.6. FR-25, FR-26, FR-28, and FR-30a constrain the existing session, rendering, cache, and CLI interfaces when tools are added. The work below is an implementation decomposition of those requirements, not a new product roadmap.
 
@@ -8,7 +8,7 @@
 
 A supported Qwen3 model must request a builtin tool through a parsed, validated call; the daemon must apply policy and approval, execute the authorized call, persist its result, and feed the result back into the model. An out-of-process plugin must receive the two V1 tool hooks and be able to veto execution or annotate the result.
 
-Before W1 starts, complete the [Phase 1 exit review](../acceptance/phase-1-exit-review.md) against the candidate commit. Link the successful native jobs, real-model streaming and restart evidence, memory-parity acceptance, and the two required post-freeze reproducible builds. An unavailable model or an unexecuted hardware gate remains pending; it is not a waiver.
+The [Phase 1 exit review](../acceptance/phase-1-exit-review.md) records the completed entry gate: successful native jobs, real-model streaming and restart evidence, memory-parity acceptance, and the required post-freeze reproducible builds. Its final tested source tree matches merged main `a4a17df`. New Phase 2 changes must retain these regression gates; an unavailable model or an unexecuted hardware gate is not a waiver.
 
 Phase 2 retains the existing vendored mlx-c engine, pinned corpus identities, exact rendering/counting path, append-only SQLite history, local JSON-RPC transport, memory guard, and SSD KV behavior. Their regression gates continue to run on every candidate.
 

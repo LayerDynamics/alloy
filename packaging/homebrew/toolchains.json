@@ -1,0 +1,14 @@
+{
+  "node": {
+    "version": "26.13.0",
+    "url": "https://nodejs.org/dist/v26.13.0/node-v26.13.0-darwin-arm64.tar.gz",
+    "sha256": "d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6",
+    "checksum_source": "https://nodejs.org/dist/v26.13.0/SHASUMS256.txt"
+  },
+  "rust": {
+    "version": "1.99.1",
+    "url": "https://static.rust-lang.org/dist/rust-1.99.1-aarch64-apple-darwin.tar.xz",
+    "sha256": "30976378b6aaefd1861ba475905c6ba22a44c981418ce52285006af26337f98c",
+    "checksum_source": "https://static.rust-lang.org/dist/rust-1.99.1-aarch64-apple-darwin.tar.xz.sha256"
+  }
+}

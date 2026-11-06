@@ -1,6 +1,6 @@
 # Phase 1 exit review
 
-**Decision: pending for the resource-error follow-up.** The completed candidate `75a960c` passed all automatic jobs, including real 4B/14B acceptance. The next candidate separates execution contention, protected ownership, and typed memory refusals; its changed runtime and error paths require fresh validation. Phase 1 is not signed off by carrying forward evidence from a different commit.
+**Decision: accepted 2026-11-06 for merged main `a4a17df5fb0c4d1ac734a98980139a5bc046352d`.** The final resource-error candidate passed fresh native, CLI and real-model acceptance. The merged Git tree exactly matches both tested candidates. [Issue #9](https://github.com/LayerDynamics/alloy/issues/9) records the final review; it and epic [#1](https://github.com/LayerDynamics/alloy/issues/1) are closed as completed. This document reconciles the earlier pending narrative with that decision and retains the failed-run history.
 
 This review implements the exit mapping in the [Phase 1 execution plan](../specs/PHASE-1-EXECUTION-PLAN.md) and [SPEC-1 Phase 1](../specs/SPEC-1-mlx-agent-harness.md.md#phase-1-vertical-slice-mlx-c-ffi--first-family--harness-skeleton). The memory-parity pull-forward is governed by the [oMLX memory design](../designs/omlx-memory-method-parity.md). The next-phase draft is the [Phase 2 execution plan](../specs/PHASE-2-EXECUTION-PLAN.md).
 
@@ -15,27 +15,31 @@ This review implements the exit mapping in the [Phase 1 execution plan](../specs
 | First Mac acceptance artifact | [phase-1-acceptance-42289710014-1](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/artifacts/13539817427); ZIP SHA-256 `77ec8a31bb30289fcfa7466038ec007f43fe11e5f8c9ef4a7c097bb7684a5bd8`. |
 | First Linux native/infrastructure job | [128139616905](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139616905), passed. |
 | First CLI job | [128139617362](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139617362), passed, including all 20 acceptance-helper tests. |
-| Completed acceptance candidate | `75a960cad88062bb3b5eae6484ef706dfc9a61c5`; [push run 42299723238](https://github.com/LayerDynamics/alloy/actions/runs/42299723238) and [PR run 42299729975](https://github.com/LayerDynamics/alloy/actions/runs/42299729975), all jobs completed successfully. |
-| Completed Mac acceptance artifact | [phase-1-acceptance-42299723238-1](https://github.com/LayerDynamics/alloy/actions/runs/42299723238/artifacts/13543413413); downloaded and verified ZIP SHA-256 `8f26857e14512b6346d79e5ca921d80f9ee85743a6a3fcc14e6222a50c3d30ee`. |
+| Earlier accepted repair candidate | `75a960cad88062bb3b5eae6484ef706dfc9a61c5`; [push run 42299723238](https://github.com/LayerDynamics/alloy/actions/runs/42299723238) and [PR run 42299729975](https://github.com/LayerDynamics/alloy/actions/runs/42299729975), all jobs completed successfully. |
+| Earlier repair Mac artifact | [phase-1-acceptance-42299723238-1](https://github.com/LayerDynamics/alloy/actions/runs/42299723238/artifacts/13543413413); downloaded and verified ZIP SHA-256 `8f26857e14512b6346d79e5ca921d80f9ee85743a6a3fcc14e6222a50c3d30ee`. |
+| Final tested source head | `bf95b93fe92f6ce0cdfc21ac8fecc0982ecc1b43`; [push run 42305914377](https://github.com/LayerDynamics/alloy/actions/runs/42305914377), all three jobs successful. |
+| Final tested PR merge candidate | `0d005c9e712074ccaf279d67bc330d6a49cd3a7f`; [PR run 42305920807](https://github.com/LayerDynamics/alloy/actions/runs/42305920807), all three jobs successful. |
+| Merged main and source equality | `a4a17df5fb0c4d1ac734a98980139a5bc046352d`; its Git tree `bca536fa8199d717d495d304c5840d5c13bc7d41` equals both final tested trees. |
+| Final inspected Mac artifact | [phase-1-acceptance-42305914377-1](https://github.com/LayerDynamics/alloy/actions/runs/42305914377/artifacts/13546233143); ZIP SHA-256 `57f1431a5cdeaaf0641341692fbf751a06f397ac4ca73e67a71904e33cda8e2a`. |
 | Two post-freeze reproducible native builds | **Passed:** [run 42276463422](https://github.com/LayerDynamics/alloy/actions/runs/42276463422/job/128093939290) at `5b3b08dd219763e14c2c097c227ed71857903c54`, and [run 42279057333](https://github.com/LayerDynamics/alloy/actions/runs/42279057333/job/128102908050) at `a76d97bd2d91ffb75074fea9641d9b38992b5da8`. Logs inspected 2026-11-06. |
-| Reviewer and date | ChatGPT, 2026-11-06: implementation/requirements review and first-run evidence inspection; final acceptance decision pending. |
+| Reviewer and date | ChatGPT, 2026-11-06: final implementation, requirements, source-tree and retained-artifact review; approved in [issue #9](https://github.com/LayerDynamics/alloy/issues/9). |
 
-A prior branch's binary, fixture-only success, skipped model test, or an artifact from a different commit cannot satisfy a real-model row. Preserve a failed run's artifact and link the succeeding rerun separately. Do not overwrite the evidence index with a claimed pass before the job completes.
+A prior branch's binary, fixture-only success, skipped model test, or an artifact from unrelated source cannot satisfy a real-model row. The final push and PR runs completed before approval; source-tree equality explicitly binds them to the merge. The separate post-merge main run was still in progress at review time and is not claimed as passing evidence here. Failed artifacts remain linked separately.
 
 ## Required exit gates
 
 | Gate | Required evidence | Status |
 | --- | --- | --- |
-| Quantized Qwen3 streams through `alloy chat` | Test 13 `qwen3_end_to_end_stream`: current-checkout build; verified corpus artifact; API and owned-PID readiness; at least two nonempty `text_delta` frames and two visible CLI stdout chunks before one terminal event; final result and CLI stdout equal the streamed text. | Pending |
-| Session survives a real process restart | Test 14 `session_restart_real_model`: distinct owned daemon PIDs using the same SQLite DB; exact prior event prefix, user content, and assistant content recovered; resumed CLI generation recalls the stored marker and appends a new turn. | Pending |
-| Cold SSD KV survives restart | Test 14 before/after cache snapshots: forced zero hot-cache limit; completed spill and native hot/protected ownership drained before stop; the 64 MiB transfer allowance remains charged in the live admission ledger; new process reports positive restore count and restored tokens after resumed generation; no cache error. | Pending |
-| Durable event history and pause/cancel | Phase 1 tests 5, 6, 7, 8 and their current harness/daemon regression suites; no changed or missing earlier event content. | Pending |
-| Engine contract documented/versioned | Test 15: engine rustdoc with `-D warnings`, documented public traits, explicit API version, and engine checks/tests. | Pending |
+| Quantized Qwen3 streams through `alloy chat` | Test 13 `qwen3_end_to_end_stream`: current-checkout build; verified corpus artifact; API and owned-PID readiness; at least two nonempty `text_delta` frames and two visible CLI stdout chunks before one terminal event; final result and CLI stdout equal the streamed text. | **Passed:** 12 deltas and 12 visible chunks on the final candidate. |
+| Session survives a real process restart | Test 14 `session_restart_real_model`: distinct owned daemon PIDs using the same SQLite DB; exact prior event prefix, user content, and assistant content recovered; resumed CLI generation recalls the stored marker and appends a new turn. | **Passed:** PIDs 71272 → 71275; all 5 prior events preserved, 9 after resume. |
+| Cold SSD KV survives restart | Test 14 before/after cache snapshots: forced zero hot-cache limit; completed spill and native hot/protected ownership drained before stop; the 64 MiB transfer allowance remains charged in the live admission ledger; new process reports positive restore count and restored tokens after resumed generation; no cache error. | **Passed:** 37 native KV tokens restored in the new process. |
+| Durable event history and pause/cancel | Phase 1 tests 5, 6, 7, 8 and their current harness/daemon regression suites; no changed or missing earlier event content. | **Passed** in final Linux/Mac suites and real restart evidence. |
+| Engine contract documented/versioned | Test 15: engine rustdoc with `-D warnings`, documented public traits, explicit API version, and engine checks/tests. | **Passed** on the final candidate. |
 | Vendored native build is reproducible | Phase 0 test 11: two successful post-freeze runs with recorded pins/corpus identity. This is distinct from Phase 1 test 11, `admission_estimate`. | **Passed** in the two linked post-freeze runs; unchanged vendor pins. |
-| Telemetry ships with its privacy/schema contract | Phase 1 tests 9 and 10; schema/anonymity, bounded flush, offline drop, and failure-isolation tests; published event schema and privacy policy before any tagged emitting pre-release. | Pending |
-| Live memory guard and residency/cache pull-forward | M1–M10 named acceptance from the [memory design](../designs/omlx-memory-method-parity.md), including live native counters and protected-resource behavior. | Pending |
-| Large pinned model and clean admission rejection | `scripts/m9_large_model_acceptance.sh`: candidate-bound pinned large-model load/generation, measured memory evidence, and separately demonstrated bounded rejection under an insufficient budget. | Pending |
-| Existing native and CLI regression gates | All required jobs in [ci.yaml](../../.github/workflows/ci.yaml); no gate silently skipped due to absent model files. | Pending |
+| Telemetry ships with its privacy/schema contract | Phase 1 tests 9 and 10; schema/anonymity, bounded flush, offline drop, and failure-isolation tests; published event schema and privacy policy before any tagged emitting pre-release. | **Phase 1 passed:** named tests and worker/deadline regressions passed. Hosted endpoint and published privacy policy remain release prerequisites. |
+| Live memory guard and residency/cache pull-forward | M1–M10 named acceptance from the [memory design](../designs/omlx-memory-method-parity.md), including live native counters and protected-resource behavior. | **Passed:** native CPU/Metal, exact protected ownership, emergency cancellation, and hot/SSD KV gates. |
+| Large pinned model and clean admission rejection | `scripts/m9_large_model_acceptance.sh`: candidate-bound pinned large-model load/generation, measured memory evidence, and separately demonstrated bounded rejection under an insufficient budget. | **Passed:** real 4B/14B Metal execution, typed protected refusal, separate `ReservationBudget` refusal, and empty shutdown ledger. |
+| Existing native and CLI regression gates | All required jobs in [ci.yaml](../../.github/workflows/ci.yaml); no gate silently skipped due to absent model files. | **Passed** in final push and PR runs. |
 
 ## First candidate results and required repairs
 
@@ -50,13 +54,13 @@ The [Mac job](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/jo
 | Frozen models | Both 4B and 14B files and aggregate hashes verified. This establishes model identity, not large-model execution. |
 | M9 large-model execution | **Failed before any native load.** The 14B startup reservation was 33,813,526,874 bytes; balanced ceiling was 15,470,674,688 bytes; reported Metal cap was 30,064,771,072 bytes. Native model handle count remained zero. |
 
-The first M9 run exposed unnecessary dense vocabulary residency and an over-large loading peak. The original loader held all checkpoint shards during host decoding; native upload then expanded vocabulary embeddings/output weights to float32. The plan also summed source, complete decoded weights, and complete native weights as though all three phases overlapped. Follow-up work keeps vocabulary matrices packed, streams and hashes bounded source chunks, and derives the loading allowance from actual ownership phases. The guard and the required 4B/14B execution test remain enforced. A fresh successful hardware run is required; the preflight rejection does not satisfy M9.
+The first M9 run exposed unnecessary dense vocabulary residency and an over-large loading peak. The original loader held all checkpoint shards during host decoding; native upload then expanded vocabulary embeddings/output weights to float32. The plan also summed source, complete decoded weights, and complete native weights as though all three phases overlapped. Follow-up work keeps vocabulary matrices packed, streams and hashes bounded source chunks, and derives the loading allowance from actual ownership phases. The guard and the required 4B/14B execution test remained enforced. The later successful hardware runs below satisfy M9; the original preflight rejection did not.
 
 The requirements review also found synchronous end-of-turn telemetry without an idle schedule or explicit network deadline. The follow-up isolates flushes on one bounded worker, adds scheduled flushing and finite HTTPS I/O deadlines, and preserves offline-drop semantics; see the [telemetry design](../designs/telemetry.md). Two direct M10 scenarios now cover positive-cap RAM reuse with SSD disabled and real second-block/manifest write failures after staging begins. Both pass locally, including cleanup, preserved native ownership, and successful recovery.
 
 Local follow-up checks pass for all MLX FFI, inference-infrastructure, and Qwen targets, 423 engine tests, and all 16 harness tests. The loader tests cover bounded body buffering, cross-shard F16/BF16/U32 conversion, exact budgets, full-file digests, and cancellation. Telemetry coverage includes a real stalled loopback TLS connection and two persisted turns while its transport remains blocked. Local daemon compilation and the two live-metrics tests pass; four Unix-socket RPC cases encounter this workspace's `EPERM` bind restriction and remain mandatory in CI. These local results do not substitute for the new candidate's Mac CPU/Metal and real 4B/14B acceptance.
 
-The Phase 2 plan was reviewed against SPEC-1 Phase 2, FR-20/21/24, the builtin policies, and B.2/B.4/B.6. Its seven work packages, exact file mapping, 16 named tests, and three exit mappings cover the defined scope. Phase 2 implementation remains gated on Phase 1 acceptance. A published privacy policy and an operational collection endpoint are release prerequisites; this review does not claim either from a mock transport test or the current `telemetry.invalid` development default.
+The Phase 2 plan was reviewed against SPEC-1 Phase 2, FR-20/21/24, the builtin policies, and B.2/B.4/B.6. Its seven work packages, exact file mapping, 16 named tests, and three exit mappings cover the defined scope. Its Phase 1 entry gate is now satisfied. A published privacy policy and an operational collection endpoint are release prerequisites; this review does not claim either from a mock transport test or the current `telemetry.invalid` development default.
 
 ## Loader repair and protected-pin acceptance correction
 
@@ -84,13 +88,32 @@ The [Mac job](https://github.com/LayerDynamics/alloy/actions/runs/42299723238/jo
 | M9 measured native memory | MLX reported peak 9,371,885,656 bytes, active 9,233,276,928 bytes at the B-idle observation, and 268,457,540 cached bytes. The peak is a native allocator measurement, distinct from the 14,104,910,369-byte startup plan. |
 | M9 shutdown | Zero native model handles, zero reserved bytes, zero active reservations, and zero MLX active bytes. Allocator cache remained separately reported. Final sequence 108 was `acceptance_passed`. |
 
-These results resolve the original preflight failure and subsequent driver classification failure for this commit. They do not independently validate the new resource-error implementation.
+These results resolve the original preflight failure and subsequent driver classification failure for `75a960c`. The later resource-error implementation has its own fresh evidence below.
 
 ## Typed resource-error follow-up
 
-The [resource-error design](../designs/engine-resource-errors.md) defines the next production contract. `Busy` denotes active/pending execution or scheduler ownership. `ProtectedResources` carries operation-scoped model pins and session-state leases with exact artifact/instance/state identities and positive observed handle counts. A retained diagnostic does not retain a protection handle. `MemoryLimitExceeded` records a typed reason, including the difference between unavailable capacity and a pressure-driven admission pause.
+The [resource-error design](../designs/engine-resource-errors.md) defines the merged production contract. `Busy` denotes active/pending execution or scheduler ownership. `ProtectedResources` carries operation-scoped model pins and session-state leases with exact artifact/instance/state identities and positive observed handle counts. A retained diagnostic does not retain a protection handle. `MemoryLimitExceeded` records a typed reason, including the difference between unavailable capacity and a pressure-driven admission pause.
 
-The M9 preflight now emits an actual `HostPreflight` engine cause with the planned startup and complete observed ceiling breakdown in failure evidence. Its pin assertion matches the original instance and typed pin directly; its full-ledger assertion specifically requires `ReservationBudget`. Session RPC responses and streamed failures preserve the captured engine cause, and CLI handling reports one terminal failure. These changes require fresh engine, daemon, CLI, and real-model acceptance before the final review decision.
+The M9 preflight emits an actual `HostPreflight` engine cause with the planned startup and complete observed ceiling breakdown in failure evidence. Its pin assertion matches the original instance and typed pin directly; its full-ledger assertion specifically requires `ReservationBudget`. Session RPC responses and streamed failures preserve the captured engine cause, and CLI handling reports one terminal failure. Fresh engine, daemon, CLI, and real-model acceptance for these changes passed at `bf95b93` and the equivalent PR merge tree.
+
+## Final acceptance at `bf95b93`, merged as `a4a17df`
+
+The final [Mac job](https://github.com/LayerDynamics/alloy/actions/runs/42305914377/job/128195038977), [Linux job](https://github.com/LayerDynamics/alloy/actions/runs/42305914377/job/128195039176), and [CLI job](https://github.com/LayerDynamics/alloy/actions/runs/42305914377/job/128195039159) all completed successfully. The independent [PR run](https://github.com/LayerDynamics/alloy/actions/runs/42305920807) passed on an equal source tree. The inspected push artifact is identified in the evidence index; the values below come from that artifact, not from the earlier `75a960c` run.
+
+| Final observation | Recorded result |
+| --- | --- |
+| Hardware | Apple M4 Max, Mac16,6, 36 GiB unified RAM, macOS 26.4/build 25E246. |
+| Test 13 | 12 nonempty deltas and 12 visible stdout chunks before one successful terminal outcome. |
+| Test 14 | PIDs 71272 → 71275; all 5 prior events and contents preserved, 9 total after resume; 37 actual native KV tokens restored. |
+| M9 budget | 14,104,910,369-byte startup/shared budget below the freshly measured 24,349,491,944-byte safe ceiling. |
+| Separate capacity refusal | Sequence 39 requires `MemoryLimitExceeded` with `ReservationBudget`, zero native loader calls, idle scheduler, released probe hold and zero leaked reservations. The ledger hold is not represented as physical allocation. |
+| Protected ownership | Sequence 69 records exact `ProtectedResources` for the original pinned 4B instance; its 2,660,373,249-byte reservation and identity survive, with zero B loader calls. |
+| Real model replacement | Both models perform real Metal prefill/decode. A's actual destruction at sequence 75 precedes B's loader at sequence 80; maximum native model handles is one. |
+| Native memory and shutdown | MLX peak 9,371,885,656 bytes; zero native handles, active bytes, reserved bytes and active reservations at shutdown. Final sequence 106 is `acceptance_passed`. |
+| Native regressions | Mac passes unified CPU/Metal/shared-array gates, 443 engine tests, 17 harness tests and 10 daemon integration tests, including required pooled-KV pressure coverage. |
+| Linux and documentation | 597 top-level Rust passes, zero failures; two existing process-global MLX tests intentionally ignored. `engine_traits_documented`, rustdoc `-D warnings`, named telemetry tests, and `vendored_build_reproducible` pass. |
+
+The final push and PR Linux jobs each also perform two matching clean native builds. All named Phase 1 tests 1–15, the memory pull-forward gates, and the written Phase 2 plan were reviewed before approval. This closes Phase 1 runtime acceptance; Homebrew distribution and the remaining release prerequisites are separate work.
 
 ## Existing reproducibility evidence
 
@@ -174,9 +197,7 @@ ALLOY_M9_OUTPUT=/absolute/path/to/phase-1-evidence/m9-acceptance.jsonl \
 
 ## Review record
 
-Fill this section after examining the linked candidate evidence:
-
-1. **Observed results:** Pending — record named test results, actual PIDs/event counts/delta counts, spill/restore counters, large-model peak/budget measurements, and reproducible-build run links from the artifacts.
-2. **Failures and repairs:** Pending — link failed artifacts and explain fixes and verified reruns. A retained failure is part of the record.
-3. **Outstanding requirements:** Pending — enumerate any required gate without passing evidence. Phase 1 remains open while this list is nonempty.
-4. **Decision:** Pending — reviewer records approval only after all required gates pass for the reviewed candidate and the Phase 2 plan has been reviewed against the current SPEC.
+1. **Observed results:** All required gates passed for `bf95b93` and the equivalent PR merge tree. The final acceptance section records actual streaming, process/history, restored KV, protected ownership, memory and shutdown observations; the evidence index identifies the downloaded artifact and successful jobs.
+2. **Failures and repairs:** The `14b4715` preflight failure, `d09fdd1` driver classification failure, loader repair, typed resource-error follow-up and successful reruns remain recorded above. No failed run is relabeled as passing.
+3. **Outstanding Phase 1 requirements:** None identified in the final review. Homebrew distribution, a published telemetry privacy policy, an operational collection endpoint and Phase 2 implementation retain their separate scope; this approval is not a public-release claim.
+4. **Decision:** Approved 2026-11-06 for merged main `a4a17df` after source-tree equality and all required evidence were verified. [Issue #9](https://github.com/LayerDynamics/alloy/issues/9) and [epic #1](https://github.com/LayerDynamics/alloy/issues/1) are closed as completed. The Phase 2 plan's entry gate is satisfied.

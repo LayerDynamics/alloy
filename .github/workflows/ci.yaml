@@ -28,7 +28,7 @@ jobs:
           cache-dependency-path: ts/cli/package-lock.json
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
 
   linux:
     name: linux-arm64
@@ -183,7 +183,7 @@ jobs:
 
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
 
       - name: Metal and unified tests
         shell: bash
@@ -293,7 +293,13 @@ jobs:
           node ts/cli/scripts/real-model-acceptance.mjs --summarize-m9 "$ALLOY_M9_OUTPUT"
           exit "$driver_status"
 
-      - name: Retain Phase 1 real-model acceptance evidence
+      - name: Homebrew installed CPU/Metal and real-model acceptance
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        shell: bash
+        run: node scripts/homebrew/ci.mjs
+
+      - name: Retain Phase 1 and Homebrew acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
