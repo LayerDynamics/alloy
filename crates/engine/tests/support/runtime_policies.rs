@@ -159,6 +159,7 @@ impl Drop for GateRelease {
 struct PolicyControl {
     admission: AdmissionController,
     events: Mutex<Vec<PolicyEvent>>,
+    instance_lease_tokens: Mutex<BTreeMap<RequestId, Vec<u32>>>,
     fail_verification_once: AtomicBool,
     fail_loading_once: AtomicBool,
     startup_gate: Arc<StartupGate>,
@@ -172,6 +173,7 @@ impl PolicyControl {
         Self {
             admission,
             events: Mutex::new(Vec::new()),
+            instance_lease_tokens: Mutex::new(BTreeMap::new()),
             fail_verification_once: AtomicBool::new(false),
             fail_loading_once: AtomicBool::new(false),
             startup_gate: Arc::new(StartupGate::default()),
@@ -368,7 +370,15 @@ impl AutoregressiveModel for PolicyModel {
         cache: &mut dyn FamilyCache,
         execution: &ExecutionControl,
     ) -> Result<TokenLogits, EngineError> {
-        self.inner_mut().decode(token, cache, execution)
+        let logits = self.inner_mut().decode(token, cache, execution)?;
+        self.control
+            .instance_lease_tokens
+            .lock()
+            .expect("observed decoded tokens")
+            .entry(execution.request_id().clone())
+            .or_default()
+            .push(token);
+        Ok(logits)
     }
 }
 
@@ -2505,6 +2515,518 @@ fn pool_enforcer_queued_eviction_is_revoked_after_pressure_recovers() {
     let report = block_on(enforcement).unwrap();
     assert!(matches!(report.model, IdleModelReclaim::NotRequested));
     assert!(!environment.admission.admissions_paused());
+    let mut stream = generation.into_events();
+    let transcript = drain(&mut stream);
+    drop(stream);
+    environment.wait_idle();
+    successful(&transcript);
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&a));
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
+    );
+}
+
+// M9_INSTANCE_SCOPED_LEASE_EXECUTION_V1
+fn instance_lease_publish(
+    environment: &PolicyEnvironment,
+    name: &str,
+    profile: ModelProfileId,
+) -> (
+    engine::types::SessionStateId,
+    engine::runtime::RetainedSessionState,
+) {
+    let rendered = block_on(
+        environment
+            .engine
+            .render_and_count(request_context(profile.clone(), "hello")),
+    )
+    .unwrap();
+    successful(&environment.run(name, profile.clone(), "hello"));
+    let generated = environment
+        .control
+        .instance_lease_tokens
+        .lock()
+        .unwrap()
+        .get(&RequestId::new(name).unwrap())
+        .cloned()
+        .expect("actual decoded token IDs");
+    assert_eq!(generated.len(), POLICY_OUTPUT);
+    let mut tokens = rendered.token_ids().to_vec();
+    tokens.extend_from_slice(&generated);
+    let artifact = environment
+        .engine
+        .registry()
+        .resolve_profile(&profile)
+        .unwrap()
+        .artifact()
+        .id()
+        .clone();
+    let index = if artifact == artifact_a() {
+        0
+    } else if artifact == artifact_b() {
+        1
+    } else {
+        2
+    };
+    let tokenizer = tokenizers::Tokenizer::from_file(
+        environment._fixtures[index]
+            ._directory
+            .path()
+            .join("tokenizer.json"),
+    )
+    .unwrap();
+    let prefix = tokenizer.decode(&tokens, false).unwrap();
+    assert_eq!(
+        tokenizer.encode(prefix.as_str(), false).unwrap().get_ids(),
+        tokens.as_slice()
+    );
+    let id = block_on(
+        environment
+            .runtime
+            .retain_session_state(RequestId::new(name).unwrap(), prefix.into_bytes()),
+    )
+    .unwrap();
+    let state = block_on(environment.runtime.lookup_session_state(id))
+        .unwrap()
+        .unwrap();
+    (id, state)
+}
+
+fn instance_lease_assert_unchanged(
+    environment: &PolicyEnvironment,
+    expected: &engine::runtime::RetainedSessionState,
+) {
+    let actual = block_on(environment.runtime.lookup_session_state(expected.state_id))
+        .unwrap()
+        .expect("leased canonical publication remains present");
+    assert_eq!(
+        format!("{actual:?}"),
+        format!("{expected:?}"),
+        "every canonical metadata field must remain unchanged"
+    );
+    assert!(
+        pool_instance(environment, &expected.artifact_id)
+            .same_instance(&expected.model_instance_id)
+    );
+    let minimum = expected.weights_reserved_bytes
+        + expected.cache_reserved_bytes
+        + expected.token_history_reserved_bytes
+        + expected.logits_reserved_bytes;
+    assert!(environment.snapshot().reserved_bytes() >= minimum);
+}
+
+#[test]
+fn pool_instance_leases_b_executes_and_publishes_while_a_is_leased() {
+    let environment = PolicyEnvironment::new_pool(false);
+    let (a_id, a) = instance_lease_publish(&environment, "scoped-publish-a", profile_a());
+    let first = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let second = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let a_accounting = environment.snapshot();
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(a.model_instance_id.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap()
+    );
+    let (b_id, b) = instance_lease_publish(&environment, "scoped-publish-b", profile_b());
+    instance_lease_assert_unchanged(&environment, &a);
+    assert_ne!(a_id, b_id);
+    assert!(block_on(environment.engine.capabilities(artifact_a())).is_ok());
+    assert!(block_on(environment.engine.capabilities(artifact_b())).is_ok());
+    let b_bytes = b.weights_reserved_bytes
+        + b.cache_reserved_bytes
+        + b.token_history_reserved_bytes
+        + b.logits_reserved_bytes;
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        a_accounting.reserved_bytes() + b_bytes
+    );
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "scoped-deny-a",
+            profile_a(),
+            "jello",
+        ))),
+        "generation must not mutate leased A",
+    );
+    assert_eq!(error.kind(), ErrorKind::Busy);
+    instance_lease_assert_unchanged(&environment, &a);
+    assert_eq!(
+        block_on(environment.engine.release_session_state(b_id)).unwrap(),
+        engine::types::ReleaseOutcome::Released
+    );
+    assert_eq!(environment.snapshot(), a_accounting);
+    drop(first);
+    instance_lease_assert_unchanged(&environment, &a);
+    drop(second);
+    let limit = deadline();
+    while block_on(environment.runtime.lookup_session_state(a_id))
+        .unwrap()
+        .is_some()
+    {
+        assert!(Instant::now() < limit);
+        thread::yield_now();
+    }
+    environment.assert_empty();
+}
+
+#[test]
+fn pool_instance_leases_cancel_b_preserves_a_and_its_accounting() {
+    let environment = PolicyEnvironment::new_pool(false);
+    let (a_id, a) = instance_lease_publish(&environment, "scoped-cancel-a", profile_a());
+    let lease = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let a_accounting = environment.snapshot();
+    let release = environment.control.execution_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "scoped-cancel-b",
+        profile_b(),
+        "hello",
+    )))
+    .unwrap();
+    environment.control.execution_gate.wait_entered();
+    let blocked = environment.snapshot();
+    assert!(
+        blocked.reserved_bytes()
+            >= a_accounting.reserved_bytes()
+                + environment.plan_b.load_limits.max_resident_bytes()
+                + environment.plan_b.cache.max_cache_bytes()
+    );
+    assert_eq!(
+        block_on(
+            environment
+                .engine
+                .cancel(RequestId::new("scoped-cancel-b").unwrap())
+        )
+        .unwrap(),
+        CancelOutcome::Requested
+    );
+    assert_eq!(environment.snapshot(), blocked);
+    assert!(environment.scheduler.is_busy().unwrap());
+    release.release();
+    let mut stream = generation.into_events();
+    let mut failures = 0;
+    while let Some(event) = next_event(&mut stream, deadline()) {
+        match event {
+            GenerationEvent::RequestFailed { error, .. } => {
+                assert!(matches!(error, EngineError::Cancelled { .. }));
+                failures += 1;
+            }
+            GenerationEvent::GenerationCompleted { .. } => panic!("cancelled B completed"),
+            _ => {}
+        }
+    }
+    drop(stream);
+    environment.wait_idle();
+    assert_eq!(failures, 1);
+    instance_lease_assert_unchanged(&environment, &a);
+    let b = pool_instance(&environment, &artifact_b());
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(b, Some(Duration::ZERO))
+        )
+        .unwrap()
+    );
+    let limit = deadline();
+    while block_on(environment.runtime.model_residency())
+        .unwrap()
+        .iter()
+        .any(|resident| resident.artifact == artifact_b())
+    {
+        assert!(Instant::now() < limit);
+        thread::yield_now();
+    }
+    assert_eq!(environment.snapshot(), a_accounting);
+    drop(lease);
+    assert_eq!(
+        block_on(environment.engine.release_session_state(a_id)).unwrap(),
+        engine::types::ReleaseOutcome::Released
+    );
+    environment.assert_empty();
+}
+
+#[test]
+fn pool_instance_leases_failed_b_startup_does_not_invalidate_a() {
+    let environment = PolicyEnvironment::new_pool(false);
+    let (a_id, a) = instance_lease_publish(&environment, "scoped-failure-a", profile_a());
+    let lease = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let accounting = environment.snapshot();
+    environment
+        .control
+        .fail_loading_once
+        .store(true, Ordering::Release);
+    let generation = block_on(environment.engine.generate(environment.request(
+        "scoped-failure-b",
+        profile_b(),
+        "hello",
+    )))
+    .unwrap();
+    let mut stream = generation.into_events();
+    let mut failures = 0;
+    while let Some(event) = next_event(&mut stream, deadline()) {
+        match event {
+            GenerationEvent::RequestFailed { error, .. } => {
+                assert!(matches!(error, EngineError::ExecutionFailed { .. }));
+                failures += 1;
+            }
+            GenerationEvent::GenerationCompleted { .. } => panic!("injected failed load completed"),
+            _ => {}
+        }
+    }
+    drop(stream);
+    environment.wait_idle();
+    assert_eq!(failures, 1);
+    assert_eq!(environment.snapshot(), accounting);
+    instance_lease_assert_unchanged(&environment, &a);
+    successful(&environment.run("scoped-failure-recovery-b", profile_b(), "hello"));
+    instance_lease_assert_unchanged(&environment, &a);
+    drop(lease);
+}
+
+#[test]
+fn pool_instance_leases_admission_does_not_credit_leased_a() {
+    let environment = PolicyEnvironment::new_pool(false);
+    let (a_id, a) = instance_lease_publish(&environment, "scoped-budget-a", profile_a());
+    let lease = block_on(environment.runtime.lease_session_state(a_id))
+        .unwrap()
+        .unwrap();
+    let required = pending_startup_reservation(&environment.plan_b);
+    let available = environment.snapshot().available_bytes();
+    assert!(available > required);
+    let blocker = environment
+        .admission
+        .reserve("scoped lease admission blocker", available - (required - 1))
+        .unwrap();
+    let accounting = environment.snapshot();
+    let loads = environment.observations.loads.load(Ordering::Relaxed);
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "scoped-budget-b",
+            profile_b(),
+            "hello",
+        ))),
+        "leased A cannot be credited as reclaimable memory",
+    );
+    assert_eq!(error.kind(), ErrorKind::MemoryLimitExceeded);
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), accounting);
+    assert_eq!(
+        environment.observations.loads.load(Ordering::Relaxed),
+        loads
+    );
+    instance_lease_assert_unchanged(&environment, &a);
+    drop(blocker);
+    successful(&environment.run("scoped-budget-recovery-b", profile_b(), "hello"));
+    instance_lease_assert_unchanged(&environment, &a);
+    drop(lease);
+}
+
+// M9_LIVE_PRESSURE_PUMP_V2
+#[test]
+fn pool_pressure_pump_keeps_polling_while_native_worker_is_blocked() {
+    use engine::memory_enforcer::PRESSURE_RECLAIM_GRACE_POLLS_MAX;
+    use engine::memory_guard::PressureLevel;
+    use engine::runtime::{IdleModelReclaim, MemoryEnforcementPump};
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("pump-observe-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    successful(&environment.run("pump-observe-warm-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let checkpoint = environment.control.events().len();
+    let release = environment.control.execution_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "pump-observe-active-b",
+        profile_b(),
+        "jello",
+    )))
+    .unwrap();
+    environment.control.execution_gate.wait_entered();
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let pressured = *source.0.lock().unwrap();
+    source.set_normal();
+    let mut pump = MemoryEnforcementPump::new(environment.runtime.clone(), enforcer);
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    let first = pump.poll_tick(&mut cx).unwrap();
+    assert_eq!(first.tick.status.pressure, PressureLevel::Ok);
+    assert!(!environment.admission.admissions_paused());
+    assert!(first.completed.is_none());
+    assert!(pump.has_pending());
+    *source.0.lock().unwrap() = pressured;
+    for index in 0..=PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        let poll = pump.poll_tick(&mut cx).unwrap();
+        assert_eq!(poll.tick.status.pressure, PressureLevel::Soft);
+        assert!(
+            environment.admission.admissions_paused(),
+            "pressure pausing must continue while the native action is blocked"
+        );
+        assert_eq!(
+            poll.tick.deferred_for_pool_drain,
+            index < PRESSURE_RECLAIM_GRACE_POLLS_MAX
+        );
+        assert!(poll.completed.is_none());
+        assert!(
+            pump.has_pending(),
+            "one pending action must be retained, not replaced"
+        );
+    }
+    source.set_normal();
+    let recovery = pump.poll_tick(&mut cx).unwrap();
+    assert_eq!(recovery.tick.status.pressure, PressureLevel::Ok);
+    assert!(!environment.admission.admissions_paused());
+    assert!(recovery.completed.is_none());
+    release.release();
+    let limit = deadline();
+    loop {
+        let poll = pump.poll_tick(&mut cx).unwrap();
+        if let Some(result) = poll.completed {
+            assert!(matches!(
+                result.unwrap().model,
+                IdleModelReclaim::NotRequested
+            ));
+            break;
+        }
+        assert!(Instant::now() < limit);
+        thread::yield_now();
+    }
+    let mut stream = generation.into_events();
+    let transcript = drain(&mut stream);
+    drop(stream);
+    environment.wait_idle();
+    successful(&transcript);
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&a));
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
+    );
+}
+
+#[derive(Debug)]
+struct PoolDrainRecoverySource {
+    pressured: engine::memory_enforcer::MemoryObservation,
+    phase: AtomicUsize,
+}
+
+impl engine::memory_enforcer::MemoryObservationSource for PoolDrainRecoverySource {
+    fn observe(
+        &self,
+    ) -> Result<engine::memory_enforcer::MemoryObservation, engine::memory_enforcer::EnforcerError>
+    {
+        let phase = self.phase.load(Ordering::Acquire);
+        let mut observation = self.pressured;
+        if phase != 0 && self.phase.fetch_add(1, Ordering::AcqRel) >= 3 {
+            observation.host.free_bytes = 20 * 1024 * 1024 * 1024;
+            observation.host.phys_footprint_bytes = 1024 * 1024 * 1024;
+            observation.mlx_active_bytes = 1024 * 1024 * 1024;
+            observation.mlx_pool_bytes = 0;
+        }
+        Ok(observation)
+    }
+}
+
+#[test]
+fn pool_pressure_reobserves_after_allocator_step_before_destroying_model() {
+    use engine::memory_enforcer::{MemoryEnforcer, PRESSURE_RECLAIM_GRACE_POLLS_MAX};
+    use engine::memory_guard::{MemoryGuardConfig, PressureLevel};
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("pump-drain-recovery-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let (_, original) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let source = Arc::new(PoolDrainRecoverySource {
+        pressured: *original.0.lock().unwrap(),
+        phase: AtomicUsize::new(0),
+    });
+    let enforcer = MemoryEnforcer::with_observation_source(
+        MemoryGuardConfig::balanced(),
+        environment.admission.clone(),
+        source.clone(),
+    );
+    for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        assert!(enforcer.tick().unwrap().deferred_for_pool_drain);
+    }
+    // Poll observation: soft. Worker entry: soft. After allocator step:
+    // normal. The production executor must not destroy the now-unneeded model.
+    source.phase.store(1, Ordering::Release);
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    assert_eq!(report.tick.status.pressure, PressureLevel::Ok);
+    assert!(matches!(report.model, IdleModelReclaim::NotRequested));
+    assert!(!environment.admission.admissions_paused());
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        before.reserved_bytes()
+    );
+    assert_eq!(
+        environment.snapshot().active_reservations(),
+        before.active_reservations()
+    );
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&a));
+    assert_eq!(environment.control.events().len(), checkpoint);
+}
+
+#[test]
+fn pool_pressure_new_grace_revokes_an_older_queued_eviction() {
+    use engine::memory_enforcer::PRESSURE_RECLAIM_GRACE_POLLS_MAX;
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("pump-new-grace-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    successful(&environment.run("pump-new-grace-warm-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let checkpoint = environment.control.events().len();
+    let release = environment.control.execution_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "pump-new-grace-b",
+        profile_b(),
+        "jello",
+    )))
+    .unwrap();
+    environment.control.execution_gate.wait_entered();
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let pressured = *source.0.lock().unwrap();
+    for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        assert!(enforcer.tick().unwrap().deferred_for_pool_drain);
+    }
+    let mut old = environment.runtime.enforce_memory_tick(enforcer.clone());
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    assert!(old.as_mut().poll(&mut cx).is_pending());
+    source.set_normal();
+    assert!(!enforcer.tick().unwrap().request_model_eviction);
+    *source.0.lock().unwrap() = pressured;
+    let new_grace = enforcer.tick().unwrap();
+    assert!(new_grace.deferred_for_pool_drain);
+    assert!(!new_grace.request_model_eviction);
+    release.release();
+    let report = block_on(old).unwrap();
+    assert!(
+        matches!(report.model, IdleModelReclaim::NotRequested),
+        "old post-grace authority must not bypass a newer grace window"
+    );
+    source.set_normal();
+    enforcer.tick().unwrap();
     let mut stream = generation.into_events();
     let transcript = drain(&mut stream);
     drop(stream);

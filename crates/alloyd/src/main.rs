@@ -5,11 +5,10 @@ use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
 use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
 use harness_core::{HardwareTier, TelemetryClient};
 use std::env;
-use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Waker};
 use std::thread;
 use std::time::Duration;
 
@@ -191,14 +190,16 @@ fn run_memory_enforcer_loop(
     enforcer: engine::memory_enforcer::MemoryEnforcer,
     engine: engine::api::EngineCore<engine::runtime::FamilyRuntime>,
 ) {
+    let mut pump = engine::runtime::MemoryEnforcementPump::new(engine.runtime().clone(), enforcer);
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
     let mut previous = PressureLevel::Ok;
     loop {
-        // Serial dispatch bounds outstanding work to one call. The worker
-        // observes pressure after accepting it, so queued decisions cannot
-        // unload models using stale pre-queue observations.
-        match block_on(engine.runtime().enforce_memory_tick(enforcer.clone())) {
-            Ok(report) => {
-                let tick = report.tick;
+        // Never block pressure observation on an occupied native worker.
+        // The pump owns at most one dispatched native action.
+        match pump.poll_tick(&mut context) {
+            Ok(poll) => {
+                let tick = poll.tick;
                 if tick.status.pressure != previous {
                     eprintln!(
                         "alloyd: memory pressure {} -> {} (usage={} soft={} hard={} paused={} deferred={})",
@@ -212,42 +213,37 @@ fn run_memory_enforcer_loop(
                     );
                     previous = tick.status.pressure;
                 }
-                if let Some(cache) = report.allocator_cache {
-                    if cache.before.cache_bytes > cache.after.cache_bytes {
-                        eprintln!(
-                            "alloyd: MLX pool drain {} -> {} MiB",
-                            cache.before.cache_bytes / (1024 * 1024),
-                            cache.after.cache_bytes / (1024 * 1024)
-                        );
+                match poll.completed {
+                    Some(Ok(report)) => {
+                        if let Some(error) = report.allocator_error {
+                            eprintln!("alloyd: allocator drain failed: {error}");
+                        }
+                        if let Some(cache) = report.allocator_cache {
+                            if cache.before.cache_bytes > cache.after.cache_bytes {
+                                eprintln!(
+                                    "alloyd: MLX pool drain {} -> {} MiB",
+                                    cache.before.cache_bytes / (1024 * 1024),
+                                    cache.after.cache_bytes / (1024 * 1024)
+                                );
+                            }
+                        }
+                        match report.model {
+                            engine::runtime::IdleModelReclaim::Evicted(instance) => {
+                                eprintln!("alloyd: pressure evicted idle model {instance:?}")
+                            }
+                            engine::runtime::IdleModelReclaim::NoEligibleVictim => {}
+                            engine::runtime::IdleModelReclaim::NotRequested => {}
+                        }
                     }
-                }
-                match report.model {
-                    engine::runtime::IdleModelReclaim::Evicted(instance) => {
-                        eprintln!("alloyd: pressure evicted idle model {instance:?}")
+                    Some(Err(error)) => {
+                        eprintln!("alloyd: native memory enforcement failed: {error}")
                     }
-                    engine::runtime::IdleModelReclaim::NoEligibleVictim => {}
-                    engine::runtime::IdleModelReclaim::NotRequested => {}
+                    None => {}
                 }
             }
-            Err(error) => {
-                eprintln!("alloyd: memory enforcer tick failed: {error}");
-                thread::sleep(Duration::from_secs(5));
-                continue;
-            }
+            Err(error) => eprintln!("alloyd: memory pressure observation failed: {error}"),
         }
         thread::sleep(ACTIVE_POLL_INTERVAL);
-    }
-}
-
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let mut future = Box::pin(future);
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::yield_now(),
-        }
     }
 }
 

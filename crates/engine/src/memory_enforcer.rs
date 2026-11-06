@@ -134,6 +134,7 @@ struct Inner {
     mlx_pool_override: Mutex<Option<u64>>,
     pressure: Mutex<PressureLevel>,
     cache_reclaim_requested: AtomicBool,
+    model_eviction_requested: AtomicBool,
     over_ceiling_polls: AtomicU64,
     reclaim_grace_polls: AtomicU64,
     hard_limit_bytes: AtomicU64,
@@ -193,6 +194,7 @@ impl MemoryEnforcer {
                 mlx_pool_override: Mutex::new(None),
                 pressure: Mutex::new(PressureLevel::Ok),
                 cache_reclaim_requested: AtomicBool::new(false),
+                model_eviction_requested: AtomicBool::new(false),
                 over_ceiling_polls: AtomicU64::new(0),
                 reclaim_grace_polls: AtomicU64::new(0),
                 hard_limit_bytes: AtomicU64::new(0),
@@ -220,6 +222,12 @@ impl MemoryEnforcer {
     /// Whether the generation / worker path should clear the MLX cache.
     pub fn cache_reclaim_requested(&self) -> bool {
         self.inner.cache_reclaim_requested.load(Ordering::Acquire)
+    }
+
+    /// Latest completed poll authorizes destructive idle-model reclamation.
+    /// A newer grace or normal-pressure poll revokes older queued actions.
+    pub(crate) fn model_eviction_requested(&self) -> bool {
+        self.inner.model_eviction_requested.load(Ordering::Acquire)
     }
 
     /// Clear the reclaim request after the worker honors it.
@@ -296,6 +304,11 @@ impl MemoryEnforcer {
 
     /// One enforcement tick (oMLX `_check_and_enforce`).
     pub fn tick(&self) -> Result<EnforcementTick, EnforcerError> {
+        // Revoke old authority while obtaining a new observation. Probe
+        // failure must not leave a stale destructive request authorized.
+        self.inner
+            .model_eviction_requested
+            .store(false, Ordering::Release);
         let observation = self.observe_memory()?;
         let host = observation.host;
         let mlx_active = observation.mlx_active_bytes;
@@ -322,6 +335,7 @@ impl MemoryEnforcer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if ceiling.hard_limit_bytes == 0 {
+            self.clear_cache_reclaim_request();
             self.set_pressure(PressureLevel::Ok);
             self.inner.admission.set_admissions_paused(false);
             self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
@@ -341,6 +355,7 @@ impl MemoryEnforcer {
 
         let new_level = memory_guard::pressure_level(usage, marks);
         if new_level == PressureLevel::Ok {
+            self.clear_cache_reclaim_request();
             self.inner.reclaim_grace_polls.store(0, Ordering::Relaxed);
         }
         self.set_pressure(new_level);
@@ -387,6 +402,9 @@ impl MemoryEnforcer {
             }
         }
 
+        self.inner
+            .model_eviction_requested
+            .store(new_level != PressureLevel::Ok, Ordering::Release);
         Ok(EnforcementTick {
             status: self.status_with_binding(ceiling),
             request_model_eviction: new_level != PressureLevel::Ok,
@@ -428,6 +446,10 @@ impl MemoryEnforcer {
             .admission
             .set_admissions_paused(level != PressureLevel::Ok);
         if level == PressureLevel::Ok {
+            self.inner
+                .model_eviction_requested
+                .store(false, Ordering::Release);
+            self.clear_cache_reclaim_request();
             self.inner.reclaim_grace_polls.store(0, Ordering::Relaxed);
             self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
             self.inner.emergency.store(false, Ordering::Relaxed);

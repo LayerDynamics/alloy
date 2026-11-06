@@ -302,6 +302,76 @@ pub struct MemoryEnforcementReport {
     pub model: IdleModelReclaim,
 }
 
+// M9_LIVE_PRESSURE_PUMP_V2
+
+/// A bounded polling bridge between the live enforcer and native ownership.
+///
+/// Poll observations continue while the worker is busy. At most one native
+/// enforcement future is retained; no dispatcher is spawned for extra polls.
+pub struct MemoryEnforcementPump {
+    runtime: FamilyRuntime,
+    enforcer: crate::memory_enforcer::MemoryEnforcer,
+    pending: Option<EngineFuture<'static, MemoryEnforcementReport>>,
+}
+
+/// One polling observation and an optional completed native action.
+pub struct MemoryEnforcementPoll {
+    /// Current poll-thread pressure; admission pausing has already occurred.
+    pub tick: crate::memory_enforcer::EnforcementTick,
+    /// Completion of the one outstanding worker call, when available.
+    pub completed: Option<Result<MemoryEnforcementReport, EngineError>>,
+}
+
+impl MemoryEnforcementPump {
+    /// Connect one runtime to its shared live enforcer.
+    pub fn new(runtime: FamilyRuntime, enforcer: crate::memory_enforcer::MemoryEnforcer) -> Self {
+        Self {
+            runtime,
+            enforcer,
+            pending: None,
+        }
+    }
+
+    /// Whether one bounded native enforcement operation is outstanding.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Observe pressure, immediately update admission, and nonblockingly
+    /// advance at most one native reclamation request.
+    pub fn poll_tick(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<MemoryEnforcementPoll, EngineError> {
+        let tick = self
+            .enforcer
+            .tick()
+            .map_err(|error| EngineError::ExecutionFailed {
+                stage: "poll live memory pressure",
+                message: error.to_string(),
+            })?;
+        if self.pending.is_none() {
+            let runtime = self.runtime.clone();
+            let enforcer = self.enforcer.clone();
+            let decision = tick.clone();
+            self.pending = Some(Box::pin(async move {
+                runtime.apply_memory_tick(enforcer, decision).await
+            }));
+        }
+        let completed = match self.pending.as_mut() {
+            Some(future) => match future.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            },
+            None => None,
+        };
+        if completed.is_some() {
+            self.pending = None;
+        }
+        Ok(MemoryEnforcementPoll { tick, completed })
+    }
+}
+
 impl FamilyRuntime {
     /// Observe live pressure and apply one bounded enforcement step.
     ///
@@ -312,16 +382,28 @@ impl FamilyRuntime {
         &self,
         enforcer: crate::memory_enforcer::MemoryEnforcer,
     ) -> EngineFuture<'_, MemoryEnforcementReport> {
-        let worker = Arc::clone(&self.worker);
         Box::pin(async move {
-            // Publish pause/pressure promptly on the caller, even while
-            // the native worker is occupied by a long operation.
             let tick = enforcer
                 .tick()
                 .map_err(|error| EngineError::ExecutionFailed {
                     stage: "live memory enforcement tick",
                     message: error.to_string(),
                 })?;
+            self.apply_memory_tick(enforcer, tick).await
+        })
+    }
+
+    /// Dispatch an already-polled decision without advancing grace twice.
+    ///
+    /// Prefer MemoryEnforcementPump for a background loop. Native execution
+    /// refreshes pressure and authorization before any destructive action.
+    pub fn apply_memory_tick(
+        &self,
+        enforcer: crate::memory_enforcer::MemoryEnforcer,
+        tick: crate::memory_enforcer::EnforcementTick,
+    ) -> EngineFuture<'_, MemoryEnforcementReport> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
             dispatch("engine-live-memory-enforcement", move || {
                 worker
                     .call(|reply| Command::EnforceMemory {
@@ -337,8 +419,8 @@ impl FamilyRuntime {
 
     /// Enable worker-owned idle model pooling and optional per-model TTL.
     ///
-    /// Existing instances receive this default. Ordinary session leases
-    /// retain their current conservative worker-wide mutation protection.
+    /// Existing instances receive this default. Session leases protect their
+    /// exact published model; unrelated artifacts may execute independently.
     /// Use before serving requests. None disables expiry, not pooling.
     pub fn with_model_pool(self, ttl: Option<Duration>) -> Result<Self, EngineError> {
         self.worker
@@ -559,8 +641,8 @@ impl FamilyRuntime {
 
     /// Pin actual canonical state against release and mutation.
     ///
-    /// A live lease prevents ordinary generation from consuming or
-    /// reclaiming this worker's published allocation.
+    /// A live lease prevents generation from mutating its owning model's
+    /// published allocation, without blocking unrelated pooled models.
     pub fn lease_session_state(
         &self,
         state_id: SessionStateId,
@@ -906,22 +988,16 @@ impl EngineRuntime for FamilyRuntime {
         Box::pin(async move {
             let artifact = registry.artifact(&artifact_id)?;
             self.backend(registry, artifact)?;
-            let summary = lock_metadata(&self.worker.summary);
-
-            if !summary.alive {
-                return Err(internal("native worker has exited"));
-            }
-            if summary.artifact.as_ref() != Some(&artifact_id) {
-                return Err(EngineError::NotFound {
-                    resource: "verified loaded artifact",
-                    id: artifact_id.into_string(),
-                });
-            }
-
-            summary
-                .capabilities
-                .clone()
-                .ok_or_else(|| internal("loaded capabilities unavailable"))
+            let worker = Arc::clone(&self.worker);
+            dispatch("engine-owned-model-capabilities", move || {
+                worker
+                    .call(|reply| Command::LoadedCapabilities {
+                        artifact: artifact_id,
+                        reply,
+                    })?
+                    .result
+            })?
+            .await
         })
     }
 }
@@ -953,6 +1029,10 @@ struct Reply<T> {
 }
 
 enum Command {
+    LoadedCapabilities {
+        artifact: ArtifactId,
+        reply: SyncSender<Reply<Capabilities>>,
+    },
     EnforceMemory {
         enforcer: crate::memory_enforcer::MemoryEnforcer,
         tick: crate::memory_enforcer::EnforcementTick,
@@ -1731,6 +1811,124 @@ struct NativeState {
 }
 
 impl NativeState {
+    // M9_INSTANCE_SCOPED_LEASE_EXECUTION_V1
+    fn select_for_startup(
+        &mut self,
+        artifact: &ArtifactRegistration,
+        backend: &dyn RuntimeBackend,
+    ) -> Result<(), EngineError> {
+        if !self.pool_enabled {
+            self.require_unleased()?;
+            self.unpublish_idle_state()?;
+            return self.switch_model(artifact, backend);
+        }
+        // Reject the target allocation only. Other leased publications
+        // remain independently owned by their StateEntry throughout B.
+        if self
+            .states
+            .values()
+            .any(|entry| entry.is_leased() && model_matches(&entry.resident, artifact, backend))
+        {
+            return Err(EngineError::Busy {
+                active_request_id: None,
+                message: "requested model owns a live canonical session lease".to_owned(),
+            });
+        }
+        let published = self
+            .states
+            .iter()
+            .find(|(_, entry)| model_matches(&entry.resident, artifact, backend))
+            .map(|(id, _)| *id);
+        if let Some(id) = published {
+            if self.resident.is_some() {
+                self.pool
+                    .try_reserve(1)
+                    .map_err(|_| EngineError::AllocationFailed {
+                        operation: "park selected model before canonical reuse",
+                        requested_bytes: None,
+                    })?;
+            }
+            let entry = self
+                .states
+                .remove(&id)
+                .ok_or_else(|| internal("selected canonical state disappeared"))?;
+            if let Some(resident) = self.resident.take() {
+                self.pool.push(resident);
+            }
+            self.resident = Some(entry.resident);
+            Ok(())
+        } else {
+            self.switch_model(artifact, backend)
+        }
+    }
+
+    fn evict_one_idle_model(
+        &mut self,
+        include_selected: bool,
+    ) -> Result<Option<ModelInstanceId>, EngineError> {
+        enum Place {
+            Pool(usize),
+            Selected,
+            Published(SessionStateId),
+        }
+        let mut best: Option<((Instant, u8, usize, [u8; 32]), Place)> = None;
+        {
+            let mut offer = |key, place| {
+                if best.as_ref().is_none_or(|(current, _)| key < *current) {
+                    best = Some((key, place));
+                }
+            };
+            for (index, resident) in self.pool.iter().enumerate() {
+                if !resident.pins.is_pinned() {
+                    offer((resident.idle_since, 0, index, [0; 32]), Place::Pool(index));
+                }
+            }
+            if include_selected && self.request_owner().is_none() {
+                if let Some(resident) = &self.resident {
+                    if !resident.pins.is_pinned() {
+                        offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
+                    }
+                }
+            }
+            for (id, entry) in &self.states {
+                if !entry.is_leased() && !entry.resident.pins.is_pinned() {
+                    offer(
+                        (entry.resident.idle_since, 2, 0, *id.as_bytes()),
+                        Place::Published(*id),
+                    );
+                }
+            }
+        }
+        let instance = match best.map(|(_, place)| place) {
+            Some(Place::Pool(index)) => {
+                let resident = self.pool.remove(index);
+                let instance = resident.model.instance_id().clone();
+                drop(resident);
+                Some(instance)
+            }
+            Some(Place::Selected) => {
+                let resident = self
+                    .resident
+                    .take()
+                    .ok_or_else(|| internal("selected eviction owner disappeared"))?;
+                let instance = resident.model.instance_id().clone();
+                drop(resident);
+                Some(instance)
+            }
+            Some(Place::Published(id)) => {
+                let entry = self
+                    .states
+                    .remove(&id)
+                    .ok_or_else(|| internal("canonical eviction owner disappeared"))?;
+                let instance = entry.resident.model.instance_id().clone();
+                drop(entry);
+                Some(instance)
+            }
+            None => None,
+        };
+        Ok(instance)
+    }
+
     fn estimate_pool_memory(
         &self,
         artifact: &ArtifactId,
@@ -1738,6 +1936,17 @@ impl NativeState {
         version: FamilyVersion,
         plan: &RuntimePlan,
     ) -> Result<MemoryEstimate, EngineError> {
+        if self.states.values().any(|entry| {
+            entry.is_leased()
+                && entry.resident.model.artifact_id() == artifact
+                && entry.resident.model.registration().family() == family
+                && entry.resident.model.registration().implementation_version() == version
+        }) {
+            return Err(EngineError::Busy {
+                active_request_id: None,
+                message: "requested model owns a live canonical session lease".to_owned(),
+            });
+        }
         let matches = |resident: &&Resident| {
             resident.model.artifact_id() == artifact
                 && resident.model.registration().family() == family
@@ -1746,7 +1955,12 @@ impl NativeState {
         let reusable = self
             .resident
             .iter()
-            .chain(self.states.values().map(|entry| &entry.resident))
+            .chain(
+                self.states
+                    .values()
+                    .filter(|entry| !entry.is_leased())
+                    .map(|entry| &entry.resident),
+            )
             .chain(self.pool.iter())
             .find(matches);
         let same_cache = reusable
@@ -1765,12 +1979,13 @@ impl NativeState {
                     available = add(available, resident_reserved_bytes(resident)?)?;
                 }
             }
-            if !self.states.values().any(StateEntry::is_leased) {
-                for resident in self
-                    .resident
-                    .iter()
-                    .chain(self.states.values().map(|entry| &entry.resident))
-                {
+            {
+                for resident in self.resident.iter().chain(
+                    self.states
+                        .values()
+                        .filter(|entry| !entry.is_leased())
+                        .map(|entry| &entry.resident),
+                ) {
                     let is_target = reusable_instance
                         .is_some_and(|id| resident.model.instance_id().same_instance(id));
                     if !is_target && !resident.pins.is_pinned() {
@@ -1862,10 +2077,11 @@ impl NativeState {
         self.resident
             .as_ref()
             .is_some_and(|resident| resident.pins.is_pinned())
-            || self
-                .states
-                .values()
-                .any(|entry| entry.resident.pins.is_pinned())
+            || (!self.pool_enabled
+                && self
+                    .states
+                    .values()
+                    .any(|entry| entry.resident.pins.is_pinned()))
     }
 
     fn expire_models_at(&mut self, now: Instant) {
@@ -1874,21 +2090,19 @@ impl NativeState {
         }
         self.pool
             .retain(|resident| resident.pins.is_pinned() || !model_ttl_expired(resident, now));
-        if self.active.is_none()
-            && self.pending.is_none()
-            && !self.states.values().any(StateEntry::is_leased)
-            && !self.selected_model_pinned()
+        // Published allocations are disjoint from selected execution.
+        // Each publication has its own lease and model-pin protection.
+        self.states.retain(|_, entry| {
+            entry.is_leased()
+                || entry.resident.pins.is_pinned()
+                || !model_ttl_expired(&entry.resident, now)
+        });
+        if self.request_owner().is_none()
+            && self.resident.as_ref().is_some_and(|resident| {
+                !resident.pins.is_pinned() && model_ttl_expired(resident, now)
+            })
         {
-            let expired = self
-                .resident
-                .as_ref()
-                .or_else(|| self.states.values().next().map(|entry| &entry.resident))
-                .is_some_and(|resident| model_ttl_expired(resident, now));
-            if expired {
-                if self.unpublish_idle_state().is_ok() {
-                    drop(self.resident.take());
-                }
-            }
+            drop(self.resident.take());
         }
         self.publish();
     }
@@ -1898,15 +2112,16 @@ impl NativeState {
         enforcer: &crate::memory_enforcer::MemoryEnforcer,
         mut tick: crate::memory_enforcer::EnforcementTick,
     ) -> Result<MemoryEnforcementReport, EngineError> {
-        // Refresh counters and classification without advancing the poll
-        // grace a second time. Normal pressure revokes queued eviction.
-        tick.status =
+        let refresh = || {
             enforcer
                 .refresh_pressure()
                 .map_err(|error| EngineError::ExecutionFailed {
                     stage: "refresh worker memory pressure",
                     message: error.to_string(),
-                })?;
+                })
+        };
+        // The queued poll decision is not authority to destroy a model.
+        tick.status = refresh()?;
         if tick.status.pressure == crate::memory_guard::PressureLevel::Ok {
             tick.request_model_eviction = false;
             tick.request_cache_reclaim = false;
@@ -1927,6 +2142,17 @@ impl NativeState {
         } else {
             None
         };
+        // Pool draining can itself recover pressure. Observe again before
+        // claiming model destruction, without consuming another grace poll.
+        tick.status = refresh()?;
+        if tick.status.pressure == crate::memory_guard::PressureLevel::Ok {
+            tick.request_model_eviction = false;
+            tick.request_cache_reclaim = false;
+            tick.deferred_for_pool_drain = false;
+        }
+        // Recovery followed by new pressure starts a new grace window.
+        // An older post-grace command must not bypass that newer decision.
+        tick.request_model_eviction &= enforcer.model_eviction_requested();
         let model = if tick.request_model_eviction {
             match self.evict_one_enforcer_model()? {
                 Some(instance) => IdleModelReclaim::Evicted(instance),
@@ -1944,65 +2170,12 @@ impl NativeState {
     }
 
     fn evict_one_enforcer_model(&mut self) -> Result<Option<ModelInstanceId>, EngineError> {
-        // Pool entries cannot own active execution, pending startup, or
-        // session leases. Pins still require revalidation here.
-        let pooled = self
-            .pool
-            .iter()
-            .enumerate()
-            .filter(|(_, resident)| !resident.pins.is_pinned())
-            .min_by_key(|(index, resident)| (resident.idle_since, *index))
-            .map(|(index, resident)| (index, resident.idle_since));
-        let selected = if self.request_owner().is_none()
-            && !self.states.values().any(StateEntry::is_leased)
-            && !self.selected_model_pinned()
-        {
-            self.resident
-                .as_ref()
-                .or_else(|| self.states.values().next().map(|entry| &entry.resident))
-                .map(|resident| resident.idle_since)
-        } else {
-            None
-        };
-        // Stable ties prefer the earlier inserted pool entry.
-        if let Some((index, time)) = pooled {
-            if selected.is_none_or(|selected_time| time <= selected_time) {
-                let resident = self.pool.remove(index);
-                let instance = resident.model.instance_id().clone();
-                drop(resident);
-                return Ok(Some(instance));
-            }
-        }
-        if selected.is_some() {
-            self.require_idle()?;
-            self.require_unleased()?;
-            self.unpublish_idle_state()?;
-            if let Some(resident) = self.resident.take() {
-                let instance = resident.model.instance_id().clone();
-                drop(resident);
-                return Ok(Some(instance));
-            }
-        }
-        Ok(None)
+        self.evict_one_idle_model(true)
     }
 
     fn evict_one_pooled_model(&mut self) -> bool {
-        // Vec order supplies a stable insertion-order tie break.
-        let victim = self
-            .pool
-            .iter()
-            .enumerate()
-            .filter(|(_, resident)| !resident.pins.is_pinned())
-            .min_by_key(|(index, resident)| (resident.idle_since, *index))
-            .map(|(index, _)| index);
-        if let Some(index) = victim {
-            // The Resident owns native resources and their real guards.
-            // No estimated bytes are subtracted from the ledger.
-            drop(self.pool.remove(index));
-            true
-        } else {
-            false
-        }
+        // Startup may reclaim other idle owners, never its selected target.
+        self.evict_one_idle_model(false).ok().flatten().is_some()
     }
 
     fn switch_model(
@@ -2059,6 +2232,23 @@ impl NativeState {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match command {
+                Command::LoadedCapabilities { artifact, reply } => {
+                    let result = self
+                        .resident
+                        .iter()
+                        .chain(self.pool.iter())
+                        .chain(self.states.values().map(|entry| &entry.resident))
+                        .find(|resident| resident.model.artifact_id() == &artifact)
+                        .map(|resident| resident.capabilities.clone())
+                        .ok_or_else(|| EngineError::NotFound {
+                            resource: "verified loaded artifact",
+                            id: artifact.into_string(),
+                        });
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
                 Command::EnforceMemory {
                     enforcer,
                     tick,
@@ -2317,10 +2507,7 @@ impl NativeState {
         setup: &Setup,
         artifact: &ArtifactRegistration,
     ) -> Result<(), EngineError> {
-        let resident = self
-            .resident
-            .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let resident = self.resident.as_ref();
 
         let Some(resident) = resident else {
             return Ok(());
@@ -2361,10 +2548,7 @@ impl NativeState {
 
     fn pressure_residency(&self, setup: &Setup) -> Result<RuntimeResidency, EngineError> {
         let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
-        let resident = self
-            .resident
-            .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let resident = self.resident.as_ref();
         let Some(resident) = resident else {
             return Ok(RuntimeResidency {
                 reusable_model: false,
@@ -2398,10 +2582,7 @@ impl NativeState {
         setup: &Setup,
     ) -> Result<crate::pressure::RequestDemand, EngineError> {
         let residency = self.pressure_residency(setup)?;
-        let resident = self
-            .resident
-            .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
+        let resident = self.resident.as_ref();
         let same_cache = residency.reusable_model
             && resident
                 .and_then(|resident| resident.cache.as_ref())
@@ -2469,14 +2650,19 @@ impl NativeState {
         } else {
             None
         };
-        let resident = self
-            .resident
-            .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident));
-        let leased = self.states.values().any(StateEntry::is_leased);
-        let has_state = !self.states.is_empty()
-            || resident
-                .is_some_and(|resident| resident.cache.is_some() || resident.candidate.is_some());
+        let selected = self.resident.as_ref();
+        let selected_state = selected.is_some_and(|r| r.cache.is_some() || r.candidate.is_some());
+        let unleased_states = self
+            .states
+            .values()
+            .filter(|entry| !entry.is_leased())
+            .count();
+        let eligible = self.pool.iter().any(|r| !r.pins.is_pinned())
+            || (self.request_owner().is_none() && selected.is_some_and(|r| !r.pins.is_pinned()))
+            || self
+                .states
+                .values()
+                .any(|entry| !entry.is_leased() && !entry.resident.pins.is_pinned());
         let execution = if self.active.is_some() {
             ExecutionState::Active
         } else if self.pending.is_some() {
@@ -2490,28 +2676,66 @@ impl NativeState {
             demand: self.pressure_demand(setup)?,
             execution,
             reclaimable: ReclaimableResources {
-                idle_session_states: usize::from(has_state),
-                leased_session_states: usize::from(leased),
-                can_release_state_without_model: resident.is_some() && !leased,
-                idle_model_loaded: resident.is_some() || !self.pool.is_empty(),
-                idle_model_has_live_leases: if self.pool.iter().any(|r| !r.pins.is_pinned()) {
-                    false
-                } else {
-                    leased || self.selected_model_pinned()
-                },
+                idle_session_states: usize::from(selected_state) + unleased_states,
+                leased_session_states: self
+                    .states
+                    .values()
+                    .filter(|entry| entry.is_leased())
+                    .count(),
+                can_release_state_without_model: selected_state || unleased_states != 0,
+                idle_model_loaded: selected.is_some()
+                    || !self.pool.is_empty()
+                    || !self.states.is_empty(),
+                idle_model_has_live_leases: !eligible,
             },
         })
     }
 
     fn pressure_release_idle_state(&mut self) -> Result<(), EngineError> {
         self.require_idle()?;
-        self.require_unleased()?;
-        // Remove canonical publication before mutation but preserve the
-        // Resident containing the model and its weight reservation.
-        self.unpublish_idle_state()?;
-        if let Some(resident) = &mut self.resident {
-            drop(resident.candidate.take());
-            drop(resident.cache.take());
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|r| r.cache.is_some() || r.candidate.is_some())
+        {
+            if let Some(resident) = &mut self.resident {
+                drop(resident.candidate.take());
+                drop(resident.cache.take());
+            }
+        } else {
+            let id = self
+                .states
+                .iter()
+                .filter(|(_, entry)| !entry.is_leased())
+                .min_by_key(|(id, entry)| (entry.resident.idle_since, *id.as_bytes()))
+                .map(|(id, _)| *id);
+            if let Some(id) = id {
+                if self.resident.is_some() {
+                    self.pool
+                        .try_reserve(1)
+                        .map_err(|_| EngineError::AllocationFailed {
+                            operation: "preserve model after idle-state reclamation",
+                            requested_bytes: None,
+                        })?;
+                }
+                let entry = self
+                    .states
+                    .remove(&id)
+                    .ok_or_else(|| internal("idle-state reclamation owner disappeared"))?;
+                let mut resident = entry.resident;
+                drop(resident.candidate.take());
+                drop(resident.cache.take());
+                if self.resident.is_none() {
+                    self.resident = Some(resident);
+                } else {
+                    self.pool.push(resident);
+                }
+            } else if self.states.values().any(StateEntry::is_leased) {
+                return Err(EngineError::Busy {
+                    active_request_id: None,
+                    message: "all canonical state allocations are leased".to_owned(),
+                });
+            }
         }
         self.publish();
         Ok(())
@@ -2519,20 +2743,14 @@ impl NativeState {
 
     fn pressure_unload_idle_model(&mut self) -> Result<(), EngineError> {
         self.require_idle()?;
-        if self.evict_one_pooled_model() {
-            self.publish();
-            return Ok(());
-        }
-        self.require_unleased()?;
-        if self.selected_model_pinned() {
+        if self.evict_one_idle_model(true)?.is_none()
+            && (self.resident.is_some() || !self.pool.is_empty() || !self.states.is_empty())
+        {
             return Err(EngineError::Busy {
                 active_request_id: None,
-                message: "idle model has an explicit residency pin".to_owned(),
+                message: "all idle model owners are protected".to_owned(),
             });
         }
-        self.unpublish_idle_state()?;
-        // Resident drop order destroys native resources before their guards.
-        drop(self.resident.take());
         self.publish();
         Ok(())
     }
@@ -2657,27 +2875,30 @@ impl NativeState {
     }
 
     fn unpublish_idle_state(&mut self) -> Result<(), EngineError> {
-        self.require_unleased()?;
-        if self.states.is_empty() {
+        if !self.pool_enabled {
+            self.require_unleased()?;
+            if self.states.is_empty() {
+                return Ok(());
+            }
+            if self.resident.is_some() || self.states.len() != 1 {
+                return Err(internal("multiple resident ownership paths"));
+            }
+        } else if self.resident.is_some() {
             return Ok(());
         }
-        if self.resident.is_some() || self.states.len() != 1 {
-            return Err(internal("multiple resident ownership paths"));
+        let id = self
+            .states
+            .iter()
+            .filter(|(_, entry)| !entry.is_leased())
+            .min_by_key(|(id, entry)| (entry.resident.idle_since, *id.as_bytes()))
+            .map(|(id, _)| *id);
+        if let Some(id) = id {
+            let entry = self
+                .states
+                .remove(&id)
+                .ok_or_else(|| internal("canonical state disappeared"))?;
+            self.resident = Some(entry.resident);
         }
-
-        let state_id = *self
-            .states
-            .keys()
-            .next()
-            .ok_or_else(|| internal("retained state disappeared"))?;
-        let entry = self
-            .states
-            .remove(&state_id)
-            .ok_or_else(|| internal("retained state disappeared"))?;
-
-        // The old canonical identity is unpublished before this allocation
-        // can become mutable for a new request.
-        self.resident = Some(entry.resident);
         Ok(())
     }
 
@@ -2688,15 +2909,14 @@ impl NativeState {
         abandoned: &AtomicBool,
     ) -> Result<Arc<MemoryReservation>, EngineError> {
         self.require_idle()?;
-        self.require_unleased()?;
         check_startup(control, abandoned)?;
 
         let artifact = setup.registry.resolve_profile(&setup.profile)?.artifact();
         setup.backend.verify_artifact(artifact, control)?;
         check_startup(control, abandoned)?;
 
+        self.select_for_startup(artifact, setup.backend.as_ref())?;
         self.reclaim_mlx_cache_before_idle_replacement(setup, artifact)?;
-        self.unpublish_idle_state()?;
 
         let admission = self.admission.clone();
         let output_bytes = setup.plan.output_bytes;
@@ -2755,7 +2975,6 @@ impl NativeState {
                 && self
                     .resident
                     .as_ref()
-                    .or_else(|| self.states.values().next().map(|entry| &entry.resident))
                     .and_then(|resident| resident.cache.as_ref())
                     .is_some_and(|cache| cache_matches(cache, &setup.plan));
             let components = incremental_startup_components(
@@ -2797,9 +3016,6 @@ impl NativeState {
         if self.pending.as_ref().map(|pending| &pending.request_id) != Some(control.request_id()) {
             return Err(internal("prefill has no matching admitted startup"));
         }
-        if !self.states.is_empty() {
-            return Err(internal("prefill cannot mutate a published entry"));
-        }
         if context.profile_id() != &setup.profile || context.token_ids().is_empty() {
             return Err(internal("prefill context does not match admitted setup"));
         }
@@ -2810,6 +3026,13 @@ impl NativeState {
             return Err(internal("prefill artifact does not match admitted setup"));
         }
 
+        if self
+            .states
+            .values()
+            .any(|entry| model_matches(&entry.resident, artifact, setup.backend.as_ref()))
+        {
+            return Err(internal("startup target still has published ownership"));
+        }
         setup.backend.verify_artifact(artifact, &control)?;
         control.check_cancelled()?;
 
@@ -3437,8 +3660,11 @@ impl NativeState {
         validate_candidate(resident, candidate)?;
         let state_id = canonical_identity(resident, token_prefix_bytes)?;
 
-        if !self.states.is_empty() {
-            return Err(internal("multiple resident ownership paths"));
+        if self.states.contains_key(&state_id) {
+            return Err(EngineError::invalid_request(
+                "token_prefix_bytes",
+                "canonical identity already owns another allocation",
+            ));
         }
 
         self.states
@@ -3527,30 +3753,34 @@ impl NativeState {
         let Some(entry) = self.states.get(state_id) else {
             return Ok(ReleaseOutcome::AlreadyAbsent);
         };
-
         if entry.is_leased() {
             return Err(EngineError::Busy {
                 active_request_id: None,
                 message: "cannot release retained state while a lease is alive".to_owned(),
             });
         }
-
-        self.require_idle()?;
-        if entry.resident.pins.is_pinned() && self.resident.is_some() {
-            return Err(internal(
-                "pinned state release conflicts with selected resident",
-            ));
+        let park = self.resident.is_some() || self.request_owner().is_some();
+        if entry.resident.pins.is_pinned() && park {
+            self.pool
+                .try_reserve(1)
+                .map_err(|_| EngineError::AllocationFailed {
+                    operation: "preserve pinned model after canonical release",
+                    requested_bytes: None,
+                })?;
         }
         let entry = self
             .states
             .remove(state_id)
             .ok_or_else(|| internal("retained state disappeared during release"))?;
-
         if entry.resident.pins.is_pinned() {
             let mut resident = entry.resident;
             drop(resident.candidate.take());
             drop(resident.cache.take());
-            self.resident = Some(resident);
+            if park {
+                self.pool.push(resident);
+            } else {
+                self.resident = Some(resident);
+            }
         } else {
             drop(entry);
         }
@@ -3571,11 +3801,21 @@ impl NativeState {
         summary.model_pin = self
             .resident
             .as_ref()
-            .or_else(|| self.states.values().next().map(|entry| &entry.resident))
+            .or_else(|| {
+                if self.pool_enabled {
+                    None
+                } else {
+                    self.states.values().next().map(|entry| &entry.resident)
+                }
+            })
             .map(|resident| resident.pins.protection_observer())
             .unwrap_or_default();
 
-        let entry = self.states.values().next();
+        let entry = if self.pool_enabled {
+            None
+        } else {
+            self.states.values().next()
+        };
         if let Some(entry) = entry {
             summary.pin = entry.pin.clone();
         }
