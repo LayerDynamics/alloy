@@ -238,3 +238,13 @@ Required checks for this feature:
    user, obtaining real CPU/GPU/ANE energy counters, frequency-state readings
    and thermal data. Missing or fabricated values cannot pass that acceptance
    check. Linux runs the portable parser, ownership and integration checks.
+7. ANE responsiveness requires more than a readable zero. A bounded Vision
+   fixture explicitly selects the Neural Engine for its main compute stage,
+   completes a warmup, and repeatedly processes changing synthetic images.
+   Production telemetry must report positive sourced ANE power during a full
+   sampling window containing repeated successful workload completions. The
+   fixture uses the model shipped with macOS and requires no download or
+   elevation. Baseline and recovery readings are recorded without assuming
+   other applications leave the ANE idle. This verifies counter responsiveness
+   during ANE-selected execution; it does not attribute every operation or
+   all system-wide power to the fixture, or introduce ANE inference in Alloy.
