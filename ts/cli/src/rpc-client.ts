@@ -20,6 +20,19 @@ type Pending = {
   onEvent?: (event: SessionEvent) => void;
 };
 
+/** Preserve server codes and additive data while remaining an ordinary Error. */
+export class RpcError extends Error {
+  readonly code: number;
+  readonly data: JsonRpcError["data"];
+
+  constructor(error: JsonRpcError) {
+    super(formatRpcError(error));
+    this.name = "RpcError";
+    this.code = error.code;
+    this.data = error.data;
+  }
+}
+
 export class RpcClient {
   #socket: net.Socket;
   #buf = "";
@@ -204,7 +217,7 @@ export class RpcClient {
     }
     this.#pending.delete(id);
     if (msg.error) {
-      pending.reject(new Error(formatRpcError(msg.error as JsonRpcError)));
+      pending.reject(new RpcError(msg.error as JsonRpcError));
       return;
     }
     pending.resolve(msg.result);

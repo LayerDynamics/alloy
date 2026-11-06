@@ -1,8 +1,9 @@
 //! Qwen3 unified-memory MLX adapter for the family-independent runtime.
 //!
-//! Verified safetensors are decoded to f32 and consumed into one set of
-//! MLX weight arrays. Full f32 MLX K/V is shared by supported CPU and Metal
-//! operations; it is not the legacy host-reference f64 cache.
+//! Verified safetensors retain dense f32 or packed Affine4 matrices in one
+//! set of MLX weight arrays, including vocabulary weights. Full f32 MLX
+//! K/V is shared by supported CPU and Metal operations; it is not the
+//! legacy host-reference f64 cache.
 //!
 //! new() selects MLX CPU for portable, deterministic setup. Use
 //! new_with_execution(..., Qwen3Execution::MlxMetal) to request Metal.
@@ -19,13 +20,13 @@
 //! provisioned headroom; RAM discovery and allocator-pressure integration
 //! are not implemented by this adapter.
 //!
-//! No resident quantized-weight, rotating-cache, sampling, thinking-mode,
-//! or cross-request prefix-reuse capability is advertised here.
+//! Affine4 residency and greedy decoding are advertised. Rotating caches,
+//! stochastic sampling, thinking mode, and public prefix reuse are not.
 
 use crate::{
     admission::AdmissionController,
     api::{EngineCore, EngineFuture},
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     family::{
         AutoregressiveModel, BufferMemoryUsage, CacheAllocationRequest, ExecutionControl,
         FamilyCache, LoadedModel, ModelFamily, ModelInstanceId, ModelLoadLimits, ModelLoadRequest,
@@ -602,12 +603,7 @@ impl ModelFamily for Qwen3Backend {
         // Headroom covers group-size variance (planning assumes 64; some
         // fixtures/checkpoints use smaller groups with larger scale tables).
         let weight_charge_limit = sum(&[decoded_bound, self.limits.loader_headroom_bytes])?;
-        let required_peak = sum(&[
-            data.source_bytes,
-            decoded_bound,
-            data.resident_bound,
-            self.limits.loader_headroom_bytes,
-        ])?;
+        let required_peak = loading_peak_bound(data, &self.limits)?;
         if request.limits().max_source_bytes() < data.source_bytes
             || request.limits().max_resident_bytes() < data.resident_bound
             || request.limits().max_load_peak_bytes() < required_peak
@@ -616,6 +612,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "MLX Qwen loading overlap",
                 required_bytes: required_peak,
                 available_bytes: request.limits().max_load_peak_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
 
@@ -672,7 +669,10 @@ impl ModelFamily for Qwen3Backend {
             &data.config,
             &data.specification.directory,
             LoadOptions {
-                max_file_bytes: as_usize(request.limits().max_source_bytes())?,
+                // Enforce the source limit used by the workspace plan even
+                // when a caller offers a larger grant. Mutated files must
+                // not expand metadata beyond that bound before hash failure.
+                max_file_bytes: as_usize(data.source_bytes)?,
                 max_weight_bytes: as_usize(weight_charge_limit)?,
             },
             &verification,
@@ -685,6 +685,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "decoded MLX Qwen weight buffers",
                 required_bytes: decoded.allocated_bytes(),
                 available_bytes: weight_charge_limit,
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let model = MlxQwen3Model::from_weights(
@@ -704,6 +705,7 @@ impl ModelFamily for Qwen3Backend {
                 operation: "measured MLX Qwen weight buffers",
                 required_bytes: measured,
                 available_bytes: request.limits().max_resident_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let mut capabilities = self.registration.capabilities().clone();
@@ -726,6 +728,12 @@ impl ModelFamily for Qwen3Backend {
 }
 
 impl RuntimeBackend for Qwen3Backend {
+    fn cache_manifest_digest(
+        &self,
+        artifact: &ArtifactRegistration,
+    ) -> Result<Option<[u8; 32]>, EngineError> {
+        Ok(Some(self.data(artifact)?.manifest_sha256))
+    }
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -798,12 +806,7 @@ impl RuntimeBackend for Qwen3Backend {
                 .checked_add(resolved.profile().max_output_tokens())
                 .and_then(|v| v.checked_add(resolved.profile().safety_margin_tokens()))
                 .ok_or_else(|| internal("Qwen3 context arithmetic overflow"))?;
-            let load_peak = sum(&[
-                data.source_bytes,
-                data.decoded_bound,
-                data.resident_bound,
-                self.limits.loader_headroom_bytes,
-            ])?;
+            let load_peak = loading_peak_bound(data, &self.limits)?;
             Ok(RuntimePlan {
                 load_limits: ModelLoadLimits::new(
                     data.source_bytes,
@@ -1016,6 +1019,26 @@ struct Qwen3NativeCache {
 }
 
 impl FamilyCache for Qwen3NativeCache {
+    fn kv_block_spec(&self) -> Option<KvCacheSpec> {
+        Some(self.inner.spec())
+    }
+    fn export_kv_block(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
+        self.inner
+            .export_block(&self.mlx_owner, start, end, self.stream.as_ref())
+            .map_err(|error| cache_error(error, "export MLX Qwen KV block"))
+    }
+    fn restore_kv_block(
+        &mut self,
+        block: &inference_infra::kv_cache::KvBlock,
+    ) -> Result<usize, EngineError> {
+        self.inner
+            .restore_block(&self.mlx_owner, block, self.stream.as_ref())
+            .map_err(|error| cache_error(error, "restore MLX Qwen KV block"))
+    }
     fn owner(&self) -> &ModelInstanceId {
         &self.owner
     }
@@ -1140,6 +1163,7 @@ impl AutoregressiveModel for Qwen3Loaded {
                 operation: "MLX Qwen KV update overlap",
                 required_bytes: required,
                 available_bytes: request.max_cache_bytes(),
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
         let inner = self
@@ -1334,9 +1358,9 @@ fn registration(
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
     FamilyRegistration::new(
-        // Numerical execution and KV layout differ from host-reference
-        // v2: canonical state identity must use the new adapter version.
-        FamilyVersion::new(qwen3::register::IMPL_VERSION, 3, 0),
+        // Packed vocabulary lookup and quantized output projection change
+        // numerical execution. Old native/disk state must miss this version.
+        FamilyVersion::new(qwen3::register::IMPL_VERSION, 4, 0),
         qwen3::register::ARCHITECTURES
             .iter()
             .map(|s| (*s).to_owned())
@@ -1401,6 +1425,7 @@ fn read_metadata(spec: &Qwen3Artifact, name: &str, limit: usize) -> Result<Vec<u
             operation: "read Qwen3 metadata",
             required_bytes: pin.bytes,
             available_bytes: as_u64(limit)?,
+            reason: MemoryLimitReason::BufferLimit,
         });
     }
     let path = component_path(spec, name)?;
@@ -1680,30 +1705,55 @@ fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
     sum(&[norm_bytes(config)?, matrix_bytes, workspace])
 }
 
-/// MLX resident estimate after upload: projections stay Affine4; embed/lm_head
-/// are dequantized once to dense float32 (oMLX-method quantized-resident).
+/// MLX resident estimate after upload: every Affine4 matrix stays packed.
+/// Embedding lookup dequantizes only the requested rows, and the output
+/// projection consumes packed weights through quantized matmul.
 fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let h = as_u64(config.hidden_size)?;
-    let v = as_u64(config.vocab_size)?;
-    let proj_elements = product(
-        as_u64(config.num_layers)?,
-        layer_projection_elements(config)?,
-    )?;
-    let proj_bytes = affine4_matrix_bytes(proj_elements, AFFINE4_GROUP_SIZE)?;
-    let embed_bytes = product(product(v, h)?, 4)?;
-    let lm_head_bytes = if config.tie_embeddings {
-        0
-    } else {
-        embed_bytes
-    };
-    let workspace = product(proj_bytes / 32 + 1, 1)?;
-    sum(&[
-        norm_bytes(config)?,
-        proj_bytes,
-        embed_bytes,
-        lm_head_bytes,
-        workspace,
-    ])
+    host_affine4_bound(config)
+}
+
+/// Largest possible individual source vector copied during native upload.
+/// Use dense float32 widths even for a quantized checkpoint: mixed dense
+/// matrices can be accepted within the decoded-weight allowance. Each
+/// vector is dropped as soon as `mlx_array_new_data` has copied it.
+fn largest_upload_buffer_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    let hidden = as_u64(config.hidden_size)?;
+    let query = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
+    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
+    let elements = [
+        product(as_u64(config.vocab_size)?, hidden)?,
+        product(hidden, query)?,
+        product(hidden, kv)?,
+        product(hidden, as_u64(config.intermediate_size)?)?,
+        hidden,
+        as_u64(config.head_dim)?,
+    ]
+    .into_iter()
+    .max()
+    .ok_or_else(|| internal("missing Qwen3 upload dimensions"))?;
+    product(elements, 4)
+}
+
+/// Source decoding and native upload are separate ownership phases.
+///
+/// The streaming loader retains bounded metadata/scratch plus decoded
+/// vectors, verifies every consumed byte, and drops its source state before
+/// returning. Upload then replaces one host vector at a time with its native
+/// array; only that vector's copy can overlap both representations. Native
+/// vocabulary matrices remain packed rather than creating dense graphs.
+fn loading_peak_bound(
+    data: &ArtifactData,
+    limits: &Qwen3BackendLimits,
+) -> Result<u64, EngineError> {
+    let host_limit = sum(&[data.decoded_bound, limits.loader_headroom_bytes])?;
+    let workspace = qwen3::loader::streaming_workspace_bound(as_usize(data.source_bytes)?)
+        .map_err(|error| model_error(error, "plan streaming Qwen loader"))?;
+    let decode_peak = sum(&[host_limit, as_u64(workspace)?])?;
+    let upload_peak = sum(&[
+        host_limit.max(data.resident_bound),
+        largest_upload_buffer_bound(&data.config)?,
+    ])?;
+    sum(&[decode_peak.max(upload_peak), limits.loader_headroom_bytes])
 }
 
 fn affine4_matrix_bytes(elements: u64, group_size: u64) -> Result<u64, EngineError> {
@@ -1968,6 +2018,7 @@ fn cache_error(error: KvCacheError, stage: &'static str) -> EngineError {
             operation: stage,
             required_bytes,
             available_bytes: limit_bytes,
+            reason: MemoryLimitReason::BufferLimit,
         },
         KvCacheError::ForeignModel => {
             EngineError::invalid_request("cache", "native cache belongs to another model")
@@ -1995,6 +2046,7 @@ fn mlx_model_error(
             operation,
             required_bytes,
             available_bytes: limit_bytes,
+            reason: MemoryLimitReason::BufferLimit,
         },
         MlxQwenError::AllocationFailed(_) => allocation(stage, None),
         MlxQwenError::Operation(OperationError::AllocationFailed(_)) => allocation(stage, None),
@@ -2015,6 +2067,7 @@ fn model_error(error: ModelError, stage: &'static str) -> EngineError {
                     operation: stage,
                     required_bytes,
                     available_bytes,
+                    reason: MemoryLimitReason::BufferLimit,
                 },
                 _ => internal("model memory sizes exceed u64"),
             }
@@ -2615,10 +2668,12 @@ mod shared_rendering_wiring_tests {
                 operation,
                 required_bytes,
                 available_bytes,
+                reason,
             } => {
                 assert_eq!(operation, "render chat template output");
                 assert!(required_bytes > 1);
                 assert_eq!(available_bytes, 1);
+                assert_eq!(reason, MemoryLimitReason::BufferLimit);
             }
             other => panic!("expected shared writer error, got {other:?}"),
         }
@@ -2994,8 +3049,8 @@ mod shared_rendering_wiring_tests {
             let resident = resident_bound(&config).expect("mlx resident");
             // Quantized host estimate must beat a full f32 duplicate.
             assert!(host < dense_matrices, "host={host} dense={dense_matrices}");
-            // MLX dequants embed/lm_head to f32, so resident ≥ host Affine4.
-            assert!(resident >= host, "resident={resident} host={host}");
+            // Every matrix, including tied/untied vocabulary weights, stays packed.
+            assert_eq!(resident, host);
             // Still well under dense when projections dominate.
             assert!(
                 resident < dense_matrices,

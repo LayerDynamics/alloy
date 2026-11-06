@@ -94,6 +94,18 @@ impl RpcError {
             data: Some(json!({ "kind": kind.as_str() })),
         }
     }
+
+    /// Preserve the engine cause inside the existing API v1 error envelope.
+    pub fn engine(error: &engine::error::EngineError) -> Self {
+        Self {
+            code: -32000,
+            message: error.to_string(),
+            data: Some(json!({
+                "kind": ErrorKind::EngineFailed.as_str(),
+                "engine_error": error.diagnostic(),
+            })),
+        }
+    }
 }
 
 /// Incoming JSON-RPC request line.
@@ -181,9 +193,8 @@ pub fn parse_request_line(line: &str) -> Result<RpcRequest, RpcError> {
     if trimmed.is_empty() {
         return Err(RpcError::invalid_request("empty line"));
     }
-    serde_json::from_str(trimmed).map_err(|error| {
-        RpcError::invalid_request(format!("malformed JSON-RPC request: {error}"))
-    })
+    serde_json::from_str(trimmed)
+        .map_err(|error| RpcError::invalid_request(format!("malformed JSON-RPC request: {error}")))
 }
 
 /// Validate JSON-RPC version and Phase-1 `api_version`.
@@ -206,9 +217,8 @@ pub fn validate_request(request: &RpcRequest) -> Result<(), RpcError> {
 
 /// Serialize a value as one NDJSON line (with trailing newline).
 pub fn encode_line(value: &impl Serialize) -> Result<String, RpcError> {
-    let mut line = serde_json::to_string(value).map_err(|error| {
-        RpcError::internal(format!("serialize response: {error}"))
-    })?;
+    let mut line = serde_json::to_string(value)
+        .map_err(|error| RpcError::internal(format!("serialize response: {error}")))?;
     line.push('\n');
     Ok(line)
 }
@@ -249,8 +259,12 @@ pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
                 "output_tokens": usage.output_tokens,
             }
         }),
-        GenerationEvent::RequestFailed { error, partial_usage } => json!({
+        GenerationEvent::RequestFailed {
+            error,
+            partial_usage,
+        } => json!({
             "message": error.to_string(),
+            "engine_error": error.diagnostic(),
             "partial_usage": {
                 "input_tokens": partial_usage.input_tokens,
                 "output_tokens": partial_usage.output_tokens,

@@ -14,6 +14,7 @@ use engine::platform;
 use engine::registry::ModelProfile;
 use engine::runtime::{FamilyRuntime, RetentionPolicy};
 use engine::scheduler::Scheduler;
+use engine::tiered_kv::TieredKvConfig;
 use engine::types::{ArtifactId, GenerationOptions, ModelProfileId};
 use mlx_ffi::memory as mlx_memory;
 use qwen3::template::CHAT_TEMPLATE;
@@ -60,6 +61,8 @@ pub struct BootRequest {
     pub admission_budget_override_bytes: Option<u64>,
     /// Prefer Metal when the platform supports it.
     pub prefer_metal: bool,
+    /// Bounded hot KV retention and optional persistent SSD snapshots.
+    pub tiered_kv: TieredKvConfig,
 }
 
 impl BootRequest {
@@ -162,6 +165,10 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
             Some(memory_enforcer.clone()),
         )
         .map_err(|error| RpcError::internal(format!("construct engine: {error}")))?;
+    engine
+        .runtime()
+        .configure_tiered_kv(request.tiered_kv.clone())
+        .map_err(|error| RpcError::internal(format!("configure tiered KV: {error}")))?;
 
     Ok(BootedEngine {
         engine,

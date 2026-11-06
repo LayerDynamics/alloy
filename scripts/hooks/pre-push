@@ -135,7 +135,7 @@ cargo test --locked -p mlx-ffi \
   --no-fail-fast -- --test-threads=1
 
 echo "==> Inference infrastructure tests"
-cargo test --locked -p inference-infra --test infra_cpu_ops
+cargo test --locked -p inference-infra --all-targets
 
 echo "==> Qwen3 tests"
 cargo test --locked -p qwen3 --all-targets

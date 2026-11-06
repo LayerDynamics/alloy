@@ -79,7 +79,10 @@ use tokenizers::{Tokenizer, pre_tokenizers::byte_level::ByteLevel};
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const IM_START_ID: u32 = 256;
 const IM_END_ID: u32 = 257;
-const BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+// The real loader's bounded metadata workspace brings fixture startup to
+// roughly 20 MiB. Pressure tests still replace this baseline with exact
+// production-plan budgets when exercising rejection and reclamation.
+const BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
 const TEMPLATE_A: &str = "{{ messages[0].content }}";
 const TEMPLATE_B: &str = "{% set body = messages[0].content %}{{ body }}";
@@ -723,11 +726,19 @@ impl TestEnvironment {
             eos_is_zero,
             discard_policy(),
             false,
+            engine::backends::Qwen3Execution::MlxCpu,
         )
     }
 
     fn prefix(retention: RetentionPolicy) -> Self {
-        Self::build(4, 8, false, retention, true)
+        Self::prefix_with_execution(retention, engine::backends::Qwen3Execution::MlxCpu)
+    }
+
+    fn prefix_with_execution(
+        retention: RetentionPolicy,
+        execution: engine::backends::Qwen3Execution,
+    ) -> Self {
+        Self::build(4, 8, false, retention, true, execution)
     }
 
     fn build(
@@ -736,6 +747,7 @@ impl TestEnvironment {
         eos_is_zero: bool,
         retention: RetentionPolicy,
         prefix_fixture: bool,
+        execution: engine::backends::Qwen3Execution,
     ) -> Self {
         assert!(!prefix_fixture || !eos_is_zero);
 
@@ -835,7 +847,7 @@ impl TestEnvironment {
         let manifest_sha256 = specification.manifest_sha256().expect("manifest identity");
         let generation_limits = GenerationLimits::new(event_capacity, 4096, 1024).expect("limits");
 
-        let inner = Qwen3Backend::new(
+        let inner = Qwen3Backend::new_with_execution(
             vec![specification],
             Qwen3BackendLimits {
                 max_files: 16,
@@ -852,6 +864,7 @@ impl TestEnvironment {
                 execution_headroom_bytes: 64 * 1024,
                 generation: generation_limits,
             },
+            execution,
         )
         .expect("Qwen backend");
 

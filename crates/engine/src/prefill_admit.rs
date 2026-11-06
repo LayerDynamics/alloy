@@ -6,7 +6,7 @@
 //! still does not fit, reject with a typed memory error that names the
 //! binding component when known.
 
-use crate::error::EngineError;
+use crate::error::{EngineError, MemoryLimitReason};
 use crate::types::DegradationOption;
 use std::num::NonZeroUsize;
 
@@ -71,8 +71,13 @@ pub fn scale_workspace_bytes(
 pub fn select_prefill_chunk(
     request: PrefillAdmitRequest,
 ) -> Result<PrefillAdmitDecision, EngineError> {
-    let min = NonZeroUsize::new(request.min_chunk_tokens.get().min(request.requested_chunk_tokens.get()))
-        .expect("min of two NonZeroUsize values is nonzero");
+    let min = NonZeroUsize::new(
+        request
+            .min_chunk_tokens
+            .get()
+            .min(request.requested_chunk_tokens.get()),
+    )
+    .expect("min of two NonZeroUsize values is nonzero");
     let requested = request.requested_chunk_tokens;
 
     if request.admit_line_bytes == 0 {
@@ -85,17 +90,15 @@ pub fn select_prefill_chunk(
 
     let mut chunk = requested;
     loop {
-        let workspace = scale_workspace_bytes(
-            request.workspace_bytes_at_requested,
-            requested,
-            chunk,
-        )?;
-        let peak = request
-            .usage_bytes
-            .checked_add(workspace)
-            .ok_or_else(|| EngineError::Internal {
-                message: "prefill peak arithmetic overflow".to_owned(),
-            })?;
+        let workspace =
+            scale_workspace_bytes(request.workspace_bytes_at_requested, requested, chunk)?;
+        let peak =
+            request
+                .usage_bytes
+                .checked_add(workspace)
+                .ok_or_else(|| EngineError::Internal {
+                    message: "prefill peak arithmetic overflow".to_owned(),
+                })?;
         if peak <= request.admit_line_bytes {
             return Ok(PrefillAdmitDecision {
                 chunk_tokens: chunk,
@@ -135,6 +138,9 @@ fn prefill_admit_rejected(
         },
         required_bytes,
         available_bytes,
+        reason: MemoryLimitReason::AllocatorCeiling {
+            ceiling_bytes: available_bytes,
+        },
     }
 }
 
@@ -195,10 +201,15 @@ mod tests {
                 operation,
                 required_bytes,
                 available_bytes,
+                reason,
             } => {
                 assert_eq!(operation, "prefill admit line (binding=metal_cap)");
                 assert_eq!(required_bytes, 14);
                 assert_eq!(available_bytes, 11);
+                assert_eq!(
+                    reason,
+                    MemoryLimitReason::AllocatorCeiling { ceiling_bytes: 11 }
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

@@ -75,6 +75,7 @@ impl MetricsSource for LiveEngineMetrics {
                 "active_request_id": execution.active_request_id.as_ref().map(|id| id.as_str()),
                 "cancellation_requested": execution.cancellation_requested,
             },
+            "kv_cache": runtime.tiered_kv_snapshot(),
             "residency": {
                 "worker_alive": residency.worker_alive,
                 "sample_age_ms": milliseconds(residency.sample_age),

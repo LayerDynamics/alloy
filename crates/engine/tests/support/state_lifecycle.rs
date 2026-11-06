@@ -20,6 +20,7 @@ use super::*;
 use engine::{
     admission::AdmissionSnapshot,
     cache_identity::{CacheIdentityInputs, compute_session_state_id},
+    error::ProtectedResource,
     runtime::RetainedSessionState,
     types::{ReleaseOutcome, SessionStateId},
 };
@@ -732,6 +733,35 @@ fn assert_same_allocation(before: &RetainedSessionState, after: &RetainedSession
     assert_eq!(before.logits_reserved_bytes, after.logits_reserved_bytes);
 }
 
+fn assert_lease_protection(
+    error: &EngineError,
+    state: &RetainedSessionState,
+    expected_handles: usize,
+) {
+    let EngineError::ProtectedResources { resources, .. } = error else {
+        panic!("expected typed canonical lease protection, got {error:?}");
+    };
+    assert_eq!(
+        resources.len(),
+        1,
+        "only the addressed allocation is blocked"
+    );
+    match &resources[0] {
+        ProtectedResource::SessionStateLease {
+            artifact_id,
+            instance_id,
+            state_id,
+            handles,
+        } => {
+            assert_eq!(artifact_id, &state.artifact_id);
+            assert!(instance_id.same_instance(&state.model_instance_id));
+            assert_eq!(state_id, &state.state_id);
+            assert_eq!(handles.get(), expected_handles);
+        }
+        other => panic!("expected a canonical lease, got {other:?}"),
+    }
+}
+
 #[test]
 fn completed_publication_binds_canonical_identity_to_actual_native_state() {
     let environment = StateEnvironment::new();
@@ -881,7 +911,7 @@ fn every_live_lease_must_be_dropped_before_release() {
         block_on(environment.engine.release_session_state(id)),
         "released state while both leases were alive",
     );
-    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_lease_protection(&error, second.state(), 2);
     assert_eq!(environment.snapshot(), accounting);
     assert_eq!(environment.tracker.counts(), counts);
 
@@ -891,7 +921,7 @@ fn every_live_lease_must_be_dropped_before_release() {
         block_on(environment.engine.release_session_state(id)),
         "released state while its second lease was alive",
     );
-    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_lease_protection(&error, second.state(), 1);
     assert_eq!(environment.snapshot(), accounting);
     assert_eq!(environment.tracker.counts(), counts);
 
@@ -923,7 +953,7 @@ fn generation_cannot_mutate_or_reclaim_a_leased_native_allocation() {
         "generation mutated a leased allocation",
     );
 
-    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_lease_protection(&error, &before, 1);
     environment.wait_idle();
 
     assert_same_allocation(&before, &environment.lookup(id));
@@ -1201,7 +1231,7 @@ impl PooledLeaseFixture {
             block_on(self.environment.engine.release_session_state(self.id)),
             "release must reject a live canonical lease",
         );
-        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_lease_protection(&error, &self.original, self.leases.len());
         let error = expect_failure(
             block_on(
                 self.environment
@@ -1210,7 +1240,7 @@ impl PooledLeaseFixture {
             ),
             "ordinary generation must preserve the existing conservative lease barrier",
         );
-        assert_eq!(error.kind(), ErrorKind::Busy);
+        assert_lease_protection(&error, &self.original, self.leases.len());
         self.environment.wait_idle();
         self.assert_protected();
         // This is allocator-only reclamation, not the destructive pressure

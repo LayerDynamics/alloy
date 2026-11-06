@@ -1,20 +1,20 @@
 //! Daemon façade over harness-core supervisor + session store.
 
+use crate::metrics::MetricsSource;
 use crate::rpc::{
     API_VERSION, ErrorKind, RpcError, RpcNotification, RpcRequest, RpcResponse, encode_line,
     validate_request, wire_event_body, wire_event_name,
 };
-use crate::metrics::MetricsSource;
 use engine::api::{ENGINE_API_VERSION, Engine, EngineFuture};
 use engine::error::EngineError;
 use engine::rendering::{
     PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions, render_and_count,
 };
 use engine::types::{
-    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability,
-    ExecutionBackend, FinishReason, Generation, GenerationEvent, GenerationEventStream,
-    GenerationRequest, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, RequestId,
-    SessionStateId, Usage, WeightRepresentation,
+    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability, ExecutionBackend,
+    FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationRequest,
+    MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, RequestId, SessionStateId,
+    Usage, WeightRepresentation,
 };
 use harness_core::{HarnessError, SessionStatus, SessionStore, Supervisor, TelemetryClient};
 use serde_json::{Value, json};
@@ -57,9 +57,8 @@ impl<E: Engine> DaemonService<E> {
         models_resident: u64,
         memory_reserved: u64,
     ) -> Result<Self, RpcError> {
-        let store = SessionStore::open(db_path).map_err(|error| {
-            RpcError::internal(format!("open session store: {error}"))
-        })?;
+        let store = SessionStore::open(db_path)
+            .map_err(|error| RpcError::internal(format!("open session store: {error}")))?;
         let next = seed_session_counter(&store)?;
         Ok(Self {
             supervisor: Supervisor::new(engine, telemetry),
@@ -80,11 +79,7 @@ impl<E: Engine> DaemonService<E> {
     }
 
     /// Handle one JSON-RPC request, writing stream notifications to `writer` as needed.
-    pub fn handle<W: Write>(
-        &self,
-        request: RpcRequest,
-        writer: &mut W,
-    ) -> Result<(), RpcError> {
+    pub fn handle<W: Write>(&self, request: RpcRequest, writer: &mut W) -> Result<(), RpcError> {
         let id = request.id.clone().unwrap_or(Value::Null);
 
         let response = match self.dispatch(&request, writer) {
@@ -101,11 +96,7 @@ impl<E: Engine> DaemonService<E> {
         Ok(())
     }
 
-    fn dispatch<W: Write>(
-        &self,
-        request: &RpcRequest,
-        writer: &mut W,
-    ) -> Result<Value, RpcError> {
+    fn dispatch<W: Write>(&self, request: &RpcRequest, writer: &mut W) -> Result<Value, RpcError> {
         validate_request(request)?;
         match request.method.as_str() {
             "session.create" => self.session_create(&request.params),
@@ -212,9 +203,10 @@ impl<E: Engine> DaemonService<E> {
             &content,
             self.max_output_tokens,
             |request_id| {
-                let mut guard = self.inflight.lock().map_err(|_| {
-                    HarnessError::Store("inflight lock poisoned".into())
-                })?;
+                let mut guard = self
+                    .inflight
+                    .lock()
+                    .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
                 let Some(slot) = guard.get_mut(&session_id) else {
                     return Err(HarnessError::Engine(format!(
                         "inflight slot missing for session {session_id}"
@@ -384,6 +376,7 @@ fn map_harness(error: HarnessError) -> RpcError {
         HarnessError::Engine(message) => {
             RpcError::application(ErrorKind::EngineFailed, message.clone())
         }
+        HarnessError::EngineFailure(error) => RpcError::engine(error),
         HarnessError::Invalid(message) => RpcError::invalid_params(message.clone()),
         other => RpcError::internal(other.to_string()),
     }

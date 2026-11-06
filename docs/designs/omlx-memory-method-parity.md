@@ -92,7 +92,7 @@ abort_limit = min(static_ceiling, metal_cap_effective)   # NOT the jittery dynam
 
 1. **ok** (`usage < soft`): resume admissions only after a fresh acceptable observation. A cancellation request or cleanup notification alone cannot resume admission.
 2. Pause admissions immediately under **soft/hard** pressure, including the bounded grace window for **non-destructive MLX/Metal pool drain**.
-3. **soft**: after grace, LRU-unload eligible **non-pinned** idle models; in-flight work continues.
+3. **soft**: after grace, spill/release eligible unleased idle KV first, then LRU-unload eligible **non-pinned** idle models if fresh pressure still requires it; in-flight work continues.
 4. **hard**: request pool drain and eligible idle LRU reclamation; ordinary hard pressure alone does not cancel generation or startup.
 5. **emergency**: usage ≥ `abort_limit` for two consecutive polls, or ≥ `abort_limit + 2 GiB` in one poll, bypasses drain grace and requests cooperative cancellation of the exact current execution or pending startup. Capture its request and scheduler lease before observing pressure; signal the scheduler directly, without queueing behind native work. Model pins do not suppress this interruption, but retain their existing residency protection.
 6. Prefill: predict peak; if over admit line → shrink chunks down to `prefill_min_chunk_tokens` (default 256) or reject/abort with typed error.
@@ -133,7 +133,9 @@ Alloy already wraps `mlx_set_wired_limit` as `mlx_ffi::memory::set_wired_limit_b
 
 ## Quantized-resident weights (M8)
 
-Stop Affine4 → host `Vec<f32>` → MLX f32 for **projection** residency. Keep packed U32 weights + scales/biases as MLX arrays; execute with `mlx_quantized_matmul`. Embeddings and `lm_head` may arrive Affine4 on disk but are dequantized **once** at MLX upload into resident float32 (embedding lookup / vocab projection need dense rows). Host loader charge estimates all matrices as Affine4 (group 64 by default); MLX `max_resident_bytes` estimates projections as Affine4 and embed/`lm_head` as float32, plus a small decode/workspace allowance — never a full float32 duplicate of the projection stack.
+Retain packed U32 weights plus scales/biases as MLX arrays for every Affine4 matrix, including embeddings and `lm_head`. Embedding lookup gathers and dequantizes only requested vocabulary rows; output and transformer projections use `mlx_quantized_matmul`. Tied embeddings and the output head share the same packed storage. Dense checkpoints still use native float32 arrays.
+
+The verified loader hashes and decodes bounded source chunks, retains owned packed/f32 vectors, and verifies complete file digests before publishing weights. It does not retain whole checkpoint shards. Admission takes the larger of the source-decode phase (host vectors plus bounded metadata/scratch) and native-upload phase (replaced host/native storage plus the largest individual vector-copy overlap), with explicit headroom. Cumulative source bytes remain a verification/read limit, distinct from simultaneously resident source memory. A new family implementation version prevents old native/SSD state from being treated as equivalent after numerical-path changes.
 
 ## Multi-model pool (M9)
 
@@ -195,6 +197,13 @@ tensor-placement policy or changes to the residency ownership model.
 - Spill cold under pressure **before** model unload when possible
 - `hot_cache_only` disables SSD writer while keeping hot RAM cache
 
+Implementation and ownership contract: [tiered-kv.md](tiered-kv.md). The
+default daemon hot cap is 25% of the live admission ceiling, with a 4 GiB
+SSD quota and an independently admitted 64 MiB transfer allowance. Cold
+snapshots are immutable, atomically published safetensors blocks. Restore
+checks artifact/profile/render/token identity and imports actual tensors;
+reopening SQLite history alone does not prove this gate.
+
 ## alloyd surface
 
 | Flag | Meaning |
@@ -204,6 +213,7 @@ tensor-placement policy or changes to the residency ownership model.
 | `--admission-budget-bytes N` | Test/override only; when set, acts as custom pinned ceiling path |
 | `--paged-ssd-cache-dir PATH` | Cold KV directory |
 | `--hot-cache-max-size SIZE` | Hot tier cap (bytes or `%` of ceiling) |
+| `--hot-cache-only` | Disable SSD reads/writes; retain bounded hot KV |
 
 ## PR stack
 
@@ -213,9 +223,8 @@ tensor-placement policy or changes to the residency ownership model.
 | PR1 | M1–M7 live ceiling + enforcer + alloyd boot — **landed in tree** (`memory_guard`, `memory_enforcer`, alloyd `--memory-guard*`, 1s poll, pool-drain grace, admission pause). Multi-model LRU unload still PR4. |
 | PR2 | M8 quantized-resident Qwen3 — **landed in tree** (`MatrixWeight::Affine4`, `mlx_quantized_matmul`, host vs MLX resident bounds, Affine4 wiring checkpoints). |
 | PR3 | M5–M6 prefill admit line + chunking — **in tree** (`prefill_admit`, enforcer `admit_line_bytes`, `FamilyRuntime::with_memory_enforcer`, alloyd chunk 1024 → floor 256). |
-| PR4 | M9 multi-model pool, lease isolation, and cooperative emergency cancellation — **implemented in the M9 branch**; unified CPU/GPU production validation and integration to `main` remain completion gates. |
-| PR5 | M10 SSD KV |
-| PR6 | W6 E2E 13–14 resume |
+| PR4 | M9 multi-model pool, lease isolation, and cooperative emergency cancellation — merged with unified CPU/GPU fixture validation; representative 4B/14B acceptance is recorded separately. |
+| Closeout PR | M10 native SSD KV, candidate-bound E2E 13–14, real 4B/14B driver, exit review, and Phase 2 plan. Results: `docs/acceptance/phase-1-exit-review.md`. |
 
 ## Acceptance matrix
 

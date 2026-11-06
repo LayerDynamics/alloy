@@ -71,7 +71,12 @@ fn assert_memory_limit(
             operation,
             required_bytes,
             available_bytes,
+            reason,
         } => {
+            assert!(matches!(
+                reason,
+                engine::error::MemoryLimitReason::ReservationBudget { .. }
+            ));
             assert_eq!(operation, expected_operation,);
 
             assert_eq!(required_bytes, expected_required,);

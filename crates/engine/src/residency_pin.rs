@@ -8,7 +8,10 @@
 //! path and serialize acquisition with eviction authorization.
 
 use crate::family::ModelInstanceId;
-use std::sync::{Arc, Weak};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Weak},
+};
 
 /// Why an explicit model pin could not be acquired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +74,15 @@ impl ModelPinOwner {
     /// A concurrent final drop may make a protected result conservative.
     /// New acquisition must still be serialized with eviction on the worker.
     pub fn is_pinned(&self) -> bool {
-        self.protection.strong_count() != 0
+        self.live_handles().is_some()
+    }
+
+    /// Snapshot the live handle count without acquiring another pin.
+    ///
+    /// Concurrent drops can make this observation conservative. New
+    /// acquisition remains serialized with native ownership operations.
+    pub(crate) fn live_handles(&self) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(self.protection.strong_count())
     }
 
     /// Observe handle lifetime without acquiring residency protection.

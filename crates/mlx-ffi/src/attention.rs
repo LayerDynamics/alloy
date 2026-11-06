@@ -3,7 +3,7 @@
 //! Native operations use actual MLX graphs on the supplied stream.
 //! There is no host arithmetic fallback in the production functions.
 //!
-//! This initial implementation supports float32 arrays with layout:
+//! Operations support float32 arrays with layout:
 //!
 //! - Q: [batch, query_heads, query_tokens, head_dim].
 //! - K/V: [batch, kv_heads, kv_tokens, head_dim].
@@ -14,6 +14,9 @@
 //! CausalSuffix validates that keys comprise the cached prefix followed
 //! by exactly the query chunk. MLX's lower-right causal alignment then
 //! implements query i attending through prefix_tokens + i.
+//! CausalOffset also supports arbitrary query/key lengths using a native
+//! Boolean mask when the lower-right causal alignment does not apply.
+//! Attention accepts either an explicit finite scale or 1 / sqrt(head_dim).
 //!
 //! These operations do not allocate or own a persistent KV cache, select
 //! model weights, perform admission, or report engine capabilities.
@@ -41,6 +44,17 @@ pub enum AttentionMask {
     CausalSuffix {
         /// Number of cached positions preceding this query chunk.
         prefix_tokens: usize,
+    },
+
+    /// Query token i may attend to keys at positions <= offset + i.
+    ///
+    /// Unlike CausalSuffix, this does not require the supplied keys to end
+    /// at the query chunk's final position. Visibility is capped by the
+    /// number of supplied keys; even usize::MAX is a valid saturated
+    /// offset and does not require overflowing position arithmetic.
+    CausalOffset {
+        /// Absolute key position visible to the first query token.
+        offset: usize,
     },
 }
 
@@ -197,6 +211,37 @@ pub fn grouped_query_attention(
     mask: AttentionMask,
     stream: &Stream,
 ) -> OperationResult<Array> {
+    let [_, _, _, head_dim] = shape4(query)?;
+    grouped_query_attention_scaled(
+        query,
+        key,
+        value,
+        1.0 / (head_dim as f32).sqrt(),
+        mask,
+        stream,
+    )
+}
+
+/// Compute lazy grouped-query attention with a caller-supplied scale.
+///
+/// Layout, GQA grouping and stream selection follow
+/// [`grouped_query_attention`]. Any finite scale is supported, including
+/// zero and negative values. Inputs are not read back or checked for finite
+/// elements; callers requiring eager validation can use
+/// [`crate::ops::all_finite`].
+///
+/// [`AttentionMask::CausalSuffix`] retains its strict cached-prefix
+/// contract. [`AttentionMask::CausalOffset`] allows arbitrary query/key
+/// lengths and computes its Boolean visibility mask in MLX. Neither path
+/// constructs scores, masks or repeated KV heads on the host.
+pub fn grouped_query_attention_scaled(
+    query: &Array,
+    key: &Array,
+    value: &Array,
+    scale: f32,
+    mask: AttentionMask,
+    stream: &Stream,
+) -> OperationResult<Array> {
     let [batch, query_heads, query_tokens, head_dim] = shape4(query)?;
     let [key_batch, kv_heads, kv_tokens, key_dim] = shape4(key)?;
     let value_shape = shape4(value)?;
@@ -216,7 +261,13 @@ pub fn grouped_query_attention(
             "query-head count must be divisible by KV-head count",
         ));
     }
+    if !scale.is_finite() {
+        return Err(OperationError::InvalidInput(
+            "attention scale must be finite",
+        ));
+    }
 
+    let mut visibility = None;
     let mask_mode = match mask {
         AttentionMask::Full => c"".as_ptr(),
         AttentionMask::CausalSuffix { prefix_tokens } => {
@@ -235,17 +286,32 @@ pub fn grouped_query_attention(
 
             c"causal".as_ptr()
         }
+        AttentionMask::CausalOffset { offset } => {
+            if offset >= kv_tokens - 1 {
+                // Every key is already visible to the first query. This
+                // also handles huge offsets without adding query indices.
+                c"".as_ptr()
+            } else if offset.checked_add(query_tokens) == Some(kv_tokens) {
+                // Preserve MLX's fast lower-right causal representation
+                // whenever it has exactly the requested visibility.
+                c"causal".as_ptr()
+            } else {
+                visibility = Some(causal_visibility(query_tokens, kv_tokens, offset, stream)?);
+                c"".as_ptr()
+            }
+        }
     };
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
     let no_array = sys::mlx_array {
         ctx: ptr::null_mut(),
     };
+    let mask_array = visibility.as_ref().map_or(no_array, Array::as_raw);
     let mut output = PendingArray::new();
 
     // SAFETY: all arrays and the stream are valid borrowed handles.
     // Shapes and GQA grouping were validated. mask_mode points to a
-    // static NUL-terminated string. Optional mask/sinks are absent.
+    // static NUL-terminated string. An optional Boolean mask is retained
+    // for the call and captured by MLX's graph. Optional sinks are absent.
     let status = unsafe {
         sys::mlx_fast_scaled_dot_product_attention(
             &mut output.raw,
@@ -254,13 +320,44 @@ pub fn grouped_query_attention(
             value.as_raw(),
             scale,
             mask_mode,
-            no_array,
+            mask_array,
             no_array,
             false,
             stream.as_raw(),
         )
     };
 
+    output.finish(status)
+}
+
+fn causal_visibility(
+    query_tokens: usize,
+    kv_tokens: usize,
+    offset: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    let rows = c_int::try_from(query_tokens)
+        .map_err(|_| OperationError::InvalidInput("query-token count exceeds C int"))?;
+    let columns = c_int::try_from(kv_tokens)
+        .map_err(|_| OperationError::InvalidInput("key-token count exceeds C int"))?;
+    let diagonal = c_int::try_from(offset)
+        .map_err(|_| OperationError::InvalidInput("causal offset exceeds C int"))?;
+    let mut output = PendingArray::new();
+
+    // SAFETY: dimensions and diagonal fit C int, and the stream/output
+    // are valid. MLX tri creates a Boolean [query_tokens, kv_tokens]
+    // array with key_index <= query_index + offset. Attention broadcasts
+    // it over batch and heads; every query can see at least key zero.
+    let status = unsafe {
+        sys::mlx_tri(
+            &mut output.raw,
+            rows,
+            columns,
+            diagonal,
+            DType::Bool as u32,
+            stream.as_raw(),
+        )
+    };
     output.finish(status)
 }
 
@@ -341,11 +438,12 @@ mod tests {
         query_shape: [usize; 4],
         key_shape: [usize; 4],
         mask: AttentionMask,
+        scale: f32,
     ) -> Vec<f32> {
         let [batch, query_heads, query_tokens, width] = query_shape;
         let [_, kv_heads, kv_tokens, _] = key_shape;
         let group = query_heads / kv_heads;
-        let scale = 1.0 / (width as f64).sqrt();
+        let scale = f64::from(scale);
         let mut output = vec![0.0; query.len()];
 
         for batch_index in 0..batch {
@@ -359,6 +457,10 @@ mod tests {
                     let key_count = match mask {
                         AttentionMask::Full => kv_tokens,
                         AttentionMask::CausalSuffix { prefix_tokens } => prefix_tokens + token + 1,
+                        AttentionMask::CausalOffset { offset } => offset
+                            .saturating_add(token)
+                            .saturating_add(1)
+                            .min(kv_tokens),
                     };
 
                     let mut scores = Vec::with_capacity(key_count);
@@ -451,7 +553,15 @@ mod tests {
         assert_eq!(result.shape(), query_shape.to_vec());
 
         let actual = read_contiguous(&result, stream);
-        let expected = attention_reference(&query, &key, &value, query_shape, key_shape, mask);
+        let expected = attention_reference(
+            &query,
+            &key,
+            &value,
+            query_shape,
+            key_shape,
+            mask,
+            1.0 / (query_shape[3] as f32).sqrt(),
+        );
 
         assert_close(&actual, &expected);
     }
@@ -505,6 +615,123 @@ mod tests {
     fn mlx_metal_rope_and_gqa_match_reference() {
         // No silent skip or CPU substitution on the Apple-Silicon lane.
         run_suite(DeviceType::Gpu);
+    }
+
+    fn run_scaled_attention_suite(kind: DeviceType) {
+        let device = Device::new(kind, 0).expect("explicit device");
+        assert!(device.is_available().expect("device availability"));
+        let stream = Stream::new(&device).expect("explicit stream");
+        assert_eq!(stream.device().expect("device").kind().expect("kind"), kind);
+
+        // Three queries inside a longer key sequence, a query chunk
+        // extending beyond the keys, and single-token decode. These
+        // cases cannot all use lower-right causal alignment.
+        for (query_tokens, kv_tokens) in [(3, 5), (6, 3), (1, 5)] {
+            let query_shape = [2, 6, query_tokens, 8];
+            let key_shape = [2, 2, kv_tokens, 8];
+            let query = data(query_shape.into_iter().product(), 2);
+            let key = data(key_shape.into_iter().product(), 5);
+            let value = data(key_shape.into_iter().product(), 13);
+            let q = array(&query, query_shape);
+            let k = array(&key, key_shape);
+            let v = array(&value, key_shape);
+
+            for scale in [0.0, 0.37, -0.6, 2.75] {
+                for mask in [
+                    AttentionMask::Full,
+                    AttentionMask::CausalOffset { offset: 0 },
+                    AttentionMask::CausalOffset { offset: 1 },
+                    AttentionMask::CausalOffset { offset: 2 },
+                    AttentionMask::CausalOffset { offset: usize::MAX },
+                ] {
+                    let result = grouped_query_attention_scaled(&q, &k, &v, scale, mask, &stream)
+                        .expect("native scaled GQA");
+                    assert_eq!(result.shape(), query_shape);
+                    assert!(!result.is_available().expect("lazy graph availability"));
+
+                    let expected = attention_reference(
+                        &query,
+                        &key,
+                        &value,
+                        query_shape,
+                        key_shape,
+                        mask,
+                        scale,
+                    );
+                    assert_close(&read_contiguous(&result, &stream), &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mlx_cpu_scaled_gqa_and_general_causal_offsets_match_reference() {
+        run_scaled_attention_suite(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_scaled_gqa_and_general_causal_offsets_match_reference() {
+        // The required Apple-Silicon lane must execute the requested GPU.
+        run_scaled_attention_suite(DeviceType::Gpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn scaled_gqa_consumes_shared_arrays_across_cpu_and_metal_streams() {
+        let cpu_device = Device::new(DeviceType::Cpu, 0).expect("CPU");
+        let metal_device = Device::new(DeviceType::Gpu, 0).expect("Metal");
+        assert!(metal_device.is_available().expect("required Metal device"));
+        let cpu = Stream::new(&cpu_device).expect("CPU stream");
+        let metal = Stream::new(&metal_device).expect("Metal stream");
+        assert_eq!(
+            metal
+                .device()
+                .expect("Metal stream device")
+                .kind()
+                .expect("kind"),
+            DeviceType::Gpu
+        );
+
+        let query_shape = [1, 4, 3, 8];
+        let key_shape = [1, 2, 5, 8];
+        let query = data(query_shape.into_iter().product(), 3);
+        let key = data(key_shape.into_iter().product(), 7);
+        let value = data(key_shape.into_iter().product(), 11);
+        // Both devices consume these exact native array handles.
+        let q = array(&query, query_shape);
+        let k = array(&key, key_shape);
+        let v = array(&value, key_shape);
+        let mask = AttentionMask::CausalOffset { offset: 1 };
+        let on_cpu =
+            grouped_query_attention_scaled(&q, &k, &v, -0.25, mask, &cpu).expect("CPU graph");
+        let on_metal =
+            grouped_query_attention_scaled(&q, &k, &v, -0.25, mask, &metal).expect("Metal graph");
+        let expected =
+            attention_reference(&query, &key, &value, query_shape, key_shape, mask, -0.25);
+
+        // Read each result on the other device's stream. The dependency
+        // graph must complete the producing stream before host access.
+        assert_close(&read_contiguous(&on_cpu, &metal), &expected);
+        assert_close(&read_contiguous(&on_metal, &cpu), &expected);
+        cpu.synchronize().expect("CPU completion");
+        metal.synchronize().expect("Metal completion");
+    }
+
+    #[test]
+    fn scaled_gqa_rejects_non_finite_scale() {
+        let device = Device::new(DeviceType::Cpu, 0).expect("CPU");
+        let stream = Stream::new(&device).expect("CPU stream");
+        let q = array(&[0.0; 32], [1, 2, 2, 8]);
+        let k = array(&[0.0; 24], [1, 1, 3, 8]);
+        let v = array(&[0.0; 24], [1, 1, 3, 8]);
+
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                grouped_query_attention_scaled(&q, &k, &v, scale, AttentionMask::Full, &stream),
+                Err(OperationError::InvalidInput(_)),
+            ));
+        }
     }
 
     #[test]

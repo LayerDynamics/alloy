@@ -73,14 +73,11 @@ impl ContextBuilder {
                 "context snapshot requires at least one message".into(),
             ));
         }
-        let snapshot_id = ContextSnapshotId::new(snapshot_id.as_ref()).map_err(|error| {
-            HarnessError::Invalid(format!("snapshot_id: {error}"))
-        })?;
-        let profile_id = ModelProfileId::new(profile_id.as_ref()).map_err(|error| {
-            HarnessError::Invalid(format!("profile_id: {error}"))
-        })?;
-        ContextSnapshot::new(snapshot_id, profile_id, messages)
-            .map_err(|error| HarnessError::Engine(error.to_string()))
+        let snapshot_id = ContextSnapshotId::new(snapshot_id.as_ref())
+            .map_err(|error| HarnessError::Invalid(format!("snapshot_id: {error}")))?;
+        let profile_id = ModelProfileId::new(profile_id.as_ref())
+            .map_err(|error| HarnessError::Invalid(format!("profile_id: {error}")))?;
+        ContextSnapshot::new(snapshot_id, profile_id, messages).map_err(HarnessError::from)
     }
 
     /// Render and tokenize through the engine contract (exact HF counts).
@@ -88,8 +85,7 @@ impl ContextBuilder {
         engine: &E,
         snapshot: ContextSnapshot,
     ) -> HarnessResult<RenderedContext> {
-        block_on(engine.render_and_count(snapshot))?
-            .map_err(|error| HarnessError::Engine(error.to_string()))
+        block_on(engine.render_and_count(snapshot))?.map_err(HarnessError::from)
     }
 }
 

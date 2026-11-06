@@ -145,6 +145,44 @@ native build. The monitor caches similar setup advice and reloads saved
 settings while disconnected, while keeping an explicit `--socket` fixed.
 Neither path waits on the native execution queue or changes admission policy.
 
+## Structured request refusals
+
+API readiness does not guarantee that a requested generation can be admitted.
+The engine preserves three distinct refusal categories through the harness,
+daemon and CLI:
+
+| Engine kind | Meaning and recovery |
+| --- | --- |
+| `busy` | Active or pending execution owns the worker or scheduler slot. Wait for that request or explicitly cancel it. |
+| `protected_resources` | Identified model pins or session-state leases prevent the requested operation. Their owner must release the relevant protection before retrying. A refusal never releases it implicitly. |
+| `memory_limit_exceeded` | A typed `reason` identifies the applicable memory constraint. This does not necessarily mean a native allocation failed. |
+
+Memory reasons distinguish `host_preflight` (planned startup versus a fresh
+safe host ceiling), `reservation_budget` (requested reservation versus available
+ledger capacity, with the complete `budget_bytes` also supplied),
+`allocator_ceiling`, `admissions_paused`, `buffer_limit`, and `advisory_estimate`.
+An advisory estimate does not claim to know the complete reservation budget.
+Paused admissions can reject a request even when the numerical reservation
+would fit. Reclaiming other runtime resources cannot make a request larger than
+the complete budget fit under that unchanged budget.
+
+The existing API v1 response envelope remains `error.code = -32000` and
+`error.data.kind = "engine_failed"`. An additive `error.data.engine_error`
+object contains the original engine `kind`, `message`, and category-specific
+fields. A streamed `request_failed` notification includes the identical object
+at `body.engine_error`, alongside its existing `message` and `partial_usage`.
+Protected-resource entries identify the protection type, artifact, process-local
+model instance, positive observed handle count, and canonical state when leased.
+These identifiers and counts are diagnostic snapshots, not release capabilities.
+
+The CLI retains RPC codes and structured data, prints recovery guidance for
+known causes, and preserves the original message for older daemons or unknown
+causes. A terminal notification and its matching final RPC error are reported
+once. No error automatically retries generation, unpins a model, releases a
+lease, changes the memory guard, or turns partial text into a successful answer.
+The monitor continues to report current runtime observations; a refused turn
+does not make a still-responsive daemon unavailable.
+
 ## Validation scope
 
 Focused CLI coverage includes standalone setup, invalid/noninteractive

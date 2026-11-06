@@ -16,7 +16,7 @@
 
 use crate::{
     cancellation::CancellationToken,
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     registry::Registry,
     scheduler::{ExecutionCancellationTarget, ExecutionOutcome, ExecutionPermit, Scheduler},
     types::{
@@ -179,8 +179,9 @@ pub trait EngineRuntime: Send + Sync + 'static {
 
     /// Release actual engine-owned session state.
     ///
-    /// Return Busy if that state is in use. Never free tensors underneath
-    /// execution or delete durable session history.
+    /// Return ProtectedResources if a canonical lease protects that state,
+    /// or Busy if native execution owns the operation. Never free tensors
+    /// underneath execution or delete durable session history.
     fn release_session_state(&self, state_id: SessionStateId) -> EngineFuture<'_, ReleaseOutcome>;
 
     /// Report capabilities established by the selected implementation.
@@ -409,6 +410,7 @@ impl<R: EngineRuntime> Engine for EngineCore<R> {
                     operation: "generation startup estimate",
                     required_bytes: estimate.reserved_bytes(),
                     available_bytes: estimate.available_bytes(),
+                    reason: MemoryLimitReason::AdvisoryEstimate,
                 });
             }
 

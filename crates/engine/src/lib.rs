@@ -35,6 +35,8 @@ pub mod rendering;
 pub mod runtime;
 pub mod scheduler;
 pub mod types;
+/// Bounded hot KV retention and atomic safetensors persistence.
+pub mod tiered_kv;
 
 #[cfg(test)]
 mod w3_acceptance;

@@ -21,7 +21,7 @@
 use crate::{
     api::ExecutionContext,
     cancellation::{CancellationToken, Cancelled},
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason},
     scheduler::ExecutionOutcome,
     types::{
         FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationOptions,
@@ -634,6 +634,7 @@ impl Producer {
                 operation: "buffer generation text delta",
                 required_bytes: bytes_as_u64(charged_bytes)?,
                 available_bytes: bytes_as_u64(self.shared.limits.max_text_delta_bytes)?,
+                reason: MemoryLimitReason::BufferLimit,
             });
         }
 

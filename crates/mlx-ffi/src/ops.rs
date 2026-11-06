@@ -1,7 +1,9 @@
 //! Explicit-stream MLX tensor operations for native model execution.
 //!
-//! Production operations build actual MLX graphs. They do not evaluate
-//! intermediate tensors or perform host-side tensor arithmetic.
+//! Arithmetic operations build lazy MLX graphs without host tensor
+//! arithmetic. Explicit validation and readback helpers are synchronization
+//! boundaries: `all_finite` reads one reduced Boolean, and `to_vec_f32`
+//! copies a requested output into a host vector.
 //!
 //! The caller selects execution streams explicitly. Arrays are not
 //! duplicated into separate CPU-model and GPU-model representations.
@@ -274,9 +276,8 @@ pub fn quantized_matmul(
     require_positive_shape(&weight_shape)?;
     require_positive_shape(&scales_shape)?;
 
-    let mode = CString::new("affine").map_err(|_| {
-        OperationError::InvalidInput("quantized_matmul mode string")
-    })?;
+    let mode = CString::new("affine")
+        .map_err(|_| OperationError::InvalidInput("quantized_matmul mode string"))?;
     let group = sys::mlx_optional_int {
         value: group_size,
         has_value: true,
@@ -327,9 +328,8 @@ pub fn dequantize(
         ));
     }
 
-    let mode = CString::new("affine").map_err(|_| {
-        OperationError::InvalidInput("dequantize mode string")
-    })?;
+    let mode = CString::new("affine")
+        .map_err(|_| OperationError::InvalidInput("dequantize mode string"))?;
     let group = sys::mlx_optional_int {
         value: group_size,
         has_value: true,
@@ -569,6 +569,92 @@ pub fn embedding_lookup(weight: &Array, tokens: &[u32], stream: &Stream) -> Oper
 
     // Gather retains the size-one sliced vocabulary dimension.
     reshape(&gathered, &[tokens.len(), shape[1]], stream)
+}
+
+/// Look up rows of an Affine4 embedding without expanding its vocabulary.
+///
+/// Packed weights remain uint32 `[vocabulary, width / 8]`; scales and biases
+/// are float32 `[vocabulary, width / group_size]`. Only the requested rows
+/// are gathered and dequantized on `stream`. The result is lazy float32
+/// `[tokens.len(), width]`, and the original packed arrays remain shared.
+pub fn quantized_embedding_lookup(
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    tokens: &[u32],
+    group_size: i32,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if weight.dtype() != DType::Uint32 {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding weight must be uint32",
+        ));
+    }
+    require_f32(scales)?;
+    require_f32(biases)?;
+    let packed_shape = weight.shape();
+    let parameter_shape = scales.shape();
+    if packed_shape.len() != 2
+        || parameter_shape.len() != 2
+        || biases.shape() != parameter_shape
+        || parameter_shape[0] != packed_shape[0]
+        || group_size <= 0
+    {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding requires matching rank-two weights and parameters",
+        ));
+    }
+    require_positive_shape(&packed_shape)?;
+    require_positive_shape(&parameter_shape)?;
+    let width = packed_shape[1]
+        .checked_mul(8)
+        .ok_or(OperationError::InvalidInput(
+            "quantized embedding width overflow",
+        ))?;
+    let group = group_size as usize;
+    if width % group != 0 || parameter_shape[1] != width / group {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding parameters disagree with width and group size",
+        ));
+    }
+    native_dimension(width)?;
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .any(|&token| u64::from(token) >= packed_shape[0] as u64)
+    {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding token IDs must be nonempty and inside the vocabulary",
+        ));
+    }
+    let count = native_dimension(tokens.len())?;
+    let indices = Array::from_u32_slice(tokens, &[count])?;
+    let take_rows = |array: &Array| {
+        let mut output = PendingArray::new();
+        // SAFETY: valid arrays/stream; rank-two inputs share the vocabulary
+        // dimension, and every uint32 index was checked before this call.
+        let status = unsafe {
+            sys::mlx_take_axis(
+                &mut output.raw,
+                array.as_raw(),
+                indices.as_raw(),
+                0,
+                stream.as_raw(),
+            )
+        };
+        output.finish(status)
+    };
+    let selected_weight = take_rows(weight)?;
+    let selected_scales = take_rows(scales)?;
+    let selected_biases = take_rows(biases)?;
+    dequantize(
+        &selected_weight,
+        &selected_scales,
+        &selected_biases,
+        group_size,
+        4,
+        stream,
+    )
 }
 
 /// Reshape a float32 tensor with an explicitly supplied shape.
@@ -890,6 +976,40 @@ pub fn cache_update(
     slice_update(cache, update, &[0, 0, offset, 0], stream)
 }
 
+/// Check that every float32 element is finite on the selected stream.
+///
+/// MLX evaluates `isfinite` and an `all` reduction natively. Only the
+/// resulting scalar Boolean is read on the host; the input tensor is not
+/// copied into a Rust buffer. Empty arrays satisfy the predicate.
+///
+/// This is an explicit validation/synchronization boundary. Arithmetic
+/// wrappers themselves remain lazy and do not call this helper implicitly.
+pub fn all_finite(input: &Array, stream: &Stream) -> OperationResult<bool> {
+    require_f32(input)?;
+    let mut finite = PendingArray::new();
+
+    // SAFETY: valid borrowed input/stream and writable owned output.
+    let status = unsafe { sys::mlx_isfinite(&mut finite.raw, input.as_raw(), stream.as_raw()) };
+    let finite = finite.finish(status)?;
+
+    let mut reduced = PendingArray::new();
+    // SAFETY: isfinite produces a Boolean array. Reducing every axis with
+    // keepdims=false produces exactly one Boolean scalar.
+    let status = unsafe { sys::mlx_all(&mut reduced.raw, finite.as_raw(), false, stream.as_raw()) };
+    let reduced = reduced.finish(status)?;
+    reduced.eval()?;
+    stream.synchronize()?;
+
+    let mut result = false;
+    // SAFETY: reduced is an evaluated Boolean scalar, and result is a
+    // valid writable target. The accessor copies the single value.
+    let status = unsafe { sys::mlx_array_item_bool(&mut result, reduced.as_raw()) };
+    if status != 0 {
+        return Err(OperationError::Mlx(Error::Status(status)));
+    }
+    Ok(result)
+}
+
 /// Return a row-major contiguous float32 array on the selected stream.
 ///
 /// This may allocate. It is not a promise of zero-copy conversion.
@@ -1095,6 +1215,68 @@ mod tests {
         );
     }
 
+    fn packed_embedding_suite(kind: DeviceType) {
+        let stream = stream(kind);
+        let words: Vec<u32> = (0..4)
+            .flat_map(|row| {
+                let word = (0..8).fold(0_u32, |word, column| {
+                    word | (((row * 3 + column) % 16) as u32) << (column * 4)
+                });
+                [word; 8]
+            })
+            .collect();
+        let scales_data = [0.25_f32, 0.5, 0.125, 0.75];
+        let biases_data = [-1.0_f32, -0.5, 0.25, 1.0];
+        let weight = Array::from_u32_slice(&words, &[4, 8]).expect("packed table");
+        let scales = Array::from_f32_slice(&scales_data, &[4, 1]).expect("scales");
+        let biases = Array::from_f32_slice(&biases_data, &[4, 1]).expect("biases");
+        let tokens = [3_u32, 0, 3];
+        let result = quantized_embedding_lookup(&weight, &scales, &biases, &tokens, 64, &stream)
+            .expect("packed row lookup");
+        assert_eq!(result.shape(), vec![3, 64]);
+        assert_eq!(result.dtype(), DType::Float32);
+        let expected: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&row| {
+                (0..64).map(move |column| {
+                    ((row as usize * 3 + column % 8) % 16) as f32 * scales_data[row as usize]
+                        + biases_data[row as usize]
+                })
+            })
+            .collect();
+        assert_close(
+            &to_vec_f32(&result, &stream).expect("selected rows"),
+            &expected,
+        );
+        assert_eq!(weight.dtype(), DType::Uint32);
+        assert_eq!(weight.shape(), vec![4, 8]);
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[], 64, &stream).is_err());
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[4], 64, &stream).is_err());
+        assert!(
+            quantized_embedding_lookup(&weight, &scales, &biases, &[u32::MAX], 64, &stream)
+                .is_err()
+        );
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[0], 0, &stream).is_err());
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[0], 32, &stream).is_err());
+        let wrong_scales = Array::from_f32_slice(&[1.0; 3], &[3, 1]).expect("wrong vocabulary");
+        assert!(
+            quantized_embedding_lookup(&weight, &wrong_scales, &wrong_scales, &[0], 64, &stream)
+                .is_err()
+        );
+        assert!(quantized_embedding_lookup(&scales, &scales, &biases, &[0], 64, &stream).is_err());
+    }
+
+    #[test]
+    fn mlx_cpu_quantized_embedding_uses_only_selected_rows() {
+        packed_embedding_suite(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_quantized_embedding_uses_only_selected_rows() {
+        packed_embedding_suite(DeviceType::Gpu);
+    }
+
     #[test]
     fn mlx_cpu_projection_graph_matches_reference() {
         execute_graph(DeviceType::Cpu);
@@ -1146,6 +1328,56 @@ mod tests {
 
         metal.synchronize().expect("Metal completion");
         cpu.synchronize().expect("CPU completion");
+    }
+
+    fn run_all_finite_suite(kind: DeviceType) {
+        let stream = stream(kind);
+        assert_eq!(
+            stream
+                .device()
+                .expect("stream device")
+                .kind()
+                .expect("kind"),
+            kind
+        );
+        let finite = Array::from_f32_slice(&[0.0, -0.0, f32::MIN, f32::MAX, 1.0, -2.0], &[2, 3])
+            .expect("finite input");
+        let transposed = transpose(&finite, &[1, 0], &stream).expect("strided input");
+        assert!(all_finite(&transposed, &stream).expect("native finite reduction"));
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let source = Array::from_f32_slice(&[1.0, invalid, 2.0, 3.0, 4.0, 5.0], &[2, 3])
+                .expect("mixed input");
+            let included = slice(&source, &[0, 1], &[2, 2], &stream).expect("non-finite column");
+            let excluded = slice(&source, &[0, 0], &[2, 1], &stream).expect("finite column");
+            assert!(!all_finite(&included, &stream).expect("strided non-finite reduction"));
+            assert!(all_finite(&excluded, &stream).expect("strided finite reduction"));
+        }
+
+        // Validate the produced lazy values, not just their finite inputs.
+        let maximum = Array::from_f32_slice(&[f32::MAX], &[1]).expect("finite scalar input");
+        let overflow = multiply(&maximum, &maximum, &stream).expect("lazy native overflow");
+        assert!(!overflow.is_available().expect("lazy graph"));
+        assert!(!all_finite(&overflow, &stream).expect("native graph validation"));
+
+        let empty = Array::from_f32_slice(&[], &[0]).expect("empty input");
+        assert!(all_finite(&empty, &stream).expect("empty reduction identity"));
+        let integer = Array::from_u32_slice(&[1, 2], &[2]).expect("integer input");
+        assert!(matches!(
+            all_finite(&integer, &stream),
+            Err(OperationError::InvalidInput(_)),
+        ));
+    }
+
+    #[test]
+    fn mlx_cpu_all_finite_reduces_native_values_and_strided_views() {
+        run_all_finite_suite(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_all_finite_reduces_native_values_and_strided_views() {
+        run_all_finite_suite(DeviceType::Gpu);
     }
 
     #[test]

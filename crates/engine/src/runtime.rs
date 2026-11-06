@@ -14,9 +14,11 @@
 //! - Exact extension: reuse the complete retained prefix and prefill the
 //!   missing suffix, provided the existing allocation satisfies the plan.
 //!
-//! Shortened, divergent, incompatible, or insufficiently retained context
-//! rebuilds from an empty logical cache. This implementation does not
-//! migrate KV into a replacement allocation or restore partial prefixes.
+//! Shortened, divergent, incompatible, or insufficiently retained hot state
+//! starts from an empty logical cache. When tiered storage is configured,
+//! a verified exact disk prefix may then be imported into that cache, even
+//! for a newly loaded model instance. At least one input token is genuinely
+//! prefilled to produce fresh final-position logits after disk restore.
 //!
 //! Canonical publication remains explicit because RenderedContext does not
 //! contain the tokenizer-produced prefix-byte payload required by the
@@ -27,17 +29,19 @@
 //! Leases pin published native state against release and mutation. Native
 //! allocations and their reservations are destroyed before release
 //! acknowledgements.
+//! A configured hot limit may spill and reclaim only unleased idle KV.
 //!
 //! Prefix-reuse capability reporting intentionally remains false until
 //! production-path verification has passed.
 
 use crate::residency_pin::{ModelPinOwner, ModelResidencyPin};
+use crate::tiered_kv::{TieredKvConfig, TieredKvSnapshot, TieredKvStore};
 use crate::{
     admission::{AdmissionController, AdmissionSnapshot, MemoryReservation, ReservationGrant},
     api::{ENGINE_API_VERSION, EngineCore, EngineFuture, EngineRuntime, ExecutionContext},
     cache_identity::{CacheIdentityInputs, compute_session_state_id},
     cancellation::CancellationToken,
-    error::EngineError,
+    error::{EngineError, MemoryLimitReason, ProtectedResource},
     family::{
         CacheAllocationRequest, ExecutionControl, FamilyCache, LoadedModel, ModelFamily,
         ModelInstanceId, ModelLoadLimits, ModelLoadRequest, TokenLogits,
@@ -130,6 +134,16 @@ pub trait TextDecoder {
 
 /// Required real backend services in addition to the actual family loader.
 pub trait RuntimeBackend: ModelFamily + 'static {
+    /// Trusted content-manifest digest for cross-process KV compatibility.
+    ///
+    /// Return None when this backend cannot bind persisted KV to verified
+    /// model bytes. The runtime calls this only after artifact verification.
+    fn cache_manifest_digest(
+        &self,
+        _artifact: &ArtifactRegistration,
+    ) -> Result<Option<[u8; 32]>, EngineError> {
+        Ok(None)
+    }
     /// Render and tokenize with verified profile inputs.
     fn render_and_count<'a>(
         &'a self,
@@ -310,6 +324,8 @@ pub struct ResidencySnapshot {
 pub enum IdleModelReclaim {
     /// Pressure was normal or allocator-drain grace is still active.
     NotRequested,
+    /// Idle KV was reclaimed; no weights were unloaded on this tick.
+    DeferredForKv,
     /// This exact native model and its accounting guards were destroyed.
     Evicted(ModelInstanceId),
     /// All remaining candidates were protected, or no model was loaded.
@@ -477,6 +493,21 @@ impl FamilyRuntime {
         Ok(self)
     }
 
+    /// Configure bounded hot retention and optional SSD KV before serving work.
+    ///
+    /// The worker admits its transfer allowance before scanning or reading cache
+    /// metadata. Existing active/pending execution rejects reconfiguration.
+    pub fn configure_tiered_kv(&self, config: TieredKvConfig) -> Result<(), EngineError> {
+        self.worker
+            .call(|reply| Command::ConfigureTieredKv { config, reply })?
+            .result
+    }
+
+    /// Read cached KV-tier metrics without waiting on the native worker.
+    pub fn tiered_kv_snapshot(&self) -> TieredKvSnapshot {
+        lock_metadata(&self.worker.summary).tiered_kv.clone()
+    }
+
     /// Change idle expiry for one exact loaded instance; false means absent.
     pub fn set_model_idle_ttl(
         &self,
@@ -588,6 +619,7 @@ impl FamilyRuntime {
                     pool: Vec::new(),
                     pool_enabled: false,
                     pool_ttl: None,
+                    tiered: None,
                     admission: worker_admission,
                     retention,
                     summary: worker_summary,
@@ -1090,6 +1122,10 @@ struct Reply<T> {
 }
 
 enum Command {
+    ConfigureTieredKv {
+        config: TieredKvConfig,
+        reply: SyncSender<Reply<()>>,
+    },
     LoadedCapabilities {
         artifact: ArtifactId,
         reply: SyncSender<Reply<Capabilities>>,
@@ -1619,6 +1655,7 @@ impl Drop for NativeSession {
 
 #[derive(Clone)]
 struct Summary {
+    tiered_kv: TieredKvSnapshot,
     published_at: Instant,
     resident_models: Vec<ResidentModelSnapshot>,
     pool_enabled: bool,
@@ -1639,6 +1676,7 @@ struct Summary {
 impl Summary {
     fn empty(alive: bool) -> Self {
         Self {
+            tiered_kv: TieredKvSnapshot::default(),
             published_at: Instant::now(),
             resident_models: Vec::new(),
             pool_enabled: false,
@@ -1679,6 +1717,18 @@ struct Resident {
     weights: MemoryReservation,
     capabilities: Capabilities,
     candidate: Option<StateCandidate>,
+}
+
+impl Resident {
+    fn pin_protection(&self) -> Option<ProtectedResource> {
+        self.pins
+            .live_handles()
+            .map(|handles| ProtectedResource::ModelPin {
+                artifact_id: self.model.artifact_id().clone(),
+                instance_id: self.model.instance_id().clone(),
+                handles,
+            })
+    }
 }
 
 struct TokenHistory {
@@ -1804,6 +1854,8 @@ impl Compatibility {
 }
 
 struct StateCandidate {
+    disk_identity: Option<String>,
+    persisted: bool,
     request_id: RequestId,
     compatibility: Compatibility,
     render_hash: [u8; 32],
@@ -1822,6 +1874,17 @@ struct StateEntry {
 impl StateEntry {
     fn is_leased(&self) -> bool {
         self.pin.strong_count() != 0
+    }
+
+    fn lease_protection(&self) -> Option<ProtectedResource> {
+        NonZeroUsize::new(self.pin.strong_count()).map(|handles| {
+            ProtectedResource::SessionStateLease {
+                artifact_id: self.resident.model.artifact_id().clone(),
+                instance_id: self.resident.model.instance_id().clone(),
+                state_id: self.metadata.state_id,
+                handles,
+            }
+        })
     }
 
     fn lease(&mut self) -> SessionStateLease {
@@ -1872,10 +1935,157 @@ struct NativeState {
     pool_ttl: Option<Duration>,
     admission: AdmissionController,
     retention: RetentionPolicy,
+    tiered: Option<TieredKvStore>,
     summary: Arc<Mutex<Summary>>,
 }
 
 impl NativeState {
+    fn tiered_snapshot(&self) -> TieredKvSnapshot {
+        let Some(store) = &self.tiered else {
+            return TieredKvSnapshot::default();
+        };
+        let mut snapshot = store.metrics.clone();
+        snapshot.hot_limit_bytes = self.admission.snapshot().map_or(0, |ledger| {
+            store.config.hot_limit.bytes(ledger.budget_bytes())
+        });
+        let bytes = |resident: &Resident| {
+            resident
+                .cache
+                .as_ref()
+                .map_or(0, |cache| cache.reservation.bytes())
+        };
+        snapshot.hot_reserved_bytes = self
+            .pool
+            .iter()
+            .chain(self.resident.iter())
+            .chain(self.states.values().map(|entry| &entry.resident))
+            .fold(0u64, |sum, resident| sum.saturating_add(bytes(resident)));
+        snapshot.protected_reserved_bytes = self
+            .states
+            .values()
+            .filter(|entry| entry.is_leased())
+            .fold(0u64, |sum, entry| {
+                sum.saturating_add(bytes(&entry.resident))
+            });
+        if self.request_owner().is_some() {
+            snapshot.protected_reserved_bytes = snapshot
+                .protected_reserved_bytes
+                .saturating_add(self.resident.as_ref().map_or(0, bytes));
+        }
+        snapshot
+    }
+
+    fn enforce_hot_limit(&mut self) {
+        if self.tiered.is_none() {
+            return;
+        }
+        loop {
+            let snapshot = self.tiered_snapshot();
+            if snapshot.hot_reserved_bytes <= snapshot.hot_limit_bytes {
+                break;
+            }
+            match self.reclaim_one_idle_kv(true) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    if let Some(store) = &mut self.tiered {
+                        store.record_error(error);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Reclaim only unleased idle KV. Keep the actual model and weight guard.
+    // The dedicated transfer guard was admitted before serving requests, so
+    // this path does not try to obtain a new grant while admission is paused.
+    fn reclaim_one_idle_kv(&mut self, include_selected: bool) -> Result<bool, EngineError> {
+        if self.tiered.is_none() {
+            return Ok(false);
+        }
+        enum Place {
+            Pool(usize),
+            Selected,
+            Published(SessionStateId),
+        }
+        let mut best: Option<((Instant, u8, usize, [u8; 32]), Place)> = None;
+        let mut offer = |key, place| {
+            if best.as_ref().is_none_or(|(current, _)| key < *current) {
+                best = Some((key, place));
+            }
+        };
+        for (index, resident) in self.pool.iter().enumerate() {
+            if resident.cache.is_some() {
+                offer((resident.idle_since, 0, index, [0; 32]), Place::Pool(index));
+            }
+        }
+        if include_selected && self.request_owner().is_none() {
+            if let Some(resident) = &self.resident {
+                if resident.cache.is_some() {
+                    offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
+                }
+            }
+        }
+        for (id, entry) in &self.states {
+            if !entry.is_leased() && entry.resident.cache.is_some() {
+                offer(
+                    (entry.resident.idle_since, 2, 0, *id.as_bytes()),
+                    Place::Published(*id),
+                );
+            }
+        }
+        let Some((_, place)) = best else {
+            return Ok(false);
+        };
+        let park_published =
+            !include_selected || self.resident.is_some() || self.request_owner().is_some();
+        if matches!(place, Place::Published(_)) && park_published {
+            self.pool
+                .try_reserve(1)
+                .map_err(|_| EngineError::AllocationFailed {
+                    operation: "preserve model after KV spill",
+                    requested_bytes: None,
+                })?;
+        }
+        let store = self
+            .tiered
+            .as_mut()
+            .ok_or_else(|| internal("KV storage disappeared"))?;
+        let release = |store: &mut TieredKvStore, resident: &mut Resident| {
+            persist_idle_kv(store, resident);
+            drop(resident.candidate.take());
+            // Native arrays drop before their reservation guard.
+            drop(resident.cache.take());
+        };
+        match place {
+            Place::Pool(index) => release(store, &mut self.pool[index]),
+            Place::Selected => release(
+                store,
+                self.resident
+                    .as_mut()
+                    .ok_or_else(|| internal("KV owner disappeared"))?,
+            ),
+            Place::Published(id) => {
+                let mut resident = self
+                    .states
+                    .remove(&id)
+                    .ok_or_else(|| internal("KV publication disappeared"))?
+                    .resident;
+                release(store, &mut resident);
+                if !park_published {
+                    self.resident = Some(resident);
+                } else {
+                    self.pool.push(resident);
+                }
+            }
+        }
+        if let Some(store) = &mut self.tiered {
+            store.metrics.hot_evictions = store.metrics.hot_evictions.saturating_add(1);
+        }
+        Ok(true)
+    }
+
     // M9_INSTANCE_SCOPED_LEASE_EXECUTION_V1
     fn select_for_startup(
         &mut self,
@@ -1889,14 +2099,16 @@ impl NativeState {
         }
         // Reject the target allocation only. Other leased publications
         // remain independently owned by their StateEntry throughout B.
-        if self
+        let resources: Vec<_> = self
             .states
             .values()
-            .any(|entry| entry.is_leased() && model_matches(&entry.resident, artifact, backend))
-        {
-            return Err(EngineError::Busy {
-                active_request_id: None,
-                message: "requested model owns a live canonical session lease".to_owned(),
+            .filter(|entry| model_matches(&entry.resident, artifact, backend))
+            .filter_map(StateEntry::lease_protection)
+            .collect();
+        if !resources.is_empty() {
+            return Err(EngineError::ProtectedResources {
+                operation: "select model for startup",
+                resources,
             });
         }
         let published = self
@@ -2001,15 +2213,20 @@ impl NativeState {
         version: FamilyVersion,
         plan: &RuntimePlan,
     ) -> Result<MemoryEstimate, EngineError> {
-        if self.states.values().any(|entry| {
-            entry.is_leased()
-                && entry.resident.model.artifact_id() == artifact
-                && entry.resident.model.registration().family() == family
-                && entry.resident.model.registration().implementation_version() == version
-        }) {
-            return Err(EngineError::Busy {
-                active_request_id: None,
-                message: "requested model owns a live canonical session lease".to_owned(),
+        let resources: Vec<_> = self
+            .states
+            .values()
+            .filter(|entry| {
+                entry.resident.model.artifact_id() == artifact
+                    && entry.resident.model.registration().family() == family
+                    && entry.resident.model.registration().implementation_version() == version
+            })
+            .filter_map(StateEntry::lease_protection)
+            .collect();
+        if !resources.is_empty() {
+            return Err(EngineError::ProtectedResources {
+                operation: "estimate model startup",
+                resources,
             });
         }
         let matches = |resident: &&Resident| {
@@ -2221,7 +2438,28 @@ impl NativeState {
         // Recovery followed by new pressure starts a new grace window.
         // An older post-grace command must not bypass that newer decision.
         tick.request_model_eviction &= enforcer.model_eviction_requested();
-        let model = if tick.request_model_eviction {
+        let reclaimed_kv = tick.request_model_eviction && self.reclaim_one_idle_kv(true)?;
+        if reclaimed_kv {
+            // Releasing live KV is an earlier tier than unloading weights.
+            // Observe the result before authorizing another destructive step.
+            if self.request_owner().is_none() {
+                if let Err(error) = self.reclaim_mlx_allocator_cache() {
+                    allocator_error = Some(error.to_string());
+                }
+            }
+            tick.status = refresh()?;
+            if tick.status.pressure == crate::memory_guard::PressureLevel::Ok {
+                tick.request_model_eviction = false;
+                tick.request_cache_reclaim = false;
+                tick.deferred_for_pool_drain = false;
+            }
+            tick.request_model_eviction &= enforcer.model_eviction_requested();
+        }
+        // Bound native work to one KV victim per tick. The next fresh tick
+        // tries any remaining idle KV before weights become eligible.
+        let model = if reclaimed_kv {
+            IdleModelReclaim::DeferredForKv
+        } else if tick.request_model_eviction {
             match self.evict_one_enforcer_model()? {
                 Some(instance) => IdleModelReclaim::Evicted(instance),
                 None => IdleModelReclaim::NoEligibleVictim,
@@ -2243,6 +2481,9 @@ impl NativeState {
 
     fn evict_one_pooled_model(&mut self) -> bool {
         // Startup may reclaim other idle owners, never its selected target.
+        if self.reclaim_one_idle_kv(false).unwrap_or(false) {
+            return true;
+        }
         self.evict_one_idle_model(false).ok().flatten().is_some()
     }
 
@@ -2259,10 +2500,10 @@ impl NativeState {
             return Ok(());
         }
         if !self.pool_enabled {
-            if self.selected_model_pinned() {
-                return Err(EngineError::Busy {
-                    active_request_id: None,
-                    message: "model replacement blocked by explicit residency pin".to_owned(),
+            if let Some(resource) = self.resident.as_ref().and_then(Resident::pin_protection) {
+                return Err(EngineError::ProtectedResources {
+                    operation: "replace resident model",
+                    resources: vec![resource],
                 });
             }
             drop(self.resident.take());
@@ -2294,6 +2535,8 @@ impl NativeState {
 
         loop {
             self.expire_models_at(Instant::now());
+            self.enforce_hot_limit();
+            self.publish();
             let command = match receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok(command) => command,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2354,6 +2597,25 @@ impl NativeState {
                         {
                             resident.idle_ttl = ttl;
                         }
+                    });
+                    self.publish();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+                Command::ConfigureTieredKv { config, reply } => {
+                    let result = self.require_idle().and_then(|()| {
+                        let updated = self
+                            .tiered
+                            .as_mut()
+                            .map_or(Ok(false), |store| store.update_limits(&config))?;
+                        if !updated {
+                            let store = TieredKvStore::open(config, &self.admission)?;
+                            self.tiered = Some(store);
+                        }
+                        self.enforce_hot_limit();
+                        Ok(())
                     });
                     self.publish();
                     let _ = reply.send(Reply {
@@ -2465,6 +2727,14 @@ impl NativeState {
                 Command::Finish { request, reply } => {
                     let usage = self.usage(&request);
                     let result = self.finish(&request);
+                    if result.is_ok() {
+                        if let (Some(store), Some(resident)) =
+                            (&mut self.tiered, &mut self.resident)
+                        {
+                            persist_idle_kv(store, resident);
+                        }
+                        self.enforce_hot_limit();
+                    }
                     self.publish();
                     let _ = reply.send(Reply { result, usage });
                 }
@@ -2698,11 +2968,76 @@ impl NativeState {
         })
     }
 
+    /// Capture eligibility and its blocker provenance together. These weak
+    /// count observations never acquire ownership. A concurrent handle drop
+    /// may make the result conservative; acquisition is worker-serialized.
+    fn idle_reclamation_observation(
+        &self,
+    ) -> (
+        crate::pressure::ReclaimableResources,
+        Vec<ProtectedResource>,
+    ) {
+        let mut resources = Vec::new();
+        let mut eligible_idle_models = 0;
+        let mut leased_session_states = 0;
+        for resident in &self.pool {
+            if let Some(resource) = resident.pin_protection() {
+                resources.push(resource);
+            } else {
+                eligible_idle_models += 1;
+            }
+        }
+        if let Some(resident) = &self.resident {
+            if let Some(resource) = resident.pin_protection() {
+                resources.push(resource);
+            } else if self.request_owner().is_none() {
+                eligible_idle_models += 1;
+            }
+        }
+        for entry in self.states.values() {
+            let pin = entry.resident.pin_protection();
+            let lease = entry.lease_protection();
+            if pin.is_none() && lease.is_none() {
+                eligible_idle_models += 1;
+            }
+            if let Some(resource) = pin {
+                resources.push(resource);
+            }
+            if let Some(resource) = lease {
+                leased_session_states += 1;
+                resources.push(resource);
+            }
+        }
+        let selected_state = self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| resident.cache.is_some() || resident.candidate.is_some());
+        let pooled_states = self
+            .pool
+            .iter()
+            .filter(|resident| resident.cache.is_some() || resident.candidate.is_some())
+            .count();
+        let idle_session_states = usize::from(selected_state) + pooled_states + self.states.len();
+        (
+            crate::pressure::ReclaimableResources {
+                idle_session_states,
+                leased_session_states,
+                can_release_state_without_model: idle_session_states != 0,
+                idle_model_loaded: self.resident.is_some()
+                    || !self.pool.is_empty()
+                    || !self.states.is_empty(),
+                eligible_idle_models,
+                idle_model_has_live_leases: !resources.is_empty(),
+            },
+            resources,
+        )
+    }
+
     fn pressure_observation(
         &self,
         setup: &Setup,
-    ) -> Result<crate::pressure::PressureObservation, EngineError> {
-        use crate::pressure::{AllocatorObservation, ExecutionState, ReclaimableResources};
+    ) -> Result<(crate::pressure::PressureObservation, Vec<ProtectedResource>), EngineError> {
+        use crate::pressure::{AllocatorObservation, ExecutionState};
         let policy = setup
             .pressure_policy
             .ok_or_else(|| internal("pressure policy missing"))?;
@@ -2718,19 +3053,7 @@ impl NativeState {
         } else {
             None
         };
-        let selected = self.resident.as_ref();
-        let selected_state = selected.is_some_and(|r| r.cache.is_some() || r.candidate.is_some());
-        let unleased_states = self
-            .states
-            .values()
-            .filter(|entry| !entry.is_leased())
-            .count();
-        let eligible = self.pool.iter().any(|r| !r.pins.is_pinned())
-            || (self.request_owner().is_none() && selected.is_some_and(|r| !r.pins.is_pinned()))
-            || self
-                .states
-                .values()
-                .any(|entry| !entry.is_leased() && !entry.resident.pins.is_pinned());
+        let (reclaimable, resources) = self.idle_reclamation_observation();
         let execution = if self.active.is_some() {
             ExecutionState::Active
         } else if self.pending.is_some() {
@@ -2738,25 +3061,16 @@ impl NativeState {
         } else {
             ExecutionState::Idle
         };
-        Ok(crate::pressure::PressureObservation {
-            admission: self.admission.snapshot()?,
-            allocator,
-            demand: self.pressure_demand(setup)?,
-            execution,
-            reclaimable: ReclaimableResources {
-                idle_session_states: usize::from(selected_state) + unleased_states,
-                leased_session_states: self
-                    .states
-                    .values()
-                    .filter(|entry| entry.is_leased())
-                    .count(),
-                can_release_state_without_model: selected_state || unleased_states != 0,
-                idle_model_loaded: selected.is_some()
-                    || !self.pool.is_empty()
-                    || !self.states.is_empty(),
-                idle_model_has_live_leases: !eligible,
+        Ok((
+            crate::pressure::PressureObservation {
+                admission: self.admission.snapshot()?,
+                allocator,
+                demand: self.pressure_demand(setup)?,
+                execution,
+                reclaimable,
             },
-        })
+            resources,
+        ))
     }
 
     fn pressure_release_idle_state(&mut self) -> Result<(), EngineError> {
@@ -2767,10 +3081,34 @@ impl NativeState {
             .is_some_and(|r| r.cache.is_some() || r.candidate.is_some())
         {
             if let Some(resident) = &mut self.resident {
+                if let Some(store) = &mut self.tiered {
+                    persist_idle_kv(store, resident);
+                }
                 drop(resident.candidate.take());
                 drop(resident.cache.take());
             }
+        } else if let Some(index) = self
+            .pool
+            .iter()
+            .enumerate()
+            .filter(|(_, resident)| resident.cache.is_some() || resident.candidate.is_some())
+            .min_by_key(|(index, resident)| (resident.idle_since, *index))
+            .map(|(index, _)| index)
+        {
+            // A model pin protects weights, not its unleased idle KV.
+            // Pooled residents cannot own canonical state leases.
+            let resident = &mut self.pool[index];
+            if let Some(store) = &mut self.tiered {
+                persist_idle_kv(store, resident);
+            }
+            drop(resident.candidate.take());
+            drop(resident.cache.take());
         } else {
+            let resources: Vec<_> = self
+                .states
+                .values()
+                .filter_map(StateEntry::lease_protection)
+                .collect();
             let id = self
                 .states
                 .iter()
@@ -2791,6 +3129,9 @@ impl NativeState {
                     .remove(&id)
                     .ok_or_else(|| internal("idle-state reclamation owner disappeared"))?;
                 let mut resident = entry.resident;
+                if let Some(store) = &mut self.tiered {
+                    persist_idle_kv(store, &mut resident);
+                }
                 drop(resident.candidate.take());
                 drop(resident.cache.take());
                 if self.resident.is_none() {
@@ -2798,10 +3139,10 @@ impl NativeState {
                 } else {
                     self.pool.push(resident);
                 }
-            } else if self.states.values().any(StateEntry::is_leased) {
-                return Err(EngineError::Busy {
-                    active_request_id: None,
-                    message: "all canonical state allocations are leased".to_owned(),
+            } else if !resources.is_empty() {
+                return Err(EngineError::ProtectedResources {
+                    operation: "reclaim idle session state",
+                    resources,
                 });
             }
         }
@@ -2811,12 +3152,11 @@ impl NativeState {
 
     fn pressure_unload_idle_model(&mut self) -> Result<(), EngineError> {
         self.require_idle()?;
-        if self.evict_one_idle_model(true)?.is_none()
-            && (self.resident.is_some() || !self.pool.is_empty() || !self.states.is_empty())
-        {
-            return Err(EngineError::Busy {
-                active_request_id: None,
-                message: "all idle model owners are protected".to_owned(),
+        let (_, resources) = self.idle_reclamation_observation();
+        if self.evict_one_idle_model(true)?.is_none() && !resources.is_empty() {
+            return Err(EngineError::ProtectedResources {
+                operation: "unload idle model",
+                resources,
             });
         }
         self.publish();
@@ -2839,7 +3179,7 @@ impl NativeState {
         // attempt to evade an exhausted budget.
         for _ in 0..=crate::pressure::MAX_RECLAMATION_ACTIONS {
             check_startup(control, abandoned)?;
-            let observation = self.pressure_observation(setup)?;
+            let (observation, resources) = self.pressure_observation(setup)?;
             let decision =
                 attempt
                     .evaluate(observation)
@@ -2853,17 +3193,39 @@ impl NativeState {
                 PressureDecision::ReleaseIdleSessionState => ReclaimAction::ReleaseIdleSessionState,
                 PressureDecision::UnloadIdleModel => ReclaimAction::UnloadIdleModel,
                 PressureDecision::Reject(reason) => {
-                    if matches!(
-                        reason,
-                        RejectReason::NativeOwnerBusy | RejectReason::ProtectedResources
-                    ) {
+                    if reason == RejectReason::NativeOwnerBusy {
                         return Err(EngineError::Busy {
                             active_request_id: self
                                 .request_owner()
                                 .map(|id| id.as_str().to_owned()),
-                            message: format!(
-                                "startup pressure policy rejected protected ownership: {reason:?}"
-                            ),
+                            message: "native execution prevents startup pressure reclamation"
+                                .to_owned(),
+                        });
+                    }
+                    if reason == RejectReason::ProtectedResources {
+                        let options = policy.options();
+                        let resources: Vec<_> = resources
+                            .into_iter()
+                            .filter(|resource| match resource {
+                                ProtectedResource::ModelPin { .. } => {
+                                    options.allow_idle_model_unload
+                                }
+                                ProtectedResource::SessionStateLease { .. } => {
+                                    options.allow_idle_model_unload
+                                        || (options.allow_idle_state_release
+                                            && observation
+                                                .reclaimable
+                                                .can_release_state_without_model)
+                                }
+                            })
+                            .collect();
+                        // Eligibility and counts were captured together, so
+                        // even a concurrent final drop cannot create an
+                        // empty or invented blocker report.
+                        debug_assert!(!resources.is_empty());
+                        return Err(EngineError::ProtectedResources {
+                            operation: "startup pressure reclamation",
+                            resources,
                         });
                     }
                     let operation = match reason {
@@ -2884,10 +3246,40 @@ impl NativeState {
                         _ => "startup pressure policy rejected admission",
                     };
                     let assessment = attempt.last_assessment();
+                    if reason == RejectReason::RequestExceedsAdmissionBudget {
+                        return Err(EngineError::MemoryLimitExceeded {
+                            operation,
+                            reason: MemoryLimitReason::ReservationBudget {
+                                budget_bytes: observation.admission.budget_bytes(),
+                            },
+                            required_bytes: observation.demand.additional_reservation_bytes,
+                            available_bytes: observation.admission.available_bytes(),
+                        });
+                    }
+                    // This early policy rejection occurs before an
+                    // assessment exists. Its domain is the native ceiling,
+                    // not the admission ledger, regardless of ledger fit.
+                    if reason == RejectReason::RequestExceedsAllocatorCeiling {
+                        let ceiling =
+                            policy.options().allocator_ceiling_bytes.ok_or_else(|| {
+                                internal("allocator ceiling rejection without a ceiling")
+                            })?;
+                        return Err(EngineError::MemoryLimitExceeded {
+                            operation,
+                            reason: MemoryLimitReason::AllocatorCeiling {
+                                ceiling_bytes: ceiling,
+                            },
+                            required_bytes: observation.demand.additional_mlx_bytes,
+                            available_bytes: ceiling,
+                        });
+                    }
                     if let Some(ceiling) = policy.options().allocator_ceiling_bytes {
                         if assessment.is_some_and(|a| a.reservation_deficit_bytes == 0) {
                             return Err(EngineError::MemoryLimitExceeded {
                                 operation,
+                                reason: MemoryLimitReason::AllocatorCeiling {
+                                    ceiling_bytes: ceiling,
+                                },
                                 required_bytes: assessment
                                     .and_then(|a| a.projected_mlx_bytes)
                                     .unwrap_or(observation.demand.additional_mlx_bytes),
@@ -2897,6 +3289,9 @@ impl NativeState {
                     }
                     return Err(EngineError::MemoryLimitExceeded {
                         operation,
+                        reason: MemoryLimitReason::ReservationBudget {
+                            budget_bytes: observation.admission.budget_bytes(),
+                        },
                         required_bytes: observation.demand.additional_reservation_bytes,
                         available_bytes: observation.admission.available_bytes(),
                     });
@@ -2933,10 +3328,15 @@ impl NativeState {
     }
 
     fn require_unleased(&self) -> Result<(), EngineError> {
-        if self.states.values().any(StateEntry::is_leased) {
-            return Err(EngineError::Busy {
-                active_request_id: None,
-                message: "retained native state has a live lease".to_owned(),
+        let resources: Vec<_> = self
+            .states
+            .values()
+            .filter_map(StateEntry::lease_protection)
+            .collect();
+        if !resources.is_empty() {
+            return Err(EngineError::ProtectedResources {
+                operation: "reuse retained session state",
+                resources,
             });
         }
         Ok(())
@@ -3103,6 +3503,32 @@ impl NativeState {
         }
         setup.backend.verify_artifact(artifact, &control)?;
         control.check_cancelled()?;
+        let disk_identity = if self
+            .tiered
+            .as_ref()
+            .is_some_and(|store| store.metrics.disk_enabled)
+            && matches!(setup.plan.cache.mode().kind, CacheKind::Full)
+        {
+            setup.backend.cache_manifest_digest(artifact)?.map(|manifest| {
+                let identity = serde_json::json!({
+                    "format": "alloy-kv-identity-v1",
+                    "manifest_sha256": crate::tiered_kv::digest(&manifest),
+                    "artifact": artifact.id().as_str(),
+                    "family": artifact.family(),
+                    "family_version": setup.backend.registration().implementation_version().to_string(),
+                    "engine_api": ENGINE_API_VERSION,
+                    "profile": context.profile_id().as_str(),
+                    "tokenizer": context.tokenizer_id().as_str(),
+                    "template": crate::tiered_kv::digest(context.template_hash()),
+                    "renderer": [&context.renderer().implementation, &context.renderer().version],
+                    "cache_representation": setup.plan.cache.mode().representation.as_str(),
+                    "cache_kind": "full",
+                });
+                crate::tiered_kv::digest(identity.to_string().as_bytes())
+            })
+        } else {
+            None
+        };
 
         let same_model = self
             .resident
@@ -3164,6 +3590,7 @@ impl NativeState {
             if observed > setup.plan.load_limits.max_resident_bytes() {
                 return Err(EngineError::MemoryLimitExceeded {
                     operation: "loaded model buffers",
+                    reason: MemoryLimitReason::BufferLimit,
                     required_bytes: observed,
                     available_bytes: setup.plan.load_limits.max_resident_bytes(),
                 });
@@ -3278,7 +3705,7 @@ impl NativeState {
             .as_mut()
             .ok_or_else(|| internal("allocated cache unavailable"))?;
 
-        let reused = previous.as_ref().map_or(0, |candidate| {
+        let mut reused = previous.as_ref().map_or(0, |candidate| {
             if candidate.compatibility.matches(
                 resident.model.as_ref(),
                 cache.cache.as_ref(),
@@ -3303,6 +3730,14 @@ impl NativeState {
             cache.cache.reset()?;
             if cache.cache.len() != 0 {
                 return Err(internal("cache reset did not clear logical state"));
+            }
+            if let (Some(store), Some(identity)) = (&mut self.tiered, &disk_identity) {
+                reused = store.restore(
+                    identity,
+                    context.token_ids(),
+                    cache.cache.as_mut(),
+                    &control,
+                )?;
             }
         } else if reused == context.token_count() {
             // Identical input requires real retained final-position logits.
@@ -3382,6 +3817,8 @@ impl NativeState {
             };
 
             Some(StateCandidate {
+                disk_identity,
+                persisted: false,
                 request_id: control.request_id().clone(),
                 compatibility,
                 render_hash: *context.render_hash(),
@@ -3821,10 +4258,10 @@ impl NativeState {
         let Some(entry) = self.states.get(state_id) else {
             return Ok(ReleaseOutcome::AlreadyAbsent);
         };
-        if entry.is_leased() {
-            return Err(EngineError::Busy {
-                active_request_id: None,
-                message: "cannot release retained state while a lease is alive".to_owned(),
+        if let Some(resource) = entry.lease_protection() {
+            return Err(EngineError::ProtectedResources {
+                operation: "release retained session state",
+                resources: vec![resource],
             });
         }
         let park = self.resident.is_some() || self.request_owner().is_some();
@@ -3864,6 +4301,7 @@ impl NativeState {
 
     fn publish(&self) {
         let mut summary = Summary::empty(true);
+        summary.tiered_kv = self.tiered_snapshot();
         let metadata = |resident: &Resident, leased| ResidentModelSnapshot {
             artifact: resident.model.artifact_id().clone(),
             weights_reserved_bytes: resident.weights.bytes(),
@@ -3942,6 +4380,31 @@ impl NativeState {
         }
 
         *lock_metadata(&self.summary) = summary;
+    }
+}
+
+fn persist_idle_kv(store: &mut TieredKvStore, resident: &mut Resident) {
+    let (Some(candidate), Some(cache)) = (&mut resident.candidate, &mut resident.cache) else {
+        return;
+    };
+    if candidate.persisted {
+        return;
+    }
+    let Some(identity) = &candidate.disk_identity else {
+        return;
+    };
+    match store.save(identity, &candidate.history.tokens, cache.cache.as_mut()) {
+        Ok(saved) => candidate.persisted = saved,
+        Err(error) => {
+            store.record_error(error);
+            // I/O failures leave valid hot state reusable. A failed native
+            // readback can invalidate its tensors; discard those arrays and
+            // guards now so the next request starts with a healthy cache.
+            if check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_err() {
+                drop(resident.candidate.take());
+                drop(resident.cache.take());
+            }
+        }
     }
 }
 
@@ -4069,6 +4532,7 @@ fn validate_candidate(resident: &Resident, candidate: &StateCandidate) -> Result
     if weights > resident.weights.bytes() {
         return Err(EngineError::MemoryLimitExceeded {
             operation: "retained model buffers",
+            reason: MemoryLimitReason::BufferLimit,
             required_bytes: weights,
             available_bytes: resident.weights.bytes(),
         });
@@ -4186,6 +4650,7 @@ fn check_cache_bytes(cache: &dyn FamilyCache, limit: u64) -> Result<(), EngineEr
     if allocated > limit {
         Err(EngineError::MemoryLimitExceeded {
             operation: "actual KV buffer allocation",
+            reason: MemoryLimitReason::BufferLimit,
             required_bytes: allocated,
             available_bytes: limit,
         })
@@ -4295,6 +4760,7 @@ mod tests {
             pool: Vec::new(),
             pool_enabled: false,
             pool_ttl: None,
+            tiered: None,
             admission: AdmissionController::new(4096).expect("controller"),
             retention,
             summary: Arc::new(Mutex::new(Summary::empty(true))),
@@ -4805,6 +5271,7 @@ mod mlx_allocator_runtime_tests {
             pool: Vec::new(),
             pool_enabled: false,
             pool_ttl: None,
+            tiered: None,
             admission: admission.clone(),
             retention: RetentionPolicy {
                 retain_model: true,
@@ -4833,6 +5300,7 @@ mod pressure_resource_reclamation_tests {
             pool: Vec::new(),
             pool_enabled: false,
             pool_ttl: None,
+            tiered: None,
             admission,
             retention: RetentionPolicy {
                 retain_model: true,
@@ -4945,6 +5413,7 @@ mod model_pool_runtime_tests {
             pool: Vec::new(),
             pool_enabled: true,
             pool_ttl: Some(Duration::from_secs(10)),
+            tiered: None,
             admission: AdmissionController::new(256).expect("ledger"),
             retention: RetentionPolicy {
                 retain_model: true,

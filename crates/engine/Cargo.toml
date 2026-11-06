@@ -7,7 +7,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+serde = { workspace = true }
 serde_json = "=1.0.145"
+safetensors = "=0.4.3"
 qwen3 = { path = "../families/qwen3" }
 minijinja = { workspace = true }
 sha2 = "=0.10.9"
@@ -15,9 +17,6 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"
 blake3 = "=1.8.7"
 mlx-ffi = { path = "../mlx-ffi" }
 inference-infra = { path = "../inference-infra" }
-
-[dev-dependencies]
-safetensors = "=0.4.3"
 
 [lints]
 workspace = true

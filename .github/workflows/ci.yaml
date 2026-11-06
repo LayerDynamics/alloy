@@ -28,7 +28,7 @@ jobs:
           cache-dependency-path: ts/cli/package-lock.json
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
 
   linux:
     name: linux-arm64
@@ -107,16 +107,12 @@ jobs:
                 tar -C /work -xf -
 
               echo "::group::MLX FFI tests"
-              cargo test --locked -p mlx-ffi \
-                --test raii \
-                --test compile \
-                --test ops \
+              cargo test --locked -p mlx-ffi --all-targets \
                 -- --test-threads=1
               echo "::endgroup::"
 
               echo "::group::Inference infrastructure tests"
-              cargo test --locked -p inference-infra \
-                --test infra_cpu_ops
+              cargo test --locked -p inference-infra --all-targets
               echo "::endgroup::"
 
               echo "::group::Qwen3 tests"
@@ -168,7 +164,11 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: [self-hosted, macOS, arm64]
-    timeout-minutes: 60
+    timeout-minutes: 180
+    env:
+      # A pre-provisioned flat artifact directory; empty uses the documented local default.
+      ALLOY_QWEN3_ARTIFACT: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
+      ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
 
     steps:
       - name: checkout
@@ -183,7 +183,7 @@ jobs:
 
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
 
       - name: Metal and unified tests
         shell: bash
@@ -193,6 +193,10 @@ jobs:
           cargo test --locked -p mlx-ffi \
             --no-fail-fast \
             -- --test-threads=1
+
+      - name: Native infrastructure and KV block transfers
+        shell: bash
+        run: cargo test --locked -p inference-infra --all-targets
 
       - name: Qwen3 tests
         shell: bash
@@ -259,3 +263,41 @@ jobs:
           set -euo pipefail
 
           cargo test --locked -p alloyd --doc
+
+      - name: "Test 13: real Qwen3 incremental CLI stream"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 35
+        shell: bash
+        run: bash ts/cli/scripts/qwen3_end_to_end_stream.sh
+
+      - name: "Test 14: real daemon restart, history, and SSD KV restore"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        shell: bash
+        run: bash ts/cli/scripts/session_restart_real_model.sh
+
+      - name: "M9: real 4B and 14B memory acceptance"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 45
+        shell: bash
+        env:
+          ALLOY_M9_MODEL_A_DIR: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
+          ALLOY_M9_MODEL_B_DIR: ${{ vars.ALLOY_M9_MODEL_B_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ALLOY_ACCEPTANCE_OUTPUT_DIR"
+          evidence_dir="$(mktemp -d "$ALLOY_ACCEPTANCE_OUTPUT_DIR/m9-large-model-XXXXXX")"
+          export ALLOY_M9_OUTPUT="$evidence_dir/acceptance.jsonl"
+          driver_status=0
+          bash scripts/m9_large_model_acceptance.sh 2>&1 | tee "$evidence_dir/driver.log" || driver_status=$?
+          node ts/cli/scripts/real-model-acceptance.mjs --summarize-m9 "$ALLOY_M9_OUTPUT"
+          exit "$driver_status"
+
+      - name: Retain Phase 1 real-model acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-1-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/phase-1-acceptance/
+          if-no-files-found: warn
+          retention-days: 30
