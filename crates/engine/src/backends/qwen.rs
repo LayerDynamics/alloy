@@ -560,7 +560,8 @@ impl Qwen3Backend {
         let generation_limits = self.limits.generation;
         let backend: Arc<dyn RuntimeBackend> = Arc::new(self);
         let mut runtime =
-            FamilyRuntime::new(vec![backend], admission, generation_limits, retention)?;
+            FamilyRuntime::new(vec![backend], admission, generation_limits, retention)?
+                .with_model_pool(Some(std::time::Duration::from_secs(300)))?;
         if let Some(enforcer) = memory_enforcer {
             runtime = runtime.with_memory_enforcer(enforcer);
         }

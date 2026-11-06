@@ -31,6 +31,7 @@
 //! Prefix-reuse capability reporting intentionally remains false until
 //! production-path verification has passed.
 
+use crate::residency_pin::{ModelPinOwner, ModelResidencyPin};
 use crate::{
     admission::{AdmissionController, AdmissionSnapshot, MemoryReservation, ReservationGrant},
     api::{ENGINE_API_VERSION, EngineFuture, EngineRuntime, ExecutionContext},
@@ -63,6 +64,7 @@ use std::{
     },
     task::{Context, Poll, Waker},
     thread,
+    time::{Duration, Instant},
 };
 
 /// Stable identity of the Qwen3 host-reference KV representation.
@@ -264,7 +266,85 @@ pub struct FamilyRuntime {
     worker: Arc<NativeWorker>,
 }
 
+/// Metadata for one actually owned native model instance.
+#[derive(Clone, Debug)]
+pub struct ModelResidencyInfo {
+    /// Identity of this particular load.
+    pub instance: ModelInstanceId,
+    /// Loaded artifact identity.
+    pub artifact: ArtifactId,
+    /// Weight bytes still committed in the admission ledger.
+    pub committed_weight_bytes: u64,
+    /// Whether explicit residency handles protect the model.
+    pub pinned: bool,
+}
+
 impl FamilyRuntime {
+    /// Enable worker-owned idle model pooling and optional per-model TTL.
+    ///
+    /// Existing instances receive this default. Ordinary session leases
+    /// retain their current conservative worker-wide mutation protection.
+    /// Use before serving requests. None disables expiry, not pooling.
+    pub fn with_model_pool(self, ttl: Option<Duration>) -> Result<Self, EngineError> {
+        self.worker
+            .call(|reply| Command::ConfigureModelPool { ttl, reply })?
+            .result?;
+        Ok(self)
+    }
+
+    /// Change idle expiry for one exact loaded instance; false means absent.
+    pub fn set_model_idle_ttl(
+        &self,
+        instance: ModelInstanceId,
+        ttl: Option<Duration>,
+    ) -> EngineFuture<'_, bool> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-model-ttl", move || {
+                worker
+                    .call(|reply| Command::SetModelTtl {
+                        instance,
+                        ttl,
+                        reply,
+                    })?
+                    .result
+            })?
+            .await
+        })
+    }
+
+    /// List actual loaded instances, including idle pool residents.
+    pub fn model_residency(&self) -> EngineFuture<'_, Vec<ModelResidencyInfo>> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-model-residency", move || {
+                worker
+                    .call(|reply| Command::ModelResidency { reply })?
+                    .result
+            })?
+            .await
+        })
+    }
+
+    /// Acquire an explicit pin for an exact loaded instance, or return None.
+    ///
+    /// Acquisition and destruction are serialized on the native worker.
+    /// Shutdown still destroys the worker's models, regardless of handles.
+    pub fn pin_model(
+        &self,
+        instance: ModelInstanceId,
+    ) -> EngineFuture<'_, Option<ModelResidencyPin>> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            dispatch("engine-model-pin", move || {
+                worker
+                    .call(|reply| Command::PinModel { instance, reply })?
+                    .result
+            })?
+            .await
+        })
+    }
+
     /// Start the worker without loading native model objects here.
     pub fn new(
         backends: Vec<Arc<dyn RuntimeBackend>>,
@@ -320,6 +400,9 @@ impl FamilyRuntime {
                     pending: None,
                     resident: None,
                     states: HashMap::new(),
+                    pool: Vec::new(),
+                    pool_enabled: false,
+                    pool_ttl: None,
                     admission: worker_admission,
                     retention,
                     summary: worker_summary,
@@ -580,7 +663,10 @@ impl EngineRuntime for FamilyRuntime {
             let same_cache = same_model && summary.cache_matches(&plan);
             let mut available = self.admission.snapshot()?.available_bytes();
 
-            if !summary.active && summary.pin.strong_count() == 0 {
+            if !summary.active
+                && summary.pin.strong_count() == 0
+                && (!summary.model_pinned || same_model)
+            {
                 let reclaim = if !same_model {
                     add(
                         add(summary.weights_bytes, summary.cache_bytes)?,
@@ -792,6 +878,22 @@ struct Reply<T> {
 }
 
 enum Command {
+    ConfigureModelPool {
+        ttl: Option<Duration>,
+        reply: SyncSender<Reply<()>>,
+    },
+    SetModelTtl {
+        instance: ModelInstanceId,
+        ttl: Option<Duration>,
+        reply: SyncSender<Reply<bool>>,
+    },
+    ModelResidency {
+        reply: SyncSender<Reply<Vec<ModelResidencyInfo>>>,
+    },
+    PinModel {
+        instance: ModelInstanceId,
+        reply: SyncSender<Reply<Option<ModelResidencyPin>>>,
+    },
     AdmitOutput {
         setup: Setup,
         control: ExecutionControl,
@@ -1292,6 +1394,7 @@ struct Summary {
     alive: bool,
     active: bool,
     pin: Weak<()>,
+    model_pinned: bool,
     artifact: Option<ArtifactId>,
     weights_bytes: u64,
     cache_bytes: u64,
@@ -1308,6 +1411,7 @@ impl Summary {
             alive,
             active: false,
             pin: Weak::new(),
+            model_pinned: false,
             artifact: None,
             weights_bytes: 0,
             cache_bytes: 0,
@@ -1333,6 +1437,9 @@ struct ResidentCache {
 }
 
 struct Resident {
+    pins: ModelPinOwner,
+    idle_since: Instant,
+    idle_ttl: Option<Duration>,
     cache: Option<ResidentCache>,
     model: Box<dyn LoadedModel>,
     weights: MemoryReservation,
@@ -1526,17 +1633,213 @@ struct NativeState {
     pending: Option<PendingStartup>,
     resident: Option<Resident>,
     states: HashMap<SessionStateId, StateEntry>,
+    pool: Vec<Resident>,
+    pool_enabled: bool,
+    pool_ttl: Option<Duration>,
     admission: AdmissionController,
     retention: RetentionPolicy,
     summary: Arc<Mutex<Summary>>,
 }
 
 impl NativeState {
+    fn residency_info(&self) -> Vec<ModelResidencyInfo> {
+        self.pool
+            .iter()
+            .chain(self.resident.iter())
+            .chain(self.states.values().map(|entry| &entry.resident))
+            .map(|resident| ModelResidencyInfo {
+                instance: resident.model.instance_id().clone(),
+                artifact: resident.model.artifact_id().clone(),
+                committed_weight_bytes: resident.weights.bytes(),
+                pinned: resident.pins.is_pinned(),
+            })
+            .collect()
+    }
+
+    fn pin_instance(
+        &mut self,
+        instance: &ModelInstanceId,
+    ) -> Result<Option<ModelResidencyPin>, EngineError> {
+        let resident = self
+            .pool
+            .iter_mut()
+            .chain(self.resident.iter_mut())
+            .chain(self.states.values_mut().map(|entry| &mut entry.resident))
+            .find(|resident| resident.model.instance_id().same_instance(instance));
+        match resident {
+            None => Ok(None),
+            Some(resident) => resident
+                .pins
+                .try_pin(instance, false)
+                .map(Some)
+                .map_err(|_| internal("model pin identity changed on native worker")),
+        }
+    }
+
+    fn selected_model_pinned(&self) -> bool {
+        self.resident
+            .as_ref()
+            .is_some_and(|resident| resident.pins.is_pinned())
+            || self
+                .states
+                .values()
+                .any(|entry| entry.resident.pins.is_pinned())
+    }
+
+    fn expire_models_at(&mut self, now: Instant) {
+        if !self.pool_enabled {
+            return;
+        }
+        self.pool
+            .retain(|resident| resident.pins.is_pinned() || !model_ttl_expired(resident, now));
+        if self.active.is_none()
+            && self.pending.is_none()
+            && !self.states.values().any(StateEntry::is_leased)
+            && !self.selected_model_pinned()
+        {
+            let expired = self
+                .resident
+                .as_ref()
+                .or_else(|| self.states.values().next().map(|entry| &entry.resident))
+                .is_some_and(|resident| model_ttl_expired(resident, now));
+            if expired {
+                if self.unpublish_idle_state().is_ok() {
+                    drop(self.resident.take());
+                }
+            }
+        }
+        self.publish();
+    }
+
+    fn evict_one_pooled_model(&mut self) -> bool {
+        // Vec order supplies a stable insertion-order tie break.
+        let victim = self
+            .pool
+            .iter()
+            .enumerate()
+            .filter(|(_, resident)| !resident.pins.is_pinned())
+            .min_by_key(|(index, resident)| (resident.idle_since, *index))
+            .map(|(index, _)| index);
+        if let Some(index) = victim {
+            // The Resident owns native resources and their real guards.
+            // No estimated bytes are subtracted from the ledger.
+            drop(self.pool.remove(index));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn switch_model(
+        &mut self,
+        artifact: &ArtifactRegistration,
+        backend: &dyn RuntimeBackend,
+    ) -> Result<(), EngineError> {
+        if self
+            .resident
+            .as_ref()
+            .is_some_and(|resident| model_matches(resident, artifact, backend))
+        {
+            return Ok(());
+        }
+        if !self.pool_enabled {
+            if self.selected_model_pinned() {
+                return Err(EngineError::Busy {
+                    active_request_id: None,
+                    message: "model replacement blocked by explicit residency pin".to_owned(),
+                });
+            }
+            drop(self.resident.take());
+            return Ok(());
+        }
+        if self.resident.is_some() {
+            self.pool
+                .try_reserve(1)
+                .map_err(|_| EngineError::AllocationFailed {
+                    operation: "reserve idle model pool entry",
+                    requested_bytes: None,
+                })?;
+        }
+        if let Some(resident) = self.resident.take() {
+            self.pool.push(resident);
+        }
+        if let Some(index) = self
+            .pool
+            .iter()
+            .position(|resident| model_matches(resident, artifact, backend))
+        {
+            self.resident = Some(self.pool.remove(index));
+        }
+        Ok(())
+    }
+
     fn run(&mut self, receiver: Receiver<Command>) {
         self.publish();
 
-        while let Ok(command) = receiver.recv() {
+        loop {
+            self.expire_models_at(Instant::now());
+            let command = match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             match command {
+                Command::ConfigureModelPool { ttl, reply } => {
+                    let result = self.require_idle().map(|()| {
+                        self.pool_enabled = true;
+                        self.pool_ttl = ttl;
+                        for resident in self
+                            .pool
+                            .iter_mut()
+                            .chain(self.resident.iter_mut())
+                            .chain(self.states.values_mut().map(|entry| &mut entry.resident))
+                        {
+                            resident.idle_ttl = ttl;
+                        }
+                    });
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+                Command::SetModelTtl {
+                    instance,
+                    ttl,
+                    reply,
+                } => {
+                    let resident = self
+                        .pool
+                        .iter_mut()
+                        .chain(self.resident.iter_mut())
+                        .chain(self.states.values_mut().map(|entry| &mut entry.resident))
+                        .find(|resident| resident.model.instance_id().same_instance(&instance));
+                    let result = Ok(match resident {
+                        Some(resident) => {
+                            resident.idle_ttl = ttl;
+                            true
+                        }
+                        None => false,
+                    });
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+                Command::ModelResidency { reply } => {
+                    let result = Ok(self.residency_info());
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
+                Command::PinModel { instance, reply } => {
+                    let result = self.pin_instance(&instance);
+                    self.publish();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
                 Command::AdmitOutput {
                     setup,
                     control,
@@ -1889,8 +2192,12 @@ impl NativeState {
                 idle_session_states: usize::from(has_state),
                 leased_session_states: usize::from(leased),
                 can_release_state_without_model: resident.is_some() && !leased,
-                idle_model_loaded: resident.is_some(),
-                idle_model_has_live_leases: leased,
+                idle_model_loaded: resident.is_some() || !self.pool.is_empty(),
+                idle_model_has_live_leases: if self.pool.iter().any(|r| !r.pins.is_pinned()) {
+                    false
+                } else {
+                    leased || self.selected_model_pinned()
+                },
             },
         })
     }
@@ -1911,7 +2218,17 @@ impl NativeState {
 
     fn pressure_unload_idle_model(&mut self) -> Result<(), EngineError> {
         self.require_idle()?;
+        if self.evict_one_pooled_model() {
+            self.publish();
+            return Ok(());
+        }
         self.require_unleased()?;
+        if self.selected_model_pinned() {
+            return Err(EngineError::Busy {
+                active_request_id: None,
+                message: "idle model has an explicit residency pin".to_owned(),
+            });
+        }
         self.unpublish_idle_state()?;
         // Resident drop order destroys native resources before their guards.
         drop(self.resident.take());
@@ -2089,8 +2406,9 @@ impl NativeState {
                 .is_some_and(|resident| model_matches(resident, artifact, setup.backend.as_ref()));
 
             if !same_model {
-                drop(self.resident.take());
-            } else if let Some(resident) = &mut self.resident {
+                self.switch_model(artifact, setup.backend.as_ref())?;
+            }
+            if let Some(resident) = &mut self.resident {
                 if resident
                     .cache
                     .as_ref()
@@ -2105,6 +2423,28 @@ impl NativeState {
 
             self.publish();
             check_startup(control, abandoned)?;
+            // Reclaim only actual idle pool owners before pressure evaluation.
+            loop {
+                let residency = self.pressure_residency(setup)?;
+                let compatible_cache = residency.reusable_model
+                    && self
+                        .resident
+                        .as_ref()
+                        .and_then(|r| r.cache.as_ref())
+                        .is_some_and(|c| cache_matches(c, &setup.plan));
+                let components = incremental_startup_components(
+                    &setup.plan,
+                    self.retention,
+                    &residency,
+                    compatible_cache,
+                )?;
+                let required = components.iter().try_fold(0u64, |n, b| add(n, *b))?;
+                if self.admission.snapshot()?.available_bytes() >= required
+                    || !self.evict_one_pooled_model()
+                {
+                    break;
+                }
+            }
             self.apply_startup_pressure(setup, control, abandoned)?;
 
             // Size the grant from post-reclaim residency so pressure and
@@ -2117,7 +2457,21 @@ impl NativeState {
                     .or_else(|| self.states.values().next().map(|entry| &entry.resident))
                     .and_then(|resident| resident.cache.as_ref())
                     .is_some_and(|cache| cache_matches(cache, &setup.plan));
-            incremental_startup_components(&setup.plan, self.retention, &residency, same_cache)
+            let components = incremental_startup_components(
+                &setup.plan,
+                self.retention,
+                &residency,
+                same_cache,
+            )?;
+            let required = components
+                .iter()
+                .try_fold(0u64, |total, bytes| add(total, *bytes))?;
+            while self.admission.snapshot()?.available_bytes() < required {
+                if !self.evict_one_pooled_model() {
+                    break;
+                }
+            }
+            Ok(components)
         })?;
 
         self.pending = Some(PendingStartup {
@@ -2163,8 +2517,9 @@ impl NativeState {
             .as_ref()
             .is_some_and(|resident| model_matches(resident, artifact, setup.backend.as_ref()));
         if !same_model {
-            drop(self.resident.take());
-        } else if let Some(resident) = &mut self.resident {
+            self.switch_model(artifact, setup.backend.as_ref())?;
+        }
+        if let Some(resident) = &mut self.resident {
             if resident
                 .cache
                 .as_ref()
@@ -2243,6 +2598,9 @@ impl NativeState {
 
             weights.try_resize(setup.plan.load_limits.max_resident_bytes())?;
             self.resident = Some(Resident {
+                pins: ModelPinOwner::new(model.instance_id().clone()),
+                idle_since: Instant::now(),
+                idle_ttl: self.pool_ttl,
                 cache: None,
                 model,
                 weights,
@@ -2662,7 +3020,10 @@ impl NativeState {
         // Drop decoder, transient logits, and workspace before replying.
         drop(active);
 
-        if !self.retention.retain_model {
+        if let Some(resident) = &mut self.resident {
+            resident.idle_since = Instant::now();
+        }
+        if !self.retention.retain_model && !self.selected_model_pinned() {
             drop(candidate);
             drop(self.resident.take());
             return Ok(());
@@ -2874,12 +3235,24 @@ impl NativeState {
         }
 
         self.require_idle()?;
+        if entry.resident.pins.is_pinned() && self.resident.is_some() {
+            return Err(internal(
+                "pinned state release conflicts with selected resident",
+            ));
+        }
         let entry = self
             .states
             .remove(state_id)
             .ok_or_else(|| internal("retained state disappeared during release"))?;
 
-        drop(entry);
+        if entry.resident.pins.is_pinned() {
+            let mut resident = entry.resident;
+            drop(resident.candidate.take());
+            drop(resident.cache.take());
+            self.resident = Some(resident);
+        } else {
+            drop(entry);
+        }
         Ok(ReleaseOutcome::Released)
     }
 
@@ -2893,6 +3266,7 @@ impl NativeState {
     fn publish(&self) {
         let mut summary = Summary::empty(true);
         summary.active = self.active.is_some() || self.pending.is_some();
+        summary.model_pinned = self.selected_model_pinned();
 
         let entry = self.states.values().next();
         if let Some(entry) = entry {
@@ -2932,6 +3306,16 @@ impl NativeState {
         }
 
         *lock_metadata(&self.summary) = summary;
+    }
+}
+
+fn model_ttl_expired(resident: &Resident, now: Instant) -> bool {
+    match (
+        resident.idle_ttl,
+        now.checked_duration_since(resident.idle_since),
+    ) {
+        (Some(ttl), Some(elapsed)) => elapsed >= ttl,
+        _ => false,
     }
 }
 
@@ -3256,6 +3640,9 @@ mod tests {
             pending: None,
             resident: None,
             states: HashMap::new(),
+            pool: Vec::new(),
+            pool_enabled: false,
+            pool_ttl: None,
             admission: AdmissionController::new(4096).expect("controller"),
             retention,
             summary: Arc::new(Mutex::new(Summary::empty(true))),
@@ -3763,6 +4150,9 @@ mod mlx_allocator_runtime_tests {
             pending: Some(pending),
             resident: None,
             states: HashMap::new(),
+            pool: Vec::new(),
+            pool_enabled: false,
+            pool_ttl: None,
             admission: admission.clone(),
             retention: RetentionPolicy {
                 retain_model: true,
@@ -3788,6 +4178,9 @@ mod pressure_resource_reclamation_tests {
             pending: None,
             resident: None,
             states: HashMap::new(),
+            pool: Vec::new(),
+            pool_enabled: false,
+            pool_ttl: None,
             admission,
             retention: RetentionPolicy {
                 retain_model: true,
@@ -3834,3 +4227,177 @@ mod pressure_resource_reclamation_tests {
 }
 
 // ALLOY_PRESSURE_STARTUP_INTEGRATION_V1
+
+#[cfg(test)]
+mod model_pool_runtime_tests {
+    use super::*;
+    use crate::family::BufferMemoryUsage;
+    use crate::types::{ExecutionBackend, WeightRepresentation};
+
+    // Ownership-only fixture: not an executable model or checkpoint test.
+    struct OwnedFixture {
+        instance: ModelInstanceId,
+        artifact: ArtifactId,
+        payload: Vec<u8>,
+        admission: AdmissionController,
+        drops: Arc<Mutex<Vec<(String, u64)>>>,
+    }
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            self.drops.lock().expect("drops").push((
+                self.artifact.as_str().to_owned(),
+                self.admission.snapshot().expect("ledger").reserved_bytes(),
+            ));
+        }
+    }
+    impl LoadedModel for OwnedFixture {
+        fn instance_id(&self) -> &ModelInstanceId {
+            &self.instance
+        }
+        fn artifact_id(&self) -> &ArtifactId {
+            &self.artifact
+        }
+        fn registration(&self) -> &crate::registry::FamilyRegistration {
+            panic!("ownership fixture does not implement execution registration")
+        }
+        fn capabilities(&self) -> &Capabilities {
+            panic!("ownership fixture does not implement execution")
+        }
+        fn memory_usage(&self) -> Result<BufferMemoryUsage, EngineError> {
+            BufferMemoryUsage::new(self.payload.len() as u64, self.payload.len() as u64)
+        }
+        fn autoregressive(&mut self) -> Option<&mut dyn crate::family::AutoregressiveModel> {
+            None
+        }
+    }
+    fn capabilities() -> Capabilities {
+        Capabilities {
+            task: "ownership-test".to_owned(),
+            family: "fixture".to_owned(),
+            backend: ExecutionBackend::HostCpu,
+            weight_representations: vec![WeightRepresentation::F32],
+            cache_modes: vec![],
+            context_limit_tokens: 1,
+            supports_streaming: false,
+            supports_incremental_kv: false,
+            supports_prefix_reuse: false,
+            decoding_modes: vec![],
+        }
+    }
+    fn state() -> NativeState {
+        NativeState {
+            active: None,
+            pending: None,
+            resident: None,
+            states: HashMap::new(),
+            pool: Vec::new(),
+            pool_enabled: true,
+            pool_ttl: Some(Duration::from_secs(10)),
+            admission: AdmissionController::new(256).expect("ledger"),
+            retention: RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: false,
+            },
+            summary: Arc::new(Mutex::new(Summary::empty(true))),
+        }
+    }
+    fn resident(
+        state: &NativeState,
+        name: &str,
+        now: Instant,
+        drops: &Arc<Mutex<Vec<(String, u64)>>>,
+    ) -> Resident {
+        let instance = ModelInstanceId::new();
+        let weights = state
+            .admission
+            .reserve("fixture weights", 64)
+            .expect("weights");
+        Resident {
+            pins: ModelPinOwner::new(instance.clone()),
+            idle_since: now,
+            idle_ttl: Some(Duration::from_secs(10)),
+            cache: None,
+            model: Box::new(OwnedFixture {
+                instance,
+                artifact: ArtifactId::new(name).expect("artifact"),
+                payload: vec![0; 64],
+                admission: state.admission.clone(),
+                drops: drops.clone(),
+            }),
+            weights,
+            capabilities: capabilities(),
+            candidate: None,
+        }
+    }
+    #[test]
+    fn two_owned_models_keep_distinct_instances_and_committed_guards() {
+        let mut state = state();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        let a = resident(&state, "a", now, &drops);
+        let b = resident(&state, "b", now, &drops);
+        assert!(!a.model.instance_id().same_instance(b.model.instance_id()));
+        state.pool.extend([a, b]);
+        assert_eq!(state.residency_info().len(), 2);
+        assert_eq!(state.admission.snapshot().unwrap().reserved_bytes(), 128);
+        assert!(drops.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn lru_destroys_native_model_before_releasing_its_guard() {
+        let mut state = state();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        let a = resident(&state, "a", now, &drops);
+        let b = resident(&state, "b", now + Duration::from_secs(1), &drops);
+        state.pool.extend([b, a]);
+        assert!(state.evict_one_pooled_model());
+        assert_eq!(drops.lock().unwrap().as_slice(), &[("a".to_owned(), 128)]);
+        assert_eq!(state.admission.snapshot().unwrap().reserved_bytes(), 64);
+        assert_eq!(state.pool[0].model.artifact_id().as_str(), "b");
+    }
+    #[test]
+    fn expired_pinned_model_survives_until_last_handle_drops() {
+        let mut state = state();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        let a = resident(&state, "a", now, &drops);
+        let instance = a.model.instance_id().clone();
+        state.pool.push(a);
+        let pin = state.pin_instance(&instance).unwrap().unwrap();
+        let clone = pin.clone();
+        state.expire_models_at(now + Duration::from_secs(10));
+        assert_eq!(state.pool.len(), 1);
+        drop(pin);
+        assert!(!state.evict_one_pooled_model());
+        drop(clone);
+        state.expire_models_at(now + Duration::from_secs(10));
+        assert!(state.pool.is_empty());
+        assert_eq!(state.admission.snapshot().unwrap().reserved_bytes(), 0);
+        assert!(state.pin_instance(&instance).unwrap().is_none());
+    }
+    #[test]
+    fn ttl_boundary_uses_injected_time_without_sleeping() {
+        let mut state = state();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        let a = resident(&state, "a", now, &drops);
+        state.pool.push(a);
+        state.expire_models_at(now + Duration::from_secs(9));
+        assert_eq!(state.pool.len(), 1);
+        state.expire_models_at(now + Duration::from_secs(10));
+        assert!(state.pool.is_empty());
+    }
+    #[test]
+    fn all_pinned_models_prevent_reclamation_and_do_not_credit_bytes() {
+        let mut state = state();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let a = resident(&state, "a", Instant::now(), &drops);
+        let instance = a.model.instance_id().clone();
+        state.pool.push(a);
+        let _pin = state.pin_instance(&instance).unwrap().unwrap();
+        let before = state.admission.snapshot().unwrap();
+        assert!(!state.evict_one_pooled_model());
+        assert_eq!(state.admission.snapshot().unwrap(), before);
+        assert!(drops.lock().unwrap().is_empty());
+    }
+}
