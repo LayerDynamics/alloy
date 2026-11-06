@@ -571,6 +571,92 @@ pub fn embedding_lookup(weight: &Array, tokens: &[u32], stream: &Stream) -> Oper
     reshape(&gathered, &[tokens.len(), shape[1]], stream)
 }
 
+/// Look up rows of an Affine4 embedding without expanding its vocabulary.
+///
+/// Packed weights remain uint32 `[vocabulary, width / 8]`; scales and biases
+/// are float32 `[vocabulary, width / group_size]`. Only the requested rows
+/// are gathered and dequantized on `stream`. The result is lazy float32
+/// `[tokens.len(), width]`, and the original packed arrays remain shared.
+pub fn quantized_embedding_lookup(
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    tokens: &[u32],
+    group_size: i32,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if weight.dtype() != DType::Uint32 {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding weight must be uint32",
+        ));
+    }
+    require_f32(scales)?;
+    require_f32(biases)?;
+    let packed_shape = weight.shape();
+    let parameter_shape = scales.shape();
+    if packed_shape.len() != 2
+        || parameter_shape.len() != 2
+        || biases.shape() != parameter_shape
+        || parameter_shape[0] != packed_shape[0]
+        || group_size <= 0
+    {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding requires matching rank-two weights and parameters",
+        ));
+    }
+    require_positive_shape(&packed_shape)?;
+    require_positive_shape(&parameter_shape)?;
+    let width = packed_shape[1]
+        .checked_mul(8)
+        .ok_or(OperationError::InvalidInput(
+            "quantized embedding width overflow",
+        ))?;
+    let group = group_size as usize;
+    if width % group != 0 || parameter_shape[1] != width / group {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding parameters disagree with width and group size",
+        ));
+    }
+    native_dimension(width)?;
+    if tokens.is_empty()
+        || tokens
+            .iter()
+            .any(|&token| u64::from(token) >= packed_shape[0] as u64)
+    {
+        return Err(OperationError::InvalidInput(
+            "quantized embedding token IDs must be nonempty and inside the vocabulary",
+        ));
+    }
+    let count = native_dimension(tokens.len())?;
+    let indices = Array::from_u32_slice(tokens, &[count])?;
+    let take_rows = |array: &Array| {
+        let mut output = PendingArray::new();
+        // SAFETY: valid arrays/stream; rank-two inputs share the vocabulary
+        // dimension, and every uint32 index was checked before this call.
+        let status = unsafe {
+            sys::mlx_take_axis(
+                &mut output.raw,
+                array.as_raw(),
+                indices.as_raw(),
+                0,
+                stream.as_raw(),
+            )
+        };
+        output.finish(status)
+    };
+    let selected_weight = take_rows(weight)?;
+    let selected_scales = take_rows(scales)?;
+    let selected_biases = take_rows(biases)?;
+    dequantize(
+        &selected_weight,
+        &selected_scales,
+        &selected_biases,
+        group_size,
+        4,
+        stream,
+    )
+}
+
 /// Reshape a float32 tensor with an explicitly supplied shape.
 ///
 /// The element count must remain unchanged. Dimensions must be positive;
@@ -1127,6 +1213,68 @@ mod tests {
             &to_vec_f32(&unchanged_tail, &stream).expect("tail"),
             &[0.0; 4],
         );
+    }
+
+    fn packed_embedding_suite(kind: DeviceType) {
+        let stream = stream(kind);
+        let words: Vec<u32> = (0..4)
+            .flat_map(|row| {
+                let word = (0..8).fold(0_u32, |word, column| {
+                    word | (((row * 3 + column) % 16) as u32) << (column * 4)
+                });
+                [word; 8]
+            })
+            .collect();
+        let scales_data = [0.25_f32, 0.5, 0.125, 0.75];
+        let biases_data = [-1.0_f32, -0.5, 0.25, 1.0];
+        let weight = Array::from_u32_slice(&words, &[4, 8]).expect("packed table");
+        let scales = Array::from_f32_slice(&scales_data, &[4, 1]).expect("scales");
+        let biases = Array::from_f32_slice(&biases_data, &[4, 1]).expect("biases");
+        let tokens = [3_u32, 0, 3];
+        let result = quantized_embedding_lookup(&weight, &scales, &biases, &tokens, 64, &stream)
+            .expect("packed row lookup");
+        assert_eq!(result.shape(), vec![3, 64]);
+        assert_eq!(result.dtype(), DType::Float32);
+        let expected: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&row| {
+                (0..64).map(move |column| {
+                    ((row as usize * 3 + column % 8) % 16) as f32 * scales_data[row as usize]
+                        + biases_data[row as usize]
+                })
+            })
+            .collect();
+        assert_close(
+            &to_vec_f32(&result, &stream).expect("selected rows"),
+            &expected,
+        );
+        assert_eq!(weight.dtype(), DType::Uint32);
+        assert_eq!(weight.shape(), vec![4, 8]);
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[], 64, &stream).is_err());
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[4], 64, &stream).is_err());
+        assert!(
+            quantized_embedding_lookup(&weight, &scales, &biases, &[u32::MAX], 64, &stream)
+                .is_err()
+        );
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[0], 0, &stream).is_err());
+        assert!(quantized_embedding_lookup(&weight, &scales, &biases, &[0], 32, &stream).is_err());
+        let wrong_scales = Array::from_f32_slice(&[1.0; 3], &[3, 1]).expect("wrong vocabulary");
+        assert!(
+            quantized_embedding_lookup(&weight, &wrong_scales, &wrong_scales, &[0], 64, &stream)
+                .is_err()
+        );
+        assert!(quantized_embedding_lookup(&scales, &scales, &biases, &[0], 64, &stream).is_err());
+    }
+
+    #[test]
+    fn mlx_cpu_quantized_embedding_uses_only_selected_rows() {
+        packed_embedding_suite(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_quantized_embedding_uses_only_selected_rows() {
+        packed_embedding_suite(DeviceType::Gpu);
     }
 
     #[test]

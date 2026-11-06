@@ -133,7 +133,9 @@ Alloy already wraps `mlx_set_wired_limit` as `mlx_ffi::memory::set_wired_limit_b
 
 ## Quantized-resident weights (M8)
 
-Stop Affine4 → host `Vec<f32>` → MLX f32 for **projection** residency. Keep packed U32 weights + scales/biases as MLX arrays; execute with `mlx_quantized_matmul`. Embeddings and `lm_head` may arrive Affine4 on disk but are dequantized **once** at MLX upload into resident float32 (embedding lookup / vocab projection need dense rows). Host loader charge estimates all matrices as Affine4 (group 64 by default); MLX `max_resident_bytes` estimates projections as Affine4 and embed/`lm_head` as float32, plus a small decode/workspace allowance — never a full float32 duplicate of the projection stack.
+Retain packed U32 weights plus scales/biases as MLX arrays for every Affine4 matrix, including embeddings and `lm_head`. Embedding lookup gathers and dequantizes only requested vocabulary rows; output and transformer projections use `mlx_quantized_matmul`. Tied embeddings and the output head share the same packed storage. Dense checkpoints still use native float32 arrays.
+
+The verified loader hashes and decodes bounded source chunks, retains owned packed/f32 vectors, and verifies complete file digests before publishing weights. It does not retain whole checkpoint shards. Admission takes the larger of the source-decode phase (host vectors plus bounded metadata/scratch) and native-upload phase (replaced host/native storage plus the largest individual vector-copy overlap), with explicit headroom. Cumulative source bytes remain a verification/read limit, distinct from simultaneously resident source memory. A new family implementation version prevents old native/SSD state from being treated as equivalent after numerical-path changes.
 
 ## Multi-model pool (M9)
 

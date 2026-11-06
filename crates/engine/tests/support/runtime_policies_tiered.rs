@@ -580,6 +580,118 @@ fn tiered_hot_only_never_creates_ssd_or_reserves_transfer_workspace() {
 }
 
 #[test]
+fn tiered_hot_only_positive_cap_reuses_native_ram_prefix_without_ssd() {
+    let directory = TestDirectory::new();
+    let disabled_path = directory
+        .path()
+        .join("positive-hot-only-must-remain-absent");
+    let execution = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Qwen3Execution::MlxMetal
+    } else {
+        Qwen3Execution::MlxCpu
+    };
+    // The existing prefix fixture uses a pinned append-friendly renderer
+    // and the real planner's fixed capacity. It can reproduce all executed
+    // tokens, including output, without replacing a growing allocation.
+    let warm = TestEnvironment::prefix_with_execution(retained_policy(), execution);
+    let runtime = warm.engine.runtime();
+    let mut config = configuration(&disabled_path, HotCacheLimit::Bytes(1024 * 1024));
+    config.hot_cache_only = true;
+    runtime.configure_tiered_kv(config).unwrap();
+    assert_eq!(warm.admission.snapshot().unwrap().reserved_bytes(), 0);
+    assert!(!disabled_path.exists());
+
+    let completed = completed_context(
+        &warm,
+        "tiered-positive-hot-seed",
+        "tiered-positive-hot-base",
+    );
+    let retained_ids = warm.render(completed.clone()).token_ids().to_vec();
+    let before = block_on(runtime.model_residency()).unwrap();
+    assert_eq!(before.len(), 1);
+    let owner = before[0].instance.clone();
+    let before_metrics = runtime.tiered_kv_snapshot();
+    assert!(before_metrics.hot_reserved_bytes > 0);
+    assert!(before_metrics.hot_reserved_bytes <= before_metrics.hot_limit_bytes);
+    let expected_backend = match execution {
+        Qwen3Execution::MlxCpu => engine::types::ExecutionBackend::MlxCpu,
+        Qwen3Execution::MlxMetal => engine::types::ExecutionBackend::MlxMetal,
+    };
+    assert_eq!(
+        block_on(warm.engine.capabilities(artifact_id()))
+            .unwrap()
+            .backend,
+        expected_backend,
+        "Apple Silicon must execute the real Metal model without fallback",
+    );
+
+    let extended = context(
+        "tiered-positive-hot-extension",
+        profile_id(),
+        &format!("{}xy", completed.messages()[0].content),
+    );
+    let rendered = warm.render(extended.clone());
+    assert!(rendered.token_ids().starts_with(&retained_ids));
+    let suffix = &rendered.token_ids()[retained_ids.len()..];
+    assert!(!suffix.is_empty() && suffix.len() < rendered.token_count());
+    let actual = warm.run("tiered-positive-hot-hit", extended.clone());
+    let work = warm.work("tiered-positive-hot-hit");
+    assert_eq!(work.prefill_tokens, suffix);
+    assert_eq!(work.prefill_calls, suffix.len().div_ceil(2));
+    assert_eq!(warm.loads(), 1);
+    assert_eq!(
+        warm.cache_allocations(),
+        1,
+        "RAM reuse must keep the actual KV allocation"
+    );
+    let after = block_on(runtime.model_residency()).unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].instance.same_instance(&owner));
+
+    let cold = TestEnvironment::prefix_with_execution(discard_policy(), execution);
+    let reference = cold.run("tiered-positive-hot-oracle", extended);
+    let cold_work = cold.work("tiered-positive-hot-oracle");
+    assert_eq!(cold_work.prefill_tokens, rendered.token_ids());
+    assert_matches_cold(&actual, &work, &reference, &cold_work);
+    cold.wait_unreserved();
+
+    let metrics = runtime.tiered_kv_snapshot();
+    assert!(metrics.enabled && !metrics.disk_enabled);
+    assert_eq!(metrics.hot_limit_bytes, 1024 * 1024);
+    assert_eq!(
+        metrics.hot_reserved_bytes,
+        before_metrics.hot_reserved_bytes
+    );
+    assert_eq!(metrics.protected_reserved_bytes, 0);
+    assert_eq!(metrics.hot_evictions, 0);
+    assert_eq!(metrics.cold_entries, 0);
+    assert_eq!(metrics.spill_count, 0);
+    assert_eq!(metrics.restore_count, 0);
+    assert_eq!(metrics.restored_tokens, 0);
+    assert_eq!(metrics.transfer_reserved_bytes, 0);
+    assert!(metrics.last_error.is_none());
+    assert!(
+        !disabled_path.exists(),
+        "hot-only execution must never create SSD state"
+    );
+    let admission = warm.admission.clone();
+    drop(warm);
+    let limit = deadline();
+    loop {
+        let accounting = admission.snapshot().unwrap();
+        if accounting.reserved_bytes() == 0 {
+            assert_eq!(accounting.active_reservations(), 0);
+            break;
+        }
+        assert!(
+            Instant::now() < limit,
+            "hot-only native ownership did not drain: {accounting:?}"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
 fn tiered_zero_hot_cap_preserves_unrelated_leased_publication_and_both_models_weights() {
     let fixtures = TieredFixtures::new();
     let directory = TestDirectory::new();
@@ -884,6 +996,204 @@ fn tiered_snapshot_quota_failure_preserves_generation_and_releases_kv_reservatio
     );
     assert_only_weights_and_transfer(&environment);
     drop_runtime_and_assert_unreserved(environment);
+}
+
+#[test]
+fn tiered_actual_staged_write_failure_cleans_partial_files_and_preserves_native_generation() {
+    let fixtures = TieredFixtures::new();
+    let oracle = fixtures.environment();
+    let rendered = render(&oracle, profile_a(), TIERED_BODY);
+    assert!(
+        rendered.token_count() > 64,
+        "persistence must write several real blocks"
+    );
+    let reference = oracle.run("tiered-io-oracle", profile_a(), TIERED_BODY);
+    let reference_work = oracle.observations.work("tiered-io-oracle");
+    drop_runtime_and_assert_unreserved(oracle);
+
+    // Both failures come from real create_new calls after at least one
+    // real safetensors block has been synced. Directory collisions work
+    // identically for privileged and unprivileged test processes.
+    for collision in ["00000001.safetensors", "manifest.json"] {
+        let directory = TestDirectory::new();
+        let environment = fixtures.environment();
+        configure(
+            &environment,
+            configuration(directory.path(), HotCacheLimit::Bytes(TIERED_BUDGET)),
+        );
+        let root = directory.path().to_path_buf();
+        let admission = environment.admission.clone();
+        let (evidence_tx, evidence_rx) = mpsc::channel();
+        *environment.control.kv_export_observer.lock().unwrap() = Some((
+            32,
+            Box::new(move |cache, block| {
+                assert_eq!(block.start, 32);
+                assert_eq!(block.tokens, 32);
+                block
+                    .payload_plan()
+                    .expect("second real native block must be valid");
+                let staged: Vec<_> = fs::read_dir(&root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".tmp-kv-v1-")
+                    })
+                    .collect();
+                assert_eq!(
+                    staged.len(),
+                    1,
+                    "the actual writer must already own staging"
+                );
+                let temporary = staged[0].clone();
+                let bytes = fs::read(temporary.join("00000000.safetensors"))
+                    .expect("first real block must have been written before the fault");
+                let tensors =
+                    SafeTensors::deserialize(&bytes).expect("complete first native block");
+                assert_eq!(tensors.len(), block.spec.layers * 2);
+                let mut nonzero = false;
+                for layer in 0..block.spec.layers {
+                    for kind in ["keys", "values"] {
+                        let tensor = tensors.tensor(&format!("layer.{layer}.{kind}")).unwrap();
+                        assert_eq!(tensor.dtype(), Dtype::F32);
+                        assert_eq!(
+                            tensor.shape(),
+                            [
+                                block.spec.batch,
+                                block.spec.kv_heads,
+                                32,
+                                block.spec.head_dim
+                            ],
+                        );
+                        for value in tensor.data().chunks_exact(4) {
+                            let value = f32::from_le_bytes(value.try_into().unwrap());
+                            assert!(value.is_finite());
+                            nonzero |= value != 0.0;
+                        }
+                    }
+                }
+                assert!(
+                    nonzero,
+                    "the staged file must contain actual nonzero Qwen KV"
+                );
+                let usage = cache
+                    .memory_usage()
+                    .expect("export must leave native KV healthy");
+                assert!(usage.allocated_bytes() > 0 && usage.used_bytes() > 0);
+                fs::create_dir(temporary.join(collision))
+                    .expect("inject deterministic I/O collision");
+                evidence_tx
+                    .send((
+                        temporary,
+                        cache.owner().clone(),
+                        cache.len(),
+                        usage.allocated_bytes(),
+                        admission.snapshot().unwrap(),
+                    ))
+                    .unwrap();
+            }),
+        ));
+
+        let actual = environment.run("tiered-io-failure", profile_a(), TIERED_BODY);
+        let work = environment.observations.work("tiered-io-failure");
+        assert_matches_cold(&actual, &work, &reference, &reference_work);
+        let (temporary, owner, logical_tokens, native_bytes, during_export) = evidence_rx
+            .try_recv()
+            .expect("fault must occur after actual block export and write");
+        assert_eq!(logical_tokens, rendered.token_count() + POLICY_OUTPUT);
+        assert!(during_export.reserved_bytes() >= TIERED_TRANSFER + native_bytes);
+        let metrics = settled_metrics(&environment);
+        assert_eq!(metrics.spill_count, 0);
+        assert_eq!(metrics.cold_entries, 0);
+        assert_eq!(metrics.restore_count, 0);
+        assert_eq!(metrics.hot_evictions, 0);
+        assert_eq!(metrics.transfer_reserved_bytes, TIERED_TRANSFER);
+        assert!(metrics.hot_reserved_bytes >= native_bytes);
+        assert!(
+            metrics
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tiered KV storage")),
+            "the failed real filesystem write must be reported: {:?}",
+            metrics.last_error,
+        );
+        assert!(
+            !temporary.exists(),
+            "partial native snapshot and collision must be cleaned"
+        );
+        assert!(
+            entries(directory.path()).is_empty(),
+            "failed snapshots must not be published"
+        );
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")
+        }));
+        assert!(pool_instance(&environment, &artifact_a()).same_instance(&owner));
+        assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            environment
+                .observations
+                .cache_allocations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            environment.control.events().iter().all(|event| {
+                event.kind != "cache-destroyed" && event.kind != "model-destroyed"
+            }),
+            "optional I/O failure must retain healthy native ownership"
+        );
+
+        // Reuse the surviving native allocation after the one-shot fault.
+        // The shorter prompt requires full logical prefill, but no reload
+        // or reallocation, and the next actual filesystem publish succeeds.
+        let recovered = environment.run("tiered-io-recovery", profile_a(), TIERED_BODY);
+        let recovered_work = environment.observations.work("tiered-io-recovery");
+        assert_matches_cold(&recovered, &recovered_work, &reference, &reference_work);
+        assert_eq!(recovered_work.prefill_tokens, rendered.token_ids());
+        assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            environment
+                .observations
+                .cache_allocations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(pool_instance(&environment, &artifact_a()).same_instance(&owner));
+        assert_eq!(settled_metrics(&environment).spill_count, 1);
+        assert_eq!(entries(directory.path()).len(), 1);
+
+        let mut release = configuration(directory.path(), HotCacheLimit::Bytes(0));
+        release.hot_cache_only = true;
+        let released = configure(&environment, release);
+        assert_eq!(released.hot_reserved_bytes, 0);
+        assert_eq!(released.transfer_reserved_bytes, 0);
+        assert_only_weights_and_transfer(&environment);
+        let control = Arc::clone(&environment.control);
+        assert_eq!(
+            control
+                .events()
+                .iter()
+                .filter(|event| event.kind == "cache-destroyed")
+                .count(),
+            1
+        );
+        drop_runtime_and_assert_unreserved(environment);
+        assert_eq!(
+            control
+                .events()
+                .iter()
+                .filter(|event| event.kind == "model-destroyed")
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]

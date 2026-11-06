@@ -279,7 +279,7 @@ impl<E: Engine> Supervisor<E> {
         }
 
         self.telemetry.record_turn();
-        let _ = self.telemetry.flush();
+        self.telemetry.request_flush();
 
         Ok(TurnOutcome {
             session_id: session_id.to_owned(),
@@ -290,7 +290,9 @@ impl<E: Engine> Supervisor<E> {
     }
 }
 
-fn lock_store(store: &Mutex<SessionStore>) -> HarnessResult<std::sync::MutexGuard<'_, SessionStore>> {
+fn lock_store(
+    store: &Mutex<SessionStore>,
+) -> HarnessResult<std::sync::MutexGuard<'_, SessionStore>> {
     store
         .lock()
         .map_err(|_| HarnessError::Store("store lock poisoned".into()))

@@ -9,14 +9,14 @@ This review implements the exit mapping in the [Phase 1 execution plan](../specs
 | Field | Value |
 | --- | --- |
 | Candidate branch | `feat/phase1-memory-closeout` |
-| Candidate commit SHA | Pending — fill from the reviewed CI run and each `candidate.json`. |
-| Pull request | Pending — link the single closeout PR after publication. |
-| Latest CI run | Pending — link the run for the reviewed candidate. |
-| Latest Mac acceptance artifact | Pending — link `phase-1-acceptance-<run_id>-<run_attempt>` from that run. |
-| Linux native/infrastructure job | Pending — link its successful job. |
-| CLI job | Pending — link its successful job. |
+| First tested implementation | `14b471598ad60b6906e24169113c27da0033c83f`; follow-up loader/telemetry repairs require fresh acceptance. |
+| Pull request | [#25 — native tensor ops, tiered KV storage, and Phase 1 acceptance](https://github.com/LayerDynamics/alloy/pull/25). |
+| First candidate CI run | [42289710014](https://github.com/LayerDynamics/alloy/actions/runs/42289710014): Linux and CLI passed; Mac failed only the M9 large-model preflight. Follow-up acceptance is pending. |
+| First Mac acceptance artifact | [phase-1-acceptance-42289710014-1](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/artifacts/13539817427); ZIP SHA-256 `77ec8a31bb30289fcfa7466038ec007f43fe11e5f8c9ef4a7c097bb7684a5bd8`. |
+| First Linux native/infrastructure job | [128139616905](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139616905), passed. |
+| First CLI job | [128139617362](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139617362), passed, including all 20 acceptance-helper tests. |
 | Two post-freeze reproducible native builds | **Passed:** [run 42276463422](https://github.com/LayerDynamics/alloy/actions/runs/42276463422/job/128093939290) at `5b3b08dd219763e14c2c097c227ed71857903c54`, and [run 42279057333](https://github.com/LayerDynamics/alloy/actions/runs/42279057333/job/128102908050) at `a76d97bd2d91ffb75074fea9641d9b38992b5da8`. Logs inspected 2026-11-06. |
-| Reviewer and date | Pending. |
+| Reviewer and date | ChatGPT, 2026-11-06: implementation/requirements review and first-run evidence inspection; final acceptance decision pending. |
 
 A prior branch's binary, fixture-only success, skipped model test, or an artifact from a different commit cannot satisfy a real-model row. Preserve a failed run's artifact and link the succeeding rerun separately. Do not overwrite the evidence index with a claimed pass before the job completes.
 
@@ -34,6 +34,27 @@ A prior branch's binary, fixture-only success, skipped model test, or an artifac
 | Live memory guard and residency/cache pull-forward | M1–M10 named acceptance from the [memory design](../designs/omlx-memory-method-parity.md), including live native counters and protected-resource behavior. | Pending |
 | Large pinned model and clean admission rejection | `scripts/m9_large_model_acceptance.sh`: candidate-bound pinned large-model load/generation, measured memory evidence, and separately demonstrated bounded rejection under an insufficient budget. | Pending |
 | Existing native and CLI regression gates | All required jobs in [ci.yaml](../../.github/workflows/ci.yaml); no gate silently skipped due to absent model files. | Pending |
+
+## First candidate results and required repairs
+
+The [Mac job](https://github.com/LayerDynamics/alloy/actions/runs/42289710014/job/128139617418) ran on an **Apple M4 Max, Mac16,6, 36 GiB unified RAM**, macOS 26.4/build 25E246. Its source and build provenance both identify `14b471598ad60b6906e24169113c27da0033c83f`; the real daemon binary SHA-256 is `1d313831ab12521feb148b9f772c2570d11dd005b75d03e23c7006eb1df90e24`.
+
+| Observed gate | Recorded result at the first candidate |
+| --- | --- |
+| Native Mac suites | MLX CPU/Metal/shared-array, infrastructure, Qwen3, engine, harness-core, and daemon suites passed. Infrastructure includes 23 native KV tests, 13 existing kernel tests, and 8 native Tensor tests. |
+| Test 13 | Passed: 12 nonempty deltas, 12 visible stdout chunks before the terminal result, 39 input tokens, 13 output tokens, one successful EOS result. |
+| Test 14 history | Passed: daemon PID 6671 stopped, new PID 6709; all 5 prior events preserved; 9 events after the resumed turn. |
+| Test 14 native KV | Passed: one spill before restart; one restore and 37 restored tokens afterward; zero hot/protected reservations at both completion observations, 67,108,864-byte transfer allowance retained, no cache error. |
+| Frozen models | Both 4B and 14B files and aggregate hashes verified. This establishes model identity, not large-model execution. |
+| M9 large-model execution | **Failed before any native load.** The 14B startup reservation was 33,813,526,874 bytes; balanced ceiling was 15,470,674,688 bytes; reported Metal cap was 30,064,771,072 bytes. Native model handle count remained zero. |
+
+The first M9 run exposed unnecessary dense vocabulary residency and an over-large loading peak. The original loader held all checkpoint shards during host decoding; native upload then expanded vocabulary embeddings/output weights to float32. The plan also summed source, complete decoded weights, and complete native weights as though all three phases overlapped. Follow-up work keeps vocabulary matrices packed, streams and hashes bounded source chunks, and derives the loading allowance from actual ownership phases. The guard and the required 4B/14B execution test remain enforced. A fresh successful hardware run is required; the preflight rejection does not satisfy M9.
+
+The requirements review also found synchronous end-of-turn telemetry without an idle schedule or explicit network deadline. The follow-up isolates flushes on one bounded worker, adds scheduled flushing and finite HTTPS I/O deadlines, and preserves offline-drop semantics; see the [telemetry design](../designs/telemetry.md). Two direct M10 scenarios now cover positive-cap RAM reuse with SSD disabled and real second-block/manifest write failures after staging begins. Both pass locally, including cleanup, preserved native ownership, and successful recovery.
+
+Local follow-up checks pass for all MLX FFI, inference-infrastructure, and Qwen targets, 423 engine tests, and all 16 harness tests. The loader tests cover bounded body buffering, cross-shard F16/BF16/U32 conversion, exact budgets, full-file digests, and cancellation. Telemetry coverage includes a real stalled loopback TLS connection and two persisted turns while its transport remains blocked. Local daemon compilation and the two live-metrics tests pass; four Unix-socket RPC cases encounter this workspace's `EPERM` bind restriction and remain mandatory in CI. These local results do not substitute for the new candidate's Mac CPU/Metal and real 4B/14B acceptance.
+
+The Phase 2 plan was reviewed against SPEC-1 Phase 2, FR-20/21/24, the builtin policies, and B.2/B.4/B.6. Its seven work packages, exact file mapping, 16 named tests, and three exit mappings cover the defined scope. Phase 2 implementation remains gated on Phase 1 acceptance. A published privacy policy and an operational collection endpoint are release prerequisites; this review does not claim either from a mock transport test or the current `telemetry.invalid` development default.
 
 ## Existing reproducibility evidence
 

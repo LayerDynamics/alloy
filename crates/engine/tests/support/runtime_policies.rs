@@ -163,6 +163,9 @@ impl Drop for GateRelease {
     }
 }
 
+type KvExportObserver =
+    Box<dyn FnOnce(&dyn FamilyCache, &inference_infra::kv_cache::KvBlock) + Send>;
+
 struct PolicyControl {
     admission: AdmissionController,
     events: Mutex<Vec<PolicyEvent>>,
@@ -174,6 +177,9 @@ struct PolicyControl {
     // 0: existing verification gate; 1: before load; 2: after load.
     startup_gate_stage: AtomicUsize,
     execution_gate: Arc<StartupGate>,
+    // Observe one successful real export at the selected token offset.
+    // Persistence tests use this boundary to arrange actual filesystem I/O failures.
+    kv_export_observer: Mutex<Option<(usize, KvExportObserver)>>,
 }
 
 impl PolicyControl {
@@ -188,6 +194,7 @@ impl PolicyControl {
             startup_gate: Arc::new(StartupGate::default()),
             startup_gate_stage: AtomicUsize::new(0),
             execution_gate: Arc::new(StartupGate::default()),
+            kv_export_observer: Mutex::new(None),
         }
     }
 
@@ -293,7 +300,26 @@ impl FamilyCache for PolicyCache {
         start: usize,
         end: usize,
     ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
-        self.inner_mut().export_kv_block(start, end)
+        let block = self.inner_mut().export_kv_block(start, end)?;
+        let observer = {
+            let mut selected = self
+                .control
+                .kv_export_observer
+                .lock()
+                .expect("KV export observer");
+            if selected
+                .as_ref()
+                .is_some_and(|(offset, _)| *offset == start)
+            {
+                selected.take().map(|(_, observer)| observer)
+            } else {
+                None
+            }
+        };
+        if let Some(observer) = observer {
+            observer(self.inner(), &block);
+        }
+        Ok(block)
     }
 
     fn restore_kv_block(

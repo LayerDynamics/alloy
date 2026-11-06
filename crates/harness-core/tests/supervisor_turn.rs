@@ -5,10 +5,10 @@ use engine::rendering::{
     PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions, render_and_count,
 };
 use engine::types::{
-    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability,
-    ExecutionBackend, FinishReason, Generation, GenerationEvent, GenerationEventStream,
-    GenerationRequest, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome,
-    SessionStateId, Usage, WeightRepresentation,
+    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability, ExecutionBackend,
+    FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationRequest,
+    MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, SessionStateId, Usage,
+    WeightRepresentation,
 };
 use harness_core::telemetry::TelemetryTransport;
 use harness_core::{EventKind, HardwareTier, SessionStore, Supervisor, TelemetryClient};
@@ -16,18 +16,23 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-struct FailTransport;
+struct FailTransport(SyncSender<()>);
 
 impl TelemetryTransport for FailTransport {
     fn post_json(&self, _endpoint: &str, _body: &str) -> Result<(), String> {
+        let _ = self.0.try_send(());
         Err("forced offline".into())
     }
 }
@@ -180,11 +185,12 @@ impl GenerationEventStream for StaticStream {
 fn supervisor_turn_persists_and_isolates_telemetry() {
     let dir = tempdir().expect("tempdir");
     let store = Mutex::new(SessionStore::open(dir.path().join("s.sqlite")).expect("store"));
+    let (attempted, received) = mpsc::sync_channel(1);
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1.0",
         HardwareTier::Ram36Gb,
         "https://127.0.0.1:1/drop",
-        Box::new(FailTransport),
+        Box::new(FailTransport(attempted)),
     ));
     let supervisor = Supervisor::new(ReplyEngine::new(), Arc::clone(&telemetry));
     supervisor
@@ -194,10 +200,20 @@ fn supervisor_turn_persists_and_isolates_telemetry() {
     let outcome = supervisor
         .run_turn(&store, "sup-1", "hello", 16)
         .expect("turn must succeed even when telemetry flush fails");
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("offline POST attempted");
+    telemetry
+        .flush()
+        .expect("worker settles after isolated failure");
     assert_eq!(outcome.assistant_text, "hi there");
     assert!(outcome.input_tokens > 0);
 
-    let events = store.lock().expect("lock").list_events("sup-1").expect("events");
+    let events = store
+        .lock()
+        .expect("lock")
+        .list_events("sup-1")
+        .expect("events");
     let kinds: Vec<_> = events.iter().map(|event| event.kind).collect();
     assert!(kinds.contains(&EventKind::UserMessage));
     assert!(kinds.contains(&EventKind::AssistantMessage));
@@ -211,4 +227,101 @@ fn supervisor_turn_persists_and_isolates_telemetry() {
             .payload["content"],
         "hi there"
     );
+}
+
+struct GatedTransport {
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl TelemetryTransport for GatedTransport {
+    fn post_json(&self, _endpoint: &str, _body: &str) -> Result<(), String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+        }
+        Err("forced offline after gate".to_owned())
+    }
+}
+
+struct ReleaseOnDrop(SyncSender<()>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
+
+#[test]
+fn supervisor_completes_two_turns_while_telemetry_transport_is_blocked() {
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(Mutex::new(
+        SessionStore::open(dir.path().join("s.sqlite")).unwrap(),
+    ));
+    let (entered, blocked) = mpsc::sync_channel(1);
+    let (release, gate) = mpsc::sync_channel(1);
+    let release = ReleaseOnDrop(release);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let telemetry = Arc::new(TelemetryClient::with_transport(
+        "0.1.0",
+        HardwareTier::Ram36Gb,
+        "https://telemetry.example.test/v1",
+        Box::new(GatedTransport {
+            entered,
+            release: Mutex::new(gate),
+            calls: Arc::clone(&calls),
+        }),
+    ));
+    let supervisor = Supervisor::new(ReplyEngine::new(), Arc::clone(&telemetry));
+    supervisor
+        .create_session(&store, "blocked-telemetry", "harness-profile")
+        .unwrap();
+    telemetry.request_flush();
+    blocked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("telemetry worker blocked");
+
+    let turn_store = Arc::clone(&store);
+    let (returned, results) = mpsc::sync_channel(1);
+    let turns = thread::spawn(move || {
+        let outcomes: Vec<_> = ["hello", "world"]
+            .into_iter()
+            .map(|prompt| supervisor.run_turn(&turn_store, "blocked-telemetry", prompt, 16))
+            .collect();
+        let _ = returned.send(outcomes);
+    });
+    let outcomes = results
+        .recv_timeout(Duration::from_secs(5))
+        .expect("both turns return while telemetry remains blocked");
+    for outcome in outcomes {
+        assert_eq!(outcome.expect("turn unaffected").assistant_text, "hi there");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "one in-flight telemetry POST"
+    );
+    assert_eq!(telemetry.snapshot().unwrap().turn_count, 2);
+    let events = store
+        .lock()
+        .unwrap()
+        .list_events("blocked-telemetry")
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::AssistantMessage)
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::RunCompleted)
+            .count(),
+        2
+    );
+    turns.join().unwrap();
+    drop(release);
 }

@@ -1,6 +1,6 @@
 //! Unified-memory MLX Qwen3 execution.
 //!
-//! This module owns one set of float32 MLX weights and executes the full
+//! This module owns one set of dense or packed Affine4 MLX weights and executes the full
 //! transformer through explicit-stream MLX operations.
 //!
 //! Supported:
@@ -236,9 +236,8 @@ impl MlxLinear {
                 let weight = upload_u32(packed, &[rows, cols / 8])?;
                 let scales = upload_f32(scales, &[rows, groups])?;
                 let biases = upload_f32(biases, &[rows, groups])?;
-                let group_size = i32::try_from(group_size).map_err(|_| {
-                    ModelError::InvalidConfig("affine4 group_size exceeds C int")
-                })?;
+                let group_size = i32::try_from(group_size)
+                    .map_err(|_| ModelError::InvalidConfig("affine4 group_size exceeds C int"))?;
                 Ok(Self::Affine4 {
                     weight,
                     scales,
@@ -249,44 +248,22 @@ impl MlxLinear {
         }
     }
 
-    /// Upload Affine4 embeddings by dequantizing once into resident float32.
-    fn upload_embedding(
-        matrix: MatrixWeight,
-        rows: usize,
-        cols: usize,
-        stream: &Stream,
-    ) -> MlxQwenResult<Array> {
-        match matrix {
-            MatrixWeight::F32(values) => upload_f32(values, &[rows, cols]),
-            MatrixWeight::Affine4 {
-                packed,
+    fn embedding_lookup(&self, tokens: &[u32], stream: &Stream) -> MlxQwenResult<Array> {
+        match self {
+            Self::Dense(weight) => Ok(ops::embedding_lookup(weight, tokens, stream)?),
+            Self::Affine4 {
+                weight,
                 scales,
                 biases,
-                rows: packed_rows,
-                cols: packed_cols,
                 group_size,
-            } => {
-                if packed_rows != rows || packed_cols != cols {
-                    return Err(ModelError::ShapeMismatch {
-                        tensor: "affine4 embedding",
-                        expected: rows.saturating_mul(cols),
-                        got: packed_rows.saturating_mul(packed_cols),
-                    }
-                    .into());
-                }
-                let groups = cols / group_size;
-                let weight = upload_u32(packed, &[rows, cols / 8])?;
-                let scales = upload_f32(scales, &[rows, groups])?;
-                let biases = upload_f32(biases, &[rows, groups])?;
-                let group_size = i32::try_from(group_size).map_err(|_| {
-                    ModelError::InvalidConfig("affine4 group_size exceeds C int")
-                })?;
-                let dense = ops::dequantize(&weight, &scales, &biases, group_size, 4, stream)?;
-                drop(weight);
-                drop(scales);
-                drop(biases);
-                Ok(dense)
-            }
+            } => Ok(ops::quantized_embedding_lookup(
+                weight,
+                scales,
+                biases,
+                tokens,
+                *group_size,
+                stream,
+            )?),
         }
     }
 
@@ -390,25 +367,25 @@ impl MlxLayer {
 }
 
 struct MlxWeights {
-    embedding: Array,
+    embedding: MlxLinear,
     layers: Vec<MlxLayer>,
     final_layernorm: Array,
-    lm_head: Option<Array>,
+    lm_head: Option<MlxLinear>,
 }
 
 impl MlxWeights {
     fn visit<'a>(&'a self, mut visitor: impl FnMut(&'a Array)) {
-        visitor(&self.embedding);
+        self.embedding.visit(&mut visitor);
         for layer in &self.layers {
             layer.visit(&mut visitor);
         }
         visitor(&self.final_layernorm);
         if let Some(head) = &self.lm_head {
-            visitor(head);
+            head.visit(&mut visitor);
         }
     }
 
-    fn output_head(&self) -> &Array {
+    fn output_head(&self) -> &MlxLinear {
         self.lm_head.as_ref().unwrap_or(&self.embedding)
     }
 }
@@ -432,7 +409,7 @@ enum OutputSelection {
 }
 
 impl MlxQwen3Model {
-    /// Validate and consume decoded float32 weights into MLX arrays.
+    /// Validate and consume decoded dense/Affine4 weights into MLX arrays.
     ///
     /// max_weight_payload_bytes must cover logical payload AND measured
     /// native backing buffers. Both are checked.
@@ -469,12 +446,7 @@ impl MlxQwen3Model {
                 .try_reserve_exact(config.num_layers)
                 .map_err(|_| MlxQwenError::AllocationFailed("MLX layer metadata"))?;
 
-            let embedding = MlxLinear::upload_embedding(
-                embed_tokens,
-                config.vocab_size,
-                config.hidden_size,
-                stream,
-            )?;
+            let embedding = MlxLinear::upload(embed_tokens, config.vocab_size, config.hidden_size)?;
 
             for layer in layers {
                 native_layers.push(MlxLayer::upload(&config, layer)?);
@@ -483,11 +455,10 @@ impl MlxQwen3Model {
             let final_layernorm = upload_f32(final_layernorm, &[config.hidden_size])?;
 
             let lm_head = match lm_head {
-                Some(head) => Some(MlxLinear::upload_embedding(
+                Some(head) => Some(MlxLinear::upload(
                     head,
                     config.vocab_size,
                     config.hidden_size,
-                    stream,
                 )?),
                 None => None,
             };
@@ -543,7 +514,7 @@ impl MlxQwen3Model {
         &self.owner
     }
 
-    /// Resident float32 tensor payload, excluding allocator overhead.
+    /// Resident dense/Affine4 tensor payload, excluding allocator overhead.
     ///
     /// Tied embeddings are counted once.
     pub fn weight_payload_bytes(&self) -> u64 {
@@ -567,8 +538,8 @@ impl MlxQwen3Model {
             .layers
             .len()
             .checked_mul(25) // Affine4 projections: up to 3 arrays each + norms
-            .and_then(|n| n.checked_add(2))
-            .and_then(|n| n.checked_add(usize::from(self.weights.lm_head.is_some())))
+            .and_then(|n| n.checked_add(4)) // three embedding arrays + final norm
+            .and_then(|n| n.checked_add(3 * usize::from(self.weights.lm_head.is_some())))
             .ok_or(ModelError::DimensionOverflow("weight query handle count"))?;
         let mut arrays = Vec::new();
         arrays
@@ -780,7 +751,7 @@ impl MlxQwen3Model {
         let position = append.start_position();
         let token_count = tokens.len();
 
-        let mut hidden = ops::embedding_lookup(&self.weights.embedding, tokens, stream)?;
+        let mut hidden = self.weights.embedding.embedding_lookup(tokens, stream)?;
 
         for (index, layer) in self.weights.layers.iter().enumerate() {
             check_cancelled(cancelled)?;
@@ -865,7 +836,7 @@ impl MlxQwen3Model {
             )?,
         };
 
-        let logits = ops::linear(&selected, self.weights.output_head(), stream)?; // dense head
+        let logits = self.weights.output_head().apply(&selected, stream)?;
 
         check_cancelled(cancelled)?;
 
@@ -1348,6 +1319,119 @@ mod tests {
         }
     }
 
+    fn vocabulary_pair(rows: usize, cols: usize, seed: usize) -> (MatrixWeight, MatrixWeight) {
+        const GROUP: usize = 64;
+        assert_eq!(cols % GROUP, 0);
+        let groups = cols / GROUP;
+        let mut packed = vec![0_u32; rows * cols / 8];
+        let mut scales = Vec::new();
+        let mut biases = Vec::new();
+        let mut dense = Vec::new();
+        for row in 0..rows {
+            for group in 0..groups {
+                let scale = 0.01 * (1 + (row + group + seed) % 3) as f32;
+                let bias = -0.06 + 0.01 * (row % 5) as f32;
+                scales.push(scale);
+                biases.push(bias);
+                for column in group * GROUP..(group + 1) * GROUP {
+                    let code = ((row * 5 + column * 3 + seed) % 16) as u32;
+                    packed[row * (cols / 8) + column / 8] |= code << ((column % 8) * 4);
+                    dense.push(code as f32 * scale + bias);
+                }
+            }
+        }
+        (
+            MatrixWeight::Affine4 {
+                packed,
+                scales,
+                biases,
+                rows,
+                cols,
+                group_size: GROUP,
+            },
+            MatrixWeight::F32(dense),
+        )
+    }
+
+    fn packed_vocabulary_suite(streams: &[&Stream]) {
+        for tied in [true, false] {
+            let mut config = Qwen3Config::tiny_fixture();
+            config.hidden_size = 64;
+            config.intermediate_size = 128;
+            config.tie_embeddings = tied;
+            let mut packed = generate_fixture(&config);
+            let mut dense = generate_fixture(&config);
+            (packed.embed_tokens, dense.embed_tokens) =
+                vocabulary_pair(config.vocab_size, config.hidden_size, 1);
+            if !tied {
+                let (quantized, reference) =
+                    vocabulary_pair(config.vocab_size, config.hidden_size, 7);
+                packed.lm_head = Some(quantized);
+                dense.lm_head = Some(reference);
+            }
+            let expected_payload = validate_weights(&config, &packed).expect("packed payload");
+            let dense_payload = validate_weights(&config, &dense).expect("dense payload");
+            assert!(expected_payload < dense_payload);
+            let reference =
+                Qwen3Model::from_weights(config.clone(), dense).expect("independent dense oracle");
+            let model = MlxQwen3Model::from_weights(config, packed, WEIGHTS, streams[0])
+                .expect("packed vocabulary model");
+            assert!(matches!(
+                &model.weights.embedding,
+                MlxLinear::Affine4 { .. }
+            ));
+            assert!(matches!(
+                model.weights.output_head(),
+                MlxLinear::Affine4 { .. }
+            ));
+            assert_eq!(model.weight_payload_bytes(), expected_payload);
+            let measured = model.weight_buffer_bytes().expect("native packed storage");
+            assert!(
+                measured < dense_payload,
+                "the vocabulary must not become a dense native table"
+            );
+            let identity = model.instance_id().clone();
+            let tokens = [3, 41, 7, 12, 8];
+            let mut cache = model.new_cache(16, CACHE, streams[0]).expect("one cache");
+            let first = model
+                .prefill(&tokens[..2], &mut cache, LOGITS, streams[0])
+                .expect("CPU/selected prefix");
+            assert_close(first.last_row(), &reference_last(&reference, &tokens[..2]));
+            let continuation_stream = streams[streams.len() - 1];
+            let next = model
+                .prefill(&tokens[2..4], &mut cache, LOGITS, continuation_stream)
+                .expect("same cache continuation");
+            assert_close(next.last_row(), &reference_last(&reference, &tokens[..4]));
+            let last = model
+                .decode(tokens[4], &mut cache, LOGITS, continuation_stream)
+                .expect("quantized output head decode");
+            assert_close(last.last_row(), &reference_last(&reference, &tokens));
+            assert_eq!(cache.len(), tokens.len());
+            assert!(cache.owner().same_instance(&identity));
+            assert!(model.instance_id().same_instance(&identity));
+            assert_eq!(
+                model
+                    .weight_buffer_bytes()
+                    .expect("unchanged packed storage"),
+                measured
+            );
+        }
+    }
+
+    #[test]
+    fn packed_vocabulary_cpu_prefill_decode_match_dense_oracle() {
+        let cpu = stream(DeviceType::Cpu);
+        packed_vocabulary_suite(&[&cpu]);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn one_packed_vocabulary_and_cache_continue_cpu_to_metal() {
+        let cpu = stream(DeviceType::Cpu);
+        let metal = stream(DeviceType::Gpu);
+        packed_vocabulary_suite(&[&cpu, &metal]);
+    }
+
     #[test]
     fn mlx_cpu_complete_forward_prefill_and_decode_match_reference() {
         forward_and_cached_suite(DeviceType::Cpu);
@@ -1538,7 +1622,10 @@ mod measured_weight_buffer_tests {
                     .expect("without output head");
                 assert!(measured as usize > without_head);
             }
-            arrays.push(model.weights.output_head());
+            model
+                .weights
+                .output_head()
+                .visit(&mut |array| arrays.push(array));
             assert_eq!(
                 measured as usize,
                 mlx_ffi::memory::array_buffer_bytes(&arrays).expect("duplicate alias")

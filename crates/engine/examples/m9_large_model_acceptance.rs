@@ -1049,8 +1049,14 @@ fn run(
     require(
         safe.hard_limit_bytes > 0 && budget <= safe.hard_limit_bytes,
         format!(
-            "safe host preflight rejected: production 14B startup {budget} bytes exceeds measured balanced ceiling {} bytes; free memory or use a larger Apple Silicon Mac",
-            safe.hard_limit_bytes
+            "safe host preflight rejected: production 14B startup {budget} bytes exceeds measured balanced ceiling {} bytes (binding {}, dynamic {}, static {}, Metal cap {}); no native model was loaded; inspect the budget_planned evidence before retrying",
+            safe.hard_limit_bytes,
+            safe.binding
+                .map(|binding| binding.as_str())
+                .unwrap_or("none"),
+            safe.dynamic_bytes,
+            safe.static_bytes,
+            safe.metal_cap_bytes,
         ),
     )?;
     let admission = AdmissionController::new(budget)?;

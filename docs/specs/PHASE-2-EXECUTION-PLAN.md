@@ -1,6 +1,6 @@
 # Phase 2 execution plan — tools and policy
 
-**Status:** Draft for review. Phase 1 exit review is pending; this document does not declare Phase 1 complete or start Phase 2 implementation.
+**Status:** Requirements review completed 2026-11-06 against the current SPEC-1 Phase 2 scope and exit criteria. Phase 1 exit review remains pending; Phase 2 implementation starts after that gate. This document is the implementation plan, not a claim that Phase 2 code exists.
 
 **Source of scope:** [SPEC-1](SPEC-1-mlx-agent-harness.md.md), §4.1 **Phase 2: Tools and policy**, FR-20/21/24, §3.2 tool registry and plugin host, §3.4 builtin tool set, and Appendices B.2/B.4/B.6. FR-25, FR-26, FR-28, and FR-30a constrain the existing session, rendering, cache, and CLI interfaces when tools are added. The work below is an implementation decomposition of those requirements, not a new product roadmap.
 

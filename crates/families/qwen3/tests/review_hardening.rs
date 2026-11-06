@@ -396,8 +396,9 @@ fn standalone_quantized_group_is_inferred() {
     std::fs::write(s.0.join("model.safetensors"), quantized).expect("quantized");
     // Affine4 stays packed for MLX; CPU Qwen3Model rejects it. Verify the
     // loader keeps resident Affine4 with the inferred group size.
-    let loaded = qwen3::loader::load_weights(&c, s.0.as_path(), qwen3::loader::LoadOptions::default())
-        .expect("infer group size four");
+    let loaded =
+        qwen3::loader::load_weights(&c, s.0.as_path(), qwen3::loader::LoadOptions::default())
+            .expect("infer group size four");
     match &loaded.embed_tokens {
         qwen3::fixture::MatrixWeight::Affine4 {
             rows: r,
@@ -419,13 +420,184 @@ fn standalone_quantized_group_is_inferred() {
         "CPU reference path must reject Affine4"
     );
 }
+
+#[test]
+fn verified_streaming_load_handles_cross_shard_triplets_with_exact_budgets() {
+    use qwen3::loader::{CheckpointVerification, load_weights_verified};
+    use sha2::{Digest, Sha256};
+
+    let scratch = Scratch::new();
+    let c = config();
+    let mut data = tensors(&c);
+    let original_payload: usize = data.values().map(|(_, _, bytes)| bytes.len()).sum();
+    let dense_embed_bytes = c.vocab_size * c.hidden_size * 4;
+    data.insert(
+        "model.embed_tokens.weight".into(),
+        (
+            Dtype::U32,
+            vec![c.vocab_size, 1],
+            (0..c.vocab_size)
+                .flat_map(|_| 0x7654_3210u32.to_le_bytes())
+                .collect(),
+        ),
+    );
+    data.insert(
+        "model.embed_tokens.scales".into(),
+        (
+            Dtype::F16,
+            vec![c.vocab_size, 2],
+            (0..c.vocab_size * 2)
+                .flat_map(|_| half::f16::from_f32(0.5).to_bits().to_le_bytes())
+                .collect(),
+        ),
+    );
+    data.insert(
+        "model.embed_tokens.biases".into(),
+        (
+            Dtype::BF16,
+            vec![c.vocab_size, 2],
+            (0..c.vocab_size * 2)
+                .flat_map(|_| half::bf16::from_f32(-1.0).to_bits().to_le_bytes())
+                .collect(),
+        ),
+    );
+    data.insert(
+        "model.norm.weight".into(),
+        (
+            Dtype::BF16,
+            vec![c.hidden_size],
+            (0..c.hidden_size)
+                .flat_map(|_| half::bf16::from_f32(1.25).to_bits().to_le_bytes())
+                .collect(),
+        ),
+    );
+    // A dense projection does not consume optional quantization
+    // parameters. Their bytes still belong to the strict index and pin.
+    data.insert(
+        "model.layers.0.self_attn.o_proj.scales".into(),
+        (Dtype::F32, vec![1], f32::NAN.to_le_bytes().to_vec()),
+    );
+    let mut shards = [Tensors::new(), Tensors::new(), Tensors::new()];
+    let filenames = ["one.safetensors", "two.safetensors", "three.safetensors"];
+    let mut weight_map = serde_json::Map::new();
+    for (index, (name, tensor)) in data.into_iter().enumerate() {
+        let shard = match name.as_str() {
+            "model.embed_tokens.weight" => 0,
+            "model.embed_tokens.scales" => 1,
+            "model.embed_tokens.biases" => 2,
+            _ => index % 3,
+        };
+        weight_map.insert(name.clone(), serde_json::json!(filenames[shard]));
+        shards[shard].insert(name, tensor);
+    }
+    for (filename, shard) in filenames.iter().zip(&shards) {
+        std::fs::write(scratch.0.join(filename), encode(shard)).expect("write shard");
+    }
+    write_config(&scratch, &config_json(&c));
+    std::fs::write(
+        scratch.0.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).expect("index"),
+    )
+    .expect("write index");
+    let mut source_bytes = 0;
+    let mut pins = BTreeMap::new();
+    for entry in std::fs::read_dir(&scratch.0).expect("components") {
+        let path = entry
+            .expect("component")
+            .path()
+            .canonicalize()
+            .expect("canonical path");
+        let bytes = std::fs::read(&path).expect("pin input");
+        source_bytes += bytes.len();
+        pins.insert(path, Sha256::digest(bytes).into());
+    }
+    let payload_bytes = original_payload - dense_embed_bytes + c.vocab_size * (4 + 2 * 4 + 2 * 4);
+    let options = LoadOptions {
+        max_file_bytes: source_bytes,
+        max_weight_bytes: payload_bytes,
+    };
+    let cancelled = || false;
+    let verification = CheckpointVerification {
+        sha256: &pins,
+        cancelled: &cancelled,
+    };
+    let loaded = load_weights_verified(&c, &scratch.0, options, &verification)
+        .expect("cross-shard mixed types fit exactly charged source and payload limits");
+    match loaded.embed_tokens {
+        qwen3::fixture::MatrixWeight::Affine4 {
+            packed,
+            scales,
+            biases,
+            rows,
+            cols,
+            group_size,
+        } => {
+            assert_eq!(packed, vec![0x7654_3210; c.vocab_size]);
+            assert_eq!(scales, vec![0.5; c.vocab_size * 2]);
+            assert_eq!(biases, vec![-1.0; c.vocab_size * 2]);
+            assert_eq!((rows, cols, group_size), (c.vocab_size, c.hidden_size, 4));
+        }
+        _ => panic!("the loader must keep the embedding packed"),
+    }
+    assert_eq!(loaded.final_layernorm, vec![1.25; c.hidden_size]);
+    assert!(loaded.layers[0].o_proj.as_f32().is_some());
+    assert!(matches!(
+        load_weights_verified(
+            &c,
+            &scratch.0,
+            LoadOptions {
+                max_file_bytes: source_bytes - 1,
+                ..options
+            },
+            &verification
+        ),
+        Err(ModelError::MemoryLimit { .. })
+    ));
+    assert!(matches!(
+        load_weights_verified(
+            &c,
+            &scratch.0,
+            LoadOptions {
+                max_weight_bytes: payload_bytes - 1,
+                ..options
+            },
+            &verification
+        ),
+        Err(ModelError::MemoryLimit { .. })
+    ));
+
+    for path in pins.keys() {
+        let mut wrong = pins.clone();
+        wrong.insert(path.clone(), [0; 32]);
+        let verification = CheckpointVerification {
+            sha256: &wrong,
+            cancelled: &cancelled,
+        };
+        assert!(
+            matches!(load_weights_verified(&c, &scratch.0, options, &verification),
+            Err(ModelError::CheckpointValidation(message)) if message.contains("SHA-256 mismatch"))
+        );
+        let mut missing = pins.clone();
+        missing.remove(path);
+        let verification = CheckpointVerification {
+            sha256: &missing,
+            cancelled: &cancelled,
+        };
+        assert!(
+            matches!(load_weights_verified(&c, &scratch.0, options, &verification),
+            Err(ModelError::CheckpointValidation(message)) if message.contains("no trusted digest"))
+        );
+    }
+}
+
 #[test]
 fn tied_memory_and_disk_heads_are_rejected() {
     let c = config();
     let mut w = generate_fixture(&c);
     w.lm_head = Some(qwen3::fixture::MatrixWeight::f32(vec![
         0.0;
-        c.vocab_size * c.hidden_size
+        c.vocab_size
+            * c.hidden_size
     ]));
     assert!(Qwen3Model::load(c.clone(), w).is_err());
     let s = Scratch::new();
