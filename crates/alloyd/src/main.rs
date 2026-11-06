@@ -1,19 +1,17 @@
 //! `alloyd` binary entrypoint.
 
-use alloyd::{
-    BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener,
-};
+use alloyd::{BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener};
 use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
 use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
 use harness_core::{HardwareTier, TelemetryClient};
 use std::env;
 use std::future::Future;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::Duration;
-use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match run() {
@@ -72,8 +70,8 @@ fn run() -> Result<(), String> {
             "--memory-guard" => {
                 index += 1;
                 let raw = require_value(&args, index, "--memory-guard")?;
-                memory_guard_tier = MemoryGuardTier::parse(&raw)
-                    .map_err(|error| error.to_string())?;
+                memory_guard_tier =
+                    MemoryGuardTier::parse(&raw).map_err(|error| error.to_string())?;
             }
             "--memory-guard-gb" => {
                 index += 1;
@@ -113,9 +111,7 @@ fn run() -> Result<(), String> {
 
     let defaults = DaemonConfig::default_paths().map_err(|error| error.message)?;
     let config = DaemonConfig {
-        socket_path: socket
-            .map(PathBuf::from)
-            .unwrap_or(defaults.socket_path),
+        socket_path: socket.map(PathBuf::from).unwrap_or(defaults.socket_path),
         db_path: db.map(PathBuf::from).unwrap_or(defaults.db_path),
     };
 
@@ -197,47 +193,40 @@ fn run_memory_enforcer_loop(
 ) {
     let mut previous = PressureLevel::Ok;
     loop {
-        match enforcer.tick() {
-            Ok(tick) => {
+        // Serial dispatch bounds outstanding work to one call. The worker
+        // observes pressure after accepting it, so queued decisions cannot
+        // unload models using stale pre-queue observations.
+        match block_on(engine.runtime().enforce_memory_tick(enforcer.clone())) {
+            Ok(report) => {
+                let tick = report.tick;
                 if tick.status.pressure != previous {
                     eprintln!(
-                        "alloyd: memory pressure {} -> {} (usage={:.2} GiB soft={:.2} hard={:.2} \
-                         ceiling={:.2} GiB binding={} paused={} reclaim={} deferred={})",
+                        "alloyd: memory pressure {} -> {} (usage={} soft={} hard={} paused={} deferred={})",
                         previous.as_str(),
                         tick.status.pressure.as_str(),
-                        tick.status.usage_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.soft_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.hard_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.hard_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.binding.unwrap_or("none"),
+                        tick.status.usage_bytes,
+                        tick.status.soft_bytes,
+                        tick.status.hard_bytes,
                         tick.status.admissions_paused,
-                        tick.request_cache_reclaim,
                         tick.deferred_for_pool_drain,
                     );
                     previous = tick.status.pressure;
                 }
-                if tick.request_cache_reclaim {
-                    // Drain on the native worker when idle. Busy generation
-                    // leaves the flag set for a later tick (oMLX also waits
-                    // for a safe boundary rather than touching Metal here).
-                    let future = engine.runtime().reclaim_mlx_allocator_cache();
-                    match block_on(future) {
-                        Ok(report) => {
-                            enforcer.clear_cache_reclaim_request();
-                            let before = report.before.cache_bytes;
-                            let after = report.after.cache_bytes;
-                            if before > after {
-                                eprintln!(
-                                    "alloyd: MLX pool drain {} -> {} MiB",
-                                    before / (1024 * 1024),
-                                    after / (1024 * 1024)
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            // Worker busy or reclaim unavailable this tick.
-                        }
+                if let Some(cache) = report.allocator_cache {
+                    if cache.before.cache_bytes > cache.after.cache_bytes {
+                        eprintln!(
+                            "alloyd: MLX pool drain {} -> {} MiB",
+                            cache.before.cache_bytes / (1024 * 1024),
+                            cache.after.cache_bytes / (1024 * 1024)
+                        );
                     }
+                }
+                match report.model {
+                    engine::runtime::IdleModelReclaim::Evicted(instance) => {
+                        eprintln!("alloyd: pressure evicted idle model {instance:?}")
+                    }
+                    engine::runtime::IdleModelReclaim::NoEligibleVictim => {}
+                    engine::runtime::IdleModelReclaim::NotRequested => {}
                 }
             }
             Err(error) => {

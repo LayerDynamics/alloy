@@ -1102,3 +1102,579 @@ fn publication_rejects_active_or_pending_generation() {
     drop(events);
     environment.wait_idle();
 }
+
+// M9_POOLED_CANONICAL_LEASES_V1
+struct PooledLeaseFixture {
+    environment: StateEnvironment,
+    id: SessionStateId,
+    original: RetainedSessionState,
+    accounting: AdmissionSnapshot,
+    counts: ResourceCounts,
+    leases: Vec<engine::runtime::SessionStateLease>,
+}
+
+impl PooledLeaseFixture {
+    fn new(name: &str) -> Self {
+        let environment = StateEnvironment::new();
+        // Both runtime handles address the same native worker. Enable the
+        // pool before loading, without changing the non-pool constructors.
+        let _ = environment
+            .runtime
+            .clone()
+            .with_model_pool(None)
+            .expect("enable lifecycle model pool");
+        let completed = environment.complete(name);
+        let id = environment.publish(&completed);
+        let original = environment.lookup(id);
+        let first = block_on(environment.runtime.lease_session_state(id))
+            .unwrap()
+            .expect("first canonical lease");
+        let second = block_on(environment.runtime.lease_session_state(id))
+            .unwrap()
+            .expect("second canonical lease");
+        assert!(
+            block_on(
+                environment
+                    .runtime
+                    .set_model_idle_ttl(original.model_instance_id.clone(), Some(Duration::ZERO),)
+            )
+            .unwrap()
+        );
+        let accounting = environment.snapshot();
+        let counts = environment.tracker.counts();
+        let fixture = Self {
+            environment,
+            id,
+            original,
+            accounting,
+            counts,
+            leases: vec![first, second],
+        };
+        fixture.assert_protected();
+        fixture
+    }
+
+    fn assert_protected(&self) {
+        let actual = self.environment.lookup(self.id);
+        assert_same_allocation(&self.original, &actual);
+        assert_eq!(
+            actual.reused_input_tokens,
+            self.original.reused_input_tokens
+        );
+        assert_eq!(
+            actual.prefilled_input_tokens,
+            self.original.prefilled_input_tokens
+        );
+        assert!(
+            actual
+                .model_instance_id
+                .same_instance(&self.original.model_instance_id)
+        );
+        let residents = block_on(self.environment.runtime.model_residency()).unwrap();
+        assert_eq!(residents.len(), 1);
+        assert!(
+            residents[0]
+                .instance
+                .same_instance(&self.original.model_instance_id)
+        );
+        assert!(
+            !residents[0].pinned,
+            "explicit model pins must not mask lease protection"
+        );
+        let now = self.environment.snapshot();
+        // Live enforcement can resize the budget, but must not change
+        // ownership of any of these four native-state reservations.
+        assert_eq!(now.reserved_bytes(), self.accounting.reserved_bytes());
+        assert_eq!(
+            now.active_reservations(),
+            self.accounting.active_reservations()
+        );
+        assert_eq!(self.environment.tracker.counts(), self.counts);
+        for lease in &self.leases {
+            assert_eq!(lease.state_id(), self.id);
+            assert_same_allocation(&self.original, lease.state());
+        }
+    }
+
+    fn assert_release_and_generation_blocked(&self, name: &str) {
+        let error = expect_failure(
+            block_on(self.environment.engine.release_session_state(self.id)),
+            "release must reject a live canonical lease",
+        );
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        let error = expect_failure(
+            block_on(
+                self.environment
+                    .engine
+                    .generate(self.environment.request(name)),
+            ),
+            "ordinary generation must preserve the existing conservative lease barrier",
+        );
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        self.environment.wait_idle();
+        self.assert_protected();
+        // This is allocator-only reclamation, not the destructive pressure
+        // test below. It must not invalidate live canonical state.
+        block_on(self.environment.runtime.reclaim_mlx_allocator_cache())
+            .expect("idle allocator-only reclamation");
+        self.assert_protected();
+    }
+
+    fn assert_destroyed(&self) {
+        assert!(
+            block_on(self.environment.runtime.lookup_session_state(self.id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            block_on(self.environment.runtime.model_residency())
+                .unwrap()
+                .is_empty()
+        );
+        let now = self.environment.snapshot();
+        assert_eq!(now.reserved_bytes(), 0);
+        assert_eq!(now.active_reservations(), 0);
+        let counts = self.environment.tracker.counts();
+        assert_eq!(counts.models_created, self.counts.models_created);
+        assert_eq!(counts.caches_created, self.counts.caches_created);
+        assert_eq!(counts.models_destroyed, self.counts.models_destroyed + 1);
+        assert_eq!(counts.caches_destroyed, self.counts.caches_destroyed + 1);
+        assert_eq!(
+            self.environment
+                .tracker
+                .destruction_order
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &["cache", "model"],
+        );
+    }
+
+    fn disable_ttl_before_final_drop(&self) {
+        assert_eq!(self.leases.len(), 1);
+        assert!(
+            block_on(
+                self.environment
+                    .runtime
+                    .set_model_idle_ttl(self.original.model_instance_id.clone(), None,)
+            )
+            .unwrap()
+        );
+        self.assert_protected();
+    }
+}
+
+#[test]
+fn pool_live_leases_expired_ttl_waits_for_every_lease() {
+    let mut fixture = PooledLeaseFixture::new("pool-two-leases-expiry");
+    fixture.assert_release_and_generation_blocked("pool-two-leases-deny");
+    drop(fixture.leases.pop());
+    fixture.assert_release_and_generation_blocked("pool-one-lease-deny");
+    drop(fixture.leases.pop());
+    // A worker may already be waiting for its next command after the last
+    // protected sweep. Drive maintenance until the actual state disappears;
+    // a single metadata query is not assumed to force a prior expiry sweep.
+    let limit = deadline();
+    while block_on(fixture.environment.runtime.lookup_session_state(fixture.id))
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            Instant::now() < limit,
+            "expired unleased state did not disappear"
+        );
+        thread::yield_now();
+    }
+    fixture.assert_destroyed();
+    assert_eq!(
+        fixture.environment.release(fixture.id),
+        ReleaseOutcome::AlreadyAbsent
+    );
+    let _ = fixture.environment.complete("pool-expiry-recovery");
+}
+
+#[test]
+fn pool_live_leases_explicit_release_after_final_drop() {
+    let mut fixture = PooledLeaseFixture::new("pool-two-leases-release");
+    fixture.assert_release_and_generation_blocked("pool-release-two-deny");
+    drop(fixture.leases.pop());
+    fixture.assert_release_and_generation_blocked("pool-release-one-deny");
+    // Both lease counts were tested with expired TTL. Disable automatic
+    // expiry while the last lease still protects A, so this test proves
+    // explicit release rather than racing it against an expiry sweep.
+    fixture.disable_ttl_before_final_drop();
+    drop(fixture.leases.pop());
+    assert_eq!(
+        fixture.environment.release(fixture.id),
+        ReleaseOutcome::Released
+    );
+    fixture.assert_destroyed();
+    let _ = fixture.environment.complete("pool-release-recovery");
+}
+
+#[derive(Debug)]
+struct PooledLeasePressure;
+
+impl engine::memory_enforcer::MemoryObservationSource for PooledLeasePressure {
+    fn observe(
+        &self,
+    ) -> Result<engine::memory_enforcer::MemoryObservation, engine::memory_enforcer::EnforcerError>
+    {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Ok(engine::memory_enforcer::MemoryObservation {
+            host: engine::memory_guard::HostMemorySnapshot {
+                physical_memory_bytes: 36 * GIB,
+                free_bytes: 5 * GIB,
+                inactive_bytes: 0,
+                active_file_bytes: 0,
+                other_apps_active_bytes: 0,
+                phys_footprint_bytes: 20 * GIB,
+                graphics_footprint_bytes: 0,
+                iogpu_wired_limit_bytes: 0,
+                recommended_working_set_bytes: 100 * GIB,
+                release_credit_bytes: 0,
+            },
+            mlx_active_bytes: 20 * GIB,
+            mlx_pool_bytes: 3 * GIB,
+        })
+    }
+}
+
+#[test]
+fn pool_live_leases_enforcer_rechecks_both_lease_counts() {
+    use engine::memory_enforcer::{MemoryEnforcer, PRESSURE_RECLAIM_GRACE_POLLS_MAX};
+    use engine::memory_guard::{MemoryGuardConfig, PressureLevel};
+    use engine::runtime::IdleModelReclaim;
+    let mut fixture = PooledLeaseFixture::new("pool-two-leases-enforcer");
+    let enforcer = MemoryEnforcer::with_observation_source(
+        MemoryGuardConfig::balanced(),
+        fixture.environment.admission.clone(),
+        Arc::new(PooledLeasePressure),
+    );
+    for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        let report = block_on(
+            fixture
+                .environment
+                .runtime
+                .enforce_memory_tick(enforcer.clone()),
+        )
+        .unwrap();
+        assert_eq!(report.tick.status.pressure, PressureLevel::Soft);
+        assert!(report.tick.deferred_for_pool_drain);
+        assert!(matches!(report.model, IdleModelReclaim::NotRequested));
+        fixture.assert_protected();
+    }
+    let report = block_on(
+        fixture
+            .environment
+            .runtime
+            .enforce_memory_tick(enforcer.clone()),
+    )
+    .unwrap();
+    assert!(!report.tick.deferred_for_pool_drain);
+    assert!(matches!(report.model, IdleModelReclaim::NoEligibleVictim));
+    fixture.assert_protected();
+    drop(fixture.leases.pop());
+    let report = block_on(
+        fixture
+            .environment
+            .runtime
+            .enforce_memory_tick(enforcer.clone()),
+    )
+    .unwrap();
+    assert!(matches!(report.model, IdleModelReclaim::NoEligibleVictim));
+    fixture.assert_protected();
+    fixture.disable_ttl_before_final_drop();
+    drop(fixture.leases.pop());
+    let report = block_on(fixture.environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => {
+            assert!(instance.same_instance(&fixture.original.model_instance_id))
+        }
+        other => panic!("expected actual unleased model eviction, got {other:?}"),
+    }
+    fixture.assert_destroyed();
+}
+
+// M9_MODEL_PIN_REPLY_AND_STATE_RELEASE_V1
+struct ModelPinReplyWake {
+    sender: mpsc::Sender<()>,
+}
+
+impl std::task::Wake for ModelPinReplyWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.sender.send(());
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.sender.send(());
+    }
+}
+
+fn model_pin_lifecycle_environment(
+    name: &str,
+) -> (StateEnvironment, SessionStateId, RetainedSessionState) {
+    let environment = StateEnvironment::new();
+    let _ = environment
+        .runtime
+        .clone()
+        .with_model_pool(None)
+        .expect("enable model-pool lifecycle fixture");
+    let completed = environment.complete(name);
+    let id = environment.publish(&completed);
+    let state = environment.lookup(id);
+    (environment, id, state)
+}
+
+fn unconsumed_model_pin_reply<'a>(
+    environment: &'a StateEnvironment,
+    state: &RetainedSessionState,
+) -> engine::api::EngineFuture<'a, Option<engine::residency_pin::ModelResidencyPin>> {
+    let release = environment.tracker.memory_gate.arm();
+    let mut lookup = environment.runtime.lookup_session_state(state.state_id);
+    let lookup_waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut lookup_cx = Context::from_waker(&lookup_waker);
+    assert!(lookup.as_mut().poll(&mut lookup_cx).is_pending());
+    environment.tracker.memory_gate.wait_entered();
+
+    let mut acquisition = environment
+        .runtime
+        .pin_model(state.model_instance_id.clone());
+    let (sender, receiver) = mpsc::channel();
+    let waker = Waker::from(Arc::new(ModelPinReplyWake { sender }));
+    let mut cx = Context::from_waker(&waker);
+    // The native worker is held inside real cache inspection. Acquisition
+    // has been dispatched but cannot complete during this first poll.
+    assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    release.release();
+    let actual = block_on(lookup).unwrap().expect("original canonical state");
+    assert_same_allocation(state, &actual);
+
+    receiver
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("pin reply published");
+    // OperationFuture publishes its result before invoking this waker.
+    // Do not poll acquisition again: the future must own the unconsumed pin.
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(residents.len(), 1);
+    assert!(
+        residents[0]
+            .instance
+            .same_instance(&state.model_instance_id)
+    );
+    assert!(residents[0].pinned);
+    acquisition
+}
+
+fn assert_model_pin_lifecycle_unchanged(
+    environment: &StateEnvironment,
+    state: &RetainedSessionState,
+    accounting: AdmissionSnapshot,
+    counts: ResourceCounts,
+) {
+    let actual = environment.lookup(state.state_id);
+    assert_same_allocation(state, &actual);
+    assert_eq!(actual.reused_input_tokens, state.reused_input_tokens);
+    assert_eq!(actual.prefilled_input_tokens, state.prefilled_input_tokens);
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(residents.len(), 1);
+    assert!(
+        residents[0]
+            .instance
+            .same_instance(&state.model_instance_id)
+    );
+    assert!(residents[0].pinned);
+    assert_eq!(environment.snapshot(), accounting);
+    assert_eq!(environment.tracker.counts(), counts);
+}
+
+fn wait_model_pin_lifecycle_expired(
+    environment: &StateEnvironment,
+    state: &RetainedSessionState,
+    counts: ResourceCounts,
+) {
+    let limit = deadline();
+    loop {
+        let residents = block_on(environment.runtime.model_residency()).unwrap();
+        if residents.is_empty() {
+            break;
+        }
+        assert_eq!(residents.len(), 1);
+        assert!(
+            residents[0]
+                .instance
+                .same_instance(&state.model_instance_id)
+        );
+        assert!(
+            Instant::now() < limit,
+            "model protection leaked after final pin drop"
+        );
+        thread::yield_now();
+    }
+    assert!(
+        block_on(environment.runtime.lookup_session_state(state.state_id))
+            .unwrap()
+            .is_none()
+    );
+    let accounting = environment.snapshot();
+    assert_eq!(accounting.reserved_bytes(), 0);
+    assert_eq!(accounting.active_reservations(), 0);
+    let after = environment.tracker.counts();
+    assert_eq!(after.models_created, counts.models_created);
+    assert_eq!(after.caches_created, counts.caches_created);
+    assert_eq!(after.models_destroyed, counts.models_destroyed + 1);
+    assert_eq!(after.caches_destroyed, counts.caches_destroyed + 1);
+    assert_eq!(
+        environment
+            .tracker
+            .destruction_order
+            .lock()
+            .unwrap()
+            .as_slice(),
+        &["cache", "model"]
+    );
+}
+
+#[test]
+fn pool_model_pin_abandoned_ready_reply_does_not_leak_protection() {
+    let (environment, id, state) = model_pin_lifecycle_environment("model-pin-abandoned-reply");
+    let accounting = environment.snapshot();
+    let counts = environment.tracker.counts();
+    let acquisition = unconsumed_model_pin_reply(&environment, &state);
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(state.model_instance_id.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap()
+    );
+    // Only the unread reply protects A; no explicit pin handle or session
+    // lease has been returned to this caller.
+    assert_model_pin_lifecycle_unchanged(&environment, &state, accounting, counts);
+    drop(acquisition);
+    wait_model_pin_lifecycle_expired(&environment, &state, counts);
+    assert_eq!(environment.release(id), ReleaseOutcome::AlreadyAbsent);
+    let _ = environment.complete("model-pin-abandon-recovery");
+}
+
+#[test]
+fn pool_model_pin_abandoned_reply_preserves_separate_explicit_pin() {
+    let (environment, _id, state) = model_pin_lifecycle_environment("model-pin-separate-owner");
+    let held = block_on(
+        environment
+            .runtime
+            .pin_model(state.model_instance_id.clone()),
+    )
+    .unwrap()
+    .expect("separately held pin");
+    assert!(held.instance_id().same_instance(&state.model_instance_id));
+    let accounting = environment.snapshot();
+    let counts = environment.tracker.counts();
+    let acquisition = unconsumed_model_pin_reply(&environment, &state);
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(state.model_instance_id.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap()
+    );
+    drop(acquisition);
+    assert_model_pin_lifecycle_unchanged(&environment, &state, accounting, counts);
+    drop(held);
+    wait_model_pin_lifecycle_expired(&environment, &state, counts);
+    let _ = environment.complete("model-pin-separate-recovery");
+}
+
+#[test]
+fn pool_model_pin_state_release_drops_session_but_retains_weights() {
+    let (environment, id, state) = model_pin_lifecycle_environment("model-pin-release-session");
+    let pin = block_on(
+        environment
+            .runtime
+            .pin_model(state.model_instance_id.clone()),
+    )
+    .unwrap()
+    .expect("model residency pin, not a session lease");
+    let final_pin = pin.clone();
+    let counts = environment.tracker.counts();
+    let before = environment.snapshot();
+    let expected_before = [
+        state.weights_reserved_bytes,
+        state.cache_reserved_bytes,
+        state.token_history_reserved_bytes,
+        state.logits_reserved_bytes,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+    .expect("native-state reservation sum");
+    assert_eq!(before.reserved_bytes(), expected_before);
+    assert_eq!(before.active_reservations(), 4);
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(state.model_instance_id.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap()
+    );
+
+    assert_eq!(environment.release(id), ReleaseOutcome::Released);
+    assert!(
+        block_on(environment.runtime.lookup_session_state(id))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        block_on(environment.runtime.lease_session_state(id))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(environment.release(id), ReleaseOutcome::AlreadyAbsent);
+
+    let assert_weights_only = || {
+        let residents = block_on(environment.runtime.model_residency()).unwrap();
+        assert_eq!(residents.len(), 1);
+        assert!(
+            residents[0]
+                .instance
+                .same_instance(&state.model_instance_id)
+        );
+        assert!(residents[0].pinned);
+        assert_eq!(
+            residents[0].committed_weight_bytes,
+            state.weights_reserved_bytes
+        );
+        let after = environment.snapshot();
+        assert_eq!(after.reserved_bytes(), state.weights_reserved_bytes);
+        assert_eq!(after.active_reservations(), 1);
+        assert_eq!(
+            before.reserved_bytes() - after.reserved_bytes(),
+            state.cache_reserved_bytes
+                + state.token_history_reserved_bytes
+                + state.logits_reserved_bytes
+        );
+        let actual = environment.tracker.counts();
+        assert_eq!(actual.models_created, counts.models_created);
+        assert_eq!(actual.caches_created, counts.caches_created);
+        assert_eq!(actual.models_destroyed, counts.models_destroyed);
+        assert_eq!(actual.caches_destroyed, counts.caches_destroyed + 1);
+        assert_eq!(
+            environment
+                .tracker
+                .destruction_order
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &["cache"]
+        );
+    };
+    assert_weights_only();
+    drop(pin);
+    assert_weights_only();
+    drop(final_pin);
+    wait_model_pin_lifecycle_expired(&environment, &state, counts);
+    let _ = environment.complete("model-pin-release-recovery");
+}

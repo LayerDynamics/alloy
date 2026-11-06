@@ -9,7 +9,8 @@
 //! generation path must honor that flag at a safe boundary (same rule as
 //! oMLX: the enforcer never touches Metal directly).
 //!
-//! Multi-model LRU unload and in-flight abort are PR4 (M9). Prefill chunk
+//! Worker-owned idle LRU unload is dispatched through FamilyRuntime.
+//! In-flight abort remains separate. Prefill chunk
 //! shrink helpers live in [`crate::prefill_admit`] (M5–M6); this enforcer
 //! publishes the admit line those helpers consume.
 
@@ -83,6 +84,8 @@ pub struct EnforcementTick {
     pub status: EnforcerStatus,
     /// True when the caller should ask the native worker to drain the MLX pool.
     pub request_cache_reclaim: bool,
+    /// Persistent pressure authorizes at most one idle-model eviction.
+    pub request_model_eviction: bool,
     /// True when soft/hard destructive steps were deferred for grace.
     pub deferred_for_pool_drain: bool,
     /// Previous pressure level (for logging transitions).
@@ -121,6 +124,7 @@ pub struct MemoryEnforcer {
 #[derive(Debug)]
 struct Inner {
     config: MemoryGuardConfig,
+    observation_source: Option<Arc<dyn MemoryObservationSource>>,
     admission: AdmissionController,
     /// Optional test override for host snapshot (None → live probe).
     host_override: Mutex<Option<HostMemorySnapshot>>,
@@ -143,12 +147,46 @@ struct Inner {
     emergency: AtomicBool,
 }
 
+/// One host and allocator observation supplied to the enforcer.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryObservation {
+    /// Host-memory counters used by the ceiling calculation.
+    pub host: HostMemorySnapshot,
+    /// Allocator active bytes; zero retains the host-footprint fallback.
+    pub mlx_active_bytes: u64,
+    /// Unused allocator-cache bytes, not resident model reservations.
+    pub mlx_pool_bytes: u64,
+}
+
+/// Injectable observation source; never owns or reclaims native models.
+///
+/// Called on the enforcement executor. Production defaults to live probes;
+/// alternate providers support platform adapters and deterministic tests.
+pub trait MemoryObservationSource: fmt::Debug + Send + Sync + 'static {
+    /// Obtain the next observation, without changing runtime ownership.
+    fn observe(&self) -> Result<MemoryObservation, EnforcerError>;
+}
+
 impl MemoryEnforcer {
+    /// Construct an enforcer using an explicit observation provider.
+    pub fn with_observation_source(
+        config: MemoryGuardConfig,
+        admission: AdmissionController,
+        source: Arc<dyn MemoryObservationSource>,
+    ) -> Self {
+        let mut enforcer = Self::new(config, admission);
+        Arc::get_mut(&mut enforcer.inner)
+            .expect("new enforcer has unique ownership")
+            .observation_source = Some(source);
+        enforcer
+    }
+
     /// Construct an enforcer bound to an admission ledger.
     pub fn new(config: MemoryGuardConfig, admission: AdmissionController) -> Self {
         Self {
             inner: Arc::new(Inner {
                 config,
+                observation_source: None,
                 admission,
                 host_override: Mutex::new(None),
                 mlx_active_override: Mutex::new(None),
@@ -181,9 +219,7 @@ impl MemoryEnforcer {
 
     /// Whether the generation / worker path should clear the MLX cache.
     pub fn cache_reclaim_requested(&self) -> bool {
-        self.inner
-            .cache_reclaim_requested
-            .load(Ordering::Acquire)
+        self.inner.cache_reclaim_requested.load(Ordering::Acquire)
     }
 
     /// Clear the reclaim request after the worker honors it.
@@ -260,9 +296,10 @@ impl MemoryEnforcer {
 
     /// One enforcement tick (oMLX `_check_and_enforce`).
     pub fn tick(&self) -> Result<EnforcementTick, EnforcerError> {
-        let host = self.observe_host()?;
-        let mlx_active = self.observe_mlx_active();
-        let pool_bytes = self.observe_mlx_pool();
+        let observation = self.observe_memory()?;
+        let host = observation.host;
+        let mlx_active = observation.mlx_active_bytes;
+        let pool_bytes = observation.mlx_pool_bytes;
         let usage = memory_guard::usage_bytes(mlx_active, host);
         let ceiling = memory_guard::ceiling_breakdown(self.inner.config, host, usage)
             .map_err(EnforcerError::Guard)?;
@@ -271,11 +308,7 @@ impl MemoryEnforcer {
         self.publish_ceiling(ceiling, marks, usage);
 
         if ceiling.hard_limit_bytes > 0 {
-            if let Err(error) = self
-                .inner
-                .admission
-                .resize_budget(ceiling.hard_limit_bytes)
-            {
+            if let Err(error) = self.inner.admission.resize_budget(ceiling.hard_limit_bytes) {
                 // Budget below reserved is expected during a large load; keep
                 // the previous ledger budget and continue pressure handling.
                 let _ = error;
@@ -297,6 +330,7 @@ impl MemoryEnforcer {
             return Ok(EnforcementTick {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: false,
+                request_model_eviction: false,
                 deferred_for_pool_drain: false,
                 previous_pressure: previous,
             });
@@ -332,6 +366,7 @@ impl MemoryEnforcer {
             return Ok(EnforcementTick {
                 status: self.status_with_binding(ceiling),
                 request_cache_reclaim: true,
+                request_model_eviction: false,
                 deferred_for_pool_drain: true,
                 previous_pressure: previous,
             });
@@ -354,6 +389,7 @@ impl MemoryEnforcer {
 
         Ok(EnforcementTick {
             status: self.status_with_binding(ceiling),
+            request_model_eviction: new_level != PressureLevel::Ok,
             request_cache_reclaim: new_level == PressureLevel::Hard
                 || self.cache_reclaim_requested(),
             deferred_for_pool_drain: false,
@@ -361,16 +397,49 @@ impl MemoryEnforcer {
         })
     }
 
+    fn observe_memory(&self) -> Result<MemoryObservation, EnforcerError> {
+        match &self.inner.observation_source {
+            Some(source) => source.observe(),
+            None => Ok(MemoryObservation {
+                host: self.observe_host()?,
+                mlx_active_bytes: self.observe_mlx_active(),
+                mlx_pool_bytes: self.observe_mlx_pool(),
+            }),
+        }
+    }
+
+    pub(crate) fn refresh_pressure(&self) -> Result<EnforcerStatus, EnforcerError> {
+        let observation = self.observe_memory()?;
+        let usage = memory_guard::usage_bytes(observation.mlx_active_bytes, observation.host);
+        let ceiling = memory_guard::ceiling_breakdown(self.inner.config, observation.host, usage)
+            .map_err(EnforcerError::Guard)?;
+        let marks = memory_guard::watermark_bytes(self.inner.config.tier, ceiling);
+        self.publish_ceiling(ceiling, marks, usage);
+        if ceiling.hard_limit_bytes > 0 {
+            let _ = self.inner.admission.resize_budget(ceiling.hard_limit_bytes);
+        }
+        let level = if ceiling.hard_limit_bytes == 0 {
+            PressureLevel::Ok
+        } else {
+            memory_guard::pressure_level(usage, marks)
+        };
+        self.set_pressure(level);
+        self.inner
+            .admission
+            .set_admissions_paused(level != PressureLevel::Ok);
+        if level == PressureLevel::Ok {
+            self.inner.reclaim_grace_polls.store(0, Ordering::Relaxed);
+            self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
+            self.inner.emergency.store(false, Ordering::Relaxed);
+        }
+        Ok(self.status())
+    }
+
     fn status_with_binding(&self, _ceiling: CeilingBreakdown) -> EnforcerStatus {
         self.status()
     }
 
-    fn publish_ceiling(
-        &self,
-        ceiling: CeilingBreakdown,
-        marks: WatermarkBytes,
-        usage: u64,
-    ) {
+    fn publish_ceiling(&self, ceiling: CeilingBreakdown, marks: WatermarkBytes, usage: u64) {
         self.inner
             .hard_limit_bytes
             .store(ceiling.hard_limit_bytes, Ordering::Relaxed);
@@ -416,7 +485,11 @@ impl MemoryEnforcer {
             self.inner.over_ceiling_polls.store(0, Ordering::Relaxed);
             return false;
         }
-        let polls = self.inner.over_ceiling_polls.fetch_add(1, Ordering::Relaxed) + 1;
+        let polls = self
+            .inner
+            .over_ceiling_polls
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         usage >= ceiling.saturating_add(EMERGENCY_OVER_CEILING_MARGIN_BYTES)
             || polls >= u64::from(EMERGENCY_OVER_CEILING_POLLS)
     }

@@ -162,6 +162,9 @@ struct PolicyControl {
     fail_verification_once: AtomicBool,
     fail_loading_once: AtomicBool,
     startup_gate: Arc<StartupGate>,
+    // 0: existing verification gate; 1: before load; 2: after load.
+    startup_gate_stage: AtomicUsize,
+    execution_gate: Arc<StartupGate>,
 }
 
 impl PolicyControl {
@@ -172,6 +175,8 @@ impl PolicyControl {
             fail_verification_once: AtomicBool::new(false),
             fail_loading_once: AtomicBool::new(false),
             startup_gate: Arc::new(StartupGate::default()),
+            startup_gate_stage: AtomicUsize::new(0),
+            execution_gate: Arc::new(StartupGate::default()),
         }
     }
 
@@ -350,7 +355,11 @@ impl AutoregressiveModel for PolicyModel {
     ) -> Result<PrefillOutput, EngineError> {
         self.control
             .record("prefill-entered", &self.artifact, Some(cache.len()));
-        self.inner_mut().prefill(tokens, cache, execution)
+        self.control.execution_gate.enter_if_armed();
+        let result = self.inner_mut().prefill(tokens, cache, execution);
+        self.control
+            .record("prefill-returned", &self.artifact, None);
+        result
     }
 
     fn decode(
@@ -385,7 +394,19 @@ impl ModelFamily for PolicyBackend {
         let artifact = request.artifact().id().clone();
 
         self.control.record("load-entered", &artifact, None);
+        let gate_stage = self.control.startup_gate_stage.load(Ordering::Acquire);
+        if gate_stage == 1 {
+            self.control.startup_gate.enter_if_armed();
+            self.control.record("load-gate-returned", &artifact, None);
+        }
+
         let model = self.inner.load(request)?;
+        self.control.record("load-constructed", &artifact, None);
+
+        if gate_stage == 2 {
+            self.control.startup_gate.enter_if_armed();
+            self.control.record("load-gate-returned", &artifact, None);
+        }
 
         if self.control.fail_loading_once.swap(false, Ordering::AcqRel) {
             // Exercise failure after actual native model construction.
@@ -432,7 +453,9 @@ impl RuntimeBackend for PolicyBackend {
         artifact: &ArtifactRegistration,
         execution: &ExecutionControl,
     ) -> Result<(), EngineError> {
-        self.control.startup_gate.enter_if_armed();
+        if self.control.startup_gate_stage.load(Ordering::Acquire) == 0 {
+            self.control.startup_gate.enter_if_armed();
+        }
         self.inner.verify_artifact(artifact, execution)?;
 
         if self
@@ -578,12 +601,26 @@ impl PolicyEnvironment {
         Self::build(retained_policy(), tight_budget, true)
     }
 
+    fn new_pool_with_event_capacity(event_capacity: usize) -> Self {
+        Self::build_with_event_capacity(retained_policy(), false, true, event_capacity)
+    }
+
     fn build(retention: RetentionPolicy, tight_budget: bool, pooling: bool) -> Self {
+        Self::build_with_event_capacity(retention, tight_budget, pooling, 8)
+    }
+
+    fn build_with_event_capacity(
+        retention: RetentionPolicy,
+        tight_budget: bool,
+        pooling: bool,
+        event_capacity: usize,
+    ) -> Self {
         let fixture_a = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let fixture_b = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let fixture_c = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let context_limit = Qwen3Config::tiny_fixture().max_context;
-        let generation_limits = GenerationLimits::new(8, 4096, 1024).expect("generation limits");
+        let generation_limits =
+            GenerationLimits::new(event_capacity, 4096, 1024).expect("generation limits");
 
         let inner = Qwen3Backend::new(
             vec![
@@ -1555,4 +1592,929 @@ fn pool_advisory_does_not_credit_any_pinned_model() {
     assert_eq!(estimate.available_bytes(), before.available_bytes());
     assert_eq!(environment.snapshot(), before);
     assert_eq!(environment.control.events().len(), checkpoint);
+}
+
+// Returns with B blocked inside prefill, zero idle TTL, and no explicit
+// model pin remaining. Only active execution ownership protects B.
+fn pool_block_active_b(
+    name: &str,
+) -> (
+    PolicyEnvironment,
+    Generation,
+    GateRelease,
+    usize,
+    AdmissionSnapshot,
+) {
+    let environment = PolicyEnvironment::new_pool(false);
+
+    successful(&environment.run(&format!("{name}-warm-a"), profile_a(), "hello"));
+    successful(&environment.run(&format!("{name}-warm-b"), profile_b(), "hello"));
+
+    let b = pool_instance(&environment, &artifact_b());
+    let setup_pin = block_on(environment.runtime.pin_model(b.clone()))
+        .unwrap()
+        .expect("B is loaded");
+
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(b, Some(Duration::ZERO),)
+        )
+        .unwrap(),
+    );
+
+    // Leave A selected and idle, with protected B in the idle pool.
+    successful(&environment.run(&format!("{name}-touch-a"), profile_a(), "hello"));
+
+    let release = environment.control.execution_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        name,
+        profile_b(),
+        "jello",
+    )))
+    .expect("B generation accepted");
+
+    environment.control.execution_gate.wait_entered();
+
+    // No explicit residency protection remains after this point.
+    drop(setup_pin);
+
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(
+        environment.engine.active_request_id().unwrap(),
+        Some(RequestId::new(name).unwrap()),
+    );
+
+    let checkpoint = environment.control.events().len();
+    let accounting = environment.snapshot();
+
+    assert!(accounting.reserved_bytes() > 0);
+    assert!(
+        accounting.reserved_bytes()
+            >= environment.plan_b.load_limits.max_resident_bytes()
+                + environment.plan_b.cache.max_cache_bytes(),
+        "B's native model and cache must remain reserved",
+    );
+
+    (environment, generation, release, checkpoint, accounting)
+}
+
+fn assert_no_b_destruction(events: &[PolicyEvent]) {
+    assert!(
+        !events.iter().any(|event| event.artifact == artifact_b()
+            && matches!(event.kind, "cache-destroyed" | "model-destroyed")),
+        "active B must retain its native model and cache",
+    );
+}
+
+fn assert_b_destruction_after_prefill_return(events: &[PolicyEvent]) {
+    let returned = event_index(events, "prefill-returned", &artifact_b());
+    for (index, event) in events.iter().enumerate() {
+        if event.artifact == artifact_b()
+            && matches!(event.kind, "cache-destroyed" | "model-destroyed")
+        {
+            assert!(
+                index > returned,
+                "B's resources were destroyed before its native call returned",
+            );
+        }
+    }
+}
+
+#[test]
+fn pool_active_generation_survives_expiry_until_cleanup() {
+    let (environment, generation, release, checkpoint, accounting) =
+        pool_block_active_b("pool-active-normal");
+
+    // Submit a real allocator-reclamation request while the worker is
+    // blocked. It cannot run concurrently with the native operation.
+    let mut reclaim = environment.runtime.reclaim_mlx_allocator_cache();
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(reclaim.as_mut().poll(&mut cx), Poll::Pending));
+
+    assert_eq!(environment.snapshot(), accounting);
+    assert!(environment.scheduler.is_busy().unwrap());
+    let events = environment.control.events();
+    assert_no_b_destruction(&events[checkpoint..]);
+
+    release.release();
+
+    let mut stream = generation.into_events();
+    let transcript = drain(&mut stream);
+    drop(stream);
+    environment.wait_idle();
+    successful(&transcript);
+
+    // Depending on command ordering, the request either sees active
+    // ownership and returns Busy, or runs after native cleanup.
+    match block_on(reclaim) {
+        Ok(_) => {}
+        Err(error) => assert_eq!(error.kind(), ErrorKind::Busy),
+    }
+
+    // Synchronize with subsequent worker maintenance.
+    let _ = block_on(environment.runtime.model_residency()).unwrap();
+    let events = environment.control.events();
+    assert_b_destruction_after_prefill_return(&events[checkpoint..]);
+    assert!(!environment.scheduler.is_busy().unwrap());
+}
+
+#[test]
+fn pool_active_cancellation_keeps_resources_until_native_return() {
+    let name = "pool-active-cancel";
+    let (environment, generation, release, checkpoint, accounting) = pool_block_active_b(name);
+
+    assert_eq!(
+        block_on(environment.engine.cancel(RequestId::new(name).unwrap())).unwrap(),
+        CancelOutcome::Requested,
+    );
+
+    // Cancellation is a signal, not completion or permission to reclaim.
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(
+        environment.engine.active_request_id().unwrap(),
+        Some(RequestId::new(name).unwrap()),
+    );
+    assert_eq!(environment.snapshot(), accounting);
+
+    let events = environment.control.events();
+    assert_no_b_destruction(&events[checkpoint..]);
+
+    release.release();
+
+    let mut stream = generation.into_events();
+    let limit = deadline();
+    let mut failures = 0;
+    let mut completions = 0;
+
+    while let Some(event) = next_event(&mut stream, limit) {
+        match event {
+            GenerationEvent::RequestFailed { error, .. } => {
+                assert!(
+                    matches!(error, EngineError::Cancelled { .. }),
+                    "expected cancellation, got {error:?}",
+                );
+                failures += 1;
+            }
+            GenerationEvent::GenerationCompleted { .. } => completions += 1,
+            _ => {}
+        }
+    }
+
+    drop(stream);
+    environment.wait_idle();
+
+    assert_eq!(failures, 1, "exactly one cancellation terminal");
+    assert_eq!(completions, 0);
+    let _ = block_on(environment.runtime.model_residency()).unwrap();
+    let events = environment.control.events();
+    assert_b_destruction_after_prefill_return(&events[checkpoint..]);
+    assert!(!environment.scheduler.is_busy().unwrap());
+}
+
+fn check_pool_pending_startup(gate_stage: usize, abandon_stream: bool) {
+    assert!(matches!(gate_stage, 1 | 2));
+    let environment = PolicyEnvironment::new_pool(false);
+
+    successful(&environment.run("pending-protect-warm-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+
+    // Set zero default TTL for incoming B without accidentally expiring A.
+    let setup_pin = block_on(environment.runtime.pin_model(a.clone()))
+        .unwrap()
+        .expect("A is loaded");
+    let _ = environment
+        .runtime
+        .clone()
+        .with_model_pool(Some(Duration::ZERO))
+        .expect("zero default idle TTL");
+    assert!(block_on(environment.runtime.set_model_idle_ttl(a.clone(), None)).unwrap(),);
+    drop(setup_pin);
+
+    let baseline = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    environment
+        .control
+        .startup_gate_stage
+        .store(gate_stage, Ordering::Release);
+    let release = environment.control.startup_gate.arm();
+
+    let name = match (gate_stage, abandon_stream) {
+        (1, false) => "pending-cancel-before-load",
+        (1, true) => "pending-abandon-before-load",
+        (2, false) => "pending-cancel-after-load",
+        _ => unreachable!(),
+    };
+    let id = RequestId::new(name).unwrap();
+    let generation = block_on(environment.engine.generate(environment.request(
+        name,
+        profile_b(),
+        "hello",
+    )))
+    .expect("B admitted");
+
+    environment.control.startup_gate.wait_entered();
+
+    let blocked = environment.snapshot();
+    assert_eq!(
+        blocked.reserved_bytes(),
+        sum(&[
+            baseline.reserved_bytes(),
+            pending_startup_reservation(&environment.plan_b),
+        ]),
+        "A plus B's full startup grant must remain charged",
+    );
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(
+        environment.engine.active_request_id().unwrap(),
+        Some(id.clone()),
+    );
+
+    let events = environment.control.events();
+    let startup_events = &events[checkpoint..];
+    event_index(startup_events, "load-entered", &artifact_b());
+    assert_eq!(
+        startup_events
+            .iter()
+            .any(|event| event.artifact == artifact_b() && event.kind == "load-constructed"),
+        gate_stage == 2,
+    );
+    assert!(
+        !startup_events
+            .iter()
+            .any(|event| matches!(event.kind, "cache-destroyed" | "model-destroyed")),
+        "neither retained A nor startup-owned B may be destroyed",
+    );
+
+    let mut stream = Some(generation.into_events());
+    if abandon_stream {
+        drop(stream.take());
+    } else {
+        assert_eq!(
+            block_on(environment.engine.cancel(id.clone())).unwrap(),
+            CancelOutcome::Requested,
+        );
+    }
+
+    // Dropping the consumer or requesting cancellation is not cleanup.
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(environment.engine.active_request_id().unwrap(), Some(id),);
+    assert_eq!(environment.snapshot(), blocked);
+    let events = environment.control.events();
+    assert!(
+        !events[checkpoint..]
+            .iter()
+            .any(|event| matches!(event.kind, "cache-destroyed" | "model-destroyed")),
+    );
+
+    // Reclamation is submitted while native startup is still blocked.
+    let mut reclaim = environment.runtime.reclaim_mlx_allocator_cache();
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(reclaim.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(environment.snapshot(), blocked);
+    assert!(environment.scheduler.is_busy().unwrap());
+
+    release.release();
+
+    if let Some(mut stream) = stream {
+        let limit = deadline();
+        let mut failures = 0;
+        let mut completions = 0;
+        while let Some(event) = next_event(&mut stream, limit) {
+            match event {
+                GenerationEvent::RequestFailed { error, .. } => {
+                    assert!(
+                        matches!(error, EngineError::Cancelled { .. }),
+                        "expected cancellation, got {error:?}",
+                    );
+                    failures += 1;
+                }
+                GenerationEvent::GenerationCompleted { .. } => completions += 1,
+                _ => {}
+            }
+        }
+        drop(stream);
+        assert_eq!(failures, 1);
+        assert_eq!(completions, 0);
+    }
+
+    environment.wait_idle();
+    match block_on(reclaim) {
+        Ok(_) => {}
+        Err(error) => assert_eq!(error.kind(), ErrorKind::Busy),
+    }
+
+    // Serialize behind cleanup and the worker's zero-TTL maintenance.
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(pool_instance(&environment, &artifact_a()), a);
+    assert!(
+        !residents
+            .iter()
+            .any(|resident| resident.artifact == artifact_b()),
+        "cancelled B must not leave a zero-TTL resident behind",
+    );
+    assert_eq!(
+        environment.snapshot(),
+        baseline,
+        "B's output, workspace, loading peak and unused grant must be released",
+    );
+
+    let events = environment.control.events();
+    let startup_events = &events[checkpoint..];
+    assert!(
+        !startup_events
+            .iter()
+            .any(|event| event.artifact == artifact_a()
+                && matches!(event.kind, "cache-destroyed" | "model-destroyed")),
+        "unrelated retained A must survive startup cleanup",
+    );
+
+    let returned = event_index(startup_events, "load-gate-returned", &artifact_b());
+    if gate_stage == 2 {
+        let destroyed = event_index(startup_events, "model-destroyed", &artifact_b());
+        assert!(
+            destroyed > returned,
+            "constructed B may be destroyed only after the loader gate returns",
+        );
+    }
+
+    environment
+        .control
+        .startup_gate_stage
+        .store(0, Ordering::Release);
+    successful(&environment.run("pending-recovery-b", profile_b(), "hello"));
+    assert_eq!(pool_instance(&environment, &artifact_a()), a);
+    let _ = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(environment.snapshot(), baseline);
+}
+
+#[test]
+fn pool_pending_startup_cancel_before_load() {
+    check_pool_pending_startup(1, false);
+}
+
+#[test]
+fn pool_pending_startup_abandoned_stream_before_load() {
+    check_pool_pending_startup(1, true);
+}
+
+#[test]
+fn pool_pending_startup_cancel_after_native_construction() {
+    check_pool_pending_startup(2, false);
+}
+
+// M9_ADMISSION_ENFORCER_BOUNDARIES_V1
+struct PoolStartupWake {
+    sender: mpsc::Sender<usize>,
+    epoch: usize,
+}
+
+impl Wake for PoolStartupWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.sender.send(self.epoch);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.sender.send(self.epoch);
+    }
+}
+
+struct PoolAdmissionReady {
+    receiver: mpsc::Receiver<usize>,
+    epoch: usize,
+}
+
+impl PoolAdmissionReady {
+    fn recv_timeout(&self, timeout: Duration) -> Result<(), mpsc::RecvTimeoutError> {
+        let limit = Instant::now() + timeout;
+        loop {
+            let remaining = limit.saturating_duration_since(Instant::now());
+            let epoch = self.receiver.recv_timeout(remaining)?;
+            if epoch == self.epoch {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn pool_unconsumed_startup<'a>(
+    environment: &'a PolicyEnvironment,
+    name: &str,
+) -> (
+    engine::api::EngineFuture<'a, Generation>,
+    GateRelease,
+    PoolAdmissionReady,
+) {
+    environment
+        .control
+        .startup_gate_stage
+        .store(0, Ordering::Release);
+    let release = environment.control.startup_gate.arm();
+    let mut startup = environment
+        .engine
+        .generate(environment.request(name, profile_b(), "hello"));
+    let (sender, receiver) = mpsc::channel();
+    let mut epoch = 0;
+    // Every poll gets a distinct waker epoch. A delayed advisory wake
+    // cannot be mistaken for publication of the admitted startup reply.
+    thread::scope(|scope| {
+        let gate = Arc::clone(&environment.control.startup_gate);
+        let gate_sender = sender.clone();
+        scope.spawn(move || {
+            gate.wait_entered();
+            let _ = gate_sender.send(usize::MAX);
+        });
+        loop {
+            if environment
+                .control
+                .startup_gate
+                .state
+                .lock()
+                .unwrap()
+                .entered
+            {
+                break;
+            }
+            epoch += 1;
+            let waker = Waker::from(Arc::new(PoolStartupWake {
+                sender: sender.clone(),
+                epoch,
+            }));
+            let mut cx = Context::from_waker(&waker);
+            assert!(startup.as_mut().poll(&mut cx).is_pending());
+            if environment
+                .control
+                .startup_gate
+                .state
+                .lock()
+                .unwrap()
+                .entered
+            {
+                break;
+            }
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("startup or gate wake");
+        }
+    });
+    while receiver.try_recv().is_ok() {}
+    (startup, release, PoolAdmissionReady { receiver, epoch })
+}
+
+fn assert_pool_only_a(environment: &PolicyEnvironment, a: &ModelInstanceId) {
+    let residents = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(residents.len(), 1);
+    assert!(residents[0].instance.same_instance(a));
+}
+
+#[test]
+fn pool_pending_generate_drop_before_grant_preserves_idle_a() {
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("drop-before-warm-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let baseline = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let (startup, release, _receiver) = pool_unconsumed_startup(&environment, "drop-before-grant");
+    assert_eq!(environment.snapshot(), baseline);
+    drop(startup);
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(environment.snapshot(), baseline);
+    release.release();
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), baseline);
+    assert_pool_only_a(&environment, &a);
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(
+                event.kind,
+                "load-entered" | "model-destroyed" | "cache-destroyed"
+            ))
+    );
+    successful(&environment.run("drop-before-recover", profile_b(), "hello"));
+}
+
+#[test]
+fn pool_pending_generate_drop_after_grant_releases_unconsumed_reply() {
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("drop-reply-warm-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let baseline = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let (startup, release, receiver) =
+        pool_unconsumed_startup(&environment, "drop-unconsumed-reply");
+    release.release();
+    let expected = baseline.reserved_bytes() + pending_startup_reservation(&environment.plan_b);
+    loop {
+        receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("admission reply wake");
+        if environment.snapshot().reserved_bytes() == expected {
+            break;
+        }
+    }
+    // Never repoll generate: that would consume the reply and start prefill.
+    assert!(environment.scheduler.is_busy().unwrap());
+    let error = expect_failure(
+        block_on(environment.runtime.reclaim_mlx_allocator_cache()),
+        "pending startup must reject allocator reclamation",
+    );
+    assert_eq!(error.kind(), ErrorKind::Busy);
+    assert_eq!(environment.snapshot().reserved_bytes(), expected);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+    drop(startup);
+    environment.wait_idle();
+    assert_eq!(environment.snapshot(), baseline);
+    assert_pool_only_a(&environment, &a);
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(
+                event.kind,
+                "load-entered" | "model-destroyed" | "cache-destroyed"
+            ))
+    );
+    successful(&environment.run("drop-reply-recover", profile_b(), "hello"));
+}
+
+#[derive(Debug)]
+struct PoolPressureSource(Mutex<engine::memory_enforcer::MemoryObservation>);
+
+impl engine::memory_enforcer::MemoryObservationSource for PoolPressureSource {
+    fn observe(
+        &self,
+    ) -> Result<engine::memory_enforcer::MemoryObservation, engine::memory_enforcer::EnforcerError>
+    {
+        Ok(*self.0.lock().unwrap())
+    }
+}
+
+impl PoolPressureSource {
+    fn set_normal(&self) {
+        let mut observation = self.0.lock().unwrap();
+        observation.host.free_bytes = 20 * 1024 * 1024 * 1024;
+        observation.host.phys_footprint_bytes = 1024 * 1024 * 1024;
+        observation.mlx_active_bytes = 1024 * 1024 * 1024;
+        observation.mlx_pool_bytes = 0;
+    }
+}
+
+fn pool_pressure_enforcer(
+    admission: AdmissionController,
+    hard: bool,
+) -> (
+    engine::memory_enforcer::MemoryEnforcer,
+    Arc<PoolPressureSource>,
+) {
+    use engine::memory_enforcer::{MemoryEnforcer, MemoryObservation};
+    use engine::memory_guard::{HostMemorySnapshot, MemoryGuardConfig};
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let usage = if hard { 32 * GIB } else { 20 * GIB };
+    let source = Arc::new(PoolPressureSource(Mutex::new(MemoryObservation {
+        host: HostMemorySnapshot {
+            physical_memory_bytes: 36 * GIB,
+            free_bytes: 5 * GIB,
+            inactive_bytes: 0,
+            active_file_bytes: 0,
+            other_apps_active_bytes: 0,
+            phys_footprint_bytes: usage,
+            graphics_footprint_bytes: 0,
+            iogpu_wired_limit_bytes: 0,
+            recommended_working_set_bytes: 100 * GIB,
+            release_credit_bytes: 0,
+        },
+        mlx_active_bytes: usage,
+        mlx_pool_bytes: 3 * GIB,
+    })));
+    let enforcer = MemoryEnforcer::with_observation_source(
+        MemoryGuardConfig::balanced(),
+        admission,
+        source.clone(),
+    );
+    (enforcer, source)
+}
+
+fn pool_pressure_after_grace(
+    environment: &PolicyEnvironment,
+    enforcer: &engine::memory_enforcer::MemoryEnforcer,
+) -> engine::runtime::MemoryEnforcementReport {
+    use engine::memory_enforcer::PRESSURE_RECLAIM_GRACE_POLLS_MAX;
+    use engine::runtime::IdleModelReclaim;
+    for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        let report = block_on(environment.runtime.enforce_memory_tick(enforcer.clone())).unwrap();
+        assert!(report.tick.deferred_for_pool_drain);
+        assert!(matches!(report.model, IdleModelReclaim::NotRequested));
+    }
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer.clone())).unwrap();
+    assert!(!report.tick.deferred_for_pool_drain);
+    report
+}
+
+#[test]
+fn pool_enforcer_grace_then_actual_lru_eviction_and_recovery() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("enforcer-warm-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let a_bytes = environment.snapshot().reserved_bytes();
+    successful(&environment.run("enforcer-warm-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let before = environment.snapshot().reserved_bytes();
+    let checkpoint = environment.control.events().len();
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected actual A eviction: {other:?}"),
+    }
+    assert_eq!(environment.snapshot().reserved_bytes(), before - a_bytes);
+    let events = environment.control.events();
+    let events = &events[checkpoint..];
+    let cache = event_index(events, "cache-destroyed", &artifact_a());
+    let model = event_index(events, "model-destroyed", &artifact_a());
+    assert!(cache < model);
+    assert!(
+        events[model].snapshot.reserved_bytes() > environment.snapshot().reserved_bytes(),
+        "model guard must still be charged when native destruction is recorded"
+    );
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    source.set_normal();
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    assert!(matches!(report.model, IdleModelReclaim::NotRequested));
+    assert!(!environment.admission.admissions_paused());
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    successful(&environment.run("enforcer-recover-b", profile_b(), "hello"));
+}
+
+#[test]
+fn pool_enforcer_all_pins_report_no_eligible_victim() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("enforcer-pinned-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let pin_a = block_on(environment.runtime.pin_model(a.clone()))
+        .unwrap()
+        .unwrap();
+    successful(&environment.run("enforcer-pinned-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let _pin_b = block_on(environment.runtime.pin_model(b.clone()))
+        .unwrap()
+        .unwrap();
+    let before = environment.snapshot();
+    let (enforcer, _) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    assert!(matches!(report.model, IdleModelReclaim::NoEligibleVictim));
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        before.reserved_bytes()
+    );
+    assert_eq!(
+        environment.snapshot().active_reservations(),
+        before.active_reservations()
+    );
+    drop(pin_a);
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected unpinned A eviction: {other:?}"),
+    }
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+}
+
+#[test]
+fn pool_enforcer_evicts_a_without_reclaiming_pending_b_grant() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("enforcer-pending-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let baseline = environment.snapshot().reserved_bytes();
+    let (startup, release, receiver) = pool_unconsumed_startup(&environment, "enforcer-pending-b");
+    release.release();
+    let pending = pending_startup_reservation(&environment.plan_b);
+    loop {
+        receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("admission reply wake");
+        if environment.snapshot().reserved_bytes() == baseline + pending {
+            break;
+        }
+    }
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected idle A eviction: {other:?}"),
+    }
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert_eq!(environment.snapshot().reserved_bytes(), pending);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+    drop(startup);
+    environment.wait_idle();
+    assert_eq!(environment.snapshot().reserved_bytes(), 0);
+    assert_eq!(environment.snapshot().active_reservations(), 0);
+    source.set_normal();
+    block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    successful(&environment.run("enforcer-pending-recover", profile_b(), "hello"));
+}
+
+#[test]
+fn pool_enforcer_evicts_idle_a_but_preserves_active_b() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool_with_event_capacity(1);
+    successful(&environment.run("enforcer-active-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    successful(&environment.run("enforcer-active-warm-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let checkpoint = environment.control.events().len();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "enforcer-active-b",
+        profile_b(),
+        "jello",
+    )))
+    .unwrap();
+    // A capacity-one event channel is not drained. Its producer cannot
+    // finish the four-token generation while this test inspects ownership.
+    let limit = deadline();
+    loop {
+        if environment.control.events()[checkpoint..]
+            .iter()
+            .any(|event| event.artifact == artifact_b() && event.kind == "prefill-returned")
+        {
+            break;
+        }
+        assert!(Instant::now() < limit, "B did not reach prefill");
+        thread::yield_now();
+    }
+    assert!(environment.scheduler.is_busy().unwrap());
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected idle A eviction: {other:?}"),
+    }
+    assert!(environment.scheduler.is_busy().unwrap());
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer.clone())).unwrap();
+    assert!(matches!(report.model, IdleModelReclaim::NoEligibleVictim));
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| event.artifact != artifact_b()
+                || !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
+    );
+    source.set_normal();
+    block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    let mut stream = generation.into_events();
+    let transcript = drain(&mut stream);
+    drop(stream);
+    environment.wait_idle();
+    successful(&transcript);
+}
+
+#[test]
+fn pool_enforcer_hard_pressure_destroys_an_actual_idle_model() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("enforcer-hard-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    let (enforcer, _) = pool_pressure_enforcer(environment.admission.clone(), true);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    assert_eq!(
+        report.tick.status.pressure,
+        engine::memory_guard::PressureLevel::Hard
+    );
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected hard-pressure model eviction: {other:?}"),
+    }
+    assert_eq!(environment.snapshot().reserved_bytes(), 0);
+    assert_eq!(environment.snapshot().active_reservations(), 0);
+}
+
+#[test]
+fn pool_enforcer_live_session_lease_blocks_model_destruction() {
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    let name = "enforcer-leased-a";
+    let rendered = block_on(
+        environment
+            .engine
+            .render_and_count(request_context(profile_a(), "hello")),
+    )
+    .unwrap();
+    successful(&environment.run(name, profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    // The fixture executes a real zero-head checkpoint and emits token 0
+    // for each output position (the successful transcript is "!!!!").
+    let tokenizer = tokenizers::Tokenizer::from_file(
+        environment._fixtures[0]
+            ._directory
+            .path()
+            .join("tokenizer.json"),
+    )
+    .unwrap();
+    let mut tokens = rendered.token_ids().to_vec();
+    tokens.extend_from_slice(&[0; POLICY_OUTPUT]);
+    let prefix = tokenizer.decode(&tokens, false).unwrap();
+    assert_eq!(
+        tokenizer.encode(prefix.as_str(), false).unwrap().get_ids(),
+        &tokens
+    );
+    let state = block_on(
+        environment
+            .runtime
+            .retain_session_state(RequestId::new(name).unwrap(), prefix.into_bytes()),
+    )
+    .unwrap();
+    let lease = block_on(environment.runtime.lease_session_state(state))
+        .unwrap()
+        .unwrap();
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+    let (enforcer, _) = pool_pressure_enforcer(environment.admission.clone(), false);
+    let report = pool_pressure_after_grace(&environment, &enforcer);
+    assert!(matches!(report.model, IdleModelReclaim::NoEligibleVictim));
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        before.reserved_bytes()
+    );
+    assert_eq!(
+        environment.snapshot().active_reservations(),
+        before.active_reservations()
+    );
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
+    );
+    drop(lease);
+    let report = block_on(environment.runtime.enforce_memory_tick(enforcer)).unwrap();
+    match report.model {
+        IdleModelReclaim::Evicted(instance) => assert!(instance.same_instance(&a)),
+        other => panic!("expected unleased A eviction: {other:?}"),
+    }
+    assert!(
+        block_on(environment.runtime.lookup_session_state(state))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(environment.snapshot().reserved_bytes(), 0);
+    assert_eq!(environment.snapshot().active_reservations(), 0);
+}
+
+#[test]
+fn pool_enforcer_queued_eviction_is_revoked_after_pressure_recovers() {
+    use engine::memory_enforcer::PRESSURE_RECLAIM_GRACE_POLLS_MAX;
+    use engine::runtime::IdleModelReclaim;
+    let environment = PolicyEnvironment::new_pool(false);
+    successful(&environment.run("enforcer-stale-a", profile_a(), "hello"));
+    let a = pool_instance(&environment, &artifact_a());
+    successful(&environment.run("enforcer-stale-warm-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+    let checkpoint = environment.control.events().len();
+    let release = environment.control.execution_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "enforcer-stale-b",
+        profile_b(),
+        "jello",
+    )))
+    .unwrap();
+    environment.control.execution_gate.wait_entered();
+    let (enforcer, source) = pool_pressure_enforcer(environment.admission.clone(), false);
+    for _ in 0..PRESSURE_RECLAIM_GRACE_POLLS_MAX {
+        assert!(enforcer.tick().unwrap().deferred_for_pool_drain);
+    }
+    let mut enforcement = environment.runtime.enforce_memory_tick(enforcer);
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    assert!(enforcement.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        environment.admission.admissions_paused(),
+        "admission pause must not wait for the blocked native worker"
+    );
+    source.set_normal();
+    release.release();
+    let report = block_on(enforcement).unwrap();
+    assert!(matches!(report.model, IdleModelReclaim::NotRequested));
+    assert!(!environment.admission.admissions_paused());
+    let mut stream = generation.into_events();
+    let transcript = drain(&mut stream);
+    drop(stream);
+    environment.wait_idle();
+    successful(&transcript);
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&a));
+    assert!(pool_instance(&environment, &artifact_b()).same_instance(&b));
+    assert!(
+        environment.control.events()[checkpoint..]
+            .iter()
+            .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
+    );
 }

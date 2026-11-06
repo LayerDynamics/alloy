@@ -279,7 +279,62 @@ pub struct ModelResidencyInfo {
     pub pinned: bool,
 }
 
+/// Result of a bounded live-pressure model-reclamation attempt.
+#[derive(Clone, Debug)]
+pub enum IdleModelReclaim {
+    /// Pressure was normal or allocator-drain grace is still active.
+    NotRequested,
+    /// This exact native model and its accounting guards were destroyed.
+    Evicted(ModelInstanceId),
+    /// All remaining candidates were protected, or no model was loaded.
+    NoEligibleVictim,
+}
+
+/// One enforcement decision and the actions completed on the native worker.
+pub struct MemoryEnforcementReport {
+    /// Fresh enforcer decision, observed after the worker accepted the call.
+    pub tick: crate::memory_enforcer::EnforcementTick,
+    /// Allocator-only reclamation, when the native worker was idle.
+    pub allocator_cache: Option<mlx_ffi::memory::CacheReclaimReport>,
+    /// Allocator drain failure does not suppress eligible model eviction.
+    pub allocator_error: Option<String>,
+    /// At most one eligible idle model is destroyed per observation.
+    pub model: IdleModelReclaim,
+}
+
 impl FamilyRuntime {
+    /// Observe live pressure and apply one bounded enforcement step.
+    ///
+    /// Call serially from the polling loop. Observations and eligibility are
+    /// recomputed on the native worker, not captured before a queued call.
+    /// Native objects never leave that worker. This does not abort work.
+    pub fn enforce_memory_tick(
+        &self,
+        enforcer: crate::memory_enforcer::MemoryEnforcer,
+    ) -> EngineFuture<'_, MemoryEnforcementReport> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            // Publish pause/pressure promptly on the caller, even while
+            // the native worker is occupied by a long operation.
+            let tick = enforcer
+                .tick()
+                .map_err(|error| EngineError::ExecutionFailed {
+                    stage: "live memory enforcement tick",
+                    message: error.to_string(),
+                })?;
+            dispatch("engine-live-memory-enforcement", move || {
+                worker
+                    .call(|reply| Command::EnforceMemory {
+                        enforcer,
+                        tick,
+                        reply,
+                    })?
+                    .result
+            })?
+            .await
+        })
+    }
+
     /// Enable worker-owned idle model pooling and optional per-model TTL.
     ///
     /// Existing instances receive this default. Ordinary session leases
@@ -898,6 +953,11 @@ struct Reply<T> {
 }
 
 enum Command {
+    EnforceMemory {
+        enforcer: crate::memory_enforcer::MemoryEnforcer,
+        tick: crate::memory_enforcer::EnforcementTick,
+        reply: SyncSender<Reply<MemoryEnforcementReport>>,
+    },
     AdvisoryPoolEstimate {
         artifact: ArtifactId,
         family: String,
@@ -1833,6 +1893,99 @@ impl NativeState {
         self.publish();
     }
 
+    fn enforce_memory_tick(
+        &mut self,
+        enforcer: &crate::memory_enforcer::MemoryEnforcer,
+        mut tick: crate::memory_enforcer::EnforcementTick,
+    ) -> Result<MemoryEnforcementReport, EngineError> {
+        // Refresh counters and classification without advancing the poll
+        // grace a second time. Normal pressure revokes queued eviction.
+        tick.status =
+            enforcer
+                .refresh_pressure()
+                .map_err(|error| EngineError::ExecutionFailed {
+                    stage: "refresh worker memory pressure",
+                    message: error.to_string(),
+                })?;
+        if tick.status.pressure == crate::memory_guard::PressureLevel::Ok {
+            tick.request_model_eviction = false;
+            tick.request_cache_reclaim = false;
+            tick.deferred_for_pool_drain = false;
+        }
+        let mut allocator_error = None;
+        let allocator_cache = if tick.request_cache_reclaim && self.request_owner().is_none() {
+            match self.reclaim_mlx_allocator_cache() {
+                Ok(report) => {
+                    enforcer.clear_cache_reclaim_request();
+                    Some(report)
+                }
+                Err(error) => {
+                    allocator_error = Some(error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let model = if tick.request_model_eviction {
+            match self.evict_one_enforcer_model()? {
+                Some(instance) => IdleModelReclaim::Evicted(instance),
+                None => IdleModelReclaim::NoEligibleVictim,
+            }
+        } else {
+            IdleModelReclaim::NotRequested
+        };
+        Ok(MemoryEnforcementReport {
+            tick,
+            allocator_cache,
+            allocator_error,
+            model,
+        })
+    }
+
+    fn evict_one_enforcer_model(&mut self) -> Result<Option<ModelInstanceId>, EngineError> {
+        // Pool entries cannot own active execution, pending startup, or
+        // session leases. Pins still require revalidation here.
+        let pooled = self
+            .pool
+            .iter()
+            .enumerate()
+            .filter(|(_, resident)| !resident.pins.is_pinned())
+            .min_by_key(|(index, resident)| (resident.idle_since, *index))
+            .map(|(index, resident)| (index, resident.idle_since));
+        let selected = if self.request_owner().is_none()
+            && !self.states.values().any(StateEntry::is_leased)
+            && !self.selected_model_pinned()
+        {
+            self.resident
+                .as_ref()
+                .or_else(|| self.states.values().next().map(|entry| &entry.resident))
+                .map(|resident| resident.idle_since)
+        } else {
+            None
+        };
+        // Stable ties prefer the earlier inserted pool entry.
+        if let Some((index, time)) = pooled {
+            if selected.is_none_or(|selected_time| time <= selected_time) {
+                let resident = self.pool.remove(index);
+                let instance = resident.model.instance_id().clone();
+                drop(resident);
+                return Ok(Some(instance));
+            }
+        }
+        if selected.is_some() {
+            self.require_idle()?;
+            self.require_unleased()?;
+            self.unpublish_idle_state()?;
+            if let Some(resident) = self.resident.take() {
+                let instance = resident.model.instance_id().clone();
+                drop(resident);
+                return Ok(Some(instance));
+            }
+        }
+        Ok(None)
+    }
+
     fn evict_one_pooled_model(&mut self) -> bool {
         // Vec order supplies a stable insertion-order tie break.
         let victim = self
@@ -1906,6 +2059,18 @@ impl NativeState {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match command {
+                Command::EnforceMemory {
+                    enforcer,
+                    tick,
+                    reply,
+                } => {
+                    let result = self.enforce_memory_tick(&enforcer, tick);
+                    self.publish();
+                    let _ = reply.send(Reply {
+                        result,
+                        usage: Usage::default(),
+                    });
+                }
                 Command::AdvisoryPoolEstimate {
                     artifact,
                     family,
