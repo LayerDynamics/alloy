@@ -81,7 +81,10 @@ fn untied_head_is_required_and_controls_logits() {
     w.lm_head = None;
     assert!(Qwen3Model::load(c.clone(), w).is_err());
     let mut w = generate_fixture(&c);
-    w.lm_head = Some(vec![0.0; c.vocab_size * c.hidden_size]);
+    w.lm_head = Some(qwen3::fixture::MatrixWeight::f32(vec![
+        0.0;
+        c.vocab_size * c.hidden_size
+    ]));
     let model = Qwen3Model::load(c, w).expect("untied model");
     assert!(
         model
@@ -154,53 +157,57 @@ fn checkpoint(untied: bool) -> (Qwen3Config, Vec<u8>) {
     add(
         "model.embed_tokens.weight".into(),
         vec![c.vocab_size, c.hidden_size],
-        &w.embed_tokens,
+        w.embed_tokens.as_f32().expect("fixture f32"),
     );
     for (index, l) in w.layers.iter().enumerate() {
         let p = format!("model.layers.{index}");
         for (name, shape, values) in [
-            ("input_layernorm", vec![c.hidden_size], &l.input_layernorm),
+            (
+                "input_layernorm",
+                vec![c.hidden_size],
+                l.input_layernorm.as_slice(),
+            ),
             (
                 "self_attn.q_proj",
                 vec![c.q_dim(), c.hidden_size],
-                &l.q_proj,
+                l.q_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "self_attn.k_proj",
                 vec![c.kv_dim(), c.hidden_size],
-                &l.k_proj,
+                l.k_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "self_attn.v_proj",
                 vec![c.kv_dim(), c.hidden_size],
-                &l.v_proj,
+                l.v_proj.as_f32().expect("fixture f32"),
             ),
-            ("self_attn.q_norm", vec![c.head_dim], &l.q_norm),
-            ("self_attn.k_norm", vec![c.head_dim], &l.k_norm),
+            ("self_attn.q_norm", vec![c.head_dim], l.q_norm.as_slice()),
+            ("self_attn.k_norm", vec![c.head_dim], l.k_norm.as_slice()),
             (
                 "self_attn.o_proj",
                 vec![c.hidden_size, c.q_dim()],
-                &l.o_proj,
+                l.o_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "post_attention_layernorm",
                 vec![c.hidden_size],
-                &l.post_attention_layernorm,
+                l.post_attention_layernorm.as_slice(),
             ),
             (
                 "mlp.gate_proj",
                 vec![c.intermediate_size, c.hidden_size],
-                &l.gate_proj,
+                l.gate_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "mlp.up_proj",
                 vec![c.intermediate_size, c.hidden_size],
-                &l.up_proj,
+                l.up_proj.as_f32().expect("fixture f32"),
             ),
             (
                 "mlp.down_proj",
                 vec![c.hidden_size, c.intermediate_size],
-                &l.down_proj,
+                l.down_proj.as_f32().expect("fixture f32"),
             ),
         ] {
             add(format!("{p}.{name}.weight"), shape, values);
@@ -215,7 +222,7 @@ fn checkpoint(untied: bool) -> (Qwen3Config, Vec<u8>) {
         add(
             "lm_head.weight".into(),
             vec![c.vocab_size, c.hidden_size],
-            head,
+            head.as_f32().expect("fixture f32"),
         );
     }
     let views: Vec<_> = data

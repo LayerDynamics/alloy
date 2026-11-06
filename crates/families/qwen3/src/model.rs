@@ -254,7 +254,7 @@ impl Qwen3Model {
         }
 
         if let Some(head) = &weights.lm_head {
-            check_tensor(
+            check_matrix(
                 "lm_head",
                 checked_product(c.vocab_size, c.hidden_size, "lm_head")?,
                 head,
@@ -264,7 +264,7 @@ impl Qwen3Model {
         let q_dim = checked_product(c.q_heads, c.head_dim, "q_dim")?;
         let kv_dim = checked_product(c.kv_heads, c.head_dim, "kv_dim")?;
 
-        check_tensor(
+        check_matrix(
             "embed_tokens",
             checked_product(c.vocab_size, c.hidden_size, "embed_tokens")?,
             &weights.embed_tokens,
@@ -281,19 +281,19 @@ impl Qwen3Model {
         for layer in &weights.layers {
             check_tensor("input_layernorm", c.hidden_size, &layer.input_layernorm)?;
 
-            check_tensor(
+            check_matrix(
                 "q_proj",
                 checked_product(q_dim, c.hidden_size, "q_proj")?,
                 &layer.q_proj,
             )?;
 
-            check_tensor(
+            check_matrix(
                 "k_proj",
                 checked_product(kv_dim, c.hidden_size, "k_proj")?,
                 &layer.k_proj,
             )?;
 
-            check_tensor(
+            check_matrix(
                 "v_proj",
                 checked_product(kv_dim, c.hidden_size, "v_proj")?,
                 &layer.v_proj,
@@ -303,7 +303,7 @@ impl Qwen3Model {
 
             check_tensor("k_norm", c.head_dim, &layer.k_norm)?;
 
-            check_tensor(
+            check_matrix(
                 "o_proj",
                 checked_product(c.hidden_size, q_dim, "o_proj")?,
                 &layer.o_proj,
@@ -315,19 +315,19 @@ impl Qwen3Model {
                 &layer.post_attention_layernorm,
             )?;
 
-            check_tensor(
+            check_matrix(
                 "gate_proj",
                 checked_product(c.intermediate_size, c.hidden_size, "gate_proj")?,
                 &layer.gate_proj,
             )?;
 
-            check_tensor(
+            check_matrix(
                 "up_proj",
                 checked_product(c.intermediate_size, c.hidden_size, "up_proj")?,
                 &layer.up_proj,
             )?;
 
-            check_tensor(
+            check_matrix(
                 "down_proj",
                 checked_product(c.hidden_size, c.intermediate_size, "down_proj")?,
                 &layer.down_proj,
@@ -411,9 +411,10 @@ impl Qwen3Model {
             }
 
             let start = id * c.hidden_size;
+            let embed = self.weights.embed_tokens.require_f32("embed_tokens")?;
 
             hidden.extend(
-                self.weights.embed_tokens[start..start + c.hidden_size]
+                embed[start..start + c.hidden_size]
                     .iter()
                     .map(|&value| f64::from(value)),
             );
@@ -422,11 +423,26 @@ impl Qwen3Model {
         for layer in &self.weights.layers {
             let normalized = rmsnorm_rows(&hidden, c.hidden_size, &layer.input_layernorm);
 
-            let mut query = linear(&normalized, c.hidden_size, &layer.q_proj, q_dim);
+            let mut query = linear(
+                &normalized,
+                c.hidden_size,
+                layer.q_proj.require_f32("q_proj")?,
+                q_dim,
+            );
 
-            let mut key = linear(&normalized, c.hidden_size, &layer.k_proj, kv_dim);
+            let mut key = linear(
+                &normalized,
+                c.hidden_size,
+                layer.k_proj.require_f32("k_proj")?,
+                kv_dim,
+            );
 
-            let value = linear(&normalized, c.hidden_size, &layer.v_proj, kv_dim);
+            let value = linear(
+                &normalized,
+                c.hidden_size,
+                layer.v_proj.require_f32("v_proj")?,
+                kv_dim,
+            );
 
             query = rmsnorm_rows(&query, c.head_dim, &layer.q_norm);
 
@@ -464,7 +480,12 @@ impl Qwen3Model {
                 c.head_dim,
             )?;
 
-            let attention_output = linear(&attended, q_dim, &layer.o_proj, c.hidden_size);
+            let attention_output = linear(
+                &attended,
+                q_dim,
+                layer.o_proj.require_f32("o_proj")?,
+                c.hidden_size,
+            );
 
             add_residual(&mut hidden, &attention_output);
             ensure_finite(&hidden, "attention residual")?;
@@ -474,14 +495,14 @@ impl Qwen3Model {
             let mut gate = linear(
                 &normalized,
                 c.hidden_size,
-                &layer.gate_proj,
+                layer.gate_proj.require_f32("gate_proj")?,
                 c.intermediate_size,
             );
 
             let up = linear(
                 &normalized,
                 c.hidden_size,
-                &layer.up_proj,
+                layer.up_proj.require_f32("up_proj")?,
                 c.intermediate_size,
             );
 
@@ -489,7 +510,12 @@ impl Qwen3Model {
                 *gate_value = silu(*gate_value) * up_value;
             }
 
-            let mlp_output = linear(&gate, c.intermediate_size, &layer.down_proj, c.hidden_size);
+            let mlp_output = linear(
+                &gate,
+                c.intermediate_size,
+                layer.down_proj.require_f32("down_proj")?,
+                c.hidden_size,
+            );
 
             add_residual(&mut hidden, &mlp_output);
             ensure_finite(&hidden, "MLP residual")?;
@@ -498,12 +524,13 @@ impl Qwen3Model {
         let normalized = rmsnorm_rows(&hidden, c.hidden_size, &self.weights.final_layernorm);
 
         let head = if c.tie_embeddings {
-            &self.weights.embed_tokens
+            self.weights.embed_tokens.require_f32("embed_tokens")?
         } else {
             self.weights
                 .lm_head
                 .as_ref()
                 .ok_or(ModelError::InvalidConfig("missing lm_head"))?
+                .require_f32("lm_head")?
         };
 
         let mut result = Vec::new();
@@ -561,6 +588,16 @@ fn check_tensor(tensor: &'static str, expected: usize, values: &[f32]) -> Result
     }
 
     Ok(())
+}
+
+fn check_matrix(
+    tensor: &'static str,
+    expected: usize,
+    values: &crate::fixture::MatrixWeight,
+) -> Result<(), ModelError> {
+    // CPU reference model requires dense f32; Affine4 is MLX-only.
+    let values = values.require_f32(tensor)?;
+    check_tensor(tensor, expected, values)
 }
 
 fn ensure_finite(values: &[f64], stage: &'static str) -> Result<(), ModelError> {

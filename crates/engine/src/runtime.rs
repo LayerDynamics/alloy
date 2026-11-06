@@ -259,6 +259,8 @@ pub struct FamilyRuntime {
     limits: GenerationLimits,
     retention: RetentionPolicy,
     pressure_policy: Option<crate::pressure::PressurePolicy>,
+    memory_enforcer: Option<crate::memory_enforcer::MemoryEnforcer>,
+    prefill_min_chunk_tokens: NonZeroUsize,
     worker: Arc<NativeWorker>,
 }
 
@@ -335,6 +337,11 @@ impl FamilyRuntime {
             limits,
             retention,
             pressure_policy: None,
+            memory_enforcer: None,
+            prefill_min_chunk_tokens: NonZeroUsize::new(
+                crate::prefill_admit::DEFAULT_PREFILL_MIN_CHUNK_TOKENS,
+            )
+            .expect("default prefill min chunk"),
             worker: Arc::new(NativeWorker {
                 sender,
                 summary,
@@ -346,6 +353,11 @@ impl FamilyRuntime {
     /// Inspect the ledger without acquiring a reservation.
     pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
         self.admission.snapshot()
+    }
+
+    /// Clone of the shared admission controller (pause / resize from the enforcer).
+    pub fn admission_controller(&self) -> AdmissionController {
+        self.admission.clone()
     }
 
     /// Publish the actual completed request under a canonical identity.
@@ -480,6 +492,24 @@ impl FamilyRuntime {
     #[must_use]
     pub fn with_pressure_policy(mut self, policy: crate::pressure::PressurePolicy) -> Self {
         self.pressure_policy = Some(policy);
+        self
+    }
+
+    /// Attach the live memory enforcer so prefill can shrink against the admit line.
+    #[must_use]
+    pub fn with_memory_enforcer(
+        mut self,
+        enforcer: crate::memory_enforcer::MemoryEnforcer,
+    ) -> Self {
+        self.memory_enforcer = Some(enforcer);
+        self
+    }
+
+    /// Override the adaptive prefill floor (default
+    /// [`crate::prefill_admit::DEFAULT_PREFILL_MIN_CHUNK_TOKENS`]).
+    #[must_use]
+    pub fn with_prefill_min_chunk_tokens(mut self, tokens: NonZeroUsize) -> Self {
+        self.prefill_min_chunk_tokens = tokens;
         self
     }
 
@@ -643,9 +673,18 @@ impl EngineRuntime for FamilyRuntime {
             }
 
             let backend = self.backend(&registry, resolved.artifact())?;
-            let plan = backend
+            let mut plan = backend
                 .plan(&registry, request.profile_id(), rendered.token_count())
                 .await?;
+            if let Some(enforcer) = &self.memory_enforcer {
+                let decision = enforcer.select_prefill_chunk(
+                    plan.prefill_chunk_tokens,
+                    self.prefill_min_chunk_tokens,
+                    plan.temporary_bytes,
+                )?;
+                plan.prefill_chunk_tokens = decision.chunk_tokens;
+                plan.temporary_bytes = decision.workspace_bytes;
+            }
             validate_plan(
                 &registry,
                 request.profile_id(),

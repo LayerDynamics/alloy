@@ -5,10 +5,17 @@ use engine::admission::AdmissionController;
 use engine::api::EngineCore;
 use engine::backends::{FilePin, Qwen3Artifact, Qwen3Backend, Qwen3BackendLimits, Qwen3Execution};
 use engine::generation::GenerationLimits;
+use engine::memory_enforcer::MemoryEnforcer;
+use engine::memory_guard::{
+    self, CeilingBreakdown, MemoryGuardConfig, should_apply_wired_limit,
+    wired_limit_suggestion_bytes,
+};
+use engine::platform;
 use engine::registry::ModelProfile;
 use engine::runtime::{FamilyRuntime, RetentionPolicy};
 use engine::scheduler::Scheduler;
 use engine::types::{ArtifactId, GenerationOptions, ModelProfileId};
+use mlx_ffi::memory as mlx_memory;
 use qwen3::template::CHAT_TEMPLATE;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,8 +33,16 @@ pub struct BootedEngine {
     pub profile_id: String,
     /// Models counted as resident after successful construction.
     pub models_resident: u64,
-    /// Admission budget bytes configured for this process.
+    /// Effective hard ceiling used as the admission ledger budget.
     pub memory_reserved: u64,
+    /// Memory-guard tier name (`safe` / `balanced` / `aggressive` / `custom`).
+    pub memory_guard_tier: String,
+    /// Binding component of the hard ceiling, when known.
+    pub ceiling_binding: Option<String>,
+    /// Static / dynamic / metal / hard breakdown for status logs.
+    pub ceiling: CeilingBreakdown,
+    /// Live soft/hard enforcer (clone into the poll thread).
+    pub memory_enforcer: MemoryEnforcer,
 }
 
 /// Boot requirements for the Phase-1 production daemon.
@@ -38,8 +53,11 @@ pub struct BootRequest {
     pub profile_id: String,
     /// Optional path to `bench/corpus/models.json` for hash verification.
     pub corpus_models_json: Option<PathBuf>,
-    /// Engine-managed admission budget.
-    pub admission_budget_bytes: u64,
+    /// oMLX-method memory-guard configuration (default balanced).
+    pub memory_guard: MemoryGuardConfig,
+    /// Optional absolute admission override for tests. When set, used as the
+    /// custom ceiling path instead of live host math.
+    pub admission_budget_override_bytes: Option<u64>,
     /// Prefer Metal when the platform supports it.
     pub prefer_metal: bool,
 }
@@ -97,7 +115,8 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         max_token_bytes: 512 * 1024,
         verification_chunk_bytes: 1024 * 1024,
         context_limit_tokens: context_limit,
-        prefill_chunk_tokens: NonZeroUsize::new(128).expect("chunk"),
+        // Start above the adaptive floor (256) so M5–M6 can shrink under pressure.
+        prefill_chunk_tokens: NonZeroUsize::new(1024).expect("chunk"),
         loader_headroom_bytes: 64 * 1024 * 1024,
         execution_headroom_bytes: 64 * 1024 * 1024,
         generation: GenerationLimits::new(64, 64 * 1024, 16 * 1024)
@@ -124,12 +143,16 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
     )
     .map_err(|error| RpcError::internal(error.to_string()))?;
 
-    let admission = AdmissionController::new(request.admission_budget_bytes)
+    let (budget_bytes, ceiling, guard_config) = resolve_admission_budget(&request)?;
+    maybe_apply_wired_limit(&request, &ceiling)?;
+
+    let admission = AdmissionController::new(budget_bytes)
         .map_err(|error| RpcError::internal(error.to_string()))?;
+    let memory_enforcer = MemoryEnforcer::new(guard_config, admission.clone());
     let scheduler =
         Scheduler::new(32).map_err(|error| RpcError::internal(error.to_string()))?;
     let engine = backend
-        .into_engine(
+        .into_engine_with_memory_enforcer(
             vec![profile],
             admission,
             scheduler,
@@ -137,6 +160,7 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
                 retain_model: true,
                 retain_cache_buffers: true,
             },
+            Some(memory_enforcer.clone()),
         )
         .map_err(|error| RpcError::internal(format!("construct engine: {error}")))?;
 
@@ -144,8 +168,95 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         engine,
         profile_id: request.profile_id,
         models_resident: 1,
-        memory_reserved: request.admission_budget_bytes,
+        memory_reserved: budget_bytes,
+        memory_guard_tier: guard_config.tier.as_str().to_owned(),
+        ceiling_binding: ceiling.binding.map(|binding| binding.as_str().to_owned()),
+        ceiling,
+        memory_enforcer,
     })
+}
+
+fn resolve_admission_budget(
+    request: &BootRequest,
+) -> Result<(u64, CeilingBreakdown, MemoryGuardConfig), RpcError> {
+    if let Some(override_bytes) = request.admission_budget_override_bytes {
+        let config = MemoryGuardConfig::custom(override_bytes)
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+        let host = platform::discover_host_memory_snapshot().unwrap_or(
+            memory_guard::HostMemorySnapshot {
+                physical_memory_bytes: override_bytes.saturating_add(2 * 1024 * 1024 * 1024),
+                free_bytes: 0,
+                inactive_bytes: 0,
+                active_file_bytes: 0,
+                other_apps_active_bytes: 0,
+                phys_footprint_bytes: 0,
+                graphics_footprint_bytes: 0,
+                iogpu_wired_limit_bytes: 0,
+                recommended_working_set_bytes: override_bytes,
+                release_credit_bytes: 0,
+            },
+        );
+        let ceiling = memory_guard::ceiling_breakdown(config, host, 0)
+            .map_err(|error| RpcError::internal(error.to_string()))?;
+        // Test override wins as the ledger budget even when metal binds lower;
+        // live guard path (no override) uses hard_limit exclusively.
+        return Ok((override_bytes, ceiling, config));
+    }
+
+    let host = platform::discover_host_memory_snapshot()
+        .map_err(|error| RpcError::internal(format!("discover host memory: {error}")))?;
+    let mlx_active = mlx_memory::active_memory_bytes().unwrap_or(0) as u64;
+    let alloy_usage = memory_guard::usage_bytes(mlx_active, host);
+    let ceiling = memory_guard::ceiling_breakdown(request.memory_guard, host, alloy_usage)
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    if ceiling.hard_limit_bytes == 0 {
+        return Err(RpcError::internal(
+            "memory guard hard ceiling is zero; check --memory-guard / host probes",
+        ));
+    }
+    Ok((ceiling.hard_limit_bytes, ceiling, request.memory_guard))
+}
+
+fn maybe_apply_wired_limit(
+    request: &BootRequest,
+    ceiling: &CeilingBreakdown,
+) -> Result<(), RpcError> {
+    let Ok(host) = platform::discover_host_memory_snapshot() else {
+        return Ok(());
+    };
+    if !should_apply_wired_limit(host) {
+        let suggestion = wired_limit_suggestion_bytes(
+            ceiling.static_bytes,
+            host.physical_memory_bytes,
+        );
+        eprintln!(
+            "alloyd: iogpu.wired_limit_mb unset; leaving Apple Metal cap active. \
+             To raise: sudo sysctl iogpu.wired_limit_mb={}",
+            suggestion / (1024 * 1024)
+        );
+        return Ok(());
+    }
+    let desired = wired_limit_suggestion_bytes(
+        ceiling.static_bytes,
+        host.physical_memory_bytes,
+    );
+    let applied = desired.min(host.iogpu_wired_limit_bytes);
+    match mlx_memory::set_wired_limit_bytes(applied as usize) {
+        Ok(previous) => {
+            eprintln!(
+                "alloyd: Metal wired limit {} -> {} (target {}, sysctl cap {})",
+                previous,
+                applied,
+                desired,
+                host.iogpu_wired_limit_bytes
+            );
+        }
+        Err(error) => {
+            eprintln!("alloyd: mlx_set_wired_limit failed: {error}");
+        }
+    }
+    let _ = request;
+    Ok(())
 }
 
 fn pin_artifact_files(

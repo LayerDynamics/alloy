@@ -27,7 +27,7 @@ fn loader_rejects_invalid_embedding_shape() {
     let expected = config.vocab_size * config.hidden_size;
     let mut weights = generate_fixture(&config);
 
-    weights.embed_tokens.pop();
+    weights.embed_tokens.as_f32_mut().expect("f32").pop();
 
     let result = Qwen3Model::load(config, weights);
 

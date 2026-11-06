@@ -288,9 +288,9 @@ impl Qwen3Model {
 
         let start = token as usize * c.hidden_size;
 
+        let embed = self.weights.embed_tokens.require_f32("embed_tokens")?;
         let mut hidden: Vec<f64> =
-            self.weights.embed_tokens
-                [start..start + c.hidden_size]
+            embed[start..start + c.hidden_size]
                 .iter()
                 .map(|&value| f64::from(value))
                 .collect();
@@ -310,7 +310,7 @@ impl Qwen3Model {
                 &linear(
                     &normalized,
                     c.hidden_size,
-                    &layer.q_proj,
+                    layer.q_proj.require_f32("q_proj")?,
                     c.q_dim(),
                 ),
                 c.head_dim,
@@ -321,7 +321,7 @@ impl Qwen3Model {
                 &linear(
                     &normalized,
                     c.hidden_size,
-                    &layer.k_proj,
+                    layer.k_proj.require_f32("k_proj")?,
                     c.kv_dim(),
                 ),
                 c.head_dim,
@@ -331,7 +331,7 @@ impl Qwen3Model {
             let value = linear(
                 &normalized,
                 c.hidden_size,
-                &layer.v_proj,
+                layer.v_proj.require_f32("v_proj")?,
                 c.kv_dim(),
             );
 
@@ -450,7 +450,7 @@ impl Qwen3Model {
                 &linear(
                     &attended,
                     c.q_dim(),
-                    &layer.o_proj,
+                    layer.o_proj.require_f32("o_proj")?,
                     c.hidden_size,
                 ),
             );
@@ -469,14 +469,14 @@ impl Qwen3Model {
             let mut gate = linear(
                 &normalized,
                 c.hidden_size,
-                &layer.gate_proj,
+                layer.gate_proj.require_f32("gate_proj")?,
                 c.intermediate_size,
             );
 
             let up = linear(
                 &normalized,
                 c.hidden_size,
-                &layer.up_proj,
+                layer.up_proj.require_f32("up_proj")?,
                 c.intermediate_size,
             );
 
@@ -492,7 +492,7 @@ impl Qwen3Model {
                 &linear(
                     &gate,
                     c.intermediate_size,
-                    &layer.down_proj,
+                    layer.down_proj.require_f32("down_proj")?,
                     c.hidden_size,
                 ),
             );
@@ -512,7 +512,7 @@ impl Qwen3Model {
         );
 
         let head = if c.tie_embeddings {
-            &self.weights.embed_tokens
+            self.weights.embed_tokens.require_f32("embed_tokens")?
         } else {
             self.weights
                 .lm_head
@@ -520,6 +520,7 @@ impl Qwen3Model {
                 .ok_or(ModelError::InvalidConfig(
                     "missing lm_head",
                 ))?
+                .require_f32("lm_head")?
         };
 
         let logits = linear(

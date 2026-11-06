@@ -528,10 +528,27 @@ impl Qwen3Backend {
         scheduler: Scheduler,
         retention: RetentionPolicy,
     ) -> Result<EngineCore<FamilyRuntime>, EngineError> {
+        self.into_engine_with_memory_enforcer(profiles, admission, scheduler, retention, None)
+    }
+
+    /// Like [`Self::into_engine`], attaching a live memory enforcer for
+    /// prefill admit-line / adaptive chunk shrink (M5–M6).
+    pub fn into_engine_with_memory_enforcer(
+        self,
+        profiles: Vec<ModelProfile>,
+        admission: AdmissionController,
+        scheduler: Scheduler,
+        retention: RetentionPolicy,
+        memory_enforcer: Option<crate::memory_enforcer::MemoryEnforcer>,
+    ) -> Result<EngineCore<FamilyRuntime>, EngineError> {
         let registry = self.registry(profiles)?;
         let generation_limits = self.limits.generation;
         let backend: Arc<dyn RuntimeBackend> = Arc::new(self);
-        let runtime = FamilyRuntime::new(vec![backend], admission, generation_limits, retention)?;
+        let mut runtime =
+            FamilyRuntime::new(vec![backend], admission, generation_limits, retention)?;
+        if let Some(enforcer) = memory_enforcer {
+            runtime = runtime.with_memory_enforcer(enforcer);
+        }
         Ok(EngineCore::new(registry, scheduler, runtime))
     }
 
@@ -566,6 +583,9 @@ impl ModelFamily for Qwen3Backend {
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
         let decoded_bound = decoded_weight_bound(&data.config)?;
+        // Headroom covers group-size variance (planning assumes 64; some
+        // fixtures/checkpoints use smaller groups with larger scale tables).
+        let weight_charge_limit = sum(&[decoded_bound, self.limits.loader_headroom_bytes])?;
         let required_peak = sum(&[
             data.source_bytes,
             decoded_bound,
@@ -637,18 +657,18 @@ impl ModelFamily for Qwen3Backend {
             &data.specification.directory,
             LoadOptions {
                 max_file_bytes: as_usize(request.limits().max_source_bytes())?,
-                max_weight_bytes: as_usize(decoded_bound)?,
+                max_weight_bytes: as_usize(weight_charge_limit)?,
             },
             &verification,
         );
         control.check_cancelled()?;
         let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
         let decoded = weight_memory(&weights)?;
-        if decoded.allocated_bytes() > decoded_bound {
+        if decoded.allocated_bytes() > weight_charge_limit {
             return Err(EngineError::MemoryLimitExceeded {
                 operation: "decoded MLX Qwen weight buffers",
                 required_bytes: decoded.allocated_bytes(),
-                available_bytes: decoded_bound,
+                available_bytes: weight_charge_limit,
             });
         }
         let model = MlxQwen3Model::from_weights(
@@ -1304,7 +1324,12 @@ fn registration(
             task: "text-generation".to_owned(),
             family: "qwen3".to_owned(),
             backend: execution.backend(),
-            weight_representations: vec![WeightRepresentation::F32],
+            weight_representations: vec![
+                WeightRepresentation::F32,
+                WeightRepresentation::Affine4 {
+                    group_size: NonZeroUsize::new(64).expect("64"),
+                },
+            ],
             cache_modes: vec![cache_mode()?],
             context_limit_tokens: context_limit,
             supports_streaming: true,
@@ -1582,40 +1607,122 @@ fn byte_decoder_map() -> BTreeMap<char, u8> {
     map
 }
 
-fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+/// Default Affine4 group size used for resident estimates when the checkpoint
+/// has not been opened yet (MLX Qwen3-4bit community artifacts use 64).
+const AFFINE4_GROUP_SIZE: u64 = 64;
+
+fn layer_projection_elements(config: &Qwen3Config) -> Result<u64, EngineError> {
     let h = as_u64(config.hidden_size)?;
     let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
     let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    let v = as_u64(config.vocab_size)?;
     let i = as_u64(config.intermediate_size)?;
-    let layer = sum(&[
-        product(2, h)?,
-        product(2, as_u64(config.head_dim)?)?,
-        product(2, product(q, h)?)?,
-        product(2, product(kv, h)?)?,
-        product(3, product(i, h)?)?,
+    sum(&[
+        product(2, product(q, h)?)?,  // q, o
+        product(2, product(kv, h)?)?, // k, v
+        product(3, product(i, h)?)?,  // gate, up, down
+    ])
+}
+
+fn norm_bytes(config: &Qwen3Config) -> Result<u64, EngineError> {
+    let h = as_u64(config.hidden_size)?;
+    let head = as_u64(config.head_dim)?;
+    let per_layer = sum(&[
+        product(2, h)?,    // input + post attention
+        product(2, head)?, // q/k norm
     ])?;
     let elements = sum(&[
-        product(v, h)?,
-        product(as_u64(config.num_layers)?, layer)?,
-        h,
+        product(as_u64(config.num_layers)?, per_layer)?,
+        h, // final layernorm
+    ])?;
+    product(elements, 4)
+}
+
+/// Host-side Affine4 payload estimate (packed codes + scales/biases for every
+/// matrix, including embed/lm_head). Used for loader charge before MLX upload.
+fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    let h = as_u64(config.hidden_size)?;
+    let v = as_u64(config.vocab_size)?;
+    let matrix_elements = sum(&[
+        product(v, h)?, // embed
+        product(as_u64(config.num_layers)?, layer_projection_elements(config)?)?,
         if config.tie_embeddings {
             0
         } else {
             product(v, h)?
         },
     ])?;
-    product(elements, 4)
+    let matrix_bytes = affine4_matrix_bytes(matrix_elements, AFFINE4_GROUP_SIZE)?;
+    let workspace = product(matrix_bytes / 32 + 1, 1)?;
+    sum(&[norm_bytes(config)?, matrix_bytes, workspace])
+}
+
+/// MLX resident estimate after upload: projections stay Affine4; embed/lm_head
+/// are dequantized once to dense float32 (oMLX-method quantized-resident).
+fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    let h = as_u64(config.hidden_size)?;
+    let v = as_u64(config.vocab_size)?;
+    let proj_elements =
+        product(as_u64(config.num_layers)?, layer_projection_elements(config)?)?;
+    let proj_bytes = affine4_matrix_bytes(proj_elements, AFFINE4_GROUP_SIZE)?;
+    let embed_bytes = product(product(v, h)?, 4)?;
+    let lm_head_bytes = if config.tie_embeddings {
+        0
+    } else {
+        embed_bytes
+    };
+    let workspace = product(proj_bytes / 32 + 1, 1)?;
+    sum(&[
+        norm_bytes(config)?,
+        proj_bytes,
+        embed_bytes,
+        lm_head_bytes,
+        workspace,
+    ])
+}
+
+fn affine4_matrix_bytes(elements: u64, group_size: u64) -> Result<u64, EngineError> {
+    if group_size == 0 {
+        return Err(EngineError::invalid_request(
+            "group_size",
+            "affine4 group size must be positive",
+        ));
+    }
+    // packed u32: 8 nibbles per word → elements/8 words * 4 bytes = elements/2
+    let packed = elements / 2;
+    // scales + biases: 2 * (elements / group_size) * 4 bytes
+    let params = product(elements / group_size, 8)?;
+    sum(&[packed, params])
 }
 
 fn decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
+    // Loader charges host Affine4 (or f32) buffers before MLX upload.
     sum(&[
-        resident_bound(config)?,
+        host_affine4_bound(config)?,
         product(
             as_u64(config.num_layers)?,
             as_u64(std::mem::size_of::<LayerWeights>())?,
         )?,
     ])
+}
+
+fn weight_memory_add_f32(
+    allocated: &mut u64,
+    used: &mut u64,
+    values: &Vec<f32>,
+) -> Result<(), EngineError> {
+    *allocated = sum(&[*allocated, product(as_u64(values.capacity())?, 4)?])?;
+    *used = sum(&[*used, product(as_u64(values.len())?, 4)?])?;
+    Ok(())
+}
+
+fn weight_memory_add_bytes(
+    allocated: &mut u64,
+    used: &mut u64,
+    bytes: u64,
+) -> Result<(), EngineError> {
+    *allocated = sum(&[*allocated, bytes])?;
+    *used = sum(&[*used, bytes])?;
+    Ok(())
 }
 
 fn weight_memory(weights: &Qwen3Weights) -> Result<BufferMemoryUsage, EngineError> {
@@ -1627,32 +1734,55 @@ fn weight_memory(weights: &Qwen3Weights) -> Result<BufferMemoryUsage, EngineErro
         as_u64(weights.layers.len())?,
         as_u64(std::mem::size_of::<LayerWeights>())?,
     )?;
-    let mut account = |values: &Vec<f32>| -> Result<(), EngineError> {
-        allocated = sum(&[allocated, product(as_u64(values.capacity())?, 4)?])?;
-        used = sum(&[used, product(as_u64(values.len())?, 4)?])?;
-        Ok(())
-    };
-    account(&weights.embed_tokens)?;
-    account(&weights.final_layernorm)?;
+    weight_memory_add_bytes(
+        &mut allocated,
+        &mut used,
+        as_u64(weights.embed_tokens.resident_bytes())?,
+    )?;
+    weight_memory_add_f32(&mut allocated, &mut used, &weights.final_layernorm)?;
     if let Some(head) = &weights.lm_head {
-        account(head)?;
+        weight_memory_add_bytes(&mut allocated, &mut used, as_u64(head.resident_bytes())?)?;
     }
     for layer in &weights.layers {
-        for tensor in [
-            &layer.input_layernorm,
-            &layer.q_proj,
-            &layer.k_proj,
-            &layer.v_proj,
-            &layer.q_norm,
-            &layer.k_norm,
-            &layer.o_proj,
-            &layer.post_attention_layernorm,
-            &layer.gate_proj,
-            &layer.up_proj,
-            &layer.down_proj,
-        ] {
-            account(tensor)?;
-        }
+        weight_memory_add_f32(&mut allocated, &mut used, &layer.input_layernorm)?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.q_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.k_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.v_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_f32(&mut allocated, &mut used, &layer.q_norm)?;
+        weight_memory_add_f32(&mut allocated, &mut used, &layer.k_norm)?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.o_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_f32(&mut allocated, &mut used, &layer.post_attention_layernorm)?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.gate_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.up_proj.resident_bytes())?,
+        )?;
+        weight_memory_add_bytes(
+            &mut allocated,
+            &mut used,
+            as_u64(layer.down_proj.resident_bytes())?,
+        )?;
     }
     BufferMemoryUsage::new(allocated, used)
 }
@@ -1952,11 +2082,12 @@ mod shared_rendering_wiring_tests {
 
     struct TensorRecord {
         name: String,
+        dtype: Dtype,
         shape: Vec<usize>,
         bytes: Vec<u8>,
     }
 
-    fn add_tensor(
+    fn add_f32_tensor(
         records: &mut Vec<TensorRecord>,
         name: String,
         shape: Vec<usize>,
@@ -1969,6 +2100,7 @@ mod shared_rendering_wiring_tests {
         assert_eq!(count, values.len(), "fixture tensor {name}");
         records.push(TensorRecord {
             name,
+            dtype: Dtype::F32,
             shape,
             bytes: values
                 .iter()
@@ -1977,8 +2109,90 @@ mod shared_rendering_wiring_tests {
         });
     }
 
-    // Serialize actual deterministic fixture weights. The rendering tests
-    // do not execute inference, but do not use a fake checkpoint either.
+    /// Group size for tiny wiring-test Affine4 checkpoints. Must divide every
+    /// matrix width in `Qwen3Config::tiny_fixture` (32 and 64). Production
+    /// planning still estimates with [`AFFINE4_GROUP_SIZE`] (64).
+    const WIRING_AFFINE4_GROUP: usize = 32;
+
+    fn quantize_affine4(
+        values: &[f32],
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+        assert_eq!(values.len(), rows.saturating_mul(cols));
+        assert!(cols > 0 && cols % 8 == 0 && group_size > 0 && cols % group_size == 0);
+        let groups = cols / group_size;
+        let mut packed = vec![0u32; rows * (cols / 8)];
+        let mut scales = vec![0f32; rows * groups];
+        let mut biases = vec![0f32; rows * groups];
+        for row in 0..rows {
+            for group in 0..groups {
+                let start = row * cols + group * group_size;
+                let slice = &values[start..start + group_size];
+                let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let scale = if max > min { (max - min) / 15.0 } else { 1.0 };
+                let bias = min;
+                scales[row * groups + group] = scale;
+                biases[row * groups + group] = bias;
+                for (offset, &value) in slice.iter().enumerate() {
+                    let code = if scale > 0.0 {
+                        ((value - bias) / scale).round().clamp(0.0, 15.0) as u32
+                    } else {
+                        0
+                    };
+                    let element = group * group_size + offset;
+                    let word = row * (cols / 8) + element / 8;
+                    let nibble = element % 8;
+                    packed[word] |= code << (4 * nibble);
+                }
+            }
+        }
+        (packed, scales, biases)
+    }
+
+    fn add_affine4_matrix(
+        records: &mut Vec<TensorRecord>,
+        weight_name: &str,
+        rows: usize,
+        cols: usize,
+        values: &[f32],
+    ) {
+        let (packed, scales, biases) =
+            quantize_affine4(values, rows, cols, WIRING_AFFINE4_GROUP);
+        let groups = cols / WIRING_AFFINE4_GROUP;
+        let base = weight_name
+            .strip_suffix(".weight")
+            .expect("matrix weight name");
+        records.push(TensorRecord {
+            name: weight_name.to_owned(),
+            dtype: Dtype::U32,
+            shape: vec![rows, cols / 8],
+            bytes: packed.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        });
+        records.push(TensorRecord {
+            name: format!("{base}.scales"),
+            dtype: Dtype::F32,
+            shape: vec![rows, groups],
+            bytes: scales
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        });
+        records.push(TensorRecord {
+            name: format!("{base}.biases"),
+            dtype: Dtype::F32,
+            shape: vec![rows, groups],
+            bytes: biases
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        });
+    }
+
+    // Serialize Affine4-resident checkpoints for wiring/execution tests.
+    // Norms stay float32; every projection/embed/lm_head is packed U32.
     fn checkpoint_bytes(config: &Qwen3Config) -> Vec<u8> {
         checkpoint_bytes_selected(config, false)
     }
@@ -1990,89 +2204,107 @@ mod shared_rendering_wiring_tests {
                 .lm_head
                 .as_mut()
                 .expect("untied test output head")
+                .as_f32_mut()
+                .expect("fixture f32")
                 .fill(0.0);
         }
         let mut records = Vec::new();
-        add_tensor(
+        add_affine4_matrix(
             &mut records,
-            "model.embed_tokens.weight".to_owned(),
-            vec![config.vocab_size, config.hidden_size],
-            &weights.embed_tokens,
+            "model.embed_tokens.weight",
+            config.vocab_size,
+            config.hidden_size,
+            weights.embed_tokens.as_f32().expect("fixture f32"),
         );
         for (index, layer) in weights.layers.iter().enumerate() {
             let prefix = format!("model.layers.{index}");
-            for (suffix, shape, values) in [
-                (
-                    "input_layernorm.weight",
-                    vec![config.hidden_size],
-                    layer.input_layernorm.as_slice(),
-                ),
-                (
-                    "self_attn.q_proj.weight",
-                    vec![config.q_dim(), config.hidden_size],
-                    layer.q_proj.as_slice(),
-                ),
-                (
-                    "self_attn.k_proj.weight",
-                    vec![config.kv_dim(), config.hidden_size],
-                    layer.k_proj.as_slice(),
-                ),
-                (
-                    "self_attn.v_proj.weight",
-                    vec![config.kv_dim(), config.hidden_size],
-                    layer.v_proj.as_slice(),
-                ),
-                (
-                    "self_attn.q_norm.weight",
-                    vec![config.head_dim],
-                    layer.q_norm.as_slice(),
-                ),
-                (
-                    "self_attn.k_norm.weight",
-                    vec![config.head_dim],
-                    layer.k_norm.as_slice(),
-                ),
-                (
-                    "self_attn.o_proj.weight",
-                    vec![config.hidden_size, config.q_dim()],
-                    layer.o_proj.as_slice(),
-                ),
-                (
-                    "post_attention_layernorm.weight",
-                    vec![config.hidden_size],
-                    layer.post_attention_layernorm.as_slice(),
-                ),
-                (
-                    "mlp.gate_proj.weight",
-                    vec![config.intermediate_size, config.hidden_size],
-                    layer.gate_proj.as_slice(),
-                ),
-                (
-                    "mlp.up_proj.weight",
-                    vec![config.intermediate_size, config.hidden_size],
-                    layer.up_proj.as_slice(),
-                ),
-                (
-                    "mlp.down_proj.weight",
-                    vec![config.hidden_size, config.intermediate_size],
-                    layer.down_proj.as_slice(),
-                ),
-            ] {
-                add_tensor(&mut records, format!("{prefix}.{suffix}"), shape, values);
-            }
+            add_f32_tensor(
+                &mut records,
+                format!("{prefix}.input_layernorm.weight"),
+                vec![config.hidden_size],
+                &layer.input_layernorm,
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                config.q_dim(),
+                config.hidden_size,
+                layer.q_proj.as_f32().expect("fixture f32"),
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                config.kv_dim(),
+                config.hidden_size,
+                layer.k_proj.as_f32().expect("fixture f32"),
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                config.kv_dim(),
+                config.hidden_size,
+                layer.v_proj.as_f32().expect("fixture f32"),
+            );
+            add_f32_tensor(
+                &mut records,
+                format!("{prefix}.self_attn.q_norm.weight"),
+                vec![config.head_dim],
+                &layer.q_norm,
+            );
+            add_f32_tensor(
+                &mut records,
+                format!("{prefix}.self_attn.k_norm.weight"),
+                vec![config.head_dim],
+                &layer.k_norm,
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                config.hidden_size,
+                config.q_dim(),
+                layer.o_proj.as_f32().expect("fixture f32"),
+            );
+            add_f32_tensor(
+                &mut records,
+                format!("{prefix}.post_attention_layernorm.weight"),
+                vec![config.hidden_size],
+                &layer.post_attention_layernorm,
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                config.intermediate_size,
+                config.hidden_size,
+                layer.gate_proj.as_f32().expect("fixture f32"),
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                config.intermediate_size,
+                config.hidden_size,
+                layer.up_proj.as_f32().expect("fixture f32"),
+            );
+            add_affine4_matrix(
+                &mut records,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                config.hidden_size,
+                config.intermediate_size,
+                layer.down_proj.as_f32().expect("fixture f32"),
+            );
         }
-        add_tensor(
+        add_f32_tensor(
             &mut records,
             "model.norm.weight".to_owned(),
             vec![config.hidden_size],
             &weights.final_layernorm,
         );
         if let Some(head) = &weights.lm_head {
-            add_tensor(
+            add_affine4_matrix(
                 &mut records,
-                "lm_head.weight".to_owned(),
-                vec![config.vocab_size, config.hidden_size],
-                head,
+                "lm_head.weight",
+                config.vocab_size,
+                config.hidden_size,
+                head.as_f32().expect("fixture f32"),
             );
         }
         let views: Vec<_> = records
@@ -2080,7 +2312,7 @@ mod shared_rendering_wiring_tests {
             .map(|record| {
                 (
                     record.name.as_str(),
-                    TensorView::new(Dtype::F32, record.shape.clone(), &record.bytes)
+                    TensorView::new(record.dtype, record.shape.clone(), &record.bytes)
                         .expect("tensor"),
                 )
             })
@@ -2471,7 +2703,15 @@ mod shared_rendering_wiring_tests {
         let caps = block_on(engine.capabilities(fixture.specification.id.clone()))
             .expect("loaded capabilities");
         assert_eq!(caps.backend, execution.backend());
-        assert_eq!(caps.weight_representations, vec![WeightRepresentation::F32]);
+        assert_eq!(
+            caps.weight_representations,
+            vec![
+                WeightRepresentation::F32,
+                WeightRepresentation::Affine4 {
+                    group_size: NonZeroUsize::new(64).expect("64"),
+                },
+            ]
+        );
         assert_eq!(
             caps.cache_modes[0].representation.as_str(),
             QWEN3_MLX_CACHE_REPRESENTATION
@@ -2696,13 +2936,18 @@ mod shared_rendering_wiring_tests {
         for tied in [true, false] {
             let mut config = Qwen3Config::tiny_fixture();
             config.tie_embeddings = tied;
-            let weights = qwen3::fixture::generate_fixture(&config);
-            let measured = weight_memory(&weights).expect("decoded accounting");
+            let dense = qwen3::fixture::generate_fixture(&config);
+            let dense_payload = weight_memory(&dense).expect("f32 accounting");
             let headers = config.num_layers * std::mem::size_of::<LayerWeights>();
-            assert_eq!(
-                measured.used_bytes() - headers as u64,
-                resident_bound(&config).expect("native payload")
-            );
+            let dense_matrices = dense_payload.used_bytes() - headers as u64;
+            let host = host_affine4_bound(&config).expect("host affine4");
+            let resident = resident_bound(&config).expect("mlx resident");
+            // Quantized host estimate must beat a full f32 duplicate.
+            assert!(host < dense_matrices, "host={host} dense={dense_matrices}");
+            // MLX dequants embed/lm_head to f32, so resident ≥ host Affine4.
+            assert!(resident >= host, "resident={resident} host={host}");
+            // Still well under dense when projections dominate.
+            assert!(resident < dense_matrices, "resident={resident} dense={dense_matrices}");
             let plan = cache_spec(&config, 16).payload_plan().expect("cache plan");
             assert_eq!(
                 cache_bound(&config, 16).expect("cache allowance"),

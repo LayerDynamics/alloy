@@ -10,7 +10,7 @@
 
 use crate::{
     config::Qwen3Config,
-    fixture::{LayerWeights, Qwen3Weights},
+    fixture::{LayerWeights, MatrixWeight, Qwen3Weights},
     model::ModelError,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -26,8 +26,8 @@ use std::{
 /// `max_file_bytes` counts all consumed config, index, and safetensors
 /// bytes cumulatively.
 ///
-/// `max_weight_bytes` limits decoded f32 tensor elements retained in
-/// the returned weights.
+/// `max_weight_bytes` limits resident weight payload retained in the
+/// returned weights (f32 elements, or Affine4 packed+scales+biases).
 ///
 /// Defaults allow at most 16 MiB of each representation. JSON objects,
 /// collection headers, allocator overhead, and other application memory
@@ -37,7 +37,7 @@ pub struct LoadOptions {
     /// Maximum cumulative source bytes consumed.
     pub max_file_bytes: usize,
 
-    /// Maximum decoded f32 weight-element bytes.
+    /// Maximum resident weight payload bytes (f32 or Affine4).
     pub max_weight_bytes: usize,
 }
 
@@ -625,7 +625,7 @@ fn load_weights_impl<'a>(
         cancelled,
     };
 
-    let embed_tokens = reader.tensor(
+    let embed_tokens = reader.matrix(
         "model.embed_tokens.weight",
         &[config.vocab_size, config.hidden_size],
     )?;
@@ -642,69 +642,72 @@ fn load_weights_impl<'a>(
         let prefix = format!("model.layers.{index}");
 
         layers.push(LayerWeights {
-            input_layernorm: reader.tensor(
+            input_layernorm: reader.vector(
                 &format!("{prefix}.input_layernorm.weight"),
-                &[config.hidden_size],
+                config.hidden_size,
             )?,
 
-            q_proj: reader.tensor(
+            q_proj: reader.matrix(
                 &format!("{prefix}.self_attn.q_proj.weight"),
                 &[q_dim, config.hidden_size],
             )?,
 
-            k_proj: reader.tensor(
+            k_proj: reader.matrix(
                 &format!("{prefix}.self_attn.k_proj.weight"),
                 &[kv_dim, config.hidden_size],
             )?,
 
-            v_proj: reader.tensor(
+            v_proj: reader.matrix(
                 &format!("{prefix}.self_attn.v_proj.weight"),
                 &[kv_dim, config.hidden_size],
             )?,
 
-            q_norm: reader.tensor(
+            q_norm: reader.vector(
                 &format!("{prefix}.self_attn.q_norm.weight"),
-                &[config.head_dim],
+                config.head_dim,
             )?,
 
-            k_norm: reader.tensor(
+            k_norm: reader.vector(
                 &format!("{prefix}.self_attn.k_norm.weight"),
-                &[config.head_dim],
+                config.head_dim,
             )?,
 
-            o_proj: reader.tensor(
+            o_proj: reader.matrix(
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 &[config.hidden_size, q_dim],
             )?,
 
-            post_attention_layernorm: reader.tensor(
+            post_attention_layernorm: reader.vector(
                 &format!("{prefix}.post_attention_layernorm.weight"),
-                &[config.hidden_size],
+                config.hidden_size,
             )?,
 
-            gate_proj: reader.tensor(
+            gate_proj: reader.matrix(
                 &format!("{prefix}.mlp.gate_proj.weight"),
                 &[config.intermediate_size, config.hidden_size],
             )?,
 
-            up_proj: reader.tensor(
+            up_proj: reader.matrix(
                 &format!("{prefix}.mlp.up_proj.weight"),
                 &[config.intermediate_size, config.hidden_size],
             )?,
 
-            down_proj: reader.tensor(
+            down_proj: reader.matrix(
                 &format!("{prefix}.mlp.down_proj.weight"),
                 &[config.hidden_size, config.intermediate_size],
             )?,
         });
     }
 
-    let final_layernorm = reader.tensor("model.norm.weight", &[config.hidden_size])?;
+    let final_layernorm = reader.vector("model.norm.weight", config.hidden_size)?;
 
     let lm_head = if config.tie_embeddings {
         None
     } else {
-        Some(reader.tensor("lm_head.weight", &[config.vocab_size, config.hidden_size])?)
+        Some(reader.matrix(
+            "lm_head.weight",
+            &[config.vocab_size, config.hidden_size],
+        )?)
     };
 
     check_loading_cancelled(cancelled)?;
@@ -740,132 +743,173 @@ impl Reader<'_> {
             .map_err(tensor_error)
     }
 
-    fn tensor(&mut self, name: &str, shape: &[usize]) -> Result<Vec<f32>, ModelError> {
-        check_loading_cancelled(self.cancelled)?;
-
-        let count = shape
-            .iter()
-            .try_fold(1usize, |total, &dimension| product(total, dimension))?;
-
-        let bytes = product(count, std::mem::size_of::<f32>())?;
-
+    fn charge(&mut self, bytes: usize) -> Result<(), ModelError> {
         let required = self
             .used
             .checked_add(bytes)
-            .ok_or(ModelError::DimensionOverflow("decoded weights"))?;
-
+            .ok_or(ModelError::DimensionOverflow("resident weights"))?;
         if required > self.limit {
             return Err(ModelError::MemoryLimit {
                 required,
                 limit: self.limit,
             });
         }
+        self.used = required;
+        Ok(())
+    }
 
+    fn vector(&mut self, name: &str, length: usize) -> Result<Vec<f32>, ModelError> {
+        check_loading_cancelled(self.cancelled)?;
+        let bytes = product(length, std::mem::size_of::<f32>())?;
+        self.charge(bytes)?;
         let view = self.view(name)?;
+        if view.shape() != [length] {
+            return Err(invalid(format!("wrong tensor shape: {name}")));
+        }
+        validate_float_dtype(view.dtype())?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(length)
+            .map_err(|_| ModelError::AllocationFailed)?;
+        for index in 0..length {
+            if index % 4096 == 0 {
+                check_loading_cancelled(self.cancelled)?;
+            }
+            output.push(float_at(&view, index)?);
+        }
+        check_loading_cancelled(self.cancelled)?;
+        Ok(output)
+    }
 
-        let output = if view.dtype() == Dtype::U32 && shape.len() == 2 {
-            let rows = shape[0];
-            let width = shape[1];
+    fn matrix(&mut self, name: &str, shape: &[usize]) -> Result<MatrixWeight, ModelError> {
+        check_loading_cancelled(self.cancelled)?;
+        if shape.len() != 2 {
+            return Err(invalid(format!("matrix requires rank-2 shape: {name}")));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
 
-            if rows == 0 || width == 0 || width % 8 != 0 || view.shape() != [rows, width / 8] {
+        let dtype = self.view(name)?.dtype();
+        if dtype == Dtype::U32 {
+            if rows == 0 || cols == 0 || cols % 8 != 0 {
                 return Err(invalid(format!("invalid packed shape: {name}")));
             }
-
+            {
+                let view = self.view(name)?;
+                if view.shape() != [rows, cols / 8] {
+                    return Err(invalid(format!("invalid packed shape: {name}")));
+                }
+            }
             let base = name
                 .strip_suffix(".weight")
                 .ok_or_else(|| invalid("invalid matrix name"))?;
+            let scale_name = format!("{base}.scales");
+            let bias_name = format!("{base}.biases");
+            let (groups, group_size) = {
+                let scales = self.view(&scale_name)?;
+                let biases = self.view(&bias_name)?;
+                if scales.shape().len() != 2
+                    || scales.shape()[0] != rows
+                    || biases.shape() != scales.shape()
+                {
+                    return Err(invalid("invalid quantization parameter shape"));
+                }
+                let groups = scales.shape()[1];
+                if groups == 0 || cols % groups != 0 {
+                    return Err(invalid("quantization groups do not divide matrix width"));
+                }
+                let group_size = cols / groups;
+                if self.group_size.is_some_and(|declared| declared != group_size) {
+                    return Err(invalid(
+                        "quantization group_size disagrees with tensor shapes",
+                    ));
+                }
+                validate_float_dtype(scales.dtype())?;
+                validate_float_dtype(biases.dtype())?;
+                (groups, group_size)
+            };
 
-            let scales = self.view(&format!("{base}.scales"))?;
+            let packed_words = product(rows, cols / 8)?;
+            let scale_count = product(rows, groups)?;
+            let packed_bytes = product(packed_words, std::mem::size_of::<u32>())?;
+            let scale_bytes = product(scale_count, std::mem::size_of::<f32>())?;
+            let bias_bytes = product(scale_count, std::mem::size_of::<f32>())?;
+            let bytes = packed_bytes
+                .checked_add(scale_bytes)
+                .and_then(|total| total.checked_add(bias_bytes))
+                .ok_or(ModelError::DimensionOverflow("affine4 weights"))?;
+            self.charge(bytes)?;
 
-            let biases = self.view(&format!("{base}.biases"))?;
-
-            if scales.shape().len() != 2
-                || scales.shape()[0] != rows
-                || biases.shape() != scales.shape()
-            {
-                return Err(invalid("invalid quantization parameter shape"));
-            }
-
-            let groups = scales.shape()[1];
-
-            if groups == 0 || width % groups != 0 {
-                return Err(invalid("quantization groups do not divide matrix width"));
-            }
-
-            let group = width / groups;
-
-            if self.group_size.is_some_and(|declared| declared != group) {
-                return Err(invalid(
-                    "quantization group_size disagrees with tensor shapes",
-                ));
-            }
-
-            validate_float_dtype(scales.dtype())?;
-            validate_float_dtype(biases.dtype())?;
-
-            let mut output = Vec::new();
-
-            output
-                .try_reserve_exact(count)
+            let mut packed = Vec::new();
+            packed
+                .try_reserve_exact(packed_words)
                 .map_err(|_| ModelError::AllocationFailed)?;
-
-            for row in 0..rows {
-                for col in 0..width {
-                    if col % 4096 == 0 {
+            {
+                let view = self.view(name)?;
+                for index in 0..packed_words {
+                    if index % 4096 == 0 {
                         check_loading_cancelled(self.cancelled)?;
                     }
-
-                    let word_index = row * (width / 8) + col / 8;
-
-                    let data = &view.data()[word_index * 4..word_index * 4 + 4];
-
-                    let word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-
-                    let code = ((word >> ((col % 8) * 4)) & 15) as f32;
-
-                    let parameter = row * groups + col / group;
-
-                    let value =
-                        code * float_at(&scales, parameter)? + float_at(&biases, parameter)?;
-
-                    if !value.is_finite() {
-                        return Err(invalid("non-finite dequantized weight"));
-                    }
-
-                    output.push(value);
+                    let data = &view.data()[index * 4..index * 4 + 4];
+                    packed.push(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
                 }
             }
 
-            output
-        } else {
-            if view.shape() != shape {
-                return Err(invalid(format!("wrong tensor shape: {name}")));
-            }
-
-            validate_float_dtype(view.dtype())?;
-
-            let mut output = Vec::new();
-
-            output
-                .try_reserve_exact(count)
+            let mut scale_values = Vec::new();
+            let mut bias_values = Vec::new();
+            scale_values
+                .try_reserve_exact(scale_count)
                 .map_err(|_| ModelError::AllocationFailed)?;
-
-            for index in 0..count {
-                if index % 4096 == 0 {
-                    check_loading_cancelled(self.cancelled)?;
+            bias_values
+                .try_reserve_exact(scale_count)
+                .map_err(|_| ModelError::AllocationFailed)?;
+            {
+                let scales = self.view(&scale_name)?;
+                let biases = self.view(&bias_name)?;
+                for index in 0..scale_count {
+                    if index % 4096 == 0 {
+                        check_loading_cancelled(self.cancelled)?;
+                    }
+                    let scale = float_at(&scales, index)?;
+                    let bias = float_at(&biases, index)?;
+                    if !scale.is_finite() || !bias.is_finite() {
+                        return Err(invalid("non-finite quantization parameter"));
+                    }
+                    scale_values.push(scale);
+                    bias_values.push(bias);
                 }
-
-                output.push(float_at(&view, index)?);
             }
+            check_loading_cancelled(self.cancelled)?;
+            return Ok(MatrixWeight::Affine4 {
+                packed,
+                scales: scale_values,
+                biases: bias_values,
+                rows,
+                cols,
+                group_size,
+            });
+        }
 
-            output
-        };
-
+        let count = product(rows, cols)?;
+        let bytes = product(count, std::mem::size_of::<f32>())?;
+        self.charge(bytes)?;
+        let view = self.view(name)?;
+        if view.shape() != shape {
+            return Err(invalid(format!("wrong tensor shape: {name}")));
+        }
+        validate_float_dtype(view.dtype())?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(count)
+            .map_err(|_| ModelError::AllocationFailed)?;
+        for index in 0..count {
+            if index % 4096 == 0 {
+                check_loading_cancelled(self.cancelled)?;
+            }
+            output.push(float_at(&view, index)?);
+        }
         check_loading_cancelled(self.cancelled)?;
-
-        self.used = required;
-
-        Ok(output)
+        Ok(MatrixWeight::F32(output))
     }
 }
 
@@ -1021,23 +1065,37 @@ mod hardening_unit_tests {
             cancelled: None,
         };
 
-        assert_eq!(
-            reader.tensor("test.weight", &[1, 8]).expect("inferred"),
-            vec![-1.0, -0.5, 0.0, 0.5, 11.0, 13.0, 15.0, 17.0,],
-        );
+        let loaded = reader.matrix("test.weight", &[1, 8]).expect("inferred");
+        match loaded {
+            MatrixWeight::Affine4 {
+                packed,
+                scales,
+                biases,
+                rows,
+                cols,
+                group_size,
+            } => {
+                assert_eq!(packed, vec![0x7654_3210u32]);
+                assert_eq!(scales, vec![0.5, 2.0]);
+                assert_eq!(biases, vec![-1.0, 3.0]);
+                assert_eq!((rows, cols, group_size), (1, 8, 4));
+            }
+            MatrixWeight::F32(_) => panic!("expected Affine4"),
+        }
 
         reader.group_size = Some(64);
 
         assert!(matches!(
-            reader.tensor("test.weight", &[1, 8],),
+            reader.matrix("test.weight", &[1, 8],),
             Err(ModelError::CheckpointValidation(_)),
         ));
 
         reader.group_size = None;
+        reader.used = 0;
         reader.limit = 1;
 
         assert!(matches!(
-            reader.tensor("test.weight", &[1, 8],),
+            reader.matrix("test.weight", &[1, 8],),
             Err(ModelError::MemoryLimit { .. }),
         ));
     }

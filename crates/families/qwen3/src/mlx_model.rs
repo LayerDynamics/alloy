@@ -29,7 +29,7 @@
 
 use crate::{
     config::Qwen3Config,
-    fixture::{LayerWeights, Qwen3Weights},
+    fixture::{LayerWeights, MatrixWeight, Qwen3Weights},
     model::ModelError,
 };
 use inference_infra::kv_cache::{KvCacheError, KvCacheSpec, MlxKvCache, MlxModelId};
@@ -195,65 +195,197 @@ impl MlxLogits {
     }
 }
 
+/// Dense float32 or resident Affine4 projection.
+enum MlxLinear {
+    Dense(Array),
+    Affine4 {
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+    },
+}
+
+impl MlxLinear {
+    fn upload(matrix: MatrixWeight, rows: usize, cols: usize) -> MlxQwenResult<Self> {
+        match matrix {
+            MatrixWeight::F32(values) => Ok(Self::Dense(upload_f32(values, &[rows, cols])?)),
+            MatrixWeight::Affine4 {
+                packed,
+                scales,
+                biases,
+                rows: packed_rows,
+                cols: packed_cols,
+                group_size,
+            } => {
+                if packed_rows != rows || packed_cols != cols {
+                    return Err(ModelError::ShapeMismatch {
+                        tensor: "affine4 matrix",
+                        expected: rows.saturating_mul(cols),
+                        got: packed_rows.saturating_mul(packed_cols),
+                    }
+                    .into());
+                }
+                if cols % 8 != 0 || group_size == 0 || cols % group_size != 0 {
+                    return Err(ModelError::InvalidConfig(
+                        "affine4 cols must be divisible by 8 and group_size",
+                    )
+                    .into());
+                }
+                let groups = cols / group_size;
+                let weight = upload_u32(packed, &[rows, cols / 8])?;
+                let scales = upload_f32(scales, &[rows, groups])?;
+                let biases = upload_f32(biases, &[rows, groups])?;
+                let group_size = i32::try_from(group_size).map_err(|_| {
+                    ModelError::InvalidConfig("affine4 group_size exceeds C int")
+                })?;
+                Ok(Self::Affine4 {
+                    weight,
+                    scales,
+                    biases,
+                    group_size,
+                })
+            }
+        }
+    }
+
+    /// Upload Affine4 embeddings by dequantizing once into resident float32.
+    fn upload_embedding(
+        matrix: MatrixWeight,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> MlxQwenResult<Array> {
+        match matrix {
+            MatrixWeight::F32(values) => upload_f32(values, &[rows, cols]),
+            MatrixWeight::Affine4 {
+                packed,
+                scales,
+                biases,
+                rows: packed_rows,
+                cols: packed_cols,
+                group_size,
+            } => {
+                if packed_rows != rows || packed_cols != cols {
+                    return Err(ModelError::ShapeMismatch {
+                        tensor: "affine4 embedding",
+                        expected: rows.saturating_mul(cols),
+                        got: packed_rows.saturating_mul(packed_cols),
+                    }
+                    .into());
+                }
+                let groups = cols / group_size;
+                let weight = upload_u32(packed, &[rows, cols / 8])?;
+                let scales = upload_f32(scales, &[rows, groups])?;
+                let biases = upload_f32(biases, &[rows, groups])?;
+                let group_size = i32::try_from(group_size).map_err(|_| {
+                    ModelError::InvalidConfig("affine4 group_size exceeds C int")
+                })?;
+                let dense = ops::dequantize(&weight, &scales, &biases, group_size, 4, stream)?;
+                drop(weight);
+                drop(scales);
+                drop(biases);
+                Ok(dense)
+            }
+        }
+    }
+
+    fn apply(&self, input: &Array, stream: &Stream) -> MlxQwenResult<Array> {
+        match self {
+            Self::Dense(weight) => Ok(ops::linear(input, weight, stream)?),
+            Self::Affine4 {
+                weight,
+                scales,
+                biases,
+                group_size,
+            } => Ok(ops::quantized_matmul(
+                input,
+                weight,
+                scales,
+                biases,
+                true,
+                *group_size,
+                4,
+                stream,
+            )?),
+        }
+    }
+
+    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+        match self {
+            Self::Dense(weight) => visitor(weight),
+            Self::Affine4 {
+                weight,
+                scales,
+                biases,
+                ..
+            } => {
+                visitor(weight);
+                visitor(scales);
+                visitor(biases);
+            }
+        }
+    }
+}
+
 struct MlxLayer {
     input_layernorm: Array,
-    q_proj: Array,
-    k_proj: Array,
-    v_proj: Array,
+    q_proj: MlxLinear,
+    k_proj: MlxLinear,
+    v_proj: MlxLinear,
     q_norm: Array,
     k_norm: Array,
-    o_proj: Array,
+    o_proj: MlxLinear,
     post_attention_layernorm: Array,
-    gate_proj: Array,
-    up_proj: Array,
-    down_proj: Array,
+    gate_proj: MlxLinear,
+    up_proj: MlxLinear,
+    down_proj: MlxLinear,
 }
 
 impl MlxLayer {
     fn upload(config: &Qwen3Config, weights: LayerWeights) -> MlxQwenResult<Self> {
         Ok(Self {
-            input_layernorm: upload(weights.input_layernorm, &[config.hidden_size])?,
-            q_proj: upload(weights.q_proj, &[config.q_dim(), config.hidden_size])?,
-            k_proj: upload(weights.k_proj, &[config.kv_dim(), config.hidden_size])?,
-            v_proj: upload(weights.v_proj, &[config.kv_dim(), config.hidden_size])?,
-            q_norm: upload(weights.q_norm, &[config.head_dim])?,
-            k_norm: upload(weights.k_norm, &[config.head_dim])?,
-            o_proj: upload(weights.o_proj, &[config.hidden_size, config.q_dim()])?,
-            post_attention_layernorm: upload(
+            input_layernorm: upload_f32(weights.input_layernorm, &[config.hidden_size])?,
+            q_proj: MlxLinear::upload(weights.q_proj, config.q_dim(), config.hidden_size)?,
+            k_proj: MlxLinear::upload(weights.k_proj, config.kv_dim(), config.hidden_size)?,
+            v_proj: MlxLinear::upload(weights.v_proj, config.kv_dim(), config.hidden_size)?,
+            q_norm: upload_f32(weights.q_norm, &[config.head_dim])?,
+            k_norm: upload_f32(weights.k_norm, &[config.head_dim])?,
+            o_proj: MlxLinear::upload(weights.o_proj, config.hidden_size, config.q_dim())?,
+            post_attention_layernorm: upload_f32(
                 weights.post_attention_layernorm,
                 &[config.hidden_size],
             )?,
-            gate_proj: upload(
+            gate_proj: MlxLinear::upload(
                 weights.gate_proj,
-                &[config.intermediate_size, config.hidden_size],
+                config.intermediate_size,
+                config.hidden_size,
             )?,
-            up_proj: upload(
+            up_proj: MlxLinear::upload(
                 weights.up_proj,
-                &[config.intermediate_size, config.hidden_size],
+                config.intermediate_size,
+                config.hidden_size,
             )?,
-            down_proj: upload(
+            down_proj: MlxLinear::upload(
                 weights.down_proj,
-                &[config.hidden_size, config.intermediate_size],
+                config.hidden_size,
+                config.intermediate_size,
             )?,
         })
     }
 
     fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
-        for array in [
-            &self.input_layernorm,
-            &self.q_proj,
-            &self.k_proj,
-            &self.v_proj,
-            &self.q_norm,
-            &self.k_norm,
-            &self.o_proj,
-            &self.post_attention_layernorm,
-            &self.gate_proj,
-            &self.up_proj,
-            &self.down_proj,
-        ] {
-            visitor(array);
-        }
+        visitor(&self.input_layernorm);
+        self.q_proj.visit(visitor);
+        self.k_proj.visit(visitor);
+        self.v_proj.visit(visitor);
+        visitor(&self.q_norm);
+        visitor(&self.k_norm);
+        self.o_proj.visit(visitor);
+        visitor(&self.post_attention_layernorm);
+        self.gate_proj.visit(visitor);
+        self.up_proj.visit(visitor);
+        self.down_proj.visit(visitor);
     }
 }
 
@@ -337,16 +469,26 @@ impl MlxQwen3Model {
                 .try_reserve_exact(config.num_layers)
                 .map_err(|_| MlxQwenError::AllocationFailed("MLX layer metadata"))?;
 
-            let embedding = upload(embed_tokens, &[config.vocab_size, config.hidden_size])?;
+            let embedding = MlxLinear::upload_embedding(
+                embed_tokens,
+                config.vocab_size,
+                config.hidden_size,
+                stream,
+            )?;
 
             for layer in layers {
                 native_layers.push(MlxLayer::upload(&config, layer)?);
             }
 
-            let final_layernorm = upload(final_layernorm, &[config.hidden_size])?;
+            let final_layernorm = upload_f32(final_layernorm, &[config.hidden_size])?;
 
             let lm_head = match lm_head {
-                Some(head) => Some(upload(head, &[config.vocab_size, config.hidden_size])?),
+                Some(head) => Some(MlxLinear::upload_embedding(
+                    head,
+                    config.vocab_size,
+                    config.hidden_size,
+                    stream,
+                )?),
                 None => None,
             };
 
@@ -424,7 +566,7 @@ impl MlxQwen3Model {
             .weights
             .layers
             .len()
-            .checked_mul(11)
+            .checked_mul(25) // Affine4 projections: up to 3 arrays each + norms
             .and_then(|n| n.checked_add(2))
             .and_then(|n| n.checked_add(usize::from(self.weights.lm_head.is_some())))
             .ok_or(ModelError::DimensionOverflow("weight query handle count"))?;
@@ -650,9 +792,9 @@ impl MlxQwen3Model {
                 stream,
             )?;
 
-            let query = ops::linear(&normalized, &layer.q_proj, stream)?;
-            let key = ops::linear(&normalized, &layer.k_proj, stream)?;
-            let value = ops::linear(&normalized, &layer.v_proj, stream)?;
+            let query = layer.q_proj.apply(&normalized, stream)?;
+            let key = layer.k_proj.apply(&normalized, stream)?;
+            let value = layer.v_proj.apply(&normalized, stream)?;
 
             let query = ops::reshape(&query, &[1, token_count, c.q_heads, c.head_dim], stream)?;
             let key = ops::reshape(&key, &[1, token_count, c.kv_heads, c.head_dim], stream)?;
@@ -690,7 +832,7 @@ impl MlxQwen3Model {
 
             let attended = ops::transpose(&attended, &[0, 2, 1, 3], stream)?;
             let attended = ops::reshape(&attended, &[token_count, c.q_dim()], stream)?;
-            let attention_output = ops::linear(&attended, &layer.o_proj, stream)?;
+            let attention_output = layer.o_proj.apply(&attended, stream)?;
             hidden = ops::residual_add(&hidden, &attention_output, stream)?;
 
             let normalized = ops::rms_norm(
@@ -699,10 +841,10 @@ impl MlxQwen3Model {
                 Qwen3Config::RMS_EPS,
                 stream,
             )?;
-            let gate = ops::linear(&normalized, &layer.gate_proj, stream)?;
-            let up = ops::linear(&normalized, &layer.up_proj, stream)?;
+            let gate = layer.gate_proj.apply(&normalized, stream)?;
+            let up = layer.up_proj.apply(&normalized, stream)?;
             let activated = ops::swiglu(&gate, &up, stream)?;
-            let mlp_output = ops::linear(&activated, &layer.down_proj, stream)?;
+            let mlp_output = layer.down_proj.apply(&activated, stream)?;
             hidden = ops::residual_add(&hidden, &mlp_output, stream)?;
         }
 
@@ -723,7 +865,7 @@ impl MlxQwen3Model {
             )?,
         };
 
-        let logits = ops::linear(&selected, self.weights.output_head(), stream)?;
+        let logits = ops::linear(&selected, self.weights.output_head(), stream)?; // dense head
 
         check_cancelled(cancelled)?;
 
@@ -819,13 +961,12 @@ fn byte_count(elements: usize) -> Result<u64, ModelError> {
         .ok_or(ModelError::DimensionOverflow("MLX payload bytes"))
 }
 
-fn upload(values: Vec<f32>, shape: &[usize]) -> MlxQwenResult<Array> {
+fn shape_i32(shape: &[usize]) -> MlxQwenResult<(usize, Vec<i32>)> {
     let mut expected = 1_usize;
     let mut dimensions = Vec::new();
     dimensions
         .try_reserve_exact(shape.len())
         .map_err(|_| MlxQwenError::AllocationFailed("weight shape metadata"))?;
-
     for &dimension in shape {
         expected = checked_product(expected, dimension, "MLX upload shape")?;
         dimensions.push(
@@ -833,7 +974,11 @@ fn upload(values: Vec<f32>, shape: &[usize]) -> MlxQwenResult<Array> {
                 .map_err(|_| ModelError::InvalidConfig("MLX weight dimension exceeds C int"))?,
         );
     }
+    Ok((expected, dimensions))
+}
 
+fn upload_f32(values: Vec<f32>, shape: &[usize]) -> MlxQwenResult<Array> {
+    let (expected, dimensions) = shape_i32(shape)?;
     if expected != values.len() {
         return Err(ModelError::ShapeMismatch {
             tensor: "MLX upload",
@@ -842,9 +987,22 @@ fn upload(values: Vec<f32>, shape: &[usize]) -> MlxQwenResult<Array> {
         }
         .into());
     }
-
     let array = Array::from_f32_slice(&values, &dimensions)?;
-    // The FFI constructor copies the supplied source buffer.
+    drop(values);
+    Ok(array)
+}
+
+fn upload_u32(values: Vec<u32>, shape: &[usize]) -> MlxQwenResult<Array> {
+    let (expected, dimensions) = shape_i32(shape)?;
+    if expected != values.len() {
+        return Err(ModelError::ShapeMismatch {
+            tensor: "MLX u32 upload",
+            expected,
+            got: values.len(),
+        }
+        .into());
+    }
+    let array = Array::from_u32_slice(&values, &dimensions)?;
     drop(values);
     Ok(array)
 }
@@ -871,6 +1029,60 @@ fn check_weight(
 
     *total = total
         .checked_add(byte_count(values.len())?)
+        .ok_or(ModelError::DimensionOverflow("MLX total weight bytes"))?;
+    Ok(())
+}
+
+fn check_matrix(
+    name: &'static str,
+    expected_elements: usize,
+    matrix: &MatrixWeight,
+    total: &mut u64,
+) -> Result<(), ModelError> {
+    if matrix.logical_elements() != expected_elements {
+        return Err(ModelError::ShapeMismatch {
+            tensor: name,
+            expected: expected_elements,
+            got: matrix.logical_elements(),
+        });
+    }
+    match matrix {
+        MatrixWeight::F32(values) => {
+            if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+                return Err(ModelError::NonFiniteWeight {
+                    tensor: name,
+                    index,
+                });
+            }
+        }
+        MatrixWeight::Affine4 {
+            scales,
+            biases,
+            cols,
+            group_size,
+            ..
+        } => {
+            if *group_size == 0 || cols % group_size != 0 || cols % 8 != 0 {
+                return Err(ModelError::InvalidConfig(
+                    "affine4 matrix geometry is invalid",
+                ));
+            }
+            if let Some(index) = scales
+                .iter()
+                .chain(biases.iter())
+                .position(|value| !value.is_finite())
+            {
+                return Err(ModelError::NonFiniteWeight {
+                    tensor: name,
+                    index,
+                });
+            }
+        }
+    }
+    let bytes = u64::try_from(matrix.resident_bytes())
+        .map_err(|_| ModelError::DimensionOverflow("MLX matrix bytes"))?;
+    *total = total
+        .checked_add(bytes)
         .ok_or(ModelError::DimensionOverflow("MLX total weight bytes"))?;
     Ok(())
 }
@@ -926,7 +1138,7 @@ fn validate_weights(c: &Qwen3Config, weights: &Qwen3Weights) -> Result<u64, Mode
     }
 
     let mut total = 0_u64;
-    check_weight(
+    check_matrix(
         "embed_tokens",
         checked_product(c.vocab_size, c.hidden_size, "embedding")?,
         &weights.embed_tokens,
@@ -934,57 +1146,62 @@ fn validate_weights(c: &Qwen3Config, weights: &Qwen3Weights) -> Result<u64, Mode
     )?;
 
     for layer in &weights.layers {
-        for (name, expected, values) in [
-            (
-                "input_layernorm",
-                c.hidden_size,
-                layer.input_layernorm.as_slice(),
-            ),
-            (
-                "q_proj",
-                checked_product(q_dim, c.hidden_size, "q_proj")?,
-                layer.q_proj.as_slice(),
-            ),
-            (
-                "k_proj",
-                checked_product(kv_dim, c.hidden_size, "k_proj")?,
-                layer.k_proj.as_slice(),
-            ),
-            (
-                "v_proj",
-                checked_product(kv_dim, c.hidden_size, "v_proj")?,
-                layer.v_proj.as_slice(),
-            ),
-            ("q_norm", c.head_dim, layer.q_norm.as_slice()),
-            ("k_norm", c.head_dim, layer.k_norm.as_slice()),
-            (
-                "o_proj",
-                checked_product(c.hidden_size, q_dim, "o_proj")?,
-                layer.o_proj.as_slice(),
-            ),
-            (
-                "post_attention_layernorm",
-                c.hidden_size,
-                layer.post_attention_layernorm.as_slice(),
-            ),
-            (
-                "gate_proj",
-                checked_product(c.intermediate_size, c.hidden_size, "gate_proj")?,
-                layer.gate_proj.as_slice(),
-            ),
-            (
-                "up_proj",
-                checked_product(c.intermediate_size, c.hidden_size, "up_proj")?,
-                layer.up_proj.as_slice(),
-            ),
-            (
-                "down_proj",
-                checked_product(c.hidden_size, c.intermediate_size, "down_proj")?,
-                layer.down_proj.as_slice(),
-            ),
-        ] {
-            check_weight(name, expected, values, &mut total)?;
-        }
+        check_weight(
+            "input_layernorm",
+            c.hidden_size,
+            &layer.input_layernorm,
+            &mut total,
+        )?;
+        check_matrix(
+            "q_proj",
+            checked_product(q_dim, c.hidden_size, "q_proj")?,
+            &layer.q_proj,
+            &mut total,
+        )?;
+        check_matrix(
+            "k_proj",
+            checked_product(kv_dim, c.hidden_size, "k_proj")?,
+            &layer.k_proj,
+            &mut total,
+        )?;
+        check_matrix(
+            "v_proj",
+            checked_product(kv_dim, c.hidden_size, "v_proj")?,
+            &layer.v_proj,
+            &mut total,
+        )?;
+        check_weight("q_norm", c.head_dim, &layer.q_norm, &mut total)?;
+        check_weight("k_norm", c.head_dim, &layer.k_norm, &mut total)?;
+        check_matrix(
+            "o_proj",
+            checked_product(c.hidden_size, q_dim, "o_proj")?,
+            &layer.o_proj,
+            &mut total,
+        )?;
+        check_weight(
+            "post_attention_layernorm",
+            c.hidden_size,
+            &layer.post_attention_layernorm,
+            &mut total,
+        )?;
+        check_matrix(
+            "gate_proj",
+            checked_product(c.intermediate_size, c.hidden_size, "gate_proj")?,
+            &layer.gate_proj,
+            &mut total,
+        )?;
+        check_matrix(
+            "up_proj",
+            checked_product(c.intermediate_size, c.hidden_size, "up_proj")?,
+            &layer.up_proj,
+            &mut total,
+        )?;
+        check_matrix(
+            "down_proj",
+            checked_product(c.hidden_size, c.intermediate_size, "down_proj")?,
+            &layer.down_proj,
+            &mut total,
+        )?;
     }
 
     check_weight(
@@ -995,7 +1212,7 @@ fn validate_weights(c: &Qwen3Config, weights: &Qwen3Weights) -> Result<u64, Mode
     )?;
 
     if let Some(head) = &weights.lm_head {
-        check_weight(
+        check_matrix(
             "lm_head",
             checked_product(c.vocab_size, c.hidden_size, "lm_head")?,
             head,

@@ -439,6 +439,73 @@ unsafe extern "C" {
         recommended_bytes: *mut u64,
         os_error: *mut i32,
     ) -> i32;
+
+    fn alloy_host_memory_pressure_probe(
+        free_bytes: *mut u64,
+        inactive_bytes: *mut u64,
+        active_file_bytes: *mut u64,
+        other_apps_active_bytes: *mut u64,
+        phys_footprint_bytes: *mut u64,
+        graphics_footprint_bytes: *mut u64,
+        iogpu_wired_limit_bytes: *mut u64,
+        os_error: *mut i32,
+    ) -> i32;
+}
+
+/// Discover a full [`crate::memory_guard::HostMemorySnapshot`] on Apple Silicon.
+///
+/// Combines the unified-memory probe with live vm_stat / phys_footprint /
+/// `iogpu.wired_limit_mb` observations for the oMLX-method memory guard.
+pub fn discover_host_memory_snapshot() -> PlatformResult<crate::memory_guard::HostMemorySnapshot> {
+    let info = discover()?;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let mut free = 0_u64;
+        let mut inactive = 0_u64;
+        let mut active_file = 0_u64;
+        let mut other_apps = 0_u64;
+        let mut phys = 0_u64;
+        let mut graphics = 0_u64;
+        let mut wired = 0_u64;
+        let mut os_error = 0_i32;
+
+        // SAFETY: all pointers refer to local writable u64/i32 storage.
+        let status = unsafe {
+            alloy_host_memory_pressure_probe(
+                &mut free,
+                &mut inactive,
+                &mut active_file,
+                &mut other_apps,
+                &mut phys,
+                &mut graphics,
+                &mut wired,
+                &mut os_error,
+            )
+        };
+        if status != 0 {
+            return Err(PlatformError::NativeProbe { status, os_error });
+        }
+
+        Ok(crate::memory_guard::HostMemorySnapshot {
+            physical_memory_bytes: info.physical_memory_bytes(),
+            free_bytes: free,
+            inactive_bytes: inactive,
+            active_file_bytes: active_file,
+            other_apps_active_bytes: other_apps,
+            phys_footprint_bytes: phys,
+            graphics_footprint_bytes: graphics,
+            iogpu_wired_limit_bytes: wired,
+            recommended_working_set_bytes: info.recommended_working_set_bytes(),
+            release_credit_bytes: 0,
+        })
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = info;
+        Err(PlatformError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(test)]
