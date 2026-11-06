@@ -2959,6 +2959,8 @@ impl NativeState {
             None
         };
         let selected = self.resident.as_ref();
+        let idle_model_loaded =
+            selected.is_some() || !self.pool.is_empty() || !self.states.is_empty();
         let selected_state = selected.is_some_and(|r| r.cache.is_some() || r.candidate.is_some());
         let unleased_states = self
             .states
@@ -2991,10 +2993,10 @@ impl NativeState {
                     .filter(|entry| entry.is_leased())
                     .count(),
                 can_release_state_without_model: selected_state || unleased_states != 0,
-                idle_model_loaded: selected.is_some()
-                    || !self.pool.is_empty()
-                    || !self.states.is_empty(),
-                idle_model_has_live_leases: !eligible,
+                idle_model_loaded,
+                // An empty pool has no eligible victim, but also no
+                // protected model. Preserve that distinction on rejection.
+                idle_model_has_live_leases: idle_model_loaded && !eligible,
             },
         })
     }

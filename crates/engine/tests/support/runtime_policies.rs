@@ -17,7 +17,10 @@
 
 use super::*;
 use engine::{
-    admission::AdmissionSnapshot, backends::Qwen3Execution, types::CacheRepresentationId,
+    admission::AdmissionSnapshot,
+    backends::Qwen3Execution,
+    pressure::{PressureOptions, PressurePolicy},
+    types::CacheRepresentationId,
 };
 use std::{
     any::Any,
@@ -534,6 +537,17 @@ impl RuntimeBackend for PolicyBackend {
         self.inner.plan(registry, profile, input_tokens)
     }
 
+    fn incremental_mlx_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        plan: &RuntimePlan,
+        residency: engine::runtime::RuntimeResidency,
+    ) -> Result<Option<u64>, EngineError> {
+        self.inner
+            .incremental_mlx_bytes(registry, profile, plan, residency)
+    }
+
     fn verify_artifact(
         &self,
         artifact: &ArtifactRegistration,
@@ -692,6 +706,30 @@ impl PolicyEnvironment {
         Self::build(retained_policy(), tight_budget, true)
     }
 
+    fn new_pool_with_startup_pressure() -> Self {
+        // Match the large-model gate: retain only weights between turns,
+        // and apply the same permissions to a real allocator forecast.
+        Self::build_with_policy(
+            RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: false,
+            },
+            true,
+            true,
+            8,
+            Some(|budget| {
+                PressurePolicy::new(PressureOptions {
+                    allocator_ceiling_bytes: Some(budget),
+                    allow_allocator_cache_clear: true,
+                    allow_idle_state_release: true,
+                    allow_idle_model_unload: true,
+                    max_reclamation_actions: 5,
+                })
+                .expect("M9 startup pressure policy")
+            }),
+        )
+    }
+
     fn new_pool_with_event_capacity(event_capacity: usize) -> Self {
         Self::build_with_event_capacity(retained_policy(), false, true, event_capacity)
     }
@@ -705,6 +743,16 @@ impl PolicyEnvironment {
         tight_budget: bool,
         pooling: bool,
         event_capacity: usize,
+    ) -> Self {
+        Self::build_with_policy(retention, tight_budget, pooling, event_capacity, None)
+    }
+
+    fn build_with_policy(
+        retention: RetentionPolicy,
+        tight_budget: bool,
+        pooling: bool,
+        event_capacity: usize,
+        pressure_policy: Option<fn(u64) -> PressurePolicy>,
     ) -> Self {
         let fixture_a = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let fixture_b = TestEnvironment::new(POLICY_OUTPUT, 8, false);
@@ -813,6 +861,11 @@ impl PolicyEnvironment {
         } else {
             runtime
         };
+        let runtime = if let Some(policy) = pressure_policy {
+            runtime.with_pressure_policy(policy(budget))
+        } else {
+            runtime
+        };
 
         Self {
             runtime: runtime.clone(),
@@ -871,6 +924,25 @@ impl PolicyEnvironment {
         let snapshot = self.snapshot();
         assert_eq!(snapshot.reserved_bytes(), 0);
         assert_eq!(snapshot.active_reservations(), 0);
+    }
+
+    fn drop_and_assert_unreserved(self) {
+        self.wait_idle();
+        let admission = self.admission.clone();
+        drop(self);
+        let limit = deadline();
+        loop {
+            let snapshot = admission.snapshot().expect("shutdown accounting");
+            if snapshot.reserved_bytes() == 0 {
+                assert_eq!(snapshot.active_reservations(), 0);
+                break;
+            }
+            assert!(
+                Instant::now() < limit,
+                "runtime ownership did not drain: {snapshot:?}"
+            );
+            thread::yield_now();
+        }
     }
 }
 
@@ -1366,6 +1438,201 @@ fn pool_pinned_a_rejects_tight_switch_without_destroying_a() {
     drop(pin);
     successful(&environment.run("pool-pin-b-retry", profile_b(), "hello"));
     assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn pool_startup_pressure_pinned_owner_returns_exact_protected_busy_then_unpin_loads_b() {
+    let environment = PolicyEnvironment::new_pool_with_startup_pressure();
+    successful(&environment.run("pressure-pin-a", profile_a(), "hello"));
+    let original_a = pool_instance(&environment, &artifact_a());
+    let pin = block_on(environment.runtime.pin_model(original_a.clone()))
+        .unwrap()
+        .expect("pin actual A instance");
+    let before = environment.snapshot();
+    let b_startup = sum(&[
+        environment.plan_b.output_bytes,
+        environment.plan_b.temporary_bytes,
+        environment.plan_b.headroom_bytes,
+        environment.plan_b.load_limits.max_load_peak_bytes(),
+        environment.plan_b.cache.max_cache_bytes(),
+    ]);
+    assert!(
+        b_startup <= before.budget_bytes(),
+        "B must fit after A is evicted"
+    );
+    assert!(
+        b_startup > before.available_bytes(),
+        "pinned A must prevent B admission"
+    );
+    let resident = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(resident.len(), 1);
+    assert_eq!(before.reserved_bytes(), resident[0].committed_weight_bytes);
+    assert_eq!(before.active_reservations(), 1);
+    let checkpoint = environment.control.events().len();
+
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-pin-refused-b",
+            profile_b(),
+            "hello",
+        ))),
+        "pressure policy must refuse protected ownership before B loads",
+    );
+    match error {
+        EngineError::Busy {
+            active_request_id,
+            message,
+        } => {
+            assert!(
+                active_request_id.is_none(),
+                "this is not scheduler contention"
+            );
+            assert_eq!(
+                message,
+                "startup pressure policy rejected protected ownership: ProtectedResources",
+            );
+        }
+        other => panic!("expected the precise protected-owner Busy rejection: {other:?}"),
+    }
+    environment.wait_idle();
+    assert_eq!(
+        environment.snapshot(),
+        before,
+        "refusal must preserve A's exact guard"
+    );
+    let resident = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(resident.len(), 1);
+    assert_eq!(resident[0].artifact, artifact_a());
+    assert!(resident[0].pinned && resident[0].instance.same_instance(&original_a));
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+    let events = environment.control.events();
+    assert!(events[checkpoint..].iter().all(|event| {
+        event.kind != "model-destroyed"
+            && !(event.kind == "load-entered" && event.artifact == artifact_b())
+    }));
+    assert!(
+        environment
+            .observations
+            .work("pressure-pin-refused-b")
+            .prefill_tokens
+            .is_empty()
+    );
+
+    drop(pin);
+    successful(&environment.run("pressure-pin-recovery-b", profile_b(), "hello"));
+    let events = environment.control.events();
+    let events = &events[checkpoint..];
+    let a_destroyed = event_index(events, "model-destroyed", &artifact_a());
+    let b_loader = event_index(events, "load-entered", &artifact_b());
+    assert!(
+        a_destroyed < b_loader,
+        "A must be destroyed before B enters its native loader"
+    );
+    assert_eq!(events[b_loader].snapshot.reserved_bytes(), b_startup);
+    let resident = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(resident.len(), 1);
+    assert_eq!(resident[0].artifact, artifact_b());
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        resident[0].committed_weight_bytes
+    );
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+    assert!(
+        !environment
+            .observations
+            .work("pressure-pin-recovery-b")
+            .prefill_tokens
+            .is_empty()
+    );
+    environment.drop_and_assert_unreserved();
+}
+
+#[test]
+fn pool_startup_pressure_full_budget_grant_rejects_before_loading_then_release_recovers() {
+    let environment = PolicyEnvironment::new_pool_with_startup_pressure();
+    let empty = environment.snapshot();
+    assert_eq!(empty.reserved_bytes(), 0);
+    assert_eq!(empty.active_reservations(), 0);
+    let blocker = environment
+        .admission
+        .reserve_grant("held full-budget acceptance probe", &[empty.budget_bytes()])
+        .unwrap();
+    let held = environment.snapshot();
+    assert_eq!(held.reserved_bytes(), held.budget_bytes());
+    assert_eq!(held.active_reservations(), 1);
+    assert_eq!(held.available_bytes(), 0);
+    assert!(!environment.admission.admissions_paused());
+
+    let error = expect_failure(
+        block_on(environment.engine.generate(environment.request(
+            "pressure-full-budget-refused-a",
+            profile_a(),
+            "hello",
+        ))),
+        "a held full-budget grant must refuse native startup",
+    );
+    match error {
+        EngineError::MemoryLimitExceeded {
+            required_bytes,
+            available_bytes,
+            ..
+        } => {
+            assert!(required_bytes > 0 && required_bytes <= held.budget_bytes());
+            assert_eq!(available_bytes, 0);
+        }
+        other => panic!("expected genuine zero-headroom memory rejection: {other:?}"),
+    }
+    environment.wait_idle();
+    assert_eq!(
+        environment.snapshot(),
+        held,
+        "failed startup must not strand a second grant"
+    );
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        environment
+            .observations
+            .cache_allocations
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(
+        environment
+            .control
+            .events()
+            .iter()
+            .all(|event| event.kind != "load-entered")
+    );
+    assert!(
+        block_on(environment.runtime.model_residency())
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(blocker);
+    environment.assert_empty();
+    successful(&environment.run("pressure-full-budget-recovery-a", profile_a(), "hello"));
+    let work = environment
+        .observations
+        .work("pressure-full-budget-recovery-a");
+    assert!(!work.prefill_tokens.is_empty());
+    assert_eq!(work.decode_tokens.len(), POLICY_OUTPUT);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        environment
+            .observations
+            .cache_allocations
+            .load(Ordering::Relaxed),
+        1
+    );
+    let resident = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(resident.len(), 1);
+    assert_eq!(resident[0].artifact, artifact_a());
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        resident[0].committed_weight_bytes
+    );
+    environment.drop_and_assert_unreserved();
 }
 
 #[test]

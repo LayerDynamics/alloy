@@ -56,6 +56,16 @@ Local follow-up checks pass for all MLX FFI, inference-infrastructure, and Qwen 
 
 The Phase 2 plan was reviewed against SPEC-1 Phase 2, FR-20/21/24, the builtin policies, and B.2/B.4/B.6. Its seven work packages, exact file mapping, 16 named tests, and three exit mappings cover the defined scope. Phase 2 implementation remains gated on Phase 1 acceptance. A published privacy policy and an operational collection endpoint are release prerequisites; this review does not claim either from a mock transport test or the current `telemetry.invalid` development default.
 
+## Loader repair and protected-pin acceptance correction
+
+The [repair run at `d09fdd1ff0900633eb800b50d97bab1484eae3cf`](https://github.com/LayerDynamics/alloy/actions/runs/42296372344) passed Linux, CLI, all Mac native/engine/harness/daemon suites, real streaming, and real daemon history/SSD-KV restart. Linux logs record 575 passing top-level Rust tests and two pre-existing process-global FFI tests ignored. The [Mac artifact](https://github.com/LayerDynamics/alloy/actions/runs/42296372344/artifacts/13542229011) has ZIP SHA-256 `9f8566005cab53d6454913a123076177b874595ee66e3216191e9732f557708b`.
+
+The repaired 14B startup plan is **14,104,910,369 bytes**, below the freshly measured **15,682,454,248-byte** balanced ceiling. Real 4B Metal generation completed with 28 input and 8 output tokens. Its retained weight reservation was 2,660,373,249 bytes. M9 then stopped at an acceptance-driver classification mismatch, before 14B loading: the configured startup pressure policy correctly returned `Busy` with `ProtectedResources` and no active request, while the driver incorrectly required `MemoryLimitExceeded` for that pinned-owner case. Artifact sequence 62 records the exact cause; A remained pinned and charged, the guard reported acceptable pressure/open admission, and B's loader was never entered.
+
+The corrected driver retains the full error and requires that specific protected-pin rejection. Generic scheduler Busy, paused admission, and unrelated memory failures cannot satisfy it. It separately holds the ledger's budget before any model is loaded and requires a real `MemoryLimitExceeded` response, no native loader entry, no leaked scheduler/grant ownership, and release of that explicit test reservation. This budget hold is not represented as a physical memory allocation. The subsequent pinned/unpinned sequence still requires real 4B/14B generation, A's actual destruction before B enters its loader, and an empty shutdown ledger. A new successful hardware run is required before the final exit decision.
+
+The independent full-budget regression exposed a production observation bug: an empty model pool was marked protected solely because it had no eligible eviction victim. The runtime now requires an actual resident model before reporting protected model ownership. Genuine pins still produce the specific protected-owner Busy response; an empty runtime with an exhausted ledger produces `MemoryLimitExceeded`. Both rejection paths are checked for native ownership, reservation cleanup, and successful recovery.
+
 ## Existing reproducibility evidence
 
 Both linked Linux jobs report `ok: vendored_build_reproducible` after two

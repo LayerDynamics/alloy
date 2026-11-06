@@ -10,7 +10,7 @@ use engine::{
     admission::AdmissionController,
     api::{Engine, EngineCore, EngineFuture},
     backends::{FilePin, Qwen3Artifact, Qwen3Backend, Qwen3BackendLimits, Qwen3Execution},
-    error::{EngineError, ErrorKind},
+    error::EngineError,
     family::{
         AutoregressiveModel, BufferMemoryUsage, CacheAllocationRequest, ExecutionControl,
         FamilyCache, LoadedModel, ModelFamily, ModelInstanceId, ModelLoadRequest, PrefillOutput,
@@ -904,13 +904,13 @@ fn generate(
     monitor: &mut Monitor,
     profile: &ModelProfileId,
     name: &str,
-) -> AcceptanceResult<Result<(), ErrorKind>> {
+) -> AcceptanceResult<Result<(), EngineError>> {
     monitor.evidence.emit("generation_requested", json!({"request_id": name, "profile_id": profile.as_str(), "prompt": PROMPT, "maximum_output_tokens": OUTPUT_TOKENS}))?;
     let generation = match monitor.wait(engine.generate(request(profile, name)?))? {
         Ok(generation) => generation,
         Err(error) => {
             monitor.evidence.emit("generation_refused", json!({"request_id": name, "error_kind": format!("{:?}", error.kind()), "message": error.to_string()}))?;
-            return Ok(Err(error.kind()));
+            return Ok(Err(error));
         }
     };
     let mut events = generation.into_events();
@@ -950,7 +950,7 @@ fn generate(
                 partial_usage,
             } => {
                 monitor.evidence.emit("generation_failed", json!({"request_id": name, "error_kind": format!("{:?}", error.kind()), "message": error.to_string(), "input_tokens": partial_usage.input_tokens, "output_tokens": partial_usage.output_tokens}))?;
-                result = Some(Err(error.kind()));
+                result = Some(Err(error));
             }
         }
     }
@@ -958,6 +958,14 @@ fn generate(
     // bounded output reservation belongs to the stream's lifetime as well.
     drop(events);
     result.ok_or_else(|| io::Error::other("generation ended without a terminal event").into())
+}
+
+// The configured startup policy distinguishes protected ownership from an
+// unprotected memory shortage. Never accept a scheduler Busy, paused guard,
+// or another native owner as proof that A's residency pin prevented eviction.
+fn protected_pin_refusal(error: &EngineError) -> bool {
+    matches!(error, EngineError::Busy { active_request_id: None, message }
+        if message == "startup pressure policy rejected protected ownership: ProtectedResources")
 }
 
 fn run(
@@ -1100,6 +1108,47 @@ fn run(
     })?);
     let engine = EngineCore::new(registry, Scheduler::new(16)?, runtime);
     let mut monitor = Monitor::new(engine.clone(), enforcer, evidence.clone());
+    // Exercise an independent admission shortage before any model is loaded.
+    // This is an explicitly recorded reservation, not a fabricated physical
+    // memory observation. Occupy the full ledger so adaptive prefill cannot
+    // turn a one-byte shortage into a successful smaller startup.
+    let budget_hold = admission.reserve("M9 insufficient-budget acceptance hold", budget)?;
+    let shortage_result = generate(&engine, &mut monitor, &ids[1], "m9-large-b-no-budget")?;
+    require(
+        shortage_result.is_err(),
+        "a fully reserved ledger must reject B before native loading",
+    )?;
+    let shortage = shortage_result.expect_err("budget refusal checked");
+    require(
+        matches!(&shortage, EngineError::MemoryLimitExceeded { required_bytes, available_bytes, .. }
+            if required_bytes > available_bytes),
+        format!("insufficient budget must return MemoryLimitExceeded; got {shortage:?}"),
+    )?;
+    let empty = monitor.wait(engine.runtime().model_residency())??;
+    let denied_ledger = admission.snapshot()?;
+    let denied_observations = evidence.observations()?;
+    require(
+        empty.is_empty()
+            && engine.active_request_id()?.is_none()
+            && denied_observations.live.is_empty()
+            && !denied_observations.loader_entries.contains_key(MODEL_B)
+            && denied_ledger.reserved_bytes() == budget
+            && denied_ledger.active_reservations() == 1,
+        "insufficient-budget refusal loaded a model or leaked scheduler/reservation ownership",
+    )?;
+    drop(budget_hold);
+    require(
+        admission.snapshot()?.reserved_bytes() == 0,
+        "acceptance budget hold did not release",
+    )?;
+    evidence.emit(
+        "insufficient_budget_refusal_verified",
+        json!({
+            "error_kind": format!("{:?}", shortage.kind()), "message": shortage.to_string(),
+            "held_reservation_bytes": budget, "available_during_probe_bytes": 0,
+            "native_loader_calls": 0, "scheduler_idle": true, "hold_released": true,
+        }),
+    )?;
     require(
         generate(&engine, &mut monitor, &ids[0], "m9-large-a")?.is_ok(),
         "real 4B generation failed",
@@ -1130,9 +1179,14 @@ fn run(
     evidence.emit("model_a_pinned", json!({"artifact_id": MODEL_A}))?;
     let pinned_result = generate(&engine, &mut monitor, &ids[1], "m9-large-b-pinned")?;
     require(
-        pinned_result == Err(ErrorKind::MemoryLimitExceeded),
-        format!("pinned A must refuse B with MemoryLimitExceeded; got {pinned_result:?}"),
+        pinned_result
+            .as_ref()
+            .is_err_and(|error| protected_pin_refusal(error)),
+        format!(
+            "pinned A must refuse B specifically for protected resources; got {pinned_result:?}"
+        ),
     )?;
+    let pinned_error = pinned_result.expect_err("specific protected-owner refusal checked");
     let residents = monitor.wait(engine.runtime().model_residency())??;
     let observations = evidence.observations()?;
     require(
@@ -1144,11 +1198,12 @@ fn run(
     )?;
     require(
         admission.snapshot()?.reserved_bytes() == idle_a_bytes
+            && engine.active_request_id()?.is_none()
             && observations.live == BTreeSet::from([MODEL_A.into()])
             && !observations.loader_entries.contains_key(MODEL_B),
         "pinned refusal leaked a reservation or entered B's native loader",
     )?;
-    evidence.emit("pinned_refusal_verified", json!({"error_kind": "MemoryLimitExceeded", "model_a_same_instance": true, "model_a_preserved": true, "b_loader_calls": 0, "reservation_bytes": idle_a_bytes}))?;
+    evidence.emit("pinned_refusal_verified", json!({"error_kind": format!("{:?}", pinned_error.kind()), "reason": "ProtectedResources", "message": pinned_error.to_string(), "active_request_id": null, "model_a_same_instance": true, "model_a_preserved": true, "b_loader_calls": 0, "reservation_bytes": idle_a_bytes}))?;
     drop(pin);
     let residents = monitor.wait(engine.runtime().model_residency())??;
     require(
@@ -1222,6 +1277,7 @@ fn run(
             "commit_sha": expected_commit, "artifacts": [MODEL_A, MODEL_B],
             "artifact_sha256": [A_SHA256, B_SHA256], "execution_backend": "MlxMetal",
             "source_and_manifest_verified": true, "real_prefill_and_decode_both_models": true,
+            "insufficient_budget_refused_without_loading": true,
             "pinned_a_refused_b_and_preserved_a": true, "unpin_allowed_b": true,
             "actual_a_destruction_before_b_loader": true, "no_double_admission": true,
             "maximum_native_model_handles": 1, "shutdown_ledger_empty": true,
@@ -1330,6 +1386,27 @@ mod tests {
         assert!(constrained_budget(0, 300).is_err());
         assert!(constrained_budget(301, 300).is_err());
         assert!(1u64 + constrained_budget(100, 300).unwrap() > 300);
+    }
+    #[test]
+    fn pin_refusal_rejects_scheduler_busy_and_unrelated_memory_failures() {
+        let message = "startup pressure policy rejected protected ownership: ProtectedResources";
+        assert!(protected_pin_refusal(&EngineError::Busy {
+            active_request_id: None,
+            message: message.into(),
+        }));
+        assert!(!protected_pin_refusal(&EngineError::Busy {
+            active_request_id: Some("another-request".into()),
+            message: message.into(),
+        }));
+        assert!(!protected_pin_refusal(&EngineError::Busy {
+            active_request_id: None,
+            message: "admissions paused".into(),
+        }));
+        assert!(!protected_pin_refusal(&EngineError::MemoryLimitExceeded {
+            operation: "unrelated budget shortage",
+            required_bytes: 2,
+            available_bytes: 1,
+        }));
     }
     #[test]
     fn sha256_parser_rejects_noncanonical_pins() {
