@@ -74,6 +74,11 @@ impl ModelPinOwner {
         self.protection.strong_count() != 0
     }
 
+    /// Observe handle lifetime without acquiring residency protection.
+    pub(crate) fn protection_observer(&self) -> Weak<()> {
+        self.protection.clone()
+    }
+
     /// Acquire protection after executor-side identity and lifecycle checks.
     ///
     /// The `evicting` value must come from current executor-owned state,

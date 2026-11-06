@@ -459,6 +459,7 @@ impl RuntimeBackend for PolicyBackend {
 }
 
 struct PolicyEnvironment {
+    runtime: FamilyRuntime,
     engine: EngineCore<FamilyRuntime>,
     admission: AdmissionController,
     scheduler: Scheduler,
@@ -561,6 +562,14 @@ fn cache_entry_reservation(plan: &RuntimePlan) -> u64 {
 
 impl PolicyEnvironment {
     fn new(retention: RetentionPolicy, tight_budget: bool) -> Self {
+        Self::build(retention, tight_budget, false)
+    }
+
+    fn new_pool(tight_budget: bool) -> Self {
+        Self::build(retained_policy(), tight_budget, true)
+    }
+
+    fn build(retention: RetentionPolicy, tight_budget: bool, pooling: bool) -> Self {
         let fixture_a = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let fixture_b = TestEnvironment::new(POLICY_OUTPUT, 8, false);
         let context_limit = Qwen3Config::tiny_fixture().max_context;
@@ -649,7 +658,15 @@ impl PolicyEnvironment {
         )
         .expect("policy runtime");
 
+        let runtime = if pooling {
+            // No wall-clock expiration during switching tests.
+            runtime.with_model_pool(None).expect("enable model pool")
+        } else {
+            runtime
+        };
+
         Self {
+            runtime: runtime.clone(),
             engine: EngineCore::new(registry, scheduler.clone(), runtime),
             admission,
             scheduler,
@@ -1031,4 +1048,228 @@ fn policy_loading_failure_releases_partial_work_and_allows_recovery() {
     assert!(new_load < new_failure);
 
     successful(&environment.run("load-recovery", profile_b(), "hello"));
+}
+
+// These tests use actual safetensors checkpoints and Qwen execution.
+// The two artifacts have deterministic fixture contents, separate IDs,
+// and separate checkpoint directories.
+
+fn pool_instance(environment: &PolicyEnvironment, artifact: &ArtifactId) -> ModelInstanceId {
+    let entries =
+        block_on(environment.runtime.model_residency()).expect("inspect actual residents");
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|entry| &entry.artifact == artifact)
+        .collect();
+    assert_eq!(matches.len(), 1, "expected exactly one load of {artifact}");
+    matches[0].instance.clone()
+}
+
+#[test]
+fn pool_two_artifacts_reuse_original_instances() {
+    let environment = PolicyEnvironment::new_pool(false);
+
+    successful(&environment.run("pool-a-first", profile_a(), "hello"));
+    let original_a = pool_instance(&environment, &artifact_a());
+
+    successful(&environment.run("pool-b-first", profile_b(), "hello"));
+    let original_b = pool_instance(&environment, &artifact_b());
+
+    assert!(!original_a.same_instance(&original_b));
+    assert_eq!(
+        block_on(environment.runtime.model_residency())
+            .unwrap()
+            .len(),
+        2,
+    );
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+
+    successful(&environment.run("pool-a-again", profile_a(), "hello"));
+
+    assert!(
+        pool_instance(&environment, &artifact_a()).same_instance(&original_a),
+        "returning to A must reuse its original loaded instance",
+    );
+    assert!(
+        pool_instance(&environment, &artifact_b()).same_instance(&original_b),
+        "switching back to A must not destroy B",
+    );
+    assert_eq!(
+        environment.observations.loads.load(Ordering::Relaxed),
+        2,
+        "A -> B -> A must perform only two actual loads",
+    );
+
+    assert!(
+        !environment
+            .control
+            .events()
+            .iter()
+            .any(|event| event.kind == "model-destroyed"),
+        "both models fit, so neither should be destroyed",
+    );
+}
+
+#[test]
+fn pool_tight_budget_reclaims_a_before_loading_b() {
+    let environment = PolicyEnvironment::new_pool(true);
+
+    successful(&environment.run("pool-tight-a", profile_a(), "hello"));
+    let checkpoint = environment.control.events().len();
+    let idle = environment.snapshot();
+
+    assert!(
+        idle.reserved_bytes()
+            .checked_add(load_entry_reservation(&environment.plan_b))
+            .expect("combined demand")
+            > idle.budget_bytes(),
+        "test must require reclamation",
+    );
+
+    successful(&environment.run("pool-tight-b", profile_b(), "hello"));
+
+    let all_events = environment.control.events();
+    let events = &all_events[checkpoint..];
+    let destroyed_a = event_index(events, "model-destroyed", &artifact_a());
+    let load_b = event_index(events, "load-entered", &artifact_b());
+
+    assert!(destroyed_a < load_b);
+    assert_eq!(
+        events[load_b].snapshot.reserved_bytes(),
+        load_entry_reservation(&environment.plan_b),
+        "A's reservations must be gone before B's actual loading",
+    );
+
+    let entries = block_on(environment.runtime.model_residency()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].artifact, artifact_b());
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn pool_pinned_a_rejects_tight_switch_without_destroying_a() {
+    let environment = PolicyEnvironment::new_pool(true);
+
+    successful(&environment.run("pool-pin-a", profile_a(), "hello"));
+    let original_a = pool_instance(&environment, &artifact_a());
+    let pin = block_on(environment.runtime.pin_model(original_a.clone()))
+        .expect("pin command")
+        .expect("A exists");
+    let before = environment.snapshot();
+    let checkpoint = environment.control.events().len();
+
+    let attempt = block_on(environment.engine.generate(environment.request(
+        "pool-pin-b",
+        profile_b(),
+        "hello",
+    )));
+
+    match attempt {
+        Err(error) => assert!(
+            matches!(
+                error,
+                EngineError::MemoryLimitExceeded { .. } | EngineError::Busy { .. }
+            ),
+            "unexpected startup error: {error:?}",
+        ),
+        Ok(generation) => {
+            let mut stream = generation.into_events();
+            let limit = deadline();
+            let mut failed = false;
+            let mut completed = false;
+
+            while let Some(event) = next_event(&mut stream, limit) {
+                match event {
+                    GenerationEvent::RequestFailed { error, .. } => {
+                        assert!(
+                            matches!(
+                                error,
+                                EngineError::MemoryLimitExceeded { .. } | EngineError::Busy { .. }
+                            ),
+                            "unexpected worker error: {error:?}",
+                        );
+                        failed = true;
+                    }
+                    GenerationEvent::GenerationCompleted { .. } => completed = true,
+                    _ => {}
+                }
+            }
+            drop(stream);
+            assert!(failed && !completed, "pinned tight switch must fail");
+        }
+    }
+
+    environment.wait_idle();
+
+    assert_eq!(environment.snapshot(), before);
+    assert!(pool_instance(&environment, &artifact_a()).same_instance(&original_a),);
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 1);
+
+    let events = environment.control.events();
+    assert!(
+        !events[checkpoint..]
+            .iter()
+            .any(|event| event.kind == "model-destroyed"),
+        "failed admission must preserve pinned A",
+    );
+
+    drop(pin);
+    successful(&environment.run("pool-pin-b-retry", profile_b(), "hello"));
+    assert_eq!(environment.observations.loads.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn pool_per_model_ttl_respects_pins_and_releases_committed_weights() {
+    let environment = PolicyEnvironment::new_pool(false);
+
+    successful(&environment.run("pool-ttl-a", profile_a(), "hello"));
+    let retained_a = environment.snapshot();
+    let a = pool_instance(&environment, &artifact_a());
+    let pin = block_on(environment.runtime.pin_model(a.clone()))
+        .unwrap()
+        .expect("pin A");
+
+    successful(&environment.run("pool-ttl-b", profile_b(), "hello"));
+    let b = pool_instance(&environment, &artifact_b());
+
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(a.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap(),
+    );
+    assert!(
+        block_on(
+            environment
+                .runtime
+                .set_model_idle_ttl(b.clone(), Some(Duration::ZERO),)
+        )
+        .unwrap(),
+    );
+
+    // Command barriers permit the worker's between-command TTL maintenance.
+    // Zero TTL avoids sleeps and scheduler-sensitive duration thresholds.
+    let _ = block_on(environment.runtime.model_residency()).unwrap();
+    let entries = block_on(environment.runtime.model_residency()).unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].instance.same_instance(&a));
+    assert!(entries[0].pinned);
+    assert_eq!(
+        environment.snapshot(),
+        retained_a,
+        "B must release its reservations while pinned A retains its original state",
+    );
+
+    drop(pin);
+
+    let _ = block_on(environment.runtime.model_residency()).unwrap();
+    assert!(
+        block_on(environment.runtime.model_residency())
+            .unwrap()
+            .is_empty(),
+    );
+    environment.assert_empty();
 }

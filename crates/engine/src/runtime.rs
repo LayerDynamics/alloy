@@ -665,7 +665,7 @@ impl EngineRuntime for FamilyRuntime {
 
             if !summary.active
                 && summary.pin.strong_count() == 0
-                && (!summary.model_pinned || same_model)
+                && (summary.model_pin.strong_count() == 0 || same_model)
             {
                 let reclaim = if !same_model {
                     add(
@@ -1394,7 +1394,7 @@ struct Summary {
     alive: bool,
     active: bool,
     pin: Weak<()>,
-    model_pinned: bool,
+    model_pin: Weak<()>,
     artifact: Option<ArtifactId>,
     weights_bytes: u64,
     cache_bytes: u64,
@@ -1411,7 +1411,7 @@ impl Summary {
             alive,
             active: false,
             pin: Weak::new(),
-            model_pinned: false,
+            model_pin: Weak::new(),
             artifact: None,
             weights_bytes: 0,
             cache_bytes: 0,
@@ -3266,7 +3266,12 @@ impl NativeState {
     fn publish(&self) {
         let mut summary = Summary::empty(true);
         summary.active = self.active.is_some() || self.pending.is_some();
-        summary.model_pinned = self.selected_model_pinned();
+        summary.model_pin = self
+            .resident
+            .as_ref()
+            .or_else(|| self.states.values().next().map(|entry| &entry.resident))
+            .map(|resident| resident.pins.protection_observer())
+            .unwrap_or_default();
 
         let entry = self.states.values().next();
         if let Some(entry) = entry {
