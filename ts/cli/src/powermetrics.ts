@@ -206,6 +206,16 @@ function frequencyMhz(value: { [key: string]: Plist }): number | null {
   return number(value.freq); // The legacy `freq` field is explicitly MHz.
 }
 
+function gpuFrequencyMhz(value: { [key: string]: Plist }): number | null {
+  // Some Macs report GPU MHz under `freq_hz`, while CPU frequencies remain Hz.
+  // Recorded GPU value 749.789 MHz and regression evidence:
+  // https://github.com/gavi/monmon/blob/main/tests/fixtures/mac15-9-m3max-macos27.plist
+  // https://github.com/gavi/monmon/blob/main/tests/test_power.py
+  const raw = number(value.freq_hz);
+  if (raw !== null && raw < 100_000) return raw;
+  return frequencyMhz(value);
+}
+
 /**
  * Map observed plist keys only. Missing and invalid counters never become zero.
  * Primary schema examples:
@@ -234,7 +244,7 @@ export function parsePowerMetricsOutput(output: string, sampledAt = Date.now()):
     gpu_power_mw: number(processor.gpu_power),
     ane_power_mw: number(processor.ane_power),
     gpu_active_percent: activePercent(gpu),
-    gpu_frequency_mhz: frequencyMhz(gpu),
+    gpu_frequency_mhz: gpuFrequencyMhz(gpu),
     thermal_pressure: typeof root.thermal_pressure === "string" ? root.thermal_pressure : null,
     disk_read_bytes_per_second: number(disk.rbytes_per_s ?? root.rbytes_per_s),
     disk_write_bytes_per_second: number(disk.wbytes_per_s ?? root.wbytes_per_s),

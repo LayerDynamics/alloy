@@ -63,6 +63,20 @@ test("hardware sample preserves units, real zero ANE power, and active residency
   assert.ok(Math.abs(metrics.cpu_clusters[0]!.active_percent! - 40) < 0.000001);
 });
 
+test("GPU freq_hz accepts the recorded MHz encoding without changing CPU conversion", () => {
+  // GPU value from the real Mac15,9/macOS27 capture linked in gpuFrequencyMhz.
+  const metrics = parsePowerMetricsOutput(sample.replace("900000000", "749.789"));
+  assert.equal(metrics.gpu_frequency_mhz, 749.789);
+  assert.equal(metrics.cpu_clusters[0]!.frequency_mhz, 3000);
+});
+
+test("GPU frequency still accepts Hz and preserves zero and missing readings", () => {
+  assert.equal(parsePowerMetricsOutput(sample.replace("900000000", "888000000")).gpu_frequency_mhz, 888);
+  assert.equal(parsePowerMetricsOutput(sample.replace("900000000", "0")).gpu_frequency_mhz, 0);
+  const missing = sample.replace("<key>freq_hz</key><real>900000000</real>", "");
+  assert.equal(parsePowerMetricsOutput(missing).gpu_frequency_mhz, null);
+});
+
 test("missing hardware values stay null; energy is not mislabeled as power", () => {
   const metrics = parsePowerMetricsOutput(wrap(`
     <key>processor</key><dict>

@@ -29,6 +29,11 @@ representative two-large-model acceptance or mark M9 complete.
 ANE power is measured in watts/milliwatts, not percent occupancy. A missing
 ANE field is unavailable, not zero. GPU active residency is the fraction of
 the sampling interval in an active state, not a count of saturated GPU cores.
+GPU frequency accepts both observed `freq_hz` encodings: actual Hz and the
+MHz values emitted under that name by some macOS versions. GPU values below
+100,000 are interpreted as MHz; larger values are converted from Hz. CPU
+cluster Hz conversion is separate. This covers the recorded 749.789 MHz
+[macOS capture and regression](https://github.com/gavi/monmon/blob/main/tests/test_power.py).
 System RAM, allocator activity, daemon footprint and reserved bytes overlap;
 they must not be summed as independent CPU and GPU memory pools.
 
