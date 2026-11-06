@@ -18,7 +18,7 @@ use crate::{
     cancellation::CancellationToken,
     error::EngineError,
     registry::Registry,
-    scheduler::{ExecutionOutcome, ExecutionPermit, Scheduler},
+    scheduler::{ExecutionCancellationTarget, ExecutionOutcome, ExecutionPermit, Scheduler},
     types::{
         ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, Generation, GenerationEvent,
         GenerationEventStream, GenerationRequest, GenerationStream, MemoryEstimate, ModelProfileId,
@@ -273,6 +273,18 @@ impl<R: EngineRuntime> EngineCore<R> {
     /// Return the active execution owner, if any.
     pub fn active_request_id(&self) -> Result<Option<RequestId>, EngineError> {
         self.scheduler.active_request_id()
+    }
+
+    /// Snapshot the current execution for a delayed cancellation decision.
+    ///
+    /// Capture before observing the condition that may require interruption.
+    /// The target is bound to this scheduler and this execution lease, so it
+    /// cannot cancel a later request. It does not own native resources or the
+    /// scheduler permit and never waits on the native worker's command queue.
+    pub fn active_cancellation_target(
+        &self,
+    ) -> Result<Option<ExecutionCancellationTarget>, EngineError> {
+        self.scheduler.active_cancellation_target()
     }
 
     /// Borrow the concrete runtime (memory reclaim, admission controller).

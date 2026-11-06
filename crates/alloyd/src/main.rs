@@ -10,7 +10,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::task::{Context, Waker};
 use std::thread;
-use std::time::Duration;
 
 fn main() -> ExitCode {
     match run() {
@@ -190,19 +189,36 @@ fn run_memory_enforcer_loop(
     enforcer: engine::memory_enforcer::MemoryEnforcer,
     engine: engine::api::EngineCore<engine::runtime::FamilyRuntime>,
 ) {
-    let mut pump = engine::runtime::MemoryEnforcementPump::new(engine.runtime().clone(), enforcer);
+    let mut pump = engine::runtime::MemoryEnforcementPump::new(engine, enforcer);
     let waker = noop_waker();
     let mut context = Context::from_waker(&waker);
     let mut previous = PressureLevel::Ok;
+    let mut previous_emergency = false;
+    let mut last_cancellation = None;
     loop {
         // Never block pressure observation on an occupied native worker.
         // The pump owns at most one dispatched native action.
         match pump.poll_tick(&mut context) {
             Ok(poll) => {
                 let tick = poll.tick;
-                if tick.status.pressure != previous {
+                match (&tick.request_execution_cancellation, poll.cancellation) {
+                    (Some(target), Some(Ok(engine::types::CancelOutcome::Requested)))
+                        if last_cancellation.as_ref() != Some(target) =>
+                    {
+                        eprintln!(
+                            "alloyd: emergency cancellation requested for {} (native cleanup pending)",
+                            target.request_id().as_str(),
+                        );
+                        last_cancellation = Some(target.clone());
+                    }
+                    (_, Some(Err(error))) => {
+                        eprintln!("alloyd: emergency cancellation signal failed: {error}");
+                    }
+                    _ => {}
+                }
+                if tick.status.pressure != previous || tick.status.emergency != previous_emergency {
                     eprintln!(
-                        "alloyd: memory pressure {} -> {} (usage={} soft={} hard={} paused={} deferred={})",
+                        "alloyd: memory pressure {} -> {} (usage={} soft={} hard={} paused={} deferred={} emergency={})",
                         previous.as_str(),
                         tick.status.pressure.as_str(),
                         tick.status.usage_bytes,
@@ -210,8 +226,10 @@ fn run_memory_enforcer_loop(
                         tick.status.hard_bytes,
                         tick.status.admissions_paused,
                         tick.deferred_for_pool_drain,
+                        tick.status.emergency,
                     );
                     previous = tick.status.pressure;
+                    previous_emergency = tick.status.emergency;
                 }
                 match poll.completed {
                     Some(Ok(report)) => {
