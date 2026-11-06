@@ -48,6 +48,13 @@ admission budget.
   supported Apple GPU/Neural Engine measurements alongside the daemon's
   live memory ledger, pressure and execution state. This user-requested
   observability slice is specified in `docs/designs/live-monitor.md`.
+- User-requested first-run workflow for the existing Qwen3 starter profile:
+  standalone `alloy setup`, explicit pinned-model provisioning, foreground
+  `alloy start`, and read-only startup-readiness `alloy doctor`. The source
+  checkout builds its current daemon and validates API readiness. This narrow
+  bootstrap is specified in `docs/designs/startup.md`; it does not implement
+  the general model registry, release-binary distribution, or the full Phase-5
+  environment/wired-limit doctor report.
 
 ## Explicitly out of scope (do not build)
 
@@ -114,8 +121,10 @@ B.6 Phase-1 wire contract (pinned here; SPEC B.6 deferred schemas/errors/api_ver
   Informal plan prose that said sessions.* meant the B.6 session.* surface;
   wire names follow Appendix B.6 verbatim.
 ts/cli/ TypeScript CLI, Node 26.13.0 pin from DR-0001
-src/{main.ts,chat.ts,rpc-client.ts,args.ts,render.ts,settings.ts,setup.ts,daemon.ts}
-test/{args,render,settings}.test.ts
+src/{main.ts,chat.ts,rpc-client.ts,args.ts,render.ts,settings.ts,setup.ts,model.ts,daemon.ts,doctor.ts}
+src/{host-metrics.ts,powermetrics.ts,monitor.ts,monitor-types.ts,monitor-render.ts,monitor-history.ts}
+models/starter-model.json (same frozen Qwen3 identity as bench/corpus/models.json)
+test/{args,render,settings,settings-paths,setup,model,daemon,doctor,main,monitor,monitor-history,monitor-publication,host-metrics,powermetrics,rpc-client,rpc-client-malformed}.test.ts
 scripts/{qwen3_end_to_end_stream,session_restart_real_model}.sh
 package.json / bin/alloy.js
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document

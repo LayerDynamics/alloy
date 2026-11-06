@@ -17,6 +17,7 @@ export type MonitorRenderOptions = {
   interactive?: boolean;
   color?: boolean;
   history?: readonly MonitorHistorySample[];
+  nextStep?: string;
 };
 
 /** Treat every external value as text, including terminal and bidi controls. */
@@ -194,13 +195,13 @@ function pressureTone(pressure: string, emergency: boolean): Tone {
   return emergency || /emergency/i.test(pressure) ? "red" : /hard|soft/i.test(pressure) ? "amber" : /^(ok|normal)$/i.test(pressure) ? "green" : "muted";
 }
 
-function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number, history: readonly MonitorHistorySample[]): Line[] {
+function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number, history: readonly MonitorHistorySample[], nextStep?: string): Line[] {
   const { alloy } = snapshot;
   const metrics = alloy.metrics;
   if (metrics === null) return [
     [s("METRICS UNAVAILABLE", "amber", true), s(" · System monitoring continues", "muted")],
     line(`Connection: ${alloy.error ?? "Waiting for daemon.metrics"}`, "muted"),
-    line("Check alloyd and its socket; select another with --socket PATH.", "text"),
+    line(nextStep ?? "Check alloyd and its socket; select another with --socket PATH.", "text"),
     line("The monitor reconnects automatically; it does not start inference.", "muted"),
   ];
   const { admission, execution, residency, memory_guard: guard } = metrics;
@@ -210,6 +211,7 @@ function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number,
   const errors: Line = [];
   if (alloy.error) errors.push(...clipped(line(`Connection: ${alloy.error}`, "amber"), guard.last_error ? Math.floor(width / 2) : width));
   if (guard.last_error) errors.push(...line(`${errors.length ? " · " : ""}Guard error: ${guard.last_error}`, "amber"));
+  const residencyLine = line(`${errors.length ? `Guard ${guardAge} · ` : ""}Residency ${age(residency.sample_age_ms + elapsed)} · Models ${residency.models_resident} · Worker ${residency.worker_alive ? "alive" : "stopped"}`, "muted");
   const body: Line[] = [
     [s("Admission ", "muted"), s(admission.admissions_paused ? "PAUSED" : "OPEN", admission.admissions_paused ? "amber" : "green", true),
       s(" · Pressure ", "muted"), s(guard.emergency ? "EMERGENCY" : guard.pressure.toUpperCase(), pressureTone(guard.pressure, guard.emergency), true),
@@ -219,8 +221,9 @@ function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number,
       ? [s("Cancellation requested; cleanup pending", "amber", true), s(` · Request ${execution.active_request_id ?? "idle"}`, "muted")]
       : [s(execution.active_request_id === null ? "IDLE" : "RUNNING", execution.active_request_id === null ? "muted" : "green", true), s(` · Request ${execution.active_request_id ?? "none"}`)],
     errors.length ? errors : line(guardDetail, "muted"),
-    line(`${errors.length ? `Guard ${guardAge} · ` : ""}Residency ${age(residency.sample_age_ms + elapsed)} · Models ${residency.models_resident} · Worker ${residency.worker_alive ? "alive" : "stopped"}`, "muted"),
+    nextStep ? line(nextStep) : residencyLine,
   ];
+  if (nextStep && capacity > body.length) body.push(residencyLine);
   if (errors.length && capacity > body.length) body.push(line(guardDetail, "muted"));
   if (capacity > body.length) body.push(line(`Available ${formatBytes(admission.available_bytes)}${guard.cache_reclaim_requested ? " · Cache reclaim requested" : ""} · PID ${metrics.process_id}`, "muted"));
   if (capacity > body.length) body.push(trend("Reserved", history.map((item) => item.reserved_percent), width, "cyan"));
@@ -232,7 +235,7 @@ function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number,
   return body;
 }
 
-function compact(snapshot: MonitorSnapshot, width: number, height: number, history: readonly MonitorHistorySample[]): Line[] {
+function compact(snapshot: MonitorSnapshot, width: number, height: number, history: readonly MonitorHistorySample[], nextStep?: string): Line[] {
   const host = snapshot.host;
   const a = host?.accelerators;
   const metrics = snapshot.alloy.metrics;
@@ -262,6 +265,7 @@ function compact(snapshot: MonitorSnapshot, width: number, height: number, histo
     if (guard.last_error) add(line(`Guard error: ${guard.last_error}`, "amber"), 190);
   }
   if (snapshot.alloy.error) add(line(`Connection: ${snapshot.alloy.error}`, "amber"), 200);
+  if (nextStep) add(line(nextStep), 205);
   add(line(`Swap ${formatBytes(host?.swap_used_bytes ?? null)} · Wired ${formatBytes(host?.wired_bytes ?? null)} · Compressed ${formatBytes(host?.compressed_bytes ?? null)}`, "muted"), 75);
   add(line(`Thermal ${a?.thermal_pressure ?? "unavailable"}${a?.gpu_frequency_mhz == null ? "" : ` · GPU ${a.gpu_frequency_mhz.toFixed(0)} MHz`}`, "muted"), 70);
   add(line("Full panels: 60 columns × 22 terminal rows", "muted"), 1);
@@ -285,7 +289,7 @@ export function renderMonitorSnapshot(snapshot: MonitorSnapshot, options: Monito
     : `q quit · Ctrl+C exit · ${(options.intervalMs ?? 1000) / 1000}s · · = missing · RAM non-free incl. caches`;
   let lines: Line[];
   if (width < 60 || height < 21) {
-    lines = compact(snapshot, width, height, history);
+    lines = compact(snapshot, width, height, history, options.nextStep);
   } else {
     const clock = new Date(snapshot.sampled_at_unix_ms).toLocaleTimeString("en-GB", { hour12: false });
     const left = [s(" ALLOY ", "cyan", true), s(" / LIVE MONITOR", "text", true)];
@@ -305,7 +309,7 @@ export function renderMonitorSnapshot(snapshot: MonitorSnapshot, options: Monito
       const accelerators = panel("ACCELERATORS", powerTag, acceleratorsBody(host, rightWidth - 4, sideHeight - 2, history), rightWidth, sideHeight);
       for (let row = 0; row < sideHeight; row++) lines.push([...system[row]!, s("  "), ...accelerators[row]!]);
       lines.push([]);
-      lines.push(...panel("ALLOY RUNTIME", runtimeTag, runtimeBody(snapshot, width - 4, runtimeHeight - 2, history), width, runtimeHeight));
+      lines.push(...panel("ALLOY RUNTIME", runtimeTag, runtimeBody(snapshot, width - 4, runtimeHeight - 2, history, options.nextStep), width, runtimeHeight));
     } else {
       const sizes = [6, 5, 7];
       const caps = [13, 14, 14];
@@ -315,7 +319,7 @@ export function renderMonitorSnapshot(snapshot: MonitorSnapshot, options: Monito
       }
       lines.push(...panel("SYSTEM", hostTag, systemBody(snapshot, width - 4, sizes[0]! - 2, history), width, sizes[0]!));
       lines.push(...panel("ACCELERATORS", powerTag, acceleratorsBody(host, width - 4, sizes[1]! - 2, history), width, sizes[1]!));
-      lines.push(...panel("ALLOY RUNTIME", runtimeTag, runtimeBody(snapshot, width - 4, sizes[2]! - 2, history), width, sizes[2]!));
+      lines.push(...panel("ALLOY RUNTIME", runtimeTag, runtimeBody(snapshot, width - 4, sizes[2]! - 2, history, options.nextStep), width, sizes[2]!));
     }
   }
   lines = lines.slice(0, Math.max(0, height - 1));

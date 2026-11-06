@@ -34,3 +34,49 @@ test("loadSettings returns null when missing", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-empty-"));
   assert.equal(loadSettings(home), null);
 });
+
+test("malformed configuration reports its path and recovery action without rewriting it", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-invalid-settings-"));
+  try {
+    fs.mkdirSync(alloyHome(home));
+    for (const content of ["{bad json", "null", JSON.stringify({ ...defaultSettings(home), version: 2 }),
+      JSON.stringify({ ...defaultSettings(home), socket: 42 }),
+      JSON.stringify({ ...defaultSettings(home), artifact: "bad\u0000path" })]) {
+      fs.writeFileSync(settingsPath(home), content);
+      assert.throws(() => loadSettings(home), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes(settingsPath(home)));
+        assert.match(error.message, /alloy setup/);
+        return true;
+      });
+      assert.equal(fs.readFileSync(settingsPath(home), "utf8"), content);
+    }
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("legacy optional corpus setting is normalized while future fields survive", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-legacy-settings-"));
+  try {
+    const { corpus_models: _pins, ...legacy } = defaultSettings(home);
+    fs.mkdirSync(alloyHome(home));
+    fs.writeFileSync(settingsPath(home), JSON.stringify({ ...legacy, future_setting: "preserved" }));
+    const loaded = loadSettings(home)!;
+    assert.equal(loaded.corpus_models, null);
+    saveSettings(loaded, home);
+    assert.equal(JSON.parse(fs.readFileSync(settingsPath(home), "utf8")).future_setting, "preserved");
+    assert.equal(fs.statSync(settingsPath(home)).mode & 0o777, 0o600);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("a failed atomic save preserves the previous configuration and removes its temporary file", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-save-failure-"));
+  try {
+    const initial = { ...defaultSettings(home), artifact: "/original/model" };
+    saveSettings(initial, home);
+    const before = fs.readFileSync(settingsPath(home), "utf8");
+    t.mock.method(fs, "renameSync", () => { throw new Error("simulated publication failure"); });
+    assert.throws(() => saveSettings({ ...initial, artifact: "/replacement/model" }, home), /publication failure/);
+    assert.equal(fs.readFileSync(settingsPath(home), "utf8"), before);
+    assert.deepEqual(fs.readdirSync(alloyHome(home)), ["settings.json"]);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

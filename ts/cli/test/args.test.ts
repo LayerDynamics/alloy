@@ -35,16 +35,30 @@ test("parseArgv --setup and --socket", () => {
     "--setup",
     "--socket",
     "/tmp/x.sock",
-    "--resume",
-    "sess-9",
   ]);
   assert.equal(args.forceSetup, true);
   assert.equal(args.socket, "/tmp/x.sock");
-  assert.equal(args.resume, "sess-9");
+  assert.equal(args.command, "setup");
 });
 
 test("parseArgv rejects unknown argument", () => {
-  assert.throws(() => parseArgv(["node", "alloy", "doctor"]), /unknown argument/);
+  assert.throws(() => parseArgv(["node", "alloy", "unknown-command"]), /unknown argument/);
+});
+
+test("startup commands keep provisioning explicit and read-only commands reject it", () => {
+  const setup = parseArgv(["node", "alloy", "setup", "--download", "--artifact", "/models/qwen", "--corpus-models", "/pins.json"]);
+  assert.equal(setup.command, "setup");
+  assert.equal(setup.download, true);
+  assert.equal(setup.artifact, "/models/qwen");
+  assert.equal(setup.corpusModels, "/pins.json");
+  assert.equal(parseArgv(["node", "alloy", "start"]).command, "start");
+  assert.equal(parseArgv(["node", "alloy", "doctor", "--json"]).json, true);
+  for (const command of ["chat", "doctor", "monitor"]) {
+    assert.throws(() => parseArgv(["node", "alloy", command, "--download"]));
+  }
+  for (const command of ["setup", "start", "doctor"]) {
+    assert.throws(() => parseArgv(["node", "alloy", command, "-m", "hello"]), /chat messages/);
+  }
 });
 
 test("monitor flags select a read-only one-shot JSON capture", () => {

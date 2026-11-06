@@ -7,6 +7,7 @@ import { RpcClient, type RpcConnectionOptions } from "./rpc-client.js";
 import type { AlloySettings } from "./settings.js";
 import { MonitorHistory } from "./monitor-history.js";
 import { renderMonitorSnapshot } from "./monitor-render.js";
+import { MonitorReadiness } from "./doctor.js";
 export { formatBytes, renderMonitorSnapshot } from "./monitor-render.js";
 
 export interface MetricsRpcClient {
@@ -89,6 +90,28 @@ export class DaemonMetricsReader {
   }
 }
 
+/** Re-date the frame at publication; native samples retain their original time bases. */
+export function refreshMonitorAges(snapshot: MonitorSnapshot, now = Date.now()): MonitorSnapshot {
+  const host = snapshot.host;
+  const powerTime = host?.accelerators.sampled_at_unix_ms;
+  return {
+    ...snapshot,
+    sampled_at_unix_ms: now,
+    host_sample_age_ms: host === null ? null : Math.max(0, now - host.sampled_at_unix_ms),
+    host: host === null ? null : {
+      ...host,
+      accelerators: {
+        ...host.accelerators,
+        age_ms: powerTime === null || powerTime === undefined ? null : Math.max(0, now - powerTime),
+      },
+    },
+    alloy: {
+      ...snapshot.alloy,
+      sample_age_ms: snapshot.alloy.metrics === null ? null : Math.max(0, now - snapshot.alloy.metrics.sampled_at_unix_ms),
+    },
+  };
+}
+
 /** Fresh host data survives daemon errors, and retained samples carry their age. */
 export async function collectMonitorSnapshot(
   collector: HostMetricsCollector,
@@ -103,25 +126,21 @@ export async function collectMonitorSnapshot(
     ...sourceHost,
     accelerators: {
       ...sourceHost.accelerators,
-      age_ms: sourcePower?.sampled_at_unix_ms === null || sourcePower?.sampled_at_unix_ms === undefined
-        ? null : Math.max(0, now - sourcePower.sampled_at_unix_ms),
       status: hostResult.status === "rejected" && sourcePower?.sampled_at_unix_ms !== null && sourcePower?.status === "ready"
         ? "stale" as const : sourceHost.accelerators.status,
       error: hostResult.status === "rejected" ? message(hostResult.reason) : sourceHost.accelerators.error,
     },
   };
-  const alloy = alloyResult.status === "fulfilled" ? {
-    ...alloyResult.value,
-    sample_age_ms: alloyResult.value.metrics === null ? null : Math.max(0, now - alloyResult.value.metrics.sampled_at_unix_ms),
-  } : { status: "unavailable" as const, sample_age_ms: null, metrics: null, error: message(alloyResult.reason) };
-  return {
+  const alloy = alloyResult.status === "fulfilled" ? alloyResult.value
+    : { status: "unavailable" as const, sample_age_ms: null, metrics: null, error: message(alloyResult.reason) };
+  return refreshMonitorAges({
     schema_version: 1,
     sampled_at_unix_ms: now,
     host,
-    host_sample_age_ms: host === null ? null : Math.max(0, now - host.sampled_at_unix_ms),
+    host_sample_age_ms: null,
     host_error: hostResult.status === "rejected" ? message(hostResult.reason) : null,
     alloy,
-  };
+  }, now);
 }
 
 /** Await each write so a slow JSON consumer cannot create an unbounded queue. */
@@ -158,9 +177,15 @@ function brokenPipe(error: unknown): boolean {
 }
 
 /** Read-only monitor: no session creation, daemon launch, or runtime mutation. */
-export async function runMonitor(settings: AlloySettings, args: CliArgs): Promise<number> {
+export async function runMonitor(settings: AlloySettings, args: CliArgs, options: {
+  configurationError?: string;
+  reloadSettings?: () => AlloySettings | null;
+} = {}): Promise<number> {
   const collector = createHostMetricsCollector({ powermetrics: args.powermetrics, intervalMs: args.intervalMs });
-  const reader = new DaemonMetricsReader(settings.socket, Math.min(2000, Math.max(500, args.intervalMs)));
+  const timeoutMs = Math.min(2000, Math.max(500, args.intervalMs));
+  let activeSettings = settings;
+  let reader = new DaemonMetricsReader(settings.socket, timeoutMs);
+  const readiness = new MonitorReadiness(settings, { ...options, ...(args.socket === undefined ? {} : { socket: args.socket }) });
   const abort = new AbortController();
   const interactive = !args.once && !args.json && process.env.TERM !== "dumb" && Boolean(process.stdout.isTTY && process.stdin.isTTY);
   const once = args.once || (!args.json && !interactive);
@@ -198,8 +223,24 @@ export async function runMonitor(settings: AlloySettings, args: CliArgs): Promis
     }
     while (!abort.signal.aborted) {
       const started = Date.now();
-      const snapshot = await collectMonitorSnapshot(collector, reader, previousHost);
+      let snapshot = await collectMonitorSnapshot(collector, reader, previousHost);
       if (abort.signal.aborted) break;
+      let nextStep: string | undefined;
+      if (snapshot.alloy.status === "unavailable") {
+        const advice = await readiness.refresh(snapshot.alloy.error, { signal: abort.signal });
+        if (abort.signal.aborted) break;
+        nextStep = advice.nextStep;
+        // Setup may finish in another terminal. Keep an explicit --socket,
+        // otherwise reconnect to the newly saved target on the next poll.
+        if (advice.settings.socket !== activeSettings.socket) {
+          reader.close();
+          reader = new DaemonMetricsReader(advice.settings.socket, timeoutMs);
+        }
+        activeSettings = advice.settings;
+      }
+      // Local readiness work can take time. History, text and JSON must all
+      // expose the age at publication, not the age before that work began.
+      snapshot = refreshMonitorAges(snapshot);
       previousHost = snapshot.host;
       lastSnapshot = snapshot;
       if (!args.json) history.push(snapshot);
@@ -213,6 +254,7 @@ export async function runMonitor(settings: AlloySettings, args: CliArgs): Promis
           interactive,
           color: interactive && process.env.NO_COLOR === undefined && process.env.TERM !== "dumb",
           history: history.snapshot(),
+          ...(nextStep === undefined ? {} : { nextStep }),
         });
         // Clear each row's old tail and any removed rows without blanking the
         // whole screen first. Shorter errors and terminal resizes leave no debris.

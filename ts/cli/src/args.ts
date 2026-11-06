@@ -1,11 +1,12 @@
 export type CliArgs = {
-  command: "chat" | "monitor";
+  command: "chat" | "monitor" | "setup" | "start" | "doctor";
   forceSetup: boolean;
   profile?: string;
   socket?: string;
   db?: string;
   artifact?: string;
   alloydBin?: string;
+  corpusModels?: string;
   message?: string;
   resume?: string;
   help: boolean;
@@ -13,24 +14,27 @@ export type CliArgs = {
   json: boolean;
   intervalMs: number;
   powermetrics: boolean;
+  download: boolean;
 };
 
 export function parseArgv(argv: string[]): CliArgs {
   const args = argv.slice(2);
   let i = 0;
-  const command = args[0] === "monitor" ? "monitor" : "chat";
-  if (args[0] === "chat" || args[0] === "monitor") {
+  const commands = ["chat", "monitor", "setup", "start", "doctor"] as const;
+  const command: CliArgs["command"] = commands.includes(args[0] as CliArgs["command"]) ? args[0] as CliArgs["command"] : "chat";
+  if (commands.includes(args[0] as CliArgs["command"])) {
     i = 1;
   }
 
   const out: CliArgs = {
     command,
-    forceSetup: false,
+    forceSetup: command === "setup",
     help: false,
     once: false,
     json: false,
     intervalMs: 1000,
     powermetrics: false,
+    download: false,
   };
 
   for (; i < args.length; i++) {
@@ -71,6 +75,12 @@ export function parseArgv(argv: string[]): CliArgs {
       case "--alloyd-bin":
         out.alloydBin = need();
         break;
+      case "--corpus-models":
+        out.corpusModels = need();
+        break;
+      case "--download":
+        out.download = true;
+        break;
       case "-m":
       case "--message":
         out.message = need();
@@ -83,7 +93,7 @@ export function parseArgv(argv: string[]): CliArgs {
         out.once = true;
         break;
       case "--json":
-        monitorOnly();
+        if (command !== "monitor" && command !== "doctor") throw new Error("--json is only valid with alloy monitor or alloy doctor");
         out.json = true;
         break;
       case "--interval": {
@@ -108,9 +118,20 @@ export function parseArgv(argv: string[]): CliArgs {
   if (command === "monitor") {
     if (out.forceSetup || out.message !== undefined || out.resume !== undefined ||
         out.profile !== undefined || out.db !== undefined || out.artifact !== undefined ||
-        out.alloydBin !== undefined) {
+        out.alloydBin !== undefined || out.corpusModels !== undefined || out.download) {
       throw new Error("alloy monitor accepts --socket, --once, --json, --interval, and --powermetrics; chat/setup options do not apply");
     }
+  }
+
+  if (out.forceSetup) {
+    if (command !== "chat" && command !== "setup") throw new Error("--setup is a standalone command; use alloy setup");
+    out.command = "setup";
+  }
+  if (out.download && out.command !== "setup" && out.command !== "start") {
+    throw new Error("--download is only valid with alloy setup or alloy start");
+  }
+  if (["setup", "start", "doctor"].includes(out.command) && (out.message !== undefined || out.resume !== undefined)) {
+    throw new Error(`${out.command} does not send chat messages or resume sessions; run alloy chat separately`);
   }
 
   return out;

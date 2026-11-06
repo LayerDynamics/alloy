@@ -78,6 +78,15 @@ The monitor connects to the selected daemon socket. It does not start the
 daemon or change its placement, and system GPU activity alone does not
 identify which execution path that daemon uses.
 
+When disconnected, the monitor shows a local readiness action: guided
+`alloy start`, configuration/model repair through `alloy setup`, or socket/API
+diagnosis. These are suggestions, never implicit mutations. Setup advice uses
+bounded model preflight and is cached for ten seconds. Saved configuration is
+reloaded during these checks; an explicit `--socket` always takes precedence.
+If the saved socket changes, the old reader is closed and the next poll uses
+the new socket. See [the startup contract](startup.md). Advice is display-only
+and does not add fields to the monitor JSON schema.
+
 ## Measurements and their meaning
 
 | Section | Measurements | Source and limits |
@@ -148,8 +157,10 @@ The capture's `alloy.sample_age_ms` is the age of the retained daemon response
 at frame publication. Within `alloy.metrics`, residency and guard ages retain
 their meaning at that daemon response's `sampled_at_unix_ms`; add the outer
 response age to obtain their age at capture. The terminal performs that
-addition. Host accelerator ages are recalculated at frame publication, and
-a failed host poll marks retained accelerator data stale.
+addition. Host, accelerator and outer daemon ages are recalculated at frame
+publication after any local readiness checks, so time spent preparing advice
+does not make old samples look fresh. A failed host poll marks retained
+accelerator data stale.
 
 Required checks for this feature:
 
