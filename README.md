@@ -172,6 +172,11 @@ a compact view; very short windows prioritize pressure, pending cleanup and
 source freshness. Full panels need at least 60 columns and 22 terminal rows.
 `TERM=dumb` prints one plain snapshot.
 
+On macOS, the default monitor reads GPU utilization through IORegistry as
+the current user. No `sudo`, power-sampling flag or running daemon is needed
+for that graph. Unsupported driver counters remain unavailable. GPU samples
+have their own status and timestamp, independent of optional power readings.
+
 The runtime panel shows the live admission budget, reserved memory, pressure,
 request and cached model-residency metadata. The monitor stays usable when
 `alloyd` is unavailable and shows the next setup/start or connection-repair
@@ -180,8 +185,8 @@ can follow setup in another terminal; an explicit `--socket` remains fixed.
 An older daemon without `daemon.metrics` must be stopped and restarted with
 the current build. Monitoring itself never starts a daemon or downloads a model.
 
-For supported Apple CPU/GPU/Neural Engine power and GPU activity counters,
-authorize Apple's sampler in the same terminal, then enable it:
+For additional Apple CPU/GPU/Neural Engine power, frequency and thermal
+counters, optionally authorize Apple's power sampler in the same terminal:
 
 ```bash
 sudo -v
@@ -190,8 +195,8 @@ node ts/cli/bin/alloy.js monitor --powermetrics
 
 Only the bounded `powermetrics` child uses `sudo -n`. The CLI remains a normal
 user process and does not collect a password or change sudoers. Without
-permission, the monitor explains the unavailable accelerator measurements
-and continues showing the other data. ANE power is an estimated component
+permission, only this optional power source is unavailable; the independent
+GPU utilization graph continues updating. ANE power is an estimated component
 power reading, not ANE utilization percentage or proof that Alloy is using
 ANE. Alloy retains its existing unified CPU/Metal execution path.
 
@@ -201,7 +206,7 @@ snapshot, or record a stream of JSON snapshots for comparison:
 
 ```bash
 node ts/cli/bin/alloy.js monitor --once --json
-node ts/cli/bin/alloy.js monitor --powermetrics --json > /tmp/alloy-monitor.ndjson
+node ts/cli/bin/alloy.js monitor --json > /tmp/alloy-monitor.ndjson
 ```
 
 Missing measurements are `null`, distinct from zero; stale readings carry

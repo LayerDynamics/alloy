@@ -337,7 +337,7 @@ export class PowerMetricsCollector {
         status: signal.aborted ? "stopped" : status,
         age_ms: this.#last.sampled_at_unix_ms === null ? null : Math.max(0, this.#now() - this.#last.sampled_at_unix_ms),
         error: /password|sudo:.*(?:terminal|tty|authentication)/i.test(detail)
-          ? "Hardware access needs authorization. Run sudo -v in this terminal, then retry --powermetrics."
+          ? "Optional power metrics need authorization. Run sudo -v for --powermetrics."
           : detail.slice(0, 400),
       };
     }

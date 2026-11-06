@@ -297,3 +297,74 @@ test("polls cannot overlap and closing cancels an in-flight read", async () => {
   assert.equal((await first).status, "unavailable");
   resolveCall?.(metrics());
 });
+
+
+test("IORegistry GPU utilization remains visible when optional power sampling is disabled or unauthorized", () => {
+  for (const powerStatus of ["disabled", "unavailable"] as const) {
+    const sample = snapshot();
+    sample.host!.gpu = {
+      source: "ioreg", status: "ready", sampled_at_unix_ms: sample.sampled_at_unix_ms,
+      age_ms: 0, utilization_percent: 37.5,
+      devices: [{ id: "42", name: "Apple GPU", utilization_percent: 37.5 }], error: null,
+    };
+    sample.host!.accelerators = emptyPowerMetrics(powerStatus,
+      powerStatus === "unavailable" ? "Power sampling needs authorization" : null);
+    for (const [columns, rows] of [[80, 24], [120, 35], [50, 18]] as const) {
+      const text = renderMonitorSnapshot(sample, { columns, rows });
+      assert.match(text, /GPU use.*37\.5%/);
+      assert.match(text, /GPU ready.*0\.0s old/);
+      assert.match(text, powerStatus === "disabled" ? /Power (?:optional|disabled)/ : /Power unavailable/);
+      assert.doesNotMatch(text, /ACCELERATORS unavailable|Hardware.*authorization/);
+      assert.ok(text.split("\n").length <= rows);
+      assert.ok(text.split("\n").every((row) => monitorTextWidth(row) <= columns));
+    }
+  }
+});
+
+test("a stale IORegistry GPU reading keeps its own error and age while power remains fresh", () => {
+  const sample = snapshot();
+  sample.host!.gpu = {
+    source: "ioreg", status: "stale", sampled_at_unix_ms: sample.sampled_at_unix_ms - 30_000,
+    age_ms: 30_000, utilization_percent: 25,
+    devices: [{ id: "42", name: "Apple GPU", utilization_percent: 25 }], error: "registry probe failed",
+  };
+  sample.host!.accelerators = {
+    ...emptyPowerMetrics("ready"), sampled_at_unix_ms: sample.sampled_at_unix_ms, age_ms: 0,
+    ane_power_mw: 0, gpu_active_percent: 99,
+  };
+  for (const [columns, rows] of [[120, 35], [80, 24], [50, 18]] as const) {
+    const text = renderMonitorSnapshot(sample, { columns, rows });
+    assert.match(text, /GPU stale.*30\.0s old/);
+    assert.match(text, /GPU use.*25\.0%/);
+    assert.match(text, /registry probe failed/);
+    assert.doesNotMatch(text, /GPU active.*99\.0%/);
+  }
+});
+
+test("multiple GPU utilization is explicitly the busiest reporting device", () => {
+  const sample = snapshot();
+  sample.host!.gpu = {
+    source: "ioreg", status: "ready", sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, utilization_percent: 80,
+    devices: [{ id: "42", name: "GPU A", utilization_percent: 20 }, { id: "43", name: "GPU B", utilization_percent: 80 }], error: null,
+  };
+  const text = renderMonitorSnapshot(sample, { columns: 120, rows: 35 });
+  assert.match(text, /GPU busiest.*80\.0%/);
+  assert.match(text, /busiest of 2 reporting GPUs/);
+  sample.host!.gpu.devices[0]!.utilization_percent = null;
+  assert.match(renderMonitorSnapshot(sample, { columns: 120, rows: 35 }), /busiest of 1 reporting GPU/);
+});
+
+test("missing ANE samples have no invented power scale or unavailable-per-second rates", () => {
+  const sample = snapshot();
+  const missing = renderMonitorSnapshot(sample, { columns: 120, rows: 35 });
+  assert.match(missing, /ANE trend unavailable/);
+  assert.match(missing, /ESTIMATED POWER · unavailable/);
+  assert.doesNotMatch(missing, /ANE 0–|unavailable\/s|Disk R\/W|Network ↓\/↑/);
+  const measuredZero = renderMonitorSnapshot(sample, { columns: 120, rows: 35, history: [{
+    at_unix_ms: sample.sampled_at_unix_ms, cpu_percent: 0, memory_percent: 50,
+    gpu_percent: 0, ane_power_mw: 0, reserved_percent: 0,
+  }] });
+  assert.match(measuredZero, /ANE 0–1 mW.*▁/);
+  assert.doesNotMatch(measuredZero, /ANE trend unavailable/);
+});

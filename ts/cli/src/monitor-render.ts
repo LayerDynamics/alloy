@@ -1,6 +1,7 @@
 import type { HostMetricsSnapshot } from "./host-metrics.js";
 import type { MonitorHistorySample } from "./monitor-history.js";
 import type { MonitorSnapshot } from "./monitor-types.js";
+import { monitorGpuReading } from "./monitor-gpu.js";
 
 type Tone = "text" | "muted" | "border" | "cyan" | "blue" | "violet" | "green" | "amber" | "red";
 type Span = { text: string; tone: Tone; bold: boolean };
@@ -156,38 +157,55 @@ function systemBody(snapshot: MonitorSnapshot, width: number, capacity: number, 
 function acceleratorsBody(host: HostMetricsSnapshot | null, width: number, capacity: number, history: readonly MonitorHistorySample[]): Line[] {
   if (host === null) return [line("Hardware sample unavailable", "amber")];
   const a = host.accelerators;
+  const reading = monitorGpuReading(host);
   const frequency = a.gpu_frequency_mhz === null ? "frequency unavailable" : `${a.gpu_frequency_mhz.toFixed(0)} MHz`;
   const thermal: Line = [s("Thermal ", "muted"), s(a.thermal_pressure ?? "unavailable", /serious|critical/i.test(a.thermal_pressure ?? "") ? "red" : "text")];
-  const note = a.error ?? (a.status === "disabled" ? "Enable with --powermetrics; authorize sudo -v first" : "source: powermetrics");
-  const gpu = meter("GPU active", a.gpu_active_percent, percent(a.gpu_active_percent), width, "violet");
+  const note = a.error
+    ? `Power ${a.status} · ${age(a.age_ms)} · ${a.error}`
+    : a.status === "disabled" ? "Power optional · enable --powermetrics"
+      : `Power ${a.status} · ${age(a.age_ms)} · powermetrics`;
+  const gpu = meter(reading.label, reading.percent, percent(reading.percent), width, "violet");
+  const gpuNote = reading.error ? `GPU ${reading.status} · ${reading.error}` : reading.description;
   if (capacity < 8) {
     const body = [gpu, line(`Est. power  CPU ${power(a.cpu_power_mw)} · GPU ${power(a.gpu_power_mw)} · ANE ${power(a.ane_power_mw)}`, "blue"),
-      [...thermal, s(` · ${a.error || a.status === "disabled" ? note : frequency}`, a.error ? "amber" : "muted")]];
+      line(reading.error && host.gpu ? gpuNote : note, reading.error || a.error ? "amber" : "muted")];
+    if (reading.error && host.gpu && capacity > body.length) body.push(line(note, a.error ? "amber" : "muted"));
     if (capacity > body.length) body.push(trend("GPU", history.map((item) => item.gpu_percent), width, "violet"));
-    if (capacity > body.length) body.push(line(note, a.error ? "amber" : "muted"));
-    if (capacity > body.length) body.push(line("GPU = active residency · ANE = power, not occupancy", "muted"));
+    if (capacity > body.length && !(reading.error && host.gpu)) body.push(line(gpuNote, reading.error ? "amber" : "muted"));
+    if (capacity > body.length) body.push([...thermal, s(` · ${frequency}`, "muted")]);
+    if (capacity > body.length) body.push(line("ANE = estimated power, not occupancy", "muted"));
     return body;
   }
   const powers = [a.cpu_power_mw, a.gpu_power_mw, a.ane_power_mw];
-  const scale = Math.max(1000, ...powers.filter((value): value is number => value !== null && Number.isFinite(value)));
+  const measuredPowers = powers.filter((value): value is number => value !== null && Number.isFinite(value) && value >= 0);
+  const scale = Math.max(1000, ...measuredPowers);
   const body = [gpu, trend("GPU", history.map((item) => item.gpu_percent), width, "violet"),
-    [...thermal, s(` · ${frequency}`, "muted")],
-    line(`ESTIMATED POWER · full bar ${power(scale)}`, "muted"),
+    reading.error && host.gpu ? line(gpuNote, "amber") : line(reading.description, "muted"),
+    line(measuredPowers.length ? `ESTIMATED POWER · full bar ${power(scale)}` : "ESTIMATED POWER · unavailable", "muted"),
     meter("CPU", ratio(a.cpu_power_mw, scale), power(a.cpu_power_mw), width, "cyan"),
     meter("GPU", ratio(a.gpu_power_mw, scale), power(a.gpu_power_mw), width, "blue"),
     meter("ANE", ratio(a.ane_power_mw, scale), power(a.ane_power_mw), width, "violet"),
     line(note, a.error ? "amber" : "muted"),
   ];
   const aneHistory = history.map((item) => item.ane_power_mw);
-  const aneScale = Math.max(1, ...aneHistory.filter((value): value is number => value !== null));
-  if (capacity > body.length) body.push(trend(`ANE 0–${power(aneScale)}`, aneHistory, width, "violet", aneScale));
-  if (capacity > body.length) body.push(line(`ANE trend 0–${power(aneScale)} · power, not occupancy`, "muted"));
+  const aneValues = aneHistory.filter((value): value is number => value !== null && Number.isFinite(value) && value >= 0);
+  const aneScale = Math.max(1, ...aneValues);
+  if (capacity > body.length) body.push(aneValues.length
+    ? trend(`ANE 0–${power(aneScale)}`, aneHistory, width, "violet", aneScale)
+    : line("ANE trend unavailable · power, not occupancy", "muted"));
+  if (aneValues.length && capacity > body.length) body.push(line(`ANE trend 0–${power(aneScale)} · power, not occupancy`, "muted"));
+  if (capacity > body.length) body.push([...thermal, s(` · ${frequency}`, "muted")]);
   for (const cluster of a.cpu_clusters) {
     if (capacity <= body.length) break;
     body.push(meter(cluster.name, cluster.active_percent, `${percent(cluster.active_percent)}${cluster.frequency_mhz === null ? "" : ` · ${cluster.frequency_mhz.toFixed(0)} MHz`}`, width, "cyan"));
   }
-  if (capacity > body.length) body.push(line(`Disk R/W  ${formatBytes(a.disk_read_bytes_per_second)}/s / ${formatBytes(a.disk_write_bytes_per_second)}/s`, "muted"));
-  if (capacity > body.length) body.push(line(`Network ↓/↑  ${formatBytes(a.network_in_bytes_per_second)}/s / ${formatBytes(a.network_out_bytes_per_second)}/s`, "muted"));
+  const rate = (value: number | null): string => value === null ? "unavailable" : `${formatBytes(value)}/s`;
+  if (capacity > body.length && (a.disk_read_bytes_per_second !== null || a.disk_write_bytes_per_second !== null)) {
+    body.push(line(`Disk R/W  ${rate(a.disk_read_bytes_per_second)} / ${rate(a.disk_write_bytes_per_second)}`, "muted"));
+  }
+  if (capacity > body.length && (a.network_in_bytes_per_second !== null || a.network_out_bytes_per_second !== null)) {
+    body.push(line(`Network ↓/↑  ${rate(a.network_in_bytes_per_second)} / ${rate(a.network_out_bytes_per_second)}`, "muted"));
+  }
   return body;
 }
 
@@ -238,6 +256,7 @@ function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number,
 function compact(snapshot: MonitorSnapshot, width: number, height: number, history: readonly MonitorHistorySample[], nextStep?: string): Line[] {
   const host = snapshot.host;
   const a = host?.accelerators;
+  const gpu = monitorGpuReading(host);
   const metrics = snapshot.alloy.metrics;
   const framed = width >= 44 && height >= 13;
   const inner = framed ? width - 4 : width;
@@ -250,11 +269,15 @@ function compact(snapshot: MonitorSnapshot, width: number, height: number, histo
   add(meter("RAM non-free", ratio(host?.memory_used_bytes ?? null, host?.memory_total_bytes ?? null),
     `${formatBytes(host?.memory_used_bytes ?? null)} / ${formatBytes(host?.memory_total_bytes ?? null)}`, inner, "blue"), 99);
   add(trend("CPU history", history.map((sample) => sample.cpu_percent), inner, "cyan"), 80);
-  add(line(`ACCELERATORS ${a?.status ?? "unavailable"} · ${age(a?.age_ms ?? null)}`, a?.status === "ready" ? "muted" : "amber"), 109);
-  add(meter("GPU active", a?.gpu_active_percent ?? null, percent(a?.gpu_active_percent ?? null), inner, "violet"), 98);
+  add(line(`${host?.gpu ? "GPU" : "ACCELERATORS"} ${gpu.status} · ${age(gpu.age_ms)}`, gpu.status === "ready" ? "muted" : "amber"), 109);
+  add(meter(gpu.label, gpu.percent, percent(gpu.percent), inner, "violet"), host?.gpu ? 108 : 98);
   add(trend("GPU history", history.map((sample) => sample.gpu_percent), inner, "violet"), 79);
   add(line(`ANE power ${power(a?.ane_power_mw ?? null)} · CPU ${power(a?.cpu_power_mw ?? null)} · GPU ${power(a?.gpu_power_mw ?? null)}`, "blue"), 97);
-  if (a?.error) add(line(`Hardware: ${a.error}`, "amber"), 190);
+  if (host?.gpu) {
+    if (gpu.error) add(line(`GPU: ${gpu.error}`, "amber"), 190);
+    add(line(`Power ${a?.status ?? "unavailable"} · ${age(a?.age_ms ?? null)}`, a?.status === "ready" ? "muted" : "amber"), 106);
+  }
+  if (a?.error) add(line(`Power: ${a.error}`, "amber"), host?.gpu ? 103 : 190);
   if (snapshot.host_error || host?.errors.length) add(line(`Host error: ${snapshot.host_error ?? host?.errors.join("; ")}`, "amber"), 190);
   add(line(`ALLOY ${snapshot.alloy.status}${snapshot.alloy.status === "unavailable" && metrics ? " (stale)" : ""} · ${age(snapshot.alloy.sample_age_ms)}`, snapshot.alloy.status === "connected" ? "green" : "amber"), 240);
   if (metrics) {
@@ -298,7 +321,8 @@ export function renderMonitorSnapshot(snapshot: MonitorSnapshot, options: Monito
     lines = [[...left, s(" ".repeat(Math.max(1, width - widthOf(left) - widthOf(right)))), ...right],
       line(` ${host?.hostname ?? "Host unavailable"} · ${host ? `${host.platform}/${host.architecture} · ` : ""}system-wide · ${range}`, "muted")];
     const hostTag = s(`${snapshot.host_error ? "STALE" : host === null ? "OFFLINE" : "HOST"} ${age(snapshot.host_sample_age_ms)}`, snapshot.host_error || host === null ? "amber" : "green");
-    const powerTag = s(`${host?.accelerators.status ?? "unavailable"} · ${age(host?.accelerators.age_ms ?? null)}`, host?.accelerators.status === "ready" ? "green" : "amber");
+    const gpu = monitorGpuReading(host);
+    const powerTag = s(`${host?.gpu ? "GPU " : ""}${gpu.status} · ${age(gpu.age_ms)}`, gpu.status === "ready" ? "green" : "amber");
     const runtimeTag = s(`${snapshot.alloy.status}${snapshot.alloy.status === "unavailable" && metrics ? " (stale)" : ""} · ${age(snapshot.alloy.sample_age_ms)}`, snapshot.alloy.status === "connected" ? "green" : "amber");
     if (width >= 108) {
       const sideHeight = Math.min(17, Math.max(9, height - 13));

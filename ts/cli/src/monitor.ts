@@ -94,12 +94,17 @@ export class DaemonMetricsReader {
 export function refreshMonitorAges(snapshot: MonitorSnapshot, now = Date.now()): MonitorSnapshot {
   const host = snapshot.host;
   const powerTime = host?.accelerators.sampled_at_unix_ms;
+  const gpuTime = host?.gpu?.sampled_at_unix_ms;
   return {
     ...snapshot,
     sampled_at_unix_ms: now,
     host_sample_age_ms: host === null ? null : Math.max(0, now - host.sampled_at_unix_ms),
     host: host === null ? null : {
       ...host,
+      ...(host.gpu === undefined ? {} : { gpu: {
+        ...host.gpu,
+        age_ms: gpuTime === null || gpuTime === undefined ? null : Math.max(0, now - gpuTime),
+      } }),
       accelerators: {
         ...host.accelerators,
         age_ms: powerTime === null || powerTime === undefined ? null : Math.max(0, now - powerTime),
@@ -124,6 +129,12 @@ export async function collectMonitorSnapshot(
   const sourcePower = sourceHost?.accelerators;
   const host = sourceHost === null ? null : {
     ...sourceHost,
+    ...(sourceHost.gpu === undefined ? {} : { gpu: {
+      ...sourceHost.gpu,
+      status: hostResult.status === "rejected" && sourceHost.gpu.sampled_at_unix_ms !== null && sourceHost.gpu.status === "ready"
+        ? "stale" as const : sourceHost.gpu.status,
+      error: hostResult.status === "rejected" ? message(hostResult.reason) : sourceHost.gpu.error,
+    } }),
     accelerators: {
       ...sourceHost.accelerators,
       status: hostResult.status === "rejected" && sourcePower?.sampled_at_unix_ms !== null && sourcePower?.status === "ready"

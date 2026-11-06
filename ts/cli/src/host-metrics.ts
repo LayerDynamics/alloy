@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { PowerMetricsCollector, runMetricCommand, type PowerMetricsSnapshot } from "./powermetrics.js";
+import { GpuMetricsCollector, type GpuMetricsSnapshot } from "./gpu-metrics.js";
 
 export type HostMetricsSnapshot = {
   sampled_at_unix_ms: number;
@@ -25,6 +26,8 @@ export type HostMetricsSnapshot = {
   wired_bytes: number | null;
   compressed_bytes: number | null;
   errors: string[];
+  /** Independent, unprivileged GPU source; absent only in older saved frames. */
+  gpu?: GpuMetricsSnapshot;
   accelerators: PowerMetricsSnapshot;
 };
 
@@ -84,12 +87,21 @@ export interface HostMetricsCollector {
 export function createHostMetricsCollector(options: {
   powermetrics: boolean;
   intervalMs?: number;
-}): HostMetricsCollector {
+}, dependencies: {
+  platform?: () => string;
+  runCommand?: typeof runMetricCommand;
+  now?: () => number;
+} = {}): HostMetricsCollector {
   const abort = new AbortController();
+  const platformName = dependencies.platform ?? os.platform;
+  const command = dependencies.runCommand ?? runMetricCommand;
+  const timestamp = dependencies.now ?? Date.now;
+  const probes = { platform: platformName, runCommand: command, now: timestamp };
   const power = new PowerMetricsCollector({
     enabled: options.powermetrics,
     ...(options.intervalMs === undefined ? {} : { intervalMs: options.intervalMs }),
-  });
+  }, probes);
+  const gpu = new GpuMetricsCollector(probes);
   let previousCpu = cpuCounters(os.cpus());
   let previousAt = performance.now();
   let pending: Promise<HostMetricsSnapshot> | null = null;
@@ -100,12 +112,12 @@ export function createHostMetricsCollector(options: {
     let swap: { total: number; used: number; free: number } | null = null;
     let vm: { wired: number | null; compressed: number | null } = { wired: null, compressed: null };
     let available: number | null = null;
-    const platform = os.platform();
+    const platform = platformName();
     const memoryProbe = async (): Promise<void> => {
       if (platform === "darwin") {
         const results = await Promise.allSettled([
-          runMetricCommand("/usr/sbin/sysctl", ["-n", "vm.swapusage"], abort.signal).then(parseMacSwap),
-          runMetricCommand("/usr/bin/vm_stat", [], abort.signal).then(parseMacVm),
+          command("/usr/sbin/sysctl", ["-n", "vm.swapusage"], abort.signal).then(parseMacSwap),
+          command("/usr/bin/vm_stat", [], abort.signal).then(parseMacVm),
         ]);
         const [swapResult, vmResult] = results;
         if (swapResult.status === "fulfilled") swap = swapResult.value;
@@ -132,16 +144,24 @@ export function createHostMetricsCollector(options: {
     const baselineWait = Math.max(0, 100 - (performance.now() - previousAt));
     // Settle every owned probe before close() resolves, even if the warm-up
     // delay aborts first. This prevents a stopped UI from leaving probe children.
-    const [memoryResult, powerResult, baselineResult] = await Promise.allSettled([
-      memoryProbe(), power.sample(abort.signal), delay(baselineWait, undefined, { signal: abort.signal }),
+    const [memoryResult, gpuResult, powerResult, baselineResult] = await Promise.allSettled([
+      memoryProbe(), gpu.sample(abort.signal), power.sample(abort.signal),
+      delay(baselineWait, undefined, { signal: abort.signal }),
     ]);
+    if (abort.signal.aborted) throw new Error("Host metrics sampling aborted.");
     if (memoryResult.status === "rejected") throw memoryResult.reason;
     if (baselineResult.status === "rejected") throw baselineResult.reason;
+    if (gpuResult.status === "rejected") throw gpuResult.reason;
     if (powerResult.status === "rejected") throw powerResult.reason;
+    const gpuSample = {
+      ...gpuResult.value,
+      age_ms: gpuResult.value.sampled_at_unix_ms === null ? null
+        : Math.max(0, timestamp() - gpuResult.value.sampled_at_unix_ms),
+    };
     const accelerators = {
       ...powerResult.value,
       age_ms: powerResult.value.sampled_at_unix_ms === null ? null
-        : Math.max(0, Date.now() - powerResult.value.sampled_at_unix_ms),
+        : Math.max(0, timestamp() - powerResult.value.sampled_at_unix_ms),
     };
     const now = performance.now();
     const currentCpu = cpuCounters(os.cpus());
@@ -154,7 +174,7 @@ export function createHostMetricsCollector(options: {
     // TypeScript cannot follow assignments inside an awaited callback.
     const sampledSwap = swap as { total: number; used: number; free: number } | null;
     return {
-      sampled_at_unix_ms: Date.now(), platform, architecture: os.arch(), hostname: os.hostname(),
+      sampled_at_unix_ms: timestamp(), platform, architecture: os.arch(), hostname: os.hostname(),
       logical_cpu_count: currentCpu.count,
       cpu_utilization_percent: utilization, cpu_sample_ms: cpuSampleMs,
       load_average: os.loadavg(), uptime_seconds: os.uptime(),
@@ -162,7 +182,7 @@ export function createHostMetricsCollector(options: {
       memory_available_bytes: available,
       swap_total_bytes: sampledSwap?.total ?? null, swap_used_bytes: sampledSwap?.used ?? null,
       swap_free_bytes: sampledSwap?.free ?? null,
-      wired_bytes: vm.wired, compressed_bytes: vm.compressed, errors, accelerators,
+      wired_bytes: vm.wired, compressed_bytes: vm.compressed, errors, gpu: gpuSample, accelerators,
     };
   }
 

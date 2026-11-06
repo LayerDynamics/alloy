@@ -5,6 +5,7 @@ import { MonitorReadiness } from "../src/doctor.js";
 import { MonitorHistory } from "../src/monitor-history.js";
 import { defaultSettings } from "../src/settings.js";
 import { emptyPowerMetrics } from "../src/powermetrics.js";
+import { emptyGpuMetrics } from "../src/gpu-metrics.js";
 import type { HostMetricsSnapshot } from "../src/host-metrics.js";
 import type { DaemonMetrics, MonitorSnapshot } from "../src/monitor-types.js";
 import type { ModelInspection } from "../src/model.js";
@@ -17,6 +18,7 @@ test("delayed readiness advice advances publication and source ages without chan
     logical_cpu_count: 12, cpu_utilization_percent: 25, cpu_sample_ms: 1000, load_average: [1, 2, 3], uptime_seconds: 900,
     memory_total_bytes: 1000, memory_free_bytes: 500, memory_used_bytes: 500, memory_available_bytes: null,
     swap_total_bytes: 0, swap_used_bytes: 0, swap_free_bytes: 0, wired_bytes: null, compressed_bytes: null, errors: [],
+    gpu: { ...emptyGpuMetrics("ready"), sampled_at_unix_ms: now - 4250, age_ms: 0, utilization_percent: 35 },
     accelerators: { ...emptyPowerMetrics("ready"), sampled_at_unix_ms: now - 4500, age_ms: 0, gpu_active_percent: 20 },
   };
   const daemon: DaemonMetrics = {
@@ -44,14 +46,24 @@ test("delayed readiness advice advances publication and source ages without chan
   assert.equal(published.sampled_at_unix_ms, now);
   assert.equal(published.host_sample_age_ms, 5250);
   assert.equal(published.host!.accelerators.age_ms, 5750);
+  assert.equal(published.host!.gpu!.age_ms, 5500);
   assert.equal(published.alloy.sample_age_ms, 4750);
   assert.equal(published.alloy.metrics, daemon);
   assert.equal(daemon.memory_guard.sample_age_ms, 600);
   assert.equal(daemon.residency.sample_age_ms, 100);
   assert.equal(published.host!.sampled_at_unix_ms, 996_000);
   assert.equal(published.host!.accelerators.sampled_at_unix_ms, 995_500);
+  assert.equal(published.host!.gpu!.sampled_at_unix_ms, 995_750);
   assert.equal(captured.sampled_at_unix_ms, 1_000_000, "publication must not mutate the collected frame");
   assert.equal(captured.host_sample_age_ms, 4000);
+  assert.equal(captured.host!.gpu!.age_ms, 4250, "publication must not mutate the independent GPU sample");
+  const failed = await collectMonitorSnapshot({ sample: async () => { throw new Error("host poll failed"); }, close: async () => {} }, {
+    read: async () => ({ status: "unavailable", sample_age_ms: null, error: "ECONNREFUSED", metrics: null }),
+  }, host);
+  assert.equal(failed.host!.gpu!.status, "stale");
+  assert.equal(failed.host!.gpu!.sampled_at_unix_ms, 995_750);
+  assert.equal(failed.host!.gpu!.age_ms, 5500);
+  assert.equal(failed.host!.gpu!.error, "host poll failed");
   const history = new MonitorHistory();
   history.push(published);
   assert.equal(history.snapshot()[0]!.cpu_percent, null, "advice delay cannot make old host data look fresh in history");

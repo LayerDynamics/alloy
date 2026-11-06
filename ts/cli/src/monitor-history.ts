@@ -1,4 +1,5 @@
 import type { MonitorSnapshot } from "./monitor-types.js";
+import { monitorGpuReading } from "./monitor-gpu.js";
 
 export const MONITOR_HISTORY_MAX_AGE_MS = 5000;
 const MAX_SAMPLES = 60;
@@ -44,13 +45,15 @@ function isFresh(timestamp: number | null, reportedAge: number | null, now: numb
     && nonnegative(reportedAge) && reportedAge <= MONITOR_HISTORY_MAX_AGE_MS;
 }
 
-/** Bounded recent samples with independent freshness for host, hardware and daemon. */
+/** Bounded samples with independent freshness for host, GPU, power and daemon. */
 export class MonitorHistory {
   #samples: MonitorHistorySample[] = [];
   #hostIdentity: string | null = null;
   #daemonPid: number | null = null;
   #hostTimestamp: number | null = null;
   #hardwareTimestamp: number | null = null;
+  #gpuTimestamp: number | null = null;
+  #gpuKey: string | null = null;
   #daemonTimestamp: number | null = null;
   #frameTimestamp: number | null = null;
 
@@ -69,6 +72,7 @@ export class MonitorHistory {
       if (this.#hostIdentity !== null && this.#hostIdentity !== identity) {
         this.#samples = [];
         this.#hostTimestamp = this.#hardwareTimestamp = this.#daemonTimestamp = null;
+        this.#gpuTimestamp = this.#gpuKey = null;
         this.#daemonPid = null;
       }
       this.#hostIdentity = identity;
@@ -96,12 +100,25 @@ export class MonitorHistory {
         next.cpu_percent = percent(host.cpu_utilization_percent);
         next.memory_percent = percent(ratio(host.memory_used_bytes, host.memory_total_bytes));
       }
+      const gpu = monitorGpuReading(host);
+      if (this.#gpuKey !== gpu.history_key) {
+        // Device utilization and active residency are different measurements.
+        // A device/source change must not relabel the old graph as the new one.
+        this.#samples = this.#samples.map((sample) => ({ ...sample, gpu_percent: null }));
+        this.#gpuTimestamp = null;
+        this.#gpuKey = gpu.history_key;
+      }
+      const gpuNew = isNew(gpu.sampled_at_unix_ms, this.#gpuTimestamp, now);
+      if (gpuNew) this.#gpuTimestamp = gpu.sampled_at_unix_ms;
+      if (hostFresh && gpuNew && gpu.status === "ready" && gpu.error === null
+          && isFresh(gpu.sampled_at_unix_ms, gpu.age_ms, now)) {
+        next.gpu_percent = percent(gpu.percent);
+      }
       const hardware = host.accelerators;
       const hardwareNew = isNew(hardware.sampled_at_unix_ms, this.#hardwareTimestamp, now);
       if (hardwareNew) this.#hardwareTimestamp = hardware.sampled_at_unix_ms;
       if (hostFresh && hardwareNew && hardware.status === "ready" && hardware.error === null
           && isFresh(hardware.sampled_at_unix_ms, hardware.age_ms, now)) {
-        next.gpu_percent = percent(hardware.gpu_active_percent);
         next.ane_power_mw = nonnegative(hardware.ane_power_mw) ? hardware.ane_power_mw : null;
       }
     }

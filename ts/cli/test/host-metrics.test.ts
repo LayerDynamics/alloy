@@ -70,3 +70,89 @@ test("closing a collector interrupts a pending initial sample", async () => {
   await collector.close();
   await rejected;
 });
+
+const gpuRegistry = `<?xml version="1.0"?><plist version="1.0"><array><dict>
+<key>IORegistryEntryID</key><integer>42</integer>
+<key>IORegistryEntryName</key><string>AGXAccelerator</string>
+<key>PerformanceStatistics</key><dict><key>Device Utilization %</key><integer>37</integer></dict>
+</dict></array></plist>`;
+
+function memoryFixture(file: string): string | null {
+  if (file === "/usr/sbin/sysctl") return "total = 0.00M used = 0.00M free = 0.00M";
+  if (file === "/usr/bin/vm_stat") return "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages wired down: 0.\n";
+  return null;
+}
+
+test("default Mac sampling publishes GPU utilization without launching any power or privileged helper", async () => {
+  const calls: string[] = [];
+  const collector = createHostMetricsCollector({ powermetrics: false }, {
+    platform: () => "darwin",
+    runCommand: async (file, args) => {
+      calls.push(file);
+      const memory = memoryFixture(file);
+      if (memory !== null) return memory;
+      assert.equal(file, "/usr/sbin/ioreg");
+      assert.deepEqual(args, ["-a", "-r", "-d", "1", "-c", "IOAccelerator"]);
+      return gpuRegistry;
+    },
+  });
+  try {
+    const sample = await collector.sample();
+    assert.equal(sample.gpu?.source, "ioreg");
+    assert.equal(sample.gpu?.status, "ready");
+    assert.equal(sample.gpu?.utilization_percent, 37);
+    assert.equal(sample.accelerators.status, "disabled");
+    assert.equal(sample.accelerators.gpu_power_mw, null);
+    assert.deepEqual(calls.sort(), ["/usr/bin/vm_stat", "/usr/sbin/ioreg", "/usr/sbin/sysctl"]);
+  } finally { await collector.close(); }
+});
+
+test("denied optional power sampling does not discard a successful independent GPU reading", async () => {
+  const collector = createHostMetricsCollector({ powermetrics: true }, {
+    platform: () => "darwin",
+    runCommand: async (file) => {
+      const memory = memoryFixture(file);
+      if (memory !== null) return memory;
+      if (file === "/usr/sbin/ioreg") return gpuRegistry;
+      if (file === "/usr/bin/powermetrics") return "cpu_power cpu\ngpu_power gpu\n";
+      assert.equal(file, "/usr/bin/sudo");
+      throw new Error("sudo: a password is required");
+    },
+  });
+  try {
+    const sample = await collector.sample();
+    assert.equal(sample.gpu?.status, "ready");
+    assert.equal(sample.gpu?.utilization_percent, 37);
+    assert.equal(sample.gpu?.error, null);
+    assert.equal(sample.accelerators.status, "unavailable");
+    assert.equal(sample.accelerators.gpu_power_mw, null);
+    assert.match(sample.accelerators.error!, /Optional power metrics need authorization/);
+    assert.deepEqual(sample.errors, []);
+  } finally { await collector.close(); }
+});
+
+test("closing the host collector waits for its GPU probe to stop and rejects the cancelled frame", async () => {
+  let signalStarted!: () => void;
+  const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+  let stopped = false;
+  const collector = createHostMetricsCollector({ powermetrics: false }, {
+    platform: () => "darwin",
+    runCommand: async (file, _args, signal) => {
+      const memory = memoryFixture(file);
+      if (memory !== null) return memory;
+      assert.equal(file, "/usr/sbin/ioreg");
+      return new Promise<string>((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          stopped = true;
+          reject(new Error("GPU probe aborted"));
+        }, { once: true });
+        signalStarted();
+      });
+    },
+  });
+  const rejected = assert.rejects(collector.sample(), /abort/i);
+  await started;
+  await collector.close();
+  await rejected;
+  assert.equal(stopped, true);
+});

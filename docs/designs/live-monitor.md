@@ -93,9 +93,22 @@ and does not add fields to the monitor JSON schema.
 | --- | --- | --- |
 | Host | CPU utilization across logical cores, load averages, installed/free/non-free RAM, uptime | Node OS counters; CPU is a delta between observations; non-free RAM includes reclaimable pages and is not Activity Monitor's app-memory total |
 | macOS memory | Wired and compressed memory, swap usage | Bounded `vm_stat` and `sysctl` reads; missing probes remain unavailable |
-| Apple accelerators | CPU/GPU/ANE estimated component power, GPU active residency, available frequency/thermal counters | Opt-in Apple `powermetrics` samples; platform-dependent fields; component estimates are not whole-machine power |
+| macOS GPU | Driver-reported device utilization, per-device identity and counters | Unprivileged IORegistry snapshot through `ioreg`; sampled by default, independent of power authorization; driver-dependent availability |
+| Optional Apple power | CPU/GPU/ANE estimated component power, GPU active residency, available frequency/thermal counters | Opt-in Apple `powermetrics` samples; platform-dependent fields; component estimates are not whole-machine power |
 | Alloy | Reserved/available bytes, current budget, reservation count, admission pause, request/cancellation state | Read-only daemon metadata, without dispatching a native-worker command |
 | Residency and pressure | Last published model metadata, pressure classification and ceiling breakdown | Explicit observation age and errors; ownership survives cancellation until actual cleanup |
+
+The default GPU bar uses `PerformanceStatistics` device utilization from
+`/usr/sbin/ioreg -a -r -d 1 -c IOAccelerator`. The class filter includes
+subclasses and the depth limit omits client children. The bounded plist reader
+preserves per-device identity and accepts only finite percentages from 0 to
+100. `Device Utilization %` takes precedence over the alternate
+`GPU Activity(%)` key. Renderer and tiler counters are not combined into a
+device total. With multiple devices, the summary is explicitly the busiest
+reporting GPU; it is never a sum or average. These driver-defined counters
+are best-effort rather than a stable telemetry contract across every driver.
+See [Apple's ioreg manual](https://github.com/apple-oss-distributions/IOKitTools/blob/main/ioreg.tproj/ioreg.8)
+and the [Stats GPU reader](https://github.com/exelban/stats/blob/master/Modules/GPU/reader.swift).
 
 ANE power is measured in watts/milliwatts, not percent occupancy. A missing
 ANE field is unavailable, not zero. GPU active residency is the fraction of
@@ -127,17 +140,31 @@ error instead of making old data appear fresh.
 Host and daemon observations are independent and not one atomic sample.
 The client serializes its polling, bounds command/RPC waits, and displays
 connection and sampling failures. Terminal shutdown restores input/cursor
-state and stops sampling. Native power samples have bounded lifetime.
+state and stops sampling. GPU registry probes and native power samples have
+bounded lifetime and are both settled before collector shutdown completes.
+
+Monitor JSON adds an independent `host.gpu` source with its own status,
+timestamp, age, utilization and device entries. The existing
+`host.accelerators` fields retain their powermetrics meanings. Readers still
+accept older version-1 captures without `host.gpu`; their GPU line remains
+explicitly labeled active residency. Changing measurement sources clears
+the GPU trend rather than joining different definitions. GPU and ANE history
+deduplicate their own source timestamps; failed power sampling cannot erase
+a fresh registry reading or make a stale GPU reading current.
 
 ## macOS power permissions
 
-Basic CPU/RAM/swap monitoring needs no administrator access. The optional
+Basic CPU/RAM/swap and GPU utilization monitoring need no administrator access.
+GPU registry sampling runs by default without a shell or privileged helper.
+The optional
 `--powermetrics` mode runs only `/usr/bin/powermetrics` through non-interactive
 `sudo -n`; authenticate with `sudo -v` in the same terminal first. The monitor
 does not collect passwords, install a privileged service, change sudoers or
 run the Node application as root. Without authorization or supported
-counters, the rest of the monitor remains usable and the accelerator section
-explains the missing measurements.
+counters, the rest of the monitor remains usable, including GPU utilization.
+The accelerator panel scopes status and authorization messages to the power
+source. This is a requirement of the selected powermetrics backend, not a
+general permission requirement for displaying a GPU utilization graph.
 
 Supported samplers are discovered from the installed tool. Samples use its
 NUL-separated plist format, with bounded parsing and command execution.
@@ -157,10 +184,10 @@ The capture's `alloy.sample_age_ms` is the age of the retained daemon response
 at frame publication. Within `alloy.metrics`, residency and guard ages retain
 their meaning at that daemon response's `sampled_at_unix_ms`; add the outer
 response age to obtain their age at capture. The terminal performs that
-addition. Host, accelerator and outer daemon ages are recalculated at frame
+addition. Host, GPU, power and outer daemon ages are recalculated at frame
 publication after any local readiness checks, so time spent preparing advice
 does not make old samples look fresh. A failed host poll marks retained
-accelerator data stale.
+GPU and power data stale.
 
 Required checks for this feature:
 
@@ -168,6 +195,11 @@ Required checks for this feature:
    handle warm-up and invalid counters without fabricated utilization.
 2. Hardware parsing distinguishes real zero power from unavailable fields,
    preserves GPU ratio units, and rejects malformed/overlarge samples.
+   GPU registry parsing preserves zero utilization and device identities,
+   rejects invalid percentages, and never invokes a privileged helper.
+   The Apple-Silicon CI host must provide a real GPU utilization reading
+   while the test process is unprivileged. Power-disabled and authorization-
+   denied fixtures must retain independent GPU readings and history.
 3. Live daemon metadata remains readable while the native worker is blocked;
    cancellation leaves reservations and the execution slot intact until cleanup.
 4. Stale observations, lost connections and missing permission remain visible;

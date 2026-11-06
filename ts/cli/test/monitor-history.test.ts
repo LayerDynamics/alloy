@@ -171,3 +171,73 @@ test("a reduced live budget can legitimately put existing reservations above 100
   history.push(sample);
   assert.equal(history.snapshot()[0]!.reserved_percent, 125);
 });
+
+
+function withGpu(sample: MonitorSnapshot, utilization = 35): MonitorSnapshot {
+  sample.host!.gpu = {
+    source: "ioreg", status: "ready", sampled_at_unix_ms: sample.sampled_at_unix_ms,
+    age_ms: 0, utilization_percent: utilization,
+    devices: [{ id: "42", name: "Apple GPU", utilization_percent: utilization }], error: null,
+  };
+  return sample;
+}
+
+test("GPU utilization history continues through disabled, unauthorized and stale power samples", () => {
+  const history = new MonitorHistory();
+  for (const [index, status] of (["disabled", "unavailable", "stale"] as const).entries()) {
+    const sample = withGpu(frame(10_000 + index * 1000), index === 0 ? 0 : 35);
+    sample.host!.accelerators = {
+      ...emptyPowerMetrics(status, status === "disabled" ? null : "power authorization unavailable"),
+      sampled_at_unix_ms: status === "stale" ? 1000 : null, age_ms: status === "stale" ? 11_000 : null,
+      ane_power_mw: status === "stale" ? 500 : null,
+    };
+    history.push(sample);
+  }
+  assert.deepEqual(history.snapshot().map((sample) => sample.gpu_percent), [0, 35, 35]);
+  assert.deepEqual(history.snapshot().map((sample) => sample.ane_power_mw), [null, null, null]);
+});
+
+test("GPU and ANE history deduplicate independently and reject each source's stale or invalid data", () => {
+  const history = new MonitorHistory();
+  history.push(withGpu(frame()));
+  const powerRepeated = withGpu(frame(11_000), 40);
+  powerRepeated.host!.accelerators.sampled_at_unix_ms = 10_000;
+  powerRepeated.host!.accelerators.age_ms = 1000;
+  history.push(powerRepeated);
+  const gpuRepeated = withGpu(frame(12_000), 45);
+  gpuRepeated.host!.gpu!.sampled_at_unix_ms = 11_000;
+  gpuRepeated.host!.gpu!.age_ms = 1000;
+  history.push(gpuRepeated);
+  const gpuFailed = withGpu(frame(13_000));
+  gpuFailed.host!.gpu!.status = "stale";
+  gpuFailed.host!.gpu!.error = "registry unavailable";
+  history.push(gpuFailed);
+  const gpuOld = withGpu(frame(14_000));
+  gpuOld.host!.gpu!.sampled_at_unix_ms = 1000;
+  gpuOld.host!.gpu!.age_ms = 0;
+  history.push(gpuOld);
+  const gpuFuture = withGpu(frame(15_000));
+  gpuFuture.host!.gpu!.sampled_at_unix_ms = 30_000;
+  history.push(gpuFuture);
+  const gpuInvalid = withGpu(frame(16_000), Number.NaN);
+  history.push(gpuInvalid);
+  assert.deepEqual(history.snapshot().map((sample) => sample.gpu_percent), [35, 40, null, null, null, null, null]);
+  assert.deepEqual(history.snapshot().map((sample) => sample.ane_power_mw), [0, null, 0, 0, 0, 0, 0]);
+});
+
+test("switching GPU sources or devices clears only the previous GPU trend", () => {
+  const history = new MonitorHistory();
+  history.push(frame());
+  const registry = withGpu(frame(11_000));
+  history.push(registry);
+  assert.equal(history.snapshot()[0]!.gpu_percent, null);
+  assert.equal(history.snapshot()[0]!.cpu_percent, 40);
+  assert.equal(history.snapshot()[0]!.ane_power_mw, 0);
+  assert.equal(history.snapshot()[1]!.gpu_percent, 35);
+  const replacement = withGpu(frame(12_000), 50);
+  replacement.host!.gpu!.devices[0]!.id = "another-gpu";
+  history.push(replacement);
+  assert.equal(history.snapshot()[1]!.gpu_percent, null);
+  assert.equal(history.snapshot()[2]!.gpu_percent, 50);
+  assert.equal(history.snapshot()[1]!.ane_power_mw, 0);
+});
