@@ -103,6 +103,163 @@ pub struct KvPayloadPlan {
     pub update_overlap_bytes: u64,
 }
 
+/// Host and native tensor-payload bounds for transferring one KV block.
+///
+/// A caller must reserve these bytes before exporting or restoring the
+/// block. They are additional to the cache's resident/update allowance.
+/// Allocator padding, metadata, serialized bytes, and externally retained
+/// native graphs require separate accounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvBlockPayloadPlan {
+    /// Logical float32 K/V payload, excluding spare vector capacity.
+    pub host_bytes: u64,
+    /// Conservative native payload for contiguous readback or input arrays.
+    pub native_transfer_bytes: u64,
+    /// Host plus native transfer payload that may be live together.
+    pub transfer_overlap_bytes: u64,
+}
+
+/// One layer of portable, row-major float32 KV data.
+///
+/// Each vector has shape [batch, kv_heads, tokens, head_dim] according
+/// to its containing [`KvBlock`]. Keys already include the model's
+/// normalization and positional encoding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KvBlockLayer {
+    /// Normalized and position-encoded key scalars.
+    pub keys: Vec<f32>,
+    /// Value scalars for the same token positions.
+    pub values: Vec<f32>,
+}
+
+/// A bounded host snapshot of committed K/V positions across every layer.
+///
+/// This value carries tensor data, not authority to access an existing
+/// cache. Restore checks the destination's actual loaded-model identity.
+/// The caller must separately validate the persisted model artifact and
+/// representation identity before using this data with a newly loaded
+/// model instance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KvBlock {
+    /// Inclusive absolute token position of the block.
+    pub start: usize,
+    /// Number of token positions in this block; must be positive.
+    pub tokens: usize,
+    /// Source cache shape and capacity, excluding loaded-model identity.
+    pub spec: KvCacheSpec,
+    /// Exactly one K/V pair per source cache layer, in layer order.
+    pub layers: Vec<KvBlockLayer>,
+}
+
+impl KvBlock {
+    /// Validate this host block and return its checked payload bounds.
+    ///
+    /// Checks all metadata, vector lengths, positions, and finite values
+    /// without allocating or starting native work. Native array creation
+    /// must never precede these exact vector-length checks.
+    ///
+    /// Reports logical tensor payload, not retained vector capacity. After
+    /// [`Self::truncate_tokens`], keep the original host-buffer allowance
+    /// until this block is dropped; truncation does not shrink allocations.
+    pub fn payload_plan(&self) -> KvCacheResult<KvBlockPayloadPlan> {
+        let plan = self.spec.block_payload_plan(self.tokens)?;
+        let end = self
+            .start
+            .checked_add(self.tokens)
+            .ok_or(KvCacheError::InvalidInput(
+                "KV block position arithmetic overflow",
+            ))?;
+        if end > self.spec.capacity_tokens {
+            return Err(KvCacheError::InvalidInput(
+                "KV block exceeds source cache capacity",
+            ));
+        }
+        if self.layers.len() != self.spec.layers {
+            return Err(KvCacheError::InvalidInput(
+                "KV block must contain every configured layer exactly once",
+            ));
+        }
+        let expected = self.spec.block_tensor_values(self.tokens)?;
+        for layer in &self.layers {
+            if layer.keys.len() != expected || layer.values.len() != expected {
+                return Err(KvCacheError::InvalidInput(
+                    "KV block vectors must match the configured float32 chunk shape",
+                ));
+            }
+            if layer
+                .keys
+                .iter()
+                .chain(&layer.values)
+                .any(|value| !value.is_finite())
+            {
+                return Err(KvCacheError::InvalidInput(
+                    "KV block contains non-finite values",
+                ));
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Retain the first `token_count` positions of every batch/head row.
+    ///
+    /// The count must be positive and no greater than the current count.
+    /// Validates the complete block and all arithmetic before modifying
+    /// either vector. Invalid requests leave data and metadata unchanged.
+    ///
+    /// Uses overlapping in-place copies and truncation, without allocating
+    /// a second host block or shrinking existing vector capacities. Keep
+    /// the original host-buffer reservation until the block is dropped.
+    /// Absolute start and source cache shape/capacity remain unchanged.
+    pub fn truncate_tokens(&mut self, token_count: usize) -> KvCacheResult<()> {
+        self.payload_plan()?;
+        if token_count == 0 || token_count > self.tokens {
+            return Err(KvCacheError::InvalidInput(
+                "KV block truncation requires a positive non-increasing token count",
+            ));
+        }
+        if token_count == self.tokens {
+            return Ok(());
+        }
+        let rows =
+            self.spec
+                .batch
+                .checked_mul(self.spec.kv_heads)
+                .ok_or(KvCacheError::InvalidInput(
+                    "KV block row-count arithmetic overflow",
+                ))?;
+        let source_stride =
+            self.tokens
+                .checked_mul(self.spec.head_dim)
+                .ok_or(KvCacheError::InvalidInput(
+                    "KV block source-stride arithmetic overflow",
+                ))?;
+        let target_stride =
+            token_count
+                .checked_mul(self.spec.head_dim)
+                .ok_or(KvCacheError::InvalidInput(
+                    "KV block target-stride arithmetic overflow",
+                ))?;
+        let target_values = self.spec.block_tensor_values(token_count)?;
+
+        // Full validation proves every source range is within the old
+        // vector and every target range precedes it. Ascending row order
+        // cannot overwrite a later row before that row has been copied.
+        // No fallible operations or allocations remain after this point.
+        for layer in &mut self.layers {
+            for values in [&mut layer.keys, &mut layer.values] {
+                for row in 1..rows {
+                    let source = row * source_stride;
+                    let target = row * target_stride;
+                    values.copy_within(source..source + target_stride, target);
+                }
+                values.truncate(target_values);
+            }
+        }
+        self.tokens = token_count;
+        Ok(())
+    }
+}
+
 /// Failure managing actual MLX KV state.
 #[derive(Debug)]
 pub enum KvCacheError {
@@ -262,6 +419,57 @@ impl KvCacheSpec {
             resident_bytes: resident,
             update_overlap_bytes: overlap,
         })
+    }
+
+    /// Plan bounded host/native payload for one nonempty token block.
+    ///
+    /// No vectors or native arrays are allocated. The caller chooses the
+    /// block size and acquires admission for this transfer allowance before
+    /// invoking export or restore. Restore also needs the existing full
+    /// cache update-overlap allowance.
+    pub fn block_payload_plan(self, tokens: usize) -> KvCacheResult<KvBlockPayloadPlan> {
+        self.payload_plan()?;
+        if tokens == 0 || tokens > self.capacity_tokens {
+            return Err(KvCacheError::InvalidInput(
+                "KV block token count must fit the nonempty cache capacity",
+            ));
+        }
+        self.block_tensor_values(tokens)?;
+        let block = Self {
+            capacity_tokens: tokens,
+            ..self
+        }
+        .payload_plan()?;
+        Ok(KvBlockPayloadPlan {
+            host_bytes: block.resident_bytes,
+            native_transfer_bytes: block.resident_bytes,
+            transfer_overlap_bytes: block.update_overlap_bytes,
+        })
+    }
+
+    fn block_tensor_values(self, tokens: usize) -> KvCacheResult<usize> {
+        let values =
+            self.chunk_shape(tokens)
+                .into_iter()
+                .try_fold(1_usize, |count, dimension| {
+                    count
+                        .checked_mul(dimension)
+                        .ok_or(KvCacheError::InvalidInput(
+                            "KV block element-count arithmetic overflow",
+                        ))
+                })?;
+        let bytes =
+            values
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or(KvCacheError::InvalidInput(
+                    "KV block vector byte-count arithmetic overflow",
+                ))?;
+        if bytes > isize::MAX as usize {
+            return Err(KvCacheError::InvalidInput(
+                "KV block tensor exceeds the host slice size limit",
+            ));
+        }
+        Ok(values)
     }
 
     fn native_shape(self) -> KvCacheResult<[c_int; 4]> {
@@ -523,6 +731,144 @@ impl MlxKvCache {
         ))?;
 
         prefix_view(layer, start, end, stream)
+    }
+
+    /// Copy only a nonempty committed token range into portable host data.
+    ///
+    /// Call [`KvCacheSpec::block_payload_plan`] and acquire the transfer
+    /// allowance before this method. Each layer is sliced first; the safe
+    /// MLX readback helper makes that view row-major contiguous before
+    /// copying. No full-cache host buffer is constructed.
+    ///
+    /// A native construction, evaluation, or completion failure leaves the
+    /// committed handles/length unchanged and invalidates this cache.
+    pub fn export_block(
+        &mut self,
+        owner: &MlxModelId,
+        start: usize,
+        end: usize,
+        stream: &Stream,
+    ) -> KvCacheResult<KvBlock> {
+        self.check_owner(owner)?;
+        if start >= end || end > self.length {
+            return Err(KvCacheError::InvalidInput(
+                "KV block export must select a nonempty committed logical range",
+            ));
+        }
+        let tokens = end - start;
+        self.spec.block_payload_plan(tokens)?;
+        let mut layers = Vec::new();
+        layers
+            .try_reserve_exact(self.spec.layers)
+            .map_err(|_| KvCacheError::AllocationFailed("KV block layer metadata"))?;
+
+        let result = (|| {
+            for layer in &self.layers {
+                let view = prefix_view(layer, start, end, stream)?;
+                let keys = ops::to_vec_f32(view.keys(), stream)?;
+                let values = ops::to_vec_f32(view.values(), stream)?;
+                if keys.iter().chain(&values).any(|value| !value.is_finite()) {
+                    return Err(KvCacheError::InvalidInput(
+                        "KV block contains non-finite values",
+                    ));
+                }
+                layers.push(KvBlockLayer { keys, values });
+            }
+            Ok(KvBlock {
+                start,
+                tokens,
+                spec: self.spec,
+                layers,
+            })
+        })();
+        result.map_err(|error| self.failed_block_transfer(error, stream))
+    }
+
+    /// Transactionally append a validated host block to this cache.
+    ///
+    /// The block must begin at the current committed length. Tensor shape
+    /// facts must match; source and destination capacities may differ if
+    /// both contain the block's ending position. The destination owner is
+    /// checked independently of the instance from which data was exported.
+    ///
+    /// All layers and values are validated before native array creation.
+    /// The existing all-layer append transaction publishes handles and
+    /// length only after successful native completion and overlap checks.
+    /// Returns the new committed length only after that publication.
+    ///
+    /// Call [`KvCacheSpec::block_payload_plan`] and reserve transfer payload
+    /// plus the full-cache update allowance before invoking this method.
+    /// Native failures preserve old handles/length and invalidate the cache.
+    pub fn restore_block(
+        &mut self,
+        owner: &MlxModelId,
+        block: &KvBlock,
+        stream: &Stream,
+    ) -> KvCacheResult<usize> {
+        self.check_owner(owner)?;
+        block.payload_plan()?;
+        if block.start != self.length {
+            return Err(KvCacheError::InvalidInput(
+                "KV block restore must append at the committed logical length",
+            ));
+        }
+        if block.spec.layers != self.spec.layers
+            || block.spec.batch != self.spec.batch
+            || block.spec.kv_heads != self.spec.kv_heads
+            || block.spec.head_dim != self.spec.head_dim
+        {
+            return Err(KvCacheError::InvalidInput(
+                "KV block tensor shape does not match the destination cache",
+            ));
+        }
+        let end = block
+            .start
+            .checked_add(block.tokens)
+            .ok_or(KvCacheError::InvalidInput(
+                "KV block position arithmetic overflow",
+            ))?;
+        if end > self.spec.capacity_tokens {
+            return Err(KvCacheError::InvalidInput(
+                "KV block restore exceeds destination capacity",
+            ));
+        }
+        let mut shape = self.spec.native_shape()?;
+        shape[2] = c_int::try_from(block.tokens)
+            .map_err(|_| KvCacheError::InvalidInput("KV block tokens exceed C int"))?;
+        let result = (|| {
+            let mut append = self.begin_append(owner, block.tokens, stream)?;
+            for (index, layer) in block.layers.iter().enumerate() {
+                // payload_plan validated both exact lengths before this
+                // safe wrapper enters its copying native constructor.
+                let keys = Array::from_f32_slice(&layer.keys, &shape)?;
+                let values = Array::from_f32_slice(&layer.values, &shape)?;
+                append.stage_layer(index, &keys, &values)?;
+            }
+            append.commit()?;
+            Ok(end)
+        })();
+        result.map_err(|error| self.failed_block_transfer(error, stream))
+    }
+
+    fn failed_block_transfer(&mut self, error: KvCacheError, stream: &Stream) -> KvCacheError {
+        let native_failure = matches!(
+            error,
+            KvCacheError::Mlx(_)
+                | KvCacheError::Operation(OperationError::Mlx(_))
+                | KvCacheError::Memory(_)
+        );
+        if native_failure {
+            self.healthy = false;
+        }
+        // Readback may fail before its own completion call. Finish any
+        // scheduled transfer work before returning, even after failure.
+        if let Err(completion) = stream.synchronize() {
+            self.healthy = false;
+            if !native_failure {
+                return KvCacheError::Mlx(completion);
+            }
+        }
+        error
     }
 
     /// Begin one nonempty all-layer append.
@@ -1166,6 +1512,433 @@ mod tests {
 
         metal.synchronize().expect("Metal completion");
         cpu.synchronize().expect("CPU completion");
+    }
+}
+
+#[cfg(test)]
+mod block_transfer_tests {
+    use super::*;
+    use mlx_ffi::{Device, DeviceType};
+
+    fn stream(kind: DeviceType) -> Stream {
+        let device = Device::new(kind, 0).expect("device");
+        assert!(device.is_available().expect("device availability"));
+        Stream::new(&device).expect("stream")
+    }
+
+    fn spec() -> KvCacheSpec {
+        KvCacheSpec {
+            layers: 2,
+            batch: 2,
+            kv_heads: 2,
+            capacity_tokens: 6,
+            head_dim: 3,
+        }
+    }
+
+    fn cache(owner: &MlxModelId, spec: KvCacheSpec, stream: &Stream) -> MlxKvCache {
+        MlxKvCache::new(owner, spec, 1024 * 1024, stream).expect("cache")
+    }
+
+    fn block(spec: KvCacheSpec, start: usize, tokens: usize) -> KvBlock {
+        let mut layers = Vec::new();
+        for layer in 0..spec.layers {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for batch in 0..spec.batch {
+                for head in 0..spec.kv_heads {
+                    for token in start..start + tokens {
+                        for dimension in 0..spec.head_dim {
+                            let value = (layer * 1000
+                                + batch * 100
+                                + head * 20
+                                + token * spec.head_dim
+                                + dimension) as f32;
+                            keys.push(value + 0.5);
+                            values.push(-value - 0.25);
+                        }
+                    }
+                }
+            }
+            layers.push(KvBlockLayer { keys, values });
+        }
+        KvBlock {
+            start,
+            tokens,
+            spec,
+            layers,
+        }
+    }
+
+    fn append_directly(cache: &mut MlxKvCache, owner: &MlxModelId, tokens: usize, stream: &Stream) {
+        let block = block(cache.spec(), cache.len(), tokens);
+        let mut shape = cache.spec().native_shape().expect("shape");
+        shape[2] = tokens as c_int;
+        let mut append = cache.begin_append(owner, tokens, stream).expect("append");
+        for (index, layer) in block.layers.iter().enumerate() {
+            let keys = Array::from_f32_slice(&layer.keys, &shape).expect("keys");
+            let values = Array::from_f32_slice(&layer.values, &shape).expect("values");
+            append.stage_layer(index, &keys, &values).expect("stage");
+        }
+        append.commit().expect("commit");
+    }
+
+    fn roundtrip(kind: DeviceType) {
+        let stream = stream(kind);
+        let old_owner = MlxModelId::new();
+        let new_owner = MlxModelId::new();
+        let spec = spec();
+        let mut source = cache(&old_owner, spec, &stream);
+        append_directly(&mut source, &old_owner, 4, &stream);
+
+        // Slicing the token axis of a capacity-six array with multiple
+        // batches/heads produces a strided view. Its raw pointer cannot be
+        // read as a flat token block without first making it contiguous.
+        let middle = source
+            .export_block(&old_owner, 1, 3, &stream)
+            .expect("noncontiguous middle block");
+        assert_eq!(middle, block(spec, 1, 2));
+        assert_eq!(middle.payload_plan().expect("plan").host_bytes, 384);
+
+        let first = source
+            .export_block(&old_owner, 0, 2, &stream)
+            .expect("first block");
+        let second = source
+            .export_block(&old_owner, 2, 4, &stream)
+            .expect("second block");
+        assert_eq!(first, block(spec, 0, 2));
+        assert_eq!(second, block(spec, 2, 2));
+
+        let destination_spec = KvCacheSpec {
+            capacity_tokens: 5,
+            ..spec
+        };
+        let mut restored = cache(&new_owner, destination_spec, &stream);
+        assert!(!old_owner.same_instance(restored.owner()));
+        assert!(new_owner.same_instance(restored.owner()));
+        assert_eq!(
+            restored
+                .restore_block(&new_owner, &first, &stream)
+                .expect("first restore"),
+            2,
+        );
+        assert_eq!(
+            restored
+                .restore_block(&new_owner, &second, &stream)
+                .expect("second restore"),
+            4,
+        );
+
+        // Both caches accept ordinary new model output after restore.
+        append_directly(&mut source, &old_owner, 1, &stream);
+        append_directly(&mut restored, &new_owner, 1, &stream);
+        let source = source
+            .export_block(&old_owner, 0, 5, &stream)
+            .expect("source continuation");
+        let restored = restored
+            .export_block(&new_owner, 0, 5, &stream)
+            .expect("restored continuation");
+        assert_eq!(restored.tokens, 5);
+        assert_eq!(restored.layers, source.layers);
+        assert_eq!(restored.layers, block(destination_spec, 0, 5).layers);
+    }
+
+    #[test]
+    fn mlx_cpu_block_roundtrip_preserves_strided_values_and_continuation() {
+        roundtrip(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_block_roundtrip_preserves_strided_values_and_continuation() {
+        roundtrip(DeviceType::Gpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_blocks_transfer_from_metal_to_new_cpu_owned_cache() {
+        let cpu = stream(DeviceType::Cpu);
+        let metal = stream(DeviceType::Gpu);
+        let old_owner = MlxModelId::new();
+        let new_owner = MlxModelId::new();
+        let mut source = cache(&old_owner, spec(), &metal);
+        append_directly(&mut source, &old_owner, 3, &metal);
+        let data = source
+            .export_block(&old_owner, 0, 3, &metal)
+            .expect("Metal export");
+        let mut restored = cache(&new_owner, spec(), &cpu);
+        assert_eq!(restored.restore_block(&new_owner, &data, &cpu).unwrap(), 3);
+        append_directly(&mut restored, &new_owner, 1, &cpu);
+        assert_eq!(
+            restored
+                .export_block(&new_owner, 0, 4, &cpu)
+                .expect("CPU continuation"),
+            block(spec(), 0, 4),
+        );
+    }
+
+    #[test]
+    fn block_payload_plan_checks_all_dimensions_and_transfer_overlap() {
+        let plan = spec().block_payload_plan(2).expect("plan");
+        assert_eq!(plan.host_bytes, 2 * 2 * 2 * 2 * 3 * 2 * 4);
+        assert_eq!(plan.native_transfer_bytes, plan.host_bytes);
+        assert_eq!(plan.transfer_overlap_bytes, plan.host_bytes * 2);
+        assert!(spec().block_payload_plan(0).is_err());
+        assert!(spec().block_payload_plan(7).is_err());
+        assert!(spec().block_payload_plan(usize::MAX).is_err());
+        let mut invalid = spec();
+        invalid.batch = 0;
+        assert!(invalid.block_payload_plan(1).is_err());
+        invalid = spec();
+        invalid.layers = usize::MAX;
+        assert!(invalid.block_payload_plan(1).is_err());
+        invalid = spec();
+        invalid.kv_heads = usize::MAX;
+        assert!(invalid.block_payload_plan(1).is_err());
+    }
+
+    #[test]
+    fn block_truncation_crops_every_batch_head_row_in_place() {
+        let mut data = block(spec(), 1, 4);
+        let allocations: Vec<_> = data
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.keys.as_ptr(),
+                    layer.keys.capacity(),
+                    layer.values.as_ptr(),
+                    layer.values.capacity(),
+                )
+            })
+            .collect();
+        data.truncate_tokens(2).expect("crop four tokens to two");
+        assert_eq!(data, block(spec(), 1, 2));
+        assert_eq!(data.payload_plan().unwrap().host_bytes, 384);
+        // Repeated cropping must use the updated row stride, while the
+        // source position and each original allocation remain intact.
+        data.truncate_tokens(1).expect("crop two tokens to one");
+        assert_eq!(data, block(spec(), 1, 1));
+        for (layer, (key_ptr, key_capacity, value_ptr, value_capacity)) in
+            data.layers.iter().zip(allocations)
+        {
+            assert_eq!(layer.keys.as_ptr(), key_ptr);
+            assert_eq!(layer.keys.capacity(), key_capacity);
+            assert_eq!(layer.values.as_ptr(), value_ptr);
+            assert_eq!(layer.values.capacity(), value_capacity);
+        }
+        let before = data.clone();
+        data.truncate_tokens(1).expect("unchanged token count");
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn invalid_block_truncation_leaves_all_data_and_metadata_unchanged() {
+        let mut data = block(spec(), 1, 4);
+        for token_count in [0, 5, usize::MAX] {
+            let before = data.clone();
+            assert!(matches!(
+                data.truncate_tokens(token_count),
+                Err(KvCacheError::InvalidInput(_)),
+            ));
+            assert_eq!(data, before);
+        }
+        // A malformed later layer must be found before earlier valid
+        // layers are compacted. This also checks validation on no-op crops.
+        data.layers[1].values.pop();
+        let before = data.clone();
+        assert!(data.truncate_tokens(2).is_err());
+        assert_eq!(data, before);
+        assert!(data.truncate_tokens(4).is_err());
+        assert_eq!(data, before);
+
+        let mut data = block(spec(), 1, 4);
+        data.layers[1].keys[2] = f32::INFINITY;
+        let before = data.clone();
+        assert!(data.truncate_tokens(2).is_err());
+        assert_eq!(data, before);
+    }
+
+    #[test]
+    fn malformed_blocks_never_change_committed_native_state() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let mut cache = cache(&owner, spec(), &stream);
+        append_directly(&mut cache, &owner, 1, &stream);
+        let before = cache.export_block(&owner, 0, 1, &stream).unwrap();
+        let valid = block(spec(), 1, 1);
+        let mut malformed = Vec::new();
+        let mut value = valid.clone();
+        value.layers.pop();
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.layers.push(value.layers[0].clone());
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.layers[1].keys.pop();
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.layers[1].values.push(0.0);
+        malformed.push(value);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut value = valid.clone();
+            value.layers[1].values[0] = invalid;
+            malformed.push(value);
+        }
+        let mut value = valid.clone();
+        value.start = 0;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.start = 2;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.start = usize::MAX;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.tokens = 0;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.tokens = usize::MAX;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.spec.head_dim += 1;
+        malformed.push(value);
+        let mut value = valid.clone();
+        value.spec.layers = usize::MAX;
+        malformed.push(value);
+        // Well-formed host data with a different tensor shape is also
+        // rejected before creating any native input arrays.
+        malformed.push(block(KvCacheSpec { batch: 1, ..spec() }, 1, 1));
+        malformed.push(block(
+            KvCacheSpec {
+                kv_heads: 1,
+                ..spec()
+            },
+            1,
+            1,
+        ));
+
+        for invalid in &malformed {
+            assert!(matches!(
+                cache.restore_block(&owner, invalid, &stream),
+                Err(KvCacheError::InvalidInput(_)),
+            ));
+            assert_eq!(cache.len(), 1);
+            assert!(cache.is_healthy());
+        }
+        assert_eq!(cache.export_block(&owner, 0, 1, &stream).unwrap(), before);
+        assert_eq!(cache.restore_block(&owner, &valid, &stream).unwrap(), 2);
+    }
+
+    #[test]
+    fn block_transfer_checks_owner_logical_bounds_and_destination_capacity() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let foreign = MlxModelId::new();
+        let mut cache = cache(&owner, spec(), &stream);
+        append_directly(&mut cache, &owner, 1, &stream);
+        for (start, end) in [(0, 0), (1, 1), (0, 2), (2, 1), (0, usize::MAX)] {
+            assert!(cache.export_block(&owner, start, end, &stream).is_err());
+        }
+        assert!(matches!(
+            cache.export_block(&foreign, 0, 1, &stream),
+            Err(KvCacheError::ForeignModel),
+        ));
+        let valid = block(spec(), 1, 1);
+        assert!(matches!(
+            cache.restore_block(&foreign, &valid, &stream),
+            Err(KvCacheError::ForeignModel),
+        ));
+        let too_large = block(
+            KvCacheSpec {
+                capacity_tokens: 8,
+                ..spec()
+            },
+            1,
+            6,
+        );
+        assert!(matches!(
+            cache.restore_block(&owner, &too_large, &stream),
+            Err(KvCacheError::InvalidInput(_)),
+        ));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.is_healthy());
+    }
+
+    #[test]
+    fn restore_commit_rejection_preserves_all_old_layer_handles_and_length() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let mut cache = cache(&owner, spec(), &stream);
+        append_directly(&mut cache, &owner, 1, &stream);
+        let before = cache.export_block(&owner, 0, 1, &stream).unwrap();
+        let valid = block(spec(), 1, 1);
+        let allowance = cache.max_buffer_overlap_bytes;
+        // Force the existing post-evaluation, pre-publication gate to
+        // reject the otherwise complete native transaction.
+        cache.max_buffer_overlap_bytes = 0;
+        assert!(matches!(
+            cache.restore_block(&owner, &valid, &stream),
+            Err(KvCacheError::PayloadLimit { .. }),
+        ));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.is_healthy());
+        assert_eq!(cache.export_block(&owner, 0, 1, &stream).unwrap(), before);
+        cache.max_buffer_overlap_bytes = allowance;
+        assert_eq!(cache.restore_block(&owner, &valid, &stream).unwrap(), 2);
+        assert_eq!(
+            cache.export_block(&owner, 0, 2, &stream).unwrap(),
+            block(spec(), 0, 2),
+        );
+    }
+
+    #[test]
+    fn export_rejects_nonfinite_native_values_without_publishing_host_data() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let mut cache = cache(&owner, spec(), &stream);
+        let mut data = block(spec(), 0, 1);
+        data.layers[1].keys[2] = f32::NAN;
+        let mut shape = spec().native_shape().unwrap();
+        shape[2] = 1;
+        let mut append = cache.begin_append(&owner, 1, &stream).unwrap();
+        for (index, layer) in data.layers.iter().enumerate() {
+            let keys = Array::from_f32_slice(&layer.keys, &shape).unwrap();
+            let values = Array::from_f32_slice(&layer.values, &shape).unwrap();
+            append.stage_layer(index, &keys, &values).unwrap();
+        }
+        append.commit().unwrap();
+        assert!(matches!(
+            cache.export_block(&owner, 0, 1, &stream),
+            Err(KvCacheError::InvalidInput(
+                "KV block contains non-finite values"
+            )),
+        ));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.is_healthy());
+    }
+
+    #[test]
+    fn reported_native_transfer_failure_invalidates_future_access() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let mut cache = cache(&owner, spec(), &stream);
+        append_directly(&mut cache, &owner, 1, &stream);
+        let result = cache.failed_block_transfer(
+            KvCacheError::Operation(OperationError::Mlx(MlxError::Status(-1))),
+            &stream,
+        );
+        assert!(matches!(result, KvCacheError::Operation(_)));
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_healthy());
+        assert!(matches!(
+            cache.export_block(&owner, 0, 1, &stream),
+            Err(KvCacheError::Invalidated),
+        ));
+        assert!(matches!(
+            cache.restore_block(&owner, &block(spec(), 1, 1), &stream),
+            Err(KvCacheError::Invalidated),
+        ));
     }
 }
 

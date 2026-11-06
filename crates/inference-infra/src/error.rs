@@ -11,12 +11,16 @@ pub enum KernelError {
     NoFiniteLogits,
     /// Constructed shape implies a different element count than the data.
     ShapeMismatch { expected: usize, got: usize },
+    /// Shape metadata or operation parameters violate the supported contract.
+    InvalidInput(&'static str),
     /// The requested cache capacity (max_len * head_dim) overflows usize.
     CapacityTooLarge { max_len: usize, head_dim: usize },
     /// Reserving a cache buffer failed (allocation would exhaust memory).
     AllocationFailed { elements: usize },
     /// An mlx-c call failed.
     Mlx(mlx_ffi::Error),
+    /// A safe native operation rejected its inputs or could not allocate metadata.
+    Operation(mlx_ffi::ops::OperationError),
 }
 
 impl fmt::Display for KernelError {
@@ -28,6 +32,7 @@ impl fmt::Display for KernelError {
             KernelError::ShapeMismatch { expected, got } => {
                 write!(f, "shape implies {expected} elements, got {got}")
             }
+            KernelError::InvalidInput(message) => write!(f, "invalid kernel input: {message}"),
             KernelError::CapacityTooLarge { max_len, head_dim } => {
                 write!(f, "cache capacity {max_len} x {head_dim} overflows usize")
             }
@@ -35,8 +40,32 @@ impl fmt::Display for KernelError {
                 write!(f, "failed to reserve {elements} f32 elements")
             }
             KernelError::Mlx(e) => write!(f, "mlx-c failure: {e}"),
+            KernelError::Operation(e) => write!(f, "{e}"),
         }
     }
 }
 
-impl std::error::Error for KernelError {}
+impl std::error::Error for KernelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Mlx(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<mlx_ffi::Error> for KernelError {
+    fn from(error: mlx_ffi::Error) -> Self {
+        Self::Mlx(error)
+    }
+}
+
+impl From<mlx_ffi::ops::OperationError> for KernelError {
+    fn from(error: mlx_ffi::ops::OperationError) -> Self {
+        match error {
+            mlx_ffi::ops::OperationError::Mlx(error) => Self::Mlx(error),
+            error => Self::Operation(error),
+        }
+    }
+}

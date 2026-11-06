@@ -358,6 +358,7 @@ dependencies = [
  "mlx-ffi",
  "qwen3",
  "safetensors",
+ "serde",
  "serde_json",
  "sha2",
  "tokenizers",

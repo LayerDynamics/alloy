@@ -284,6 +284,25 @@ impl FamilyCache for PolicyCache {
         self.inner_mut().truncate(token_count)
     }
 
+    fn kv_block_spec(&self) -> Option<inference_infra::kv_cache::KvCacheSpec> {
+        self.inner().kv_block_spec()
+    }
+
+    fn export_kv_block(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
+        self.inner_mut().export_kv_block(start, end)
+    }
+
+    fn restore_kv_block(
+        &mut self,
+        block: &inference_infra::kv_cache::KvBlock,
+    ) -> Result<usize, EngineError> {
+        self.inner_mut().restore_kv_block(block)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self.inner().as_any()
     }
@@ -465,6 +484,13 @@ impl ModelFamily for PolicyBackend {
 }
 
 impl RuntimeBackend for PolicyBackend {
+    fn cache_manifest_digest(
+        &self,
+        artifact: &ArtifactRegistration,
+    ) -> Result<Option<[u8; 32]>, EngineError> {
+        self.inner.cache_manifest_digest(artifact)
+    }
+
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -3120,3 +3146,6 @@ fn pool_pressure_new_grace_revokes_an_older_queued_eviction() {
             .all(|event| !matches!(event.kind, "cache-destroyed" | "model-destroyed"))
     );
 }
+
+#[path = "runtime_policies_tiered.rs"]
+mod tiered;

@@ -726,6 +726,12 @@ impl ModelFamily for Qwen3Backend {
 }
 
 impl RuntimeBackend for Qwen3Backend {
+    fn cache_manifest_digest(
+        &self,
+        artifact: &ArtifactRegistration,
+    ) -> Result<Option<[u8; 32]>, EngineError> {
+        Ok(Some(self.data(artifact)?.manifest_sha256))
+    }
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -1016,6 +1022,26 @@ struct Qwen3NativeCache {
 }
 
 impl FamilyCache for Qwen3NativeCache {
+    fn kv_block_spec(&self) -> Option<KvCacheSpec> {
+        Some(self.inner.spec())
+    }
+    fn export_kv_block(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
+        self.inner
+            .export_block(&self.mlx_owner, start, end, self.stream.as_ref())
+            .map_err(|error| cache_error(error, "export MLX Qwen KV block"))
+    }
+    fn restore_kv_block(
+        &mut self,
+        block: &inference_infra::kv_cache::KvBlock,
+    ) -> Result<usize, EngineError> {
+        self.inner
+            .restore_block(&self.mlx_owner, block, self.stream.as_ref())
+            .map_err(|error| cache_error(error, "restore MLX Qwen KV block"))
+    }
     fn owner(&self) -> &ModelInstanceId {
         &self.owner
     }

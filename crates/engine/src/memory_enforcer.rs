@@ -7,6 +7,8 @@
 //! This module does **not** call Metal or clear the MLX cache itself. The
 //! poll thread publishes allocator-drain requests and idle-model eviction
 //! authorization; FamilyRuntime revalidates them on the native worker.
+//! With tiered KV configured, that worker spills eligible idle KV before
+//! unloading weights, reobserving pressure between bounded reclamation steps.
 //!
 //! Only emergency pressure requests cooperative execution cancellation.
 //! The polling bridge captures the request and scheduler lease before the

@@ -40,8 +40,9 @@ admission budget.
 - Daemon `alloyd`: UDS JSON-RPC server exposing the B.6 Phase-1 chat/session
   streaming subset with verbatim B.6 method names (`session.*`,
   `sessions.resume`) and `api_version` negotiation.
-- Prefix-cache **stub only** — the interface, not the implementation; the
-  real single-session prefix cache lands in Phase 3 with its tests.
+- The public prefix-cache interface remains a stub for Phase 3. The required
+  M10 pull-forward adds internal hot retention and actual native KV
+  spill/restore; it does not implement general multi-session prefix sharing.
 - Telemetry client (FR-35): in-memory anonymous-count collection, HTTPS/TLS
   flush, offline drop, failure-isolated, plus the initial event schema.
 - Read-only `alloy monitor`: live system-wide CPU, unified RAM, swap and
@@ -59,7 +60,7 @@ admission budget.
 ## Explicitly out of scope (do not build)
 
 Tool registry, policy engine, MCP client, skills, plugins, compaction,
-prefix-cache reuse logic, additional families, oMLX adapter, general-purpose
+general multi-session prefix-cache sharing, additional families, oMLX adapter, general-purpose
 TUI beyond the read-only live monitor, the TS SDK
 as a published package (the CLI's internal client library is the seed for
 it), the conversion CLI.
@@ -75,7 +76,7 @@ src/{loader,forward,decode,registry}.rs
 tests/{forward_cpu.rs,template.rs}
 fixtures/tiny-qwen3/ synthetic small config + weights, CI-sized
 crates/engine/ engine core
-src/{api.rs,registry.rs,scheduler.rs,cache.rs,cache_identity.rs,admission.rs}
+src/{api.rs,registry.rs,scheduler.rs,cache.rs,cache_identity.rs,admission.rs,tiered_kv.rs}
 tests include named W3 acceptance coverage (`stream_events_order`,
 `admission_estimate`, `cache_stub_interface` over the real cache,
 `engine_traits_documented`)
@@ -126,10 +127,13 @@ src/{host-metrics.ts,powermetrics.ts,monitor.ts,monitor-types.ts,monitor-render.
 models/starter-model.json (same frozen Qwen3 identity as bench/corpus/models.json)
 test/{args,render,settings,settings-paths,setup,model,daemon,doctor,main,monitor,monitor-history,monitor-publication,host-metrics,powermetrics,rpc-client,rpc-client-malformed}.test.ts
 scripts/{qwen3_end_to_end_stream,session_restart_real_model}.sh
+scripts/real-model-acceptance.mjs (candidate-bound CLI/RPC/restart driver)
+scripts/m9_large_model_acceptance.sh (repository root; real 4B/14B driver)
+crates/engine/examples/m9_large_model_acceptance.rs
 package.json / bin/alloy.js
 docs/specs/PHASE-1-EXECUTION-PLAN.md this document
 docs/events/telemetry-v1.json initial event schema
-.github/workflows/ci.yaml Linux + Mac lanes run automatically on every repository branch/tag push and same-repository PR, including `harness-core` and `alloyd` (`--all-targets` / `--doc`). Fork PRs use hosted Linux checks only. Mac E2E tests 13–14 remain W7 work; automatic execution of the existing suites does not establish those E2E results.
+.github/workflows/ci.yaml Linux + Mac lanes run automatically on every repository branch/tag push and same-repository PR, including `harness-core` and `alloyd` (`--all-targets` / `--doc`). Fork PRs use hosted Linux checks only. The Mac lane also runs real-model tests 13–14 and the M9 large-model driver, with evidence uploaded on success or failure. Missing artifacts fail acceptance. Actual results are indexed in `docs/acceptance/phase-1-exit-review.md`.
 
 ## Named tests
 
@@ -147,8 +151,8 @@ docs/events/telemetry-v1.json initial event schema
 | 10 | `telemetry_offline_drop` | unreachable endpoint drops counts, never queues, never affects sessions | Linux CI |
 | 11 | `admission_estimate` | estimate_memory within 20% of measured for the synthetic model | Linux CI |
 | 12 | `cache_stub_interface` | prefix-cache stub exists behind the B.1 interface and reports unimplemented | Linux CI |
-| 13 | `qwen3_end_to_end_stream` | `alloy chat` streams tokens from the pinned quantized Qwen3 corpus artifact, in-process | Mac |
-| 14 | `session_restart_real_model` | exit criterion on real hardware: session survives restart with the real model | Mac |
+| 13 | `qwen3_end_to_end_stream` | Candidate-built CLI/daemon emits multiple incremental deltas before one terminal event; decoded text matches the final result | Mac |
+| 14 | `session_restart_real_model` | Recovered user/assistant history survives a real daemon restart; resumed generation imports actual SSD KV into the new native instance | Mac |
 | 15 | `engine_traits_documented` | rustdoc builds with zero missing-doc lints on engine public traits; engine API version constant present | Linux CI |
 
 Test 11 is a computed here from the NFR "measured memory within 20% of
@@ -164,6 +168,12 @@ fully — Phase 1 only proves the estimate exists and is honest for one model.
 | Engine API traits documented and versioned | Test 15 + B.1 version constant |
 | Vendored-build reproducibility verified twice | Phase 0 test 11 in CI — two green CI runs post-corpus-freeze satisfy this |
 | Telemetry emits anonymous counts per the initial event schema | Tests 9, 10 + `docs/events/telemetry-v1.json` |
+
+M9 additionally requires the frozen 4B/14B acceptance driver; M10 requires
+native KV spill/restore evidence, distinct from the SQLite history assertion.
+The [exit review](../acceptance/phase-1-exit-review.md) binds each gate to its
+commit and run. The [Phase 2 plan](PHASE-2-EXECUTION-PLAN.md) records the next
+scope, exact file set, named tests, and sequencing.
 
 ## Work items
 

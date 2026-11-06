@@ -285,6 +285,36 @@ pub trait FamilyCache: Any {
     fn reset(&mut self) -> Result<(), EngineError>;
     /// Restore a recoverable prefix, or reject without fabricating state.
     fn truncate(&mut self, token_count: usize) -> Result<(), EngineError>;
+    /// Layout available for bounded native KV transfer, or None when unsupported.
+    fn kv_block_spec(&self) -> Option<inference_infra::kv_cache::KvCacheSpec> {
+        None
+    }
+    /// Copy one bounded committed block on the owning worker.
+    ///
+    /// The caller must admit transfer buffers before calling this method.
+    fn export_kv_block(
+        &mut self,
+        _start: usize,
+        _end: usize,
+    ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
+        Err(EngineError::unsupported(
+            "KV persistence",
+            "family has no block exporter",
+        ))
+    }
+    /// Append a validated persisted block to this actual model-owned cache.
+    ///
+    /// The runtime verifies artifact and prefix identity before calling this;
+    /// the family verifies native ownership, shape, and transactional publication.
+    fn restore_kv_block(
+        &mut self,
+        _block: &inference_infra::kv_cache::KvBlock,
+    ) -> Result<usize, EngineError> {
+        Err(EngineError::unsupported(
+            "KV persistence",
+            "family has no block restorer",
+        ))
+    }
     /// Family-private concrete inspection.
     fn as_any(&self) -> &dyn Any;
     /// Family-private concrete mutation.

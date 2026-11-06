@@ -1,7 +1,9 @@
 //! Explicit-stream MLX tensor operations for native model execution.
 //!
-//! Production operations build actual MLX graphs. They do not evaluate
-//! intermediate tensors or perform host-side tensor arithmetic.
+//! Arithmetic operations build lazy MLX graphs without host tensor
+//! arithmetic. Explicit validation and readback helpers are synchronization
+//! boundaries: `all_finite` reads one reduced Boolean, and `to_vec_f32`
+//! copies a requested output into a host vector.
 //!
 //! The caller selects execution streams explicitly. Arrays are not
 //! duplicated into separate CPU-model and GPU-model representations.
@@ -274,9 +276,8 @@ pub fn quantized_matmul(
     require_positive_shape(&weight_shape)?;
     require_positive_shape(&scales_shape)?;
 
-    let mode = CString::new("affine").map_err(|_| {
-        OperationError::InvalidInput("quantized_matmul mode string")
-    })?;
+    let mode = CString::new("affine")
+        .map_err(|_| OperationError::InvalidInput("quantized_matmul mode string"))?;
     let group = sys::mlx_optional_int {
         value: group_size,
         has_value: true,
@@ -327,9 +328,8 @@ pub fn dequantize(
         ));
     }
 
-    let mode = CString::new("affine").map_err(|_| {
-        OperationError::InvalidInput("dequantize mode string")
-    })?;
+    let mode = CString::new("affine")
+        .map_err(|_| OperationError::InvalidInput("dequantize mode string"))?;
     let group = sys::mlx_optional_int {
         value: group_size,
         has_value: true,
@@ -890,6 +890,40 @@ pub fn cache_update(
     slice_update(cache, update, &[0, 0, offset, 0], stream)
 }
 
+/// Check that every float32 element is finite on the selected stream.
+///
+/// MLX evaluates `isfinite` and an `all` reduction natively. Only the
+/// resulting scalar Boolean is read on the host; the input tensor is not
+/// copied into a Rust buffer. Empty arrays satisfy the predicate.
+///
+/// This is an explicit validation/synchronization boundary. Arithmetic
+/// wrappers themselves remain lazy and do not call this helper implicitly.
+pub fn all_finite(input: &Array, stream: &Stream) -> OperationResult<bool> {
+    require_f32(input)?;
+    let mut finite = PendingArray::new();
+
+    // SAFETY: valid borrowed input/stream and writable owned output.
+    let status = unsafe { sys::mlx_isfinite(&mut finite.raw, input.as_raw(), stream.as_raw()) };
+    let finite = finite.finish(status)?;
+
+    let mut reduced = PendingArray::new();
+    // SAFETY: isfinite produces a Boolean array. Reducing every axis with
+    // keepdims=false produces exactly one Boolean scalar.
+    let status = unsafe { sys::mlx_all(&mut reduced.raw, finite.as_raw(), false, stream.as_raw()) };
+    let reduced = reduced.finish(status)?;
+    reduced.eval()?;
+    stream.synchronize()?;
+
+    let mut result = false;
+    // SAFETY: reduced is an evaluated Boolean scalar, and result is a
+    // valid writable target. The accessor copies the single value.
+    let status = unsafe { sys::mlx_array_item_bool(&mut result, reduced.as_raw()) };
+    if status != 0 {
+        return Err(OperationError::Mlx(Error::Status(status)));
+    }
+    Ok(result)
+}
+
 /// Return a row-major contiguous float32 array on the selected stream.
 ///
 /// This may allocate. It is not a promise of zero-copy conversion.
@@ -1146,6 +1180,56 @@ mod tests {
 
         metal.synchronize().expect("Metal completion");
         cpu.synchronize().expect("CPU completion");
+    }
+
+    fn run_all_finite_suite(kind: DeviceType) {
+        let stream = stream(kind);
+        assert_eq!(
+            stream
+                .device()
+                .expect("stream device")
+                .kind()
+                .expect("kind"),
+            kind
+        );
+        let finite = Array::from_f32_slice(&[0.0, -0.0, f32::MIN, f32::MAX, 1.0, -2.0], &[2, 3])
+            .expect("finite input");
+        let transposed = transpose(&finite, &[1, 0], &stream).expect("strided input");
+        assert!(all_finite(&transposed, &stream).expect("native finite reduction"));
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let source = Array::from_f32_slice(&[1.0, invalid, 2.0, 3.0, 4.0, 5.0], &[2, 3])
+                .expect("mixed input");
+            let included = slice(&source, &[0, 1], &[2, 2], &stream).expect("non-finite column");
+            let excluded = slice(&source, &[0, 0], &[2, 1], &stream).expect("finite column");
+            assert!(!all_finite(&included, &stream).expect("strided non-finite reduction"));
+            assert!(all_finite(&excluded, &stream).expect("strided finite reduction"));
+        }
+
+        // Validate the produced lazy values, not just their finite inputs.
+        let maximum = Array::from_f32_slice(&[f32::MAX], &[1]).expect("finite scalar input");
+        let overflow = multiply(&maximum, &maximum, &stream).expect("lazy native overflow");
+        assert!(!overflow.is_available().expect("lazy graph"));
+        assert!(!all_finite(&overflow, &stream).expect("native graph validation"));
+
+        let empty = Array::from_f32_slice(&[], &[0]).expect("empty input");
+        assert!(all_finite(&empty, &stream).expect("empty reduction identity"));
+        let integer = Array::from_u32_slice(&[1, 2], &[2]).expect("integer input");
+        assert!(matches!(
+            all_finite(&integer, &stream),
+            Err(OperationError::InvalidInput(_)),
+        ));
+    }
+
+    #[test]
+    fn mlx_cpu_all_finite_reduces_native_values_and_strided_views() {
+        run_all_finite_suite(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mlx_metal_all_finite_reduces_native_values_and_strided_views() {
+        run_all_finite_suite(DeviceType::Gpu);
     }
 
     #[test]

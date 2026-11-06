@@ -34,11 +34,16 @@ Qwen3. See `docs/specs/PHASE-1-EXECUTION-PLAN.md`.
 
 Merged foundations include the W6 CLI (#18), memory parity (#19), and M9
 residency/emergency cancellation with unified CPU/GPU validation (#22).
-M9 still requires the representative two-large-model constrained-budget
-acceptance in `docs/designs/omlx-memory-method-parity.md`.
+The remaining closeout gates have reproducible drivers: real 4B/14B
+constrained-budget residency, incremental Qwen3 streaming, and daemon restart
+with durable history plus restored native SSD KV. The Mac workflow runs them
+from its checked-out commit and retains the evidence. Completion is recorded
+in [the Phase 1 exit review](docs/acceptance/phase-1-exit-review.md); wiring a
+test does not establish its result.
 
-Mac E2E tests 13–14 (real Qwen3-4B-4bit stream / session restart) are not
-green yet; they need the memory-parity stack and a local artifact.
+The daemon supports bounded hot RAM and persistent safetensors KV. See
+[the M10 storage contract](docs/designs/tiered-kv.md) for configuration,
+reservation ownership, corruption handling, and restart semantics.
 
 ## Repo map
 

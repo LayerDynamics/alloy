@@ -6,6 +6,7 @@ use alloyd::{
 };
 use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
 use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
+use engine::tiered_kv::{HotCacheLimit, TieredKvConfig};
 use harness_core::{HardwareTier, TelemetryClient};
 use std::env;
 use std::path::PathBuf;
@@ -37,6 +38,9 @@ fn run() -> Result<(), String> {
     let mut admission_budget_override: Option<u64> = None;
     let mut prefer_metal = cfg!(all(target_os = "macos", target_arch = "aarch64"));
     let mut endpoint = "https://telemetry.invalid/v1".to_owned();
+    let mut paged_ssd_cache_dir = None;
+    let mut hot_cache_limit = HotCacheLimit::Percent(25);
+    let mut hot_cache_only = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -93,6 +97,21 @@ fn run() -> Result<(), String> {
             }
             "--cpu" => prefer_metal = false,
             "--metal" => prefer_metal = true,
+            "--paged-ssd-cache-dir" => {
+                index += 1;
+                paged_ssd_cache_dir = Some(PathBuf::from(require_value(
+                    &args,
+                    index,
+                    "--paged-ssd-cache-dir",
+                )?));
+            }
+            "--hot-cache-max-size" => {
+                index += 1;
+                let value = require_value(&args, index, "--hot-cache-max-size")?;
+                hot_cache_limit =
+                    HotCacheLimit::parse(&value).map_err(|error| error.to_string())?;
+            }
+            "--hot-cache-only" => hot_cache_only = true,
             "--telemetry-endpoint" => {
                 index += 1;
                 endpoint = require_value(&args, index, "--telemetry-endpoint")?;
@@ -138,6 +157,15 @@ fn run() -> Result<(), String> {
         }
     };
 
+    let cache_directory = paged_ssd_cache_dir.unwrap_or_else(|| {
+        config
+            .db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("kv-cache")
+    });
+    let mut tiered_kv = TieredKvConfig::new(Some(cache_directory), hot_cache_limit);
+    tiered_kv.hot_cache_only = hot_cache_only;
     let booted = boot_qwen3(BootRequest {
         artifact_dir: PathBuf::from(artifact),
         profile_id: profile.clone(),
@@ -145,6 +173,7 @@ fn run() -> Result<(), String> {
         memory_guard,
         admission_budget_override_bytes: admission_budget_override,
         prefer_metal,
+        tiered_kv,
     })
     .map_err(|error| error.message)?;
 
@@ -258,6 +287,11 @@ fn run_memory_enforcer_loop(
                                 eprintln!("alloyd: pressure evicted idle model {instance:?}")
                             }
                             engine::runtime::IdleModelReclaim::NoEligibleVictim => {}
+                            engine::runtime::IdleModelReclaim::DeferredForKv => {
+                                eprintln!(
+                                    "alloyd: pressure released idle KV; model weights retained"
+                                );
+                            }
                             engine::runtime::IdleModelReclaim::NotRequested => {}
                         }
                     }
@@ -310,6 +344,9 @@ OPTIONS:
   --memory-guard TIER          safe|balanced|aggressive|custom (default: balanced)
   --memory-guard-gb N          Custom ceiling in GiB (implies --memory-guard custom)
   --admission-budget-bytes N   Test override for the admission ledger (optional)
+  --paged-ssd-cache-dir PATH   Persistent KV blocks (default: kv-cache beside the session DB)
+  --hot-cache-max-size SIZE    Idle KV cap: bytes, KiB/MiB/GiB, or budget percent (default: 25%)
+  --hot-cache-only             Keep bounded RAM retention; disable the SSD tier
   --metal                     Metal transformer operations with shared CPU/Metal memory
                               Default on native Apple Silicon; no silent CPU fallback
   --cpu                       MLX CPU transformer operations (default on other platforms)
