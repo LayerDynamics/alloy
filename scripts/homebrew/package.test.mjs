@@ -8,7 +8,8 @@ import { installPackage, parseOptions, selectNativeArtifacts, sha256 } from "./p
 import { renderFormula } from "./formula.mjs";
 const COMMIT = "bf95b93fe92f6ce0cdfc21ac8fecc0982ecc1b43";
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy brew 'quoted-"));
+  // Compare actual installation identities even when TMPDIR contains a symlink.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "alloy brew 'quoted-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const sourceRoot = path.join(root, "source");
   const prefix = path.join(root, "Cellar/alloy/0.1.0");

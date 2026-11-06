@@ -9,7 +9,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 
 function installedPackage(t: TestContext) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-installed-"));
+  // Node resolves imported module URLs through macOS's /var -> /private/var alias.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "alloy-installed-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const installed = path.join(root, "installed package");
   const cwd = path.join(root, "unrelated working directory");

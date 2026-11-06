@@ -95,6 +95,12 @@ export async function main() {
   let ownTap = false, installAttempted = false;
   try {
     result.brew_version = (await execute(brew, ["--version"], { env, log })).stdout.trim();
+    result.host = {
+      os: (await execute("/usr/bin/sw_vers", [], { env, log })).stdout.trim(),
+      architecture: process.arch,
+      xcode: (await execute("/usr/bin/xcodebuild", ["-version"], { env, log })).stdout.trim(),
+      sdk_version: (await execute("/usr/bin/xcrun", ["--show-sdk-version"], { env, log })).stdout.trim(),
+    };
     const taps = (await execute(brew, ["tap"], { env, log })).stdout.split("\n").map((x) => x.trim().toLowerCase());
     assert(!taps.includes(tap), `refusing to reuse an existing tap ${tap}`);
     const installed = await execute(brew, ["list", "--formula", "--versions", name], { env, log, allowed: [0, 1] });
