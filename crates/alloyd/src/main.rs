@@ -1,19 +1,15 @@
 //! `alloyd` binary entrypoint.
 
-use alloyd::{
-    BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener,
-};
+use alloyd::{BootRequest, DaemonConfig, DaemonService, bind_listener, boot_qwen3, serve_listener};
 use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
 use engine::memory_guard::{MemoryGuardConfig, MemoryGuardTier, PressureLevel};
 use harness_core::{HardwareTier, TelemetryClient};
 use std::env;
-use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
-use std::thread;
-use std::time::Duration;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::task::{Context, Waker};
+use std::thread;
 
 fn main() -> ExitCode {
     match run() {
@@ -72,8 +68,8 @@ fn run() -> Result<(), String> {
             "--memory-guard" => {
                 index += 1;
                 let raw = require_value(&args, index, "--memory-guard")?;
-                memory_guard_tier = MemoryGuardTier::parse(&raw)
-                    .map_err(|error| error.to_string())?;
+                memory_guard_tier =
+                    MemoryGuardTier::parse(&raw).map_err(|error| error.to_string())?;
             }
             "--memory-guard-gb" => {
                 index += 1;
@@ -113,9 +109,7 @@ fn run() -> Result<(), String> {
 
     let defaults = DaemonConfig::default_paths().map_err(|error| error.message)?;
     let config = DaemonConfig {
-        socket_path: socket
-            .map(PathBuf::from)
-            .unwrap_or(defaults.socket_path),
+        socket_path: socket.map(PathBuf::from).unwrap_or(defaults.socket_path),
         db_path: db.map(PathBuf::from).unwrap_or(defaults.db_path),
     };
 
@@ -195,70 +189,79 @@ fn run_memory_enforcer_loop(
     enforcer: engine::memory_enforcer::MemoryEnforcer,
     engine: engine::api::EngineCore<engine::runtime::FamilyRuntime>,
 ) {
+    let mut pump = engine::runtime::MemoryEnforcementPump::new(engine, enforcer);
+    let waker = noop_waker();
+    let mut context = Context::from_waker(&waker);
     let mut previous = PressureLevel::Ok;
+    let mut previous_emergency = false;
+    let mut last_cancellation = None;
     loop {
-        match enforcer.tick() {
-            Ok(tick) => {
-                if tick.status.pressure != previous {
+        // Never block pressure observation on an occupied native worker.
+        // The pump owns at most one dispatched native action.
+        match pump.poll_tick(&mut context) {
+            Ok(poll) => {
+                let tick = poll.tick;
+                match (&tick.request_execution_cancellation, poll.cancellation) {
+                    (Some(target), Some(Ok(engine::types::CancelOutcome::Requested)))
+                        if last_cancellation.as_ref() != Some(target) =>
+                    {
+                        eprintln!(
+                            "alloyd: emergency cancellation requested for {} (native cleanup pending)",
+                            target.request_id().as_str(),
+                        );
+                        last_cancellation = Some(target.clone());
+                    }
+                    (_, Some(Err(error))) => {
+                        eprintln!("alloyd: emergency cancellation signal failed: {error}");
+                    }
+                    _ => {}
+                }
+                if tick.status.pressure != previous || tick.status.emergency != previous_emergency {
                     eprintln!(
-                        "alloyd: memory pressure {} -> {} (usage={:.2} GiB soft={:.2} hard={:.2} \
-                         ceiling={:.2} GiB binding={} paused={} reclaim={} deferred={})",
+                        "alloyd: memory pressure {} -> {} (usage={} soft={} hard={} paused={} deferred={} emergency={})",
                         previous.as_str(),
                         tick.status.pressure.as_str(),
-                        tick.status.usage_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.soft_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.hard_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.hard_limit_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                        tick.status.binding.unwrap_or("none"),
+                        tick.status.usage_bytes,
+                        tick.status.soft_bytes,
+                        tick.status.hard_bytes,
                         tick.status.admissions_paused,
-                        tick.request_cache_reclaim,
                         tick.deferred_for_pool_drain,
+                        tick.status.emergency,
                     );
                     previous = tick.status.pressure;
+                    previous_emergency = tick.status.emergency;
                 }
-                if tick.request_cache_reclaim {
-                    // Drain on the native worker when idle. Busy generation
-                    // leaves the flag set for a later tick (oMLX also waits
-                    // for a safe boundary rather than touching Metal here).
-                    let future = engine.runtime().reclaim_mlx_allocator_cache();
-                    match block_on(future) {
-                        Ok(report) => {
-                            enforcer.clear_cache_reclaim_request();
-                            let before = report.before.cache_bytes;
-                            let after = report.after.cache_bytes;
-                            if before > after {
+                match poll.completed {
+                    Some(Ok(report)) => {
+                        if let Some(error) = report.allocator_error {
+                            eprintln!("alloyd: allocator drain failed: {error}");
+                        }
+                        if let Some(cache) = report.allocator_cache {
+                            if cache.before.cache_bytes > cache.after.cache_bytes {
                                 eprintln!(
                                     "alloyd: MLX pool drain {} -> {} MiB",
-                                    before / (1024 * 1024),
-                                    after / (1024 * 1024)
+                                    cache.before.cache_bytes / (1024 * 1024),
+                                    cache.after.cache_bytes / (1024 * 1024)
                                 );
                             }
                         }
-                        Err(_) => {
-                            // Worker busy or reclaim unavailable this tick.
+                        match report.model {
+                            engine::runtime::IdleModelReclaim::Evicted(instance) => {
+                                eprintln!("alloyd: pressure evicted idle model {instance:?}")
+                            }
+                            engine::runtime::IdleModelReclaim::NoEligibleVictim => {}
+                            engine::runtime::IdleModelReclaim::NotRequested => {}
                         }
                     }
+                    Some(Err(error)) => {
+                        eprintln!("alloyd: native memory enforcement failed: {error}")
+                    }
+                    None => {}
                 }
             }
-            Err(error) => {
-                eprintln!("alloyd: memory enforcer tick failed: {error}");
-                thread::sleep(Duration::from_secs(5));
-                continue;
-            }
+            Err(error) => eprintln!("alloyd: memory pressure observation failed: {error}"),
         }
         thread::sleep(ACTIVE_POLL_INTERVAL);
-    }
-}
-
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let mut future = Box::pin(future);
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::yield_now(),
-        }
     }
 }
 

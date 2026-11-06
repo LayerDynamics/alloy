@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local Mac verification before every push.
+# Start the local Mac prerequisites, then verify before every push.
 # Skip explicitly with: SKIP_HOOKS=1 git push
 set -euo pipefail
 
@@ -14,6 +14,121 @@ cd "$(git rev-parse --show-toplevel)"
 
 BRANCH="$(git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD)"
 echo "==> pre-push: local Mac verification on ${BRANCH}"
+
+fail() {
+  echo "pre-push: $*" >&2
+  exit 1
+}
+
+runner_is_running() {
+  local status="$1" label="$2" pid
+  pid="$(printf '%s\n' "$status" | awk -v label="$label" '$3 == label {print $1; exit}')"
+  case "$pid" in
+    ""|0|*[!0-9]*) return 1 ;;
+  esac
+  [ "$pid" -gt 0 ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+ensure_runner() {
+  local runner="${ALLOY_RUNNER_COMMAND:-$HOME/.local/bin/alloy-runner}"
+  local status label registered_pid deadline
+  [ -x "$runner" ] || fail "runner wrapper is missing or not executable: $runner"
+  status="$("$runner" status)" || fail "cannot check the runner: $runner status"
+  label="$(printf '%s\n' "$status" | sed -n 's/^status \(actions\.runner\..*\):$/\1/p')"
+  [ -n "$label" ] || fail "unrecognized runner status: $status"
+
+  if runner_is_running "$status" "$label"; then
+    echo "==> GitHub Actions runner is already running"
+    return
+  fi
+
+  if printf '%s\n' "$status" | grep -Fxq 'not installed'; then
+    echo "==> Installing the registered runner's background service"
+    "$runner" install || fail "runner service installation failed"
+    "$runner" start || fail "runner service start failed"
+  elif printf '%s\n' "$status" | grep -Fxq 'Stopped'; then
+    echo "==> Starting the GitHub Actions runner"
+    "$runner" start || fail "runner service start failed"
+  else
+    registered_pid="$(printf '%s\n' "$status" | awk -v label="$label" '$3 == label {print $1; exit}')"
+    [ -n "$registered_pid" ] || fail "unrecognized runner status: $status"
+    echo "==> Starting the loaded GitHub Actions runner"
+    # No -k: a runner that starts concurrently must not be restarted.
+    launchctl kickstart "gui/$(id -u)/$label" || fail "runner service kickstart failed"
+  fi
+
+  deadline=$((SECONDS + 10#$STARTUP_WAIT_SECONDS))
+  while :; do
+    status="$("$runner" status)" || fail "cannot check the runner after startup"
+    if runner_is_running "$status" "$label"; then
+      echo "==> GitHub Actions runner process is running"
+      return
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || fail "runner has no live process after startup; inspect: $runner status"
+    sleep 1
+  done
+}
+
+ACTIVE_DOCKER_PROBE_PID=""
+cleanup_docker_probe() {
+  if [ -n "$ACTIVE_DOCKER_PROBE_PID" ]; then
+    kill -KILL "$ACTIVE_DOCKER_PROBE_PID" 2>/dev/null || true
+    wait "$ACTIVE_DOCKER_PROBE_PID" 2>/dev/null || true
+    ACTIVE_DOCKER_PROBE_PID=""
+  fi
+}
+trap cleanup_docker_probe EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+docker_is_ready() {
+  # Bound the disposable CLI probe as well as the startup polling loop.
+  # Only this probe process is terminated if the daemon never responds.
+  local probe_deadline result=0
+  docker info >/dev/null 2>&1 &
+  ACTIVE_DOCKER_PROBE_PID=$!
+  probe_deadline=$((SECONDS + 5))
+  while kill -0 "$ACTIVE_DOCKER_PROBE_PID" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$probe_deadline" ]; then
+      cleanup_docker_probe
+      return 1
+    fi
+    sleep 1
+  done
+  wait "$ACTIVE_DOCKER_PROBE_PID" || result=$?
+  ACTIVE_DOCKER_PROBE_PID=""
+  return "$result"
+}
+
+ensure_docker() {
+  local deadline
+  command -v docker >/dev/null 2>&1 || fail "Docker CLI is missing; install Docker Desktop first"
+  if docker_is_ready; then
+    echo "==> Docker daemon is already ready"
+    return
+  fi
+
+  echo "==> Opening Docker Desktop and waiting for its daemon"
+  open -g -a Docker || fail "cannot open Docker Desktop"
+  deadline=$((SECONDS + 10#$STARTUP_WAIT_SECONDS))
+  until docker_is_ready; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "Docker daemon did not become ready; inspect Docker Desktop and run: docker info"
+    sleep 1
+  done
+  echo "==> Docker daemon is ready"
+}
+
+if [ "$(uname -s)" = Darwin ]; then
+  # Git clients need not load the interactive shell's PATH.
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.docker/bin:/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin:$PATH"
+  STARTUP_WAIT_SECONDS="${ALLOY_PRE_PUSH_START_TIMEOUT_SECONDS:-120}"
+  case "$STARTUP_WAIT_SECONDS" in
+    ""|*[!0-9]*) fail "ALLOY_PRE_PUSH_START_TIMEOUT_SECONDS must be a nonnegative integer" ;;
+  esac
+  ensure_runner
+  ensure_docker
+fi
 
 echo "==> MLX FFI tests"
 cargo test --locked -p mlx-ffi \

@@ -28,6 +28,8 @@ pub mod prefill_admit;
 pub mod platform;
 /// Bounded unified-memory pressure and reclamation decisions.
 pub mod pressure;
+pub mod residency_policy;
+pub mod residency_pin;
 pub mod registry;
 pub mod rendering;
 pub mod runtime;

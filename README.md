@@ -67,6 +67,37 @@ cargo build -p alloyd
 cd ts/cli && npm ci && npm run build
 ```
 
+### Local pre-push checks
+
+Enable the repository's tracked hook once per checkout:
+
+```bash
+git config --local core.hooksPath scripts/hooks
+```
+
+On macOS, each push first checks the registered GitHub Actions runner through
+`~/.local/bin/alloy-runner`. It installs the runner's background service if
+missing, starts it when stopped, and requires a live process before continuing.
+A running runner is left available for its current job. The wrapper must change
+into the existing runner installation directory before invoking `svc.sh`.
+
+The hook then checks `docker info`, opens Docker Desktop if needed, and waits
+for the daemon before running the existing native MLX, Qwen3, engine, harness,
+and daemon checks. A startup or test failure blocks the push. Docker startup
+does not move the native Mac CPU/GPU tests into containers.
+
+The default startup polling window is 120 seconds per service; Docker API
+probes are individually limited to five seconds. Override the polling window
+with `ALLOY_PRE_PUSH_START_TIMEOUT_SECONDS` or the runner wrapper's absolute
+path with `ALLOY_RUNNER_COMMAND`. Runner process readiness is a local check;
+GitHub connectivity is still reported by the runner and Actions UI.
+
+Run the same checks without pushing:
+
+```bash
+bash scripts/hooks/pre-push </dev/null
+```
+
 Daemon (production profile, local artifact directory):
 
 ```bash
