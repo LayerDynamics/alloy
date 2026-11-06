@@ -240,8 +240,10 @@ test("an unready child cannot survive the readiness deadline", { timeout: 5000 }
 
 test("source builds launch Cargo's reported executable and honor a nondefault target directory", { timeout: 5000 }, async (t) => {
   const root = workspace(t);
-  const source = path.join(root, "source");
-  fs.mkdirSync(path.join(source, "crates/alloyd"), { recursive: true });
+  const sourceDirectory = path.join(root, "source");
+  const source = path.join(root, "source-alias");
+  fs.mkdirSync(path.join(sourceDirectory, "crates/alloyd"), { recursive: true });
+  fs.symlinkSync(sourceDirectory, source, "dir");
   fs.writeFileSync(path.join(source, "Cargo.toml"), "[workspace]\n");
   fs.writeFileSync(path.join(source, "crates/alloyd/Cargo.toml"), "[package]\nname='alloyd'\n");
   const built = script(root, "custom target/debug/actual-daemon", runningBody);
@@ -264,7 +266,8 @@ test("source builds launch Cargo's reported executable and honor a nondefault ta
   assert.equal(code, 130);
   const build = JSON.parse(fs.readFileSync(buildRecord, "utf8")) as { args: string[]; cwd: string; target: string };
   assert.deepEqual(build.args, ["build", "--locked", "-p", "alloyd", "--message-format=json-render-diagnostics"]);
-  assert.equal(build.cwd, source);
+  // Child cwd resolves aliases, including macOS's /var -> /private/var.
+  assert.equal(fs.realpathSync(build.cwd), fs.realpathSync(source));
   assert.equal(build.target, env.CARGO_TARGET_DIR);
   const native = JSON.parse(fs.readFileSync(record, "utf8")) as { pid: number; args: string[] };
   assert.equal(native.args[native.args.indexOf("--corpus-models") + 1], settings.corpus_models);
