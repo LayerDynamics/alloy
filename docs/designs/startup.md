@@ -46,6 +46,11 @@ of `alloy` after `npm --prefix ts/cli ci` and `npm --prefix ts/cli run build`.
    output. Select the actual executable from its compiler-artifact message;
    never assume `target/debug`, and honor `CARGO_TARGET_DIR`. Build output and
    failures remain visible. The build has a separate thirty-minute deadline.
+   Multi-GB model verification uses an optimized `sha2` dependency even in dev
+   builds. The Qwen loader enables the pinned crate's ARM SHA backend on Apple
+   Silicon; normal dependency feature unification applies it to engine and
+   daemon verification too. Standalone Mac loader tests use the same backend.
+   All expected digests and verification passes remain enforced.
 6. Probe again after a build to avoid a duplicate listener if another daemon
    started meanwhile. Launch the owned native child with the selected model,
    profile, socket, database and corpus pins. New-launch readiness verifies
@@ -61,6 +66,21 @@ of `alloy` after `npm --prefix ts/cli ci` and `npm --prefix ts/cli run build`.
 The launcher supplies no CPU override. Native Apple-Silicon builds retain
 the existing shared CPU/Metal behavior described in
 [the monitor execution defaults](live-monitor.md#execution-defaults).
+
+Run one foreground `start` for a socket and wait for its `READY` line. A
+second launch during the first daemon's initialization can see no listener
+yet; if the first daemon becomes ready before the second, the PID check
+rejects the second child. A later `Already running` message refers to the
+existing listener. Use its current `daemon.metrics.process_id` when collecting
+process diagnostics; a PID printed before a restart is no longer authoritative.
+
+Interactive chat is a text client; `monitor` is the read-only dashboard.
+While a submitted turn has produced no text, chat reports that it is still
+waiting on stderr, beginning at five seconds and then every fifteen seconds.
+This reports a pending request, not a claim that loading or inference has
+finished. Runtime warnings remain visible. A successful final response must
+agree with streamed text; missing or inconsistent output is reported as an
+error instead of returning an empty successful prompt.
 
 ## Model identity, discovery and publication
 

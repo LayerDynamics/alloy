@@ -81,6 +81,9 @@ In a source checkout, `start` builds the current daemon with Cargo, then runs
 the executable Cargo reports, including with a custom `CARGO_TARGET_DIR`.
 The first build compiles vendored MLX; later builds are incremental. An explicit
 `--alloyd-bin /path/to/alloyd` selects a prebuilt daemon instead.
+Development builds optimize the SHA-256 dependency used for model integrity
+checks, and Apple Silicon enables its ARM SHA backend. Model verification
+still checks every expected digest.
 
 Wait for **`READY — Alloy API 1`**, then keep that terminal open. In another
 terminal, from the repository root:
@@ -96,6 +99,10 @@ compatible daemon is reused without changing or stopping it. API readiness
 confirms the listener and protocol; real model loading and generation still
 need to succeed on the first chat request. Native Apple-Silicon builds keep
 their existing shared CPU/Metal default; no `--metal` flag is required.
+Run one `start` command for the selected socket and wait for `READY` before
+connecting clients. Chat uses a text prompt; `monitor` opens the dashboard.
+Chat reports when it is still waiting for the first response and displays
+runtime warnings on stderr; one-shot stdout remains model text.
 
 These commands handle configuration and diagnostics independently:
 

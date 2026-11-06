@@ -58,6 +58,11 @@ unsafe_op_in_unsafe_fn = "warn"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
 
+[profile.dev.package.sha2]
+# Keep multi-GB artifact verification fast without changing the application's
+# debug profile or skipping any trusted-digest checks.
+opt-level = 3
+
 [profile.release]
 # Defaults are fine for Phase 0. Byte-level reproducibility for named test
 # `vendored_build_reproducible` (test 11) comes from environment
