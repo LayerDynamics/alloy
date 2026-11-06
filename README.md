@@ -115,8 +115,10 @@ GPU, unified RAM and reservation trends; the larger view also graphs ANE
 power. Admission pauses, emergency pressure and cancellation awaiting cleanup
 have explicit labels. A wider terminal (around 120 columns) places system and
 hardware panels side by side; an 80×24 terminal keeps the core readings visible.
-`NO_COLOR=1` disables color. Small terminals use a compact view, and `TERM=dumb`
-prints one plain snapshot.
+`NO_COLOR=1` disables color. Small terminals retain usage bars and history in
+a compact view; very short windows prioritize pressure, pending cleanup and
+source freshness. Full panels need at least 60 columns and 22 terminal rows.
+`TERM=dumb` prints one plain snapshot.
 
 The runtime panel shows the live admission budget, reserved memory, pressure,
 request and cached model-residency metadata. The monitor stays usable when

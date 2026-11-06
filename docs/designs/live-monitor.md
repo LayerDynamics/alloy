@@ -21,8 +21,12 @@ representative two-large-model acceptance or mark M9 complete.
 The interactive view uses colored, bordered system, accelerator and runtime
 panels. Wide terminals place system and hardware measurements side by side;
 80×24 terminals stack the panels and retain connection state, admission,
-pressure, cancellation and exit controls. Smaller windows use a compact text
-view that retains hardware freshness. Resizing takes effect on the next
+pressure, cancellation and exit controls. Full panels require 60 columns and
+22 terminal rows (one row is reserved by the live loop). Smaller windows keep
+CPU, RAM and GPU bars plus recent CPU/GPU history in a compact view, with a
+border when space permits. Very short windows select pressure, cancellation
+and freshness labels before optional readings instead of truncating the last
+lines. Resizing takes effect on the next
 sampling frame. `q` and Ctrl+C restore the previous terminal input mode,
 cursor and screen. The renderer clears old row tails when text shrinks without
 blanking the whole screen between frames.

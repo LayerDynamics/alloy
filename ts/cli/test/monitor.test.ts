@@ -109,9 +109,42 @@ test("small terminals retain hardware freshness and failures next to cached valu
   });
   const text = renderMonitorSnapshot(sample, { columns: 50, rows: 18 });
   assert.match(text, /ACCELERATORS stale.*30\.0s old/);
-  assert.match(text, /GPU active 25\.0%/);
+  assert.match(text, /GPU active.*25\.0%/);
   assert.match(text, /ANE power 0 mW/);
   assert.match(text, /sudo authorization expired/);
+});
+
+test("short and narrow windows retain bars and history with a refused daemon connection", () => {
+  const sample = snapshot();
+  sample.alloy = { status: "unavailable", sample_age_ms: null, metrics: null,
+    error: "connect ECONNREFUSED /Users/ryanoboyle/.alloy/alloyd.sock" };
+  Object.assign(sample.host!.accelerators, { status: "ready", age_ms: 0, gpu_active_percent: 18.7, ane_power_mw: 0 });
+  const history = [{ at_unix_ms: sample.sampled_at_unix_ms, cpu_percent: 31, memory_percent: 95,
+    gpu_percent: 18, ane_power_mw: 0, reserved_percent: null }];
+  for (const [columns, rows] of [[90, 17], [90, 20], [59, 23]] as const) {
+    const text = renderMonitorSnapshot(sample, { columns, rows, history });
+    for (const label of ["CPU", "RAM non-free", "GPU active", "CPU history", "GPU history", "ANE power 0 mW", "ECONNREFUSED", "q quit"]) {
+      assert.ok(text.includes(label), `${columns}x${rows}: ${label}`);
+    }
+    assert.match(text, /CPU\s+━/);
+    assert.match(text, /GPU active\s+━/);
+    assert.match(text, /CPU history.*▃/);
+    assert.ok(text.split("\n").length <= rows);
+    assert.ok(text.split("\n").every((row) => monitorTextWidth(row) <= columns));
+  }
+});
+
+test("very short windows prioritize pressure, cancellation and freshness over optional readings", () => {
+  const sample = snapshot();
+  sample.alloy.status = "unavailable";
+  sample.alloy.sample_age_ms = 5100;
+  sample.host!.accelerators.status = "stale";
+  sample.host!.accelerators.age_ms = 30_000;
+  const text = renderMonitorSnapshot(sample, { columns: 80, rows: 9 });
+  for (const label of ["PAUSED", "EMERGENCY", "cleanup pending", "ALLOY unavailable (stale)", "5.1s old", "ACCELERATORS stale", "30.0s old", "q quit"]) {
+    assert.ok(text.includes(label), label);
+  }
+  assert.ok(text.split("\n").length <= 9);
 });
 
 test("history graphs preserve unknown samples, real zero, and a fixed percentage scale", () => {

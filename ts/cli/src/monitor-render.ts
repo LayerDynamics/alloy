@@ -232,26 +232,46 @@ function runtimeBody(snapshot: MonitorSnapshot, width: number, capacity: number,
   return body;
 }
 
-function compact(snapshot: MonitorSnapshot, width: number, height: number): Line[] {
+function compact(snapshot: MonitorSnapshot, width: number, height: number, history: readonly MonitorHistorySample[]): Line[] {
   const host = snapshot.host;
   const a = host?.accelerators;
   const metrics = snapshot.alloy.metrics;
-  const lines: Line[] = [line("ALLOY MONITOR · read-only", "cyan"),
-    line(`HOST ${snapshot.host_error ? "STALE · " : ""}${age(snapshot.host_sample_age_ms)} · ${host?.hostname ?? "unavailable"}`, "muted"),
-    line(`ACCELERATORS ${a?.status ?? "unavailable"} · ${age(a?.age_ms ?? null)}`, a?.status === "ready" ? "muted" : "amber"),
-    line(`CPU ${percent(host?.cpu_utilization_percent ?? null)} · GPU active ${percent(a?.gpu_active_percent ?? null)}`),
-    line(`RAM non-free ${formatBytes(host?.memory_used_bytes ?? null)} / ${formatBytes(host?.memory_total_bytes ?? null)} incl. caches`),
-    line(`Swap ${formatBytes(host?.swap_used_bytes ?? null)} · ANE power ${power(a?.ane_power_mw ?? null)}`),
-    line(`ALLOY ${snapshot.alloy.status}${snapshot.alloy.status === "unavailable" && metrics ? " (stale)" : ""} · ${age(snapshot.alloy.sample_age_ms)}`, "amber"),
-  ];
+  const framed = width >= 44 && height >= 13;
+  const inner = framed ? width - 4 : width;
+  const rows: Array<{ spans: Line; priority: number }> = [];
+  const add = (spans: Line, priority: number): void => { rows.push({ spans, priority }); };
+  // Select by importance before restoring display order. Short windows must not
+  // hide cancellation/pressure or the freshness labels for retained readings.
+  add(line(`HOST ${snapshot.host_error ? "STALE · " : ""}${age(snapshot.host_sample_age_ms)} · ${host?.hostname ?? "unavailable"}`, "muted"), 110);
+  add(meter("CPU", host?.cpu_utilization_percent ?? null, percent(host?.cpu_utilization_percent ?? null), inner, "cyan"), 100);
+  add(meter("RAM non-free", ratio(host?.memory_used_bytes ?? null, host?.memory_total_bytes ?? null),
+    `${formatBytes(host?.memory_used_bytes ?? null)} / ${formatBytes(host?.memory_total_bytes ?? null)}`, inner, "blue"), 99);
+  add(trend("CPU history", history.map((sample) => sample.cpu_percent), inner, "cyan"), 80);
+  add(line(`ACCELERATORS ${a?.status ?? "unavailable"} · ${age(a?.age_ms ?? null)}`, a?.status === "ready" ? "muted" : "amber"), 109);
+  add(meter("GPU active", a?.gpu_active_percent ?? null, percent(a?.gpu_active_percent ?? null), inner, "violet"), 98);
+  add(trend("GPU history", history.map((sample) => sample.gpu_percent), inner, "violet"), 79);
+  add(line(`ANE power ${power(a?.ane_power_mw ?? null)} · CPU ${power(a?.cpu_power_mw ?? null)} · GPU ${power(a?.gpu_power_mw ?? null)}`, "blue"), 97);
+  if (a?.error) add(line(`Hardware: ${a.error}`, "amber"), 190);
+  if (snapshot.host_error || host?.errors.length) add(line(`Host error: ${snapshot.host_error ?? host?.errors.join("; ")}`, "amber"), 190);
+  add(line(`ALLOY ${snapshot.alloy.status}${snapshot.alloy.status === "unavailable" && metrics ? " (stale)" : ""} · ${age(snapshot.alloy.sample_age_ms)}`, snapshot.alloy.status === "connected" ? "green" : "amber"), 240);
   if (metrics) {
-    lines.push(line(`Admission ${metrics.admission.admissions_paused ? "PAUSED" : "OPEN"} · Pressure ${metrics.memory_guard.emergency ? "EMERGENCY" : metrics.memory_guard.pressure}`, pressureTone(metrics.memory_guard.pressure, metrics.memory_guard.emergency)));
-    lines.push(line(metrics.execution.cancellation_requested ? "Cancellation requested; cleanup pending" : `Request ${metrics.execution.active_request_id ?? "idle"}`, "amber"));
-  } else if (snapshot.alloy.error) lines.push(line(`Connection: ${snapshot.alloy.error}`, "muted"));
-  if (a?.error) lines.push(line(`Hardware: ${a.error}`, "amber"));
-  if (snapshot.host_error || host?.errors.length) lines.push(line(`Host error: ${snapshot.host_error ?? host?.errors.join("; ")}`, "amber"));
-  lines.push(line("Enlarge terminal for graphs and model details.", "muted"));
-  return lines.slice(0, Math.max(0, height - 1)).map((row) => clipped(row, width));
+    const { admission, memory_guard: guard, execution } = metrics;
+    add(line(`Admission ${admission.admissions_paused ? "PAUSED" : "OPEN"} · Pressure ${guard.emergency ? "EMERGENCY" : guard.pressure}`, pressureTone(guard.pressure, guard.emergency)), 220);
+    add(line(execution.cancellation_requested ? "Cancellation requested; cleanup pending" : `Request ${execution.active_request_id ?? "idle"}`, execution.cancellation_requested ? "amber" : "text"), 210);
+    add(meter("Ledger", ratio(admission.reserved_bytes, admission.budget_bytes), `${formatBytes(admission.reserved_bytes)} / ${formatBytes(admission.budget_bytes)} reserved`, inner, "cyan"), 85);
+    if (guard.last_error) add(line(`Guard error: ${guard.last_error}`, "amber"), 190);
+  }
+  if (snapshot.alloy.error) add(line(`Connection: ${snapshot.alloy.error}`, "amber"), 200);
+  add(line(`Swap ${formatBytes(host?.swap_used_bytes ?? null)} · Wired ${formatBytes(host?.wired_bytes ?? null)} · Compressed ${formatBytes(host?.compressed_bytes ?? null)}`, "muted"), 75);
+  add(line(`Thermal ${a?.thermal_pressure ?? "unavailable"}${a?.gpu_frequency_mhz == null ? "" : ` · GPU ${a.gpu_frequency_mhz.toFixed(0)} MHz`}`, "muted"), 70);
+  add(line("Full panels: 60 columns × 22 terminal rows", "muted"), 1);
+  const budget = Math.max(0, height - (framed ? 3 : 2));
+  const visible = rows.map((row, index) => ({ ...row, index }))
+    .sort((a, b) => b.priority - a.priority || a.index - b.index).slice(0, budget)
+    .sort((a, b) => a.index - b.index).map((row) => row.spans);
+  return framed
+    ? panel("ALLOY MONITOR", s("compact · read-only", "muted"), visible, width, visible.length + 2)
+    : [line("ALLOY MONITOR · read-only", "cyan"), ...visible].map((row) => clipped(row, width));
 }
 
 /** Pure responsive renderer. Color is explicit; JSON never passes through it. */
@@ -265,7 +285,7 @@ export function renderMonitorSnapshot(snapshot: MonitorSnapshot, options: Monito
     : `q quit · Ctrl+C exit · ${(options.intervalMs ?? 1000) / 1000}s · · = missing · RAM non-free incl. caches`;
   let lines: Line[];
   if (width < 60 || height < 21) {
-    lines = compact(snapshot, width, height);
+    lines = compact(snapshot, width, height, history);
   } else {
     const clock = new Date(snapshot.sampled_at_unix_ms).toLocaleTimeString("en-GB", { hour12: false });
     const left = [s(" ALLOY ", "cyan", true), s(" / LIVE MONITOR", "text", true)];
