@@ -118,14 +118,14 @@ static NSNumber *Milliwatts(int64_t delta, NSString *unit, double seconds) {
   return isfinite(value) && value >= 0 ? @(value) : nil;
 }
 
-static NSString *Component(NSString *name) {
+static NSString *AlloyPowerComponent(NSString *name) {
   if ([name hasSuffix:@"CPU Energy"]) return @"cpu";
   if ([name hasSuffix:@"GPU Energy"]) return @"gpu";
   if ([name hasPrefix:@"ANE"]) return @"ane";
   return nil;
 }
 static BOOL Wanted(NSString *group, NSString *subgroup, NSString *channel, NSString *unit) {
-  if ([group isEqualToString:@"Energy Model"]) return Component(channel) != nil;
+  if ([group isEqualToString:@"Energy Model"]) return AlloyPowerComponent(channel) != nil;
   if ([group isEqualToString:@"CLPC"] && [subgroup isEqualToString:@"Energy Counters"]) {
     return [@[@"CPU Energy", @"GPU Energy", @"ANE"] containsObject:channel] && [unit isEqualToString:@"nJ"];
   }
@@ -457,7 +457,7 @@ static NSDictionary *Collect(unsigned interval, NSError **error) {
         gpu = StateMetrics(ReadStates(&api, item), tables[@"GPU"], YES);
         continue;
       }
-      NSString *component = Component(channel);
+      NSString *component = AlloyPowerComponent(channel);
       BOOL energy = Wanted(group, subgroup, channel, unit);
       if (!component || !energy) continue;
       NSString *key = [NSString stringWithFormat:@"%@:%@", component, group];
