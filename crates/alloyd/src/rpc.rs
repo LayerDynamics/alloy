@@ -1,5 +1,11 @@
 //! JSON-RPC 2.0 codec, `api_version` gate, and Phase-1 error registry.
 
+#[path = "rpc/slab_transport.rs"]
+mod slab_transport;
+pub use slab_transport::{
+    RpcTransportLimits, measure_slab_session_event, write_slab_session_event,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -237,7 +243,11 @@ pub fn wire_event_name(event: &engine::types::GenerationEvent) -> &'static str {
     }
 }
 
-/// JSON body for a streamed session event notification.
+/// Compatibility/fixture JSON body for a session event.
+///
+/// This helper materializes a Value tree. Production slab-batch notifications
+/// must use write_slab_session_event, which borrows the slab directly.
+/// Non-batch callers retain their existing encoding behavior.
 pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
     use engine::types::GenerationEvent;
     match event {
