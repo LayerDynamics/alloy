@@ -182,6 +182,16 @@ fn product(left: usize, right: usize) -> Result<usize, ModelError> {
         .ok_or(ModelError::DimensionOverflow("checkpoint tensor"))
 }
 
+fn dtype_byte_width(dtype: Dtype) -> Result<usize, ModelError> {
+    let bits = dtype.bitsize();
+    if bits == 0 || !bits.is_multiple_of(8) {
+        return Err(invalid(format!(
+            "unsupported non-byte-aligned tensor dtype: {dtype:?}"
+        )));
+    }
+    Ok(bits / 8)
+}
+
 fn check_loading_cancelled(cancelled: Option<&dyn Fn() -> bool>) -> Result<(), ModelError> {
     if cancelled.is_some_and(|check| check()) {
         return Err(ModelError::Cancelled);
@@ -490,7 +500,7 @@ impl OpenShard {
                 .shape
                 .iter()
                 .try_fold(1usize, |count, &dimension| product(count, dimension))?;
-            if end - start != product(elements, info.dtype.size())? {
+            if end - start != product(elements, dtype_byte_width(info.dtype)?)? {
                 return Err(safetensors_error(format!(
                     "tensor size does not match shape: {name}"
                 )));
@@ -1199,7 +1209,8 @@ impl DecodedTensor {
         bytes: &[u8],
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<(), ModelError> {
-        for (index, element) in bytes.chunks_exact(dtype.size()).enumerate() {
+        let element_width = dtype_byte_width(dtype)?;
+        for (index, element) in bytes.chunks_exact(element_width).enumerate() {
             if index % 4096 == 0 {
                 check_loading_cancelled(cancelled)?;
             }
@@ -1261,7 +1272,7 @@ fn decode_shards(
             let mut decoded = if needed.contains(&name) {
                 Some(DecodedTensor::allocate(
                     info.dtype,
-                    remaining / info.dtype.size(),
+                    remaining / dtype_byte_width(info.dtype)?,
                 )?)
             } else {
                 None
@@ -1269,7 +1280,7 @@ fn decode_shards(
             while remaining > 0 {
                 let mut chunk_bytes = remaining.min(scratch.len());
                 if decoded.is_some() {
-                    chunk_bytes -= chunk_bytes % info.dtype.size();
+                    chunk_bytes -= chunk_bytes % dtype_byte_width(info.dtype)?;
                 }
                 if chunk_bytes == 0 {
                     return Err(safetensors_error("read buffer cannot fit a tensor element"));
@@ -1459,7 +1470,7 @@ mod hardening_unit_tests {
             ),
         ];
 
-        let bytes = safetensors::tensor::serialize(views, &None).expect("serialize");
+        let bytes = safetensors::tensor::serialize(views, None).expect("serialize");
 
         let directory = TestDirectory::new();
         let path = directory.0.join("model.safetensors");
@@ -1558,7 +1569,7 @@ mod hardening_unit_tests {
 
     fn write_tensor_shard(path: &Path, name: &str, dtype: Dtype, count: usize, body: &[u8]) {
         let view = safetensors::tensor::TensorView::new(dtype, vec![count], body).expect("view");
-        let bytes = safetensors::tensor::serialize([(name, view)], &None).expect("serialize");
+        let bytes = safetensors::tensor::serialize([(name, view)], None).expect("serialize");
         std::fs::write(path, bytes).expect("write shard");
     }
 

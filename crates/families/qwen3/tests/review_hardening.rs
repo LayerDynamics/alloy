@@ -135,7 +135,7 @@ fn encode(data: &Tensors) -> Vec<u8> {
             )
         })
         .collect();
-    safetensors::tensor::serialize(views, &None).expect("serialize")
+    safetensors::tensor::serialize(views, None).expect("serialize")
 }
 fn config_json(c: &Qwen3Config) -> serde_json::Value {
     serde_json::json!({"hidden_size":c.hidden_size,"num_hidden_layers":c.num_layers,

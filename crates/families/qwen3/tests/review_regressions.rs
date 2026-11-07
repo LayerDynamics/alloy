@@ -238,7 +238,7 @@ fn checkpoint(untied: bool) -> (Qwen3Config, Vec<u8>) {
         .collect();
     (
         c,
-        safetensors::tensor::serialize(views, &None).expect("serialize"),
+        safetensors::tensor::serialize(views, None).expect("serialize"),
     )
 }
 #[test]
@@ -302,7 +302,7 @@ fn safetensors_indexed_shards_load_and_unsafe_paths_fail() {
     let mut a = Vec::new();
     let mut b = Vec::new();
     let mut map = serde_json::Map::new();
-    let mut names: Vec<_> = tensors.names().into_iter().cloned().collect();
+    let mut names: Vec<_> = tensors.names().into_iter().map(str::to_string).collect();
     names.sort();
     for (index, name) in names.iter().enumerate() {
         let view = tensors.tensor(name).expect("view");
@@ -317,12 +317,12 @@ fn safetensors_indexed_shards_load_and_unsafe_paths_fail() {
     }
     std::fs::write(
         scratch.0.join("one.safetensors"),
-        safetensors::tensor::serialize(a, &None).expect("one"),
+        safetensors::tensor::serialize(a, None).expect("one"),
     )
     .expect("write one");
     std::fs::write(
         scratch.0.join("two.safetensors"),
-        safetensors::tensor::serialize(b, &None).expect("two"),
+        safetensors::tensor::serialize(b, None).expect("two"),
     )
     .expect("write two");
     let index = scratch.0.join("model.safetensors.index.json");
