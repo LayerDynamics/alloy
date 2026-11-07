@@ -421,12 +421,12 @@ impl Qwen3SessionCache {
             });
         }
 
-        if let Some(compatibility) = &self.compatibility {
-            if compatibility.artifact_id != self.artifact_id {
-                return Err(EngineError::Internal {
-                    message: "retained compatibility belongs to another artifact".to_owned(),
-                });
-            }
+        if let Some(compatibility) = &self.compatibility
+            && compatibility.artifact_id != self.artifact_id
+        {
+            return Err(EngineError::Internal {
+                message: "retained compatibility belongs to another artifact".to_owned(),
+            });
         }
 
         if let Some(logits) = &self.last_logits {

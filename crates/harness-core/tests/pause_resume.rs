@@ -6,10 +6,10 @@ use engine::rendering::{
     PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions, render_and_count,
 };
 use engine::types::{
-    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability,
-    ExecutionBackend, FinishReason, Generation, GenerationEvent, GenerationEventStream,
-    GenerationRequest, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, RequestId,
-    SessionStateId, Usage, WeightRepresentation,
+    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability, ExecutionBackend,
+    FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationRequest,
+    MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, RequestId, SessionStateId,
+    Usage, WeightRepresentation,
 };
 use harness_core::{HardwareTier, SessionStatus, SessionStore, Supervisor, TelemetryClient};
 use serde_json::json;
@@ -246,7 +246,10 @@ fn pause_keeps_active_when_cancel_fails() {
 fn resume_rejects_active_and_completed() {
     let dir = tempdir().expect("tempdir");
     let store = Mutex::new(SessionStore::open(dir.path().join("s.sqlite")).expect("store"));
-    let supervisor = Supervisor::new(OrderEngine::new(Arc::new(Mutex::new(Vec::new())), false), telemetry());
+    let supervisor = Supervisor::new(
+        OrderEngine::new(Arc::new(Mutex::new(Vec::new())), false),
+        telemetry(),
+    );
     supervisor
         .create_session(&store, "r-1", "profile")
         .expect("create");

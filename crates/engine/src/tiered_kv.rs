@@ -760,8 +760,10 @@ fn read_block(
             }
             let values: Vec<f32> = tensor
                 .data()
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
                 .collect();
             if values.iter().any(|value| !value.is_finite()) {
                 return Err(invalid("KV tensor contains nonfinite values"));

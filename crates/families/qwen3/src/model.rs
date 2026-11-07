@@ -223,13 +223,13 @@ impl Qwen3Model {
             ));
         }
 
-        if c.q_heads % c.kv_heads != 0 {
+        if !c.q_heads.is_multiple_of(c.kv_heads) {
             return Err(ModelError::InvalidConfig(
                 "query-head count must be divisible by KV-head count",
             ));
         }
 
-        if c.head_dim % 2 != 0 {
+        if !c.head_dim.is_multiple_of(2) {
             return Err(ModelError::InvalidConfig(
                 "split-half RoPE requires an even head dimension",
             ));

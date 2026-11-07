@@ -1121,6 +1121,10 @@ struct Reply<T> {
     usage: Usage,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Worker commands keep request setup and reservation ownership inline without extra allocation in the bounded handoff queue"
+)]
 enum Command {
     ConfigureTieredKv {
         config: TieredKvConfig,
@@ -1925,6 +1929,9 @@ struct PendingStartup {
     grant: ReservationGrant,
 }
 
+// Deterministic idle-victim order: timestamp, owner class, pool index, state ID.
+type IdleVictimKey = (Instant, u8, usize, [u8; 32]);
+
 struct NativeState {
     active: Option<Active>,
     pending: Option<PendingStartup>,
@@ -2009,7 +2016,7 @@ impl NativeState {
             Selected,
             Published(SessionStateId),
         }
-        let mut best: Option<((Instant, u8, usize, [u8; 32]), Place)> = None;
+        let mut best: Option<(IdleVictimKey, Place)> = None;
         let mut offer = |key, place| {
             if best.as_ref().is_none_or(|(current, _)| key < *current) {
                 best = Some((key, place));
@@ -2020,12 +2027,12 @@ impl NativeState {
                 offer((resident.idle_since, 0, index, [0; 32]), Place::Pool(index));
             }
         }
-        if include_selected && self.request_owner().is_none() {
-            if let Some(resident) = &self.resident {
-                if resident.cache.is_some() {
-                    offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
-                }
-            }
+        if include_selected
+            && self.request_owner().is_none()
+            && let Some(resident) = &self.resident
+            && resident.cache.is_some()
+        {
+            offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
         }
         for (id, entry) in &self.states {
             if !entry.is_leased() && entry.resident.cache.is_some() {
@@ -2148,7 +2155,7 @@ impl NativeState {
             Selected,
             Published(SessionStateId),
         }
-        let mut best: Option<((Instant, u8, usize, [u8; 32]), Place)> = None;
+        let mut best: Option<(IdleVictimKey, Place)> = None;
         {
             let mut offer = |key, place| {
                 if best.as_ref().is_none_or(|(current, _)| key < *current) {
@@ -2160,12 +2167,12 @@ impl NativeState {
                     offer((resident.idle_since, 0, index, [0; 32]), Place::Pool(index));
                 }
             }
-            if include_selected && self.request_owner().is_none() {
-                if let Some(resident) = &self.resident {
-                    if !resident.pins.is_pinned() {
-                        offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
-                    }
-                }
+            if include_selected
+                && self.request_owner().is_none()
+                && let Some(resident) = &self.resident
+                && !resident.pins.is_pinned()
+            {
+                offer((resident.idle_since, 1, 0, [0; 32]), Place::Selected);
             }
             for (id, entry) in &self.states {
                 if !entry.is_leased() && !entry.resident.pins.is_pinned() {
@@ -2274,15 +2281,13 @@ impl NativeState {
                         available = add(available, resident_reserved_bytes(resident)?)?;
                     }
                 }
-                if !same_cache {
-                    if let Some(resident) = reusable {
-                        // Compatible model weights remain owned. Startup may
-                        // replace incompatible KV and its associated history.
-                        let replaceable = resident_reserved_bytes(resident)?
-                            .checked_sub(resident.weights.bytes())
-                            .ok_or_else(|| internal("invalid resident accounting"))?;
-                        available = add(available, replaceable)?;
-                    }
+                if !same_cache && let Some(resident) = reusable {
+                    // Compatible model weights remain owned. Startup may
+                    // replace incompatible KV and its associated history.
+                    let replaceable = resident_reserved_bytes(resident)?
+                        .checked_sub(resident.weights.bytes())
+                        .ok_or_else(|| internal("invalid resident accounting"))?;
+                    available = add(available, replaceable)?;
                 }
             }
         }
@@ -2442,10 +2447,10 @@ impl NativeState {
         if reclaimed_kv {
             // Releasing live KV is an earlier tier than unloading weights.
             // Observe the result before authorizing another destructive step.
-            if self.request_owner().is_none() {
-                if let Err(error) = self.reclaim_mlx_allocator_cache() {
-                    allocator_error = Some(error.to_string());
-                }
+            if self.request_owner().is_none()
+                && let Err(error) = self.reclaim_mlx_allocator_cache()
+            {
+                allocator_error = Some(error.to_string());
             }
             tick.status = refresh()?;
             if tick.status.pressure == crate::memory_guard::PressureLevel::Ok {
@@ -3273,19 +3278,19 @@ impl NativeState {
                             available_bytes: ceiling,
                         });
                     }
-                    if let Some(ceiling) = policy.options().allocator_ceiling_bytes {
-                        if assessment.is_some_and(|a| a.reservation_deficit_bytes == 0) {
-                            return Err(EngineError::MemoryLimitExceeded {
-                                operation,
-                                reason: MemoryLimitReason::AllocatorCeiling {
-                                    ceiling_bytes: ceiling,
-                                },
-                                required_bytes: assessment
-                                    .and_then(|a| a.projected_mlx_bytes)
-                                    .unwrap_or(observation.demand.additional_mlx_bytes),
-                                available_bytes: ceiling,
-                            });
-                        }
+                    if let Some(ceiling) = policy.options().allocator_ceiling_bytes
+                        && assessment.is_some_and(|a| a.reservation_deficit_bytes == 0)
+                    {
+                        return Err(EngineError::MemoryLimitExceeded {
+                            operation,
+                            reason: MemoryLimitReason::AllocatorCeiling {
+                                ceiling_bytes: ceiling,
+                            },
+                            required_bytes: assessment
+                                .and_then(|a| a.projected_mlx_bytes)
+                                .unwrap_or(observation.demand.additional_mlx_bytes),
+                            available_bytes: ceiling,
+                        });
                     }
                     return Err(EngineError::MemoryLimitExceeded {
                         operation,
@@ -3397,18 +3402,17 @@ impl NativeState {
             if !same_model {
                 self.switch_model(artifact, setup.backend.as_ref())?;
             }
-            if let Some(resident) = &mut self.resident {
-                if resident
+            if let Some(resident) = &mut self.resident
+                && resident
                     .cache
                     .as_ref()
                     .is_some_and(|cache| !cache_matches(cache, &setup.plan))
-                {
-                    drop(resident.candidate.take());
-                    drop(resident.cache.take());
-                }
-                // Keep compatible logical contents until prepare can
-                // inspect the exact newly rendered token sequence.
+            {
+                drop(resident.candidate.take());
+                drop(resident.cache.take());
             }
+            // Keep compatible logical contents until prepare can
+            // inspect the exact newly rendered token sequence.
 
             self.publish();
             check_startup(control, abandoned)?;
@@ -3537,15 +3541,14 @@ impl NativeState {
         if !same_model {
             self.switch_model(artifact, setup.backend.as_ref())?;
         }
-        if let Some(resident) = &mut self.resident {
-            if resident
+        if let Some(resident) = &mut self.resident
+            && resident
                 .cache
                 .as_ref()
                 .is_some_and(|cache| !cache_matches(cache, &setup.plan))
-            {
-                drop(resident.candidate.take());
-                drop(resident.cache.take());
-            }
+        {
+            drop(resident.candidate.take());
+            drop(resident.cache.take());
         }
 
         let workspace_bytes = add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?;
@@ -4027,22 +4030,19 @@ impl NativeState {
         let mut active = self.active.take();
         let mut candidate = None;
 
-        if let Some(active) = &mut active {
-            if active.text_finished
-                && !active.control.is_cancelled()
-                && retains_contents(self.retention)
-            {
-                if let (Some(mut completed), Some(logits)) =
-                    (active.candidate.take(), active.logits.take())
-                {
-                    // Retention is optional. If its independent idle
-                    // reservation cannot fit, discard it rather than
-                    // misaccounting allocations or failing completed work.
-                    if let Ok(retained) = RetainedLogits::new(logits, &self.admission) {
-                        completed.last_logits = Some(retained);
-                        candidate = Some(completed);
-                    }
-                }
+        if let Some(active) = &mut active
+            && active.text_finished
+            && !active.control.is_cancelled()
+            && retains_contents(self.retention)
+            && let (Some(mut completed), Some(logits)) =
+                (active.candidate.take(), active.logits.take())
+        {
+            // Retention is optional. If its independent idle
+            // reservation cannot fit, discard it rather than
+            // misaccounting allocations or failing completed work.
+            if let Ok(retained) = RetainedLogits::new(logits, &self.admission) {
+                completed.last_logits = Some(retained);
+                candidate = Some(completed);
             }
         }
 
@@ -4084,13 +4084,12 @@ impl NativeState {
             drop(completed);
         }
 
-        if let Some(cache) = &mut resident.cache {
-            if cache.cache.reset().is_err()
+        if let Some(cache) = &mut resident.cache
+            && (cache.cache.reset().is_err()
                 || cache.cache.len() != 0
-                || check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_err()
-            {
-                drop(resident.cache.take());
-            }
+                || check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes()).is_err())
+        {
+            drop(resident.cache.take());
         }
 
         Ok(())

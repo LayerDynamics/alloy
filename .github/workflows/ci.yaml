@@ -3,13 +3,14 @@ name: ci
 on:
   pull_request:
   push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -19,16 +20,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Node runtime
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '26.13.0'
           cache: npm
           cache-dependency-path: ts/cli/package-lock.json
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
 
   linux:
     name: linux-arm64
@@ -37,7 +40,9 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: pins and corpus
         shell: bash
@@ -106,6 +111,15 @@ jobs:
                 -cf - . |
                 tar -C /work -xf -
 
+              echo "::group::Format check"
+              rustup component add rustfmt clippy 2>/dev/null || true
+              cargo fmt --all -- --check
+              echo "::endgroup::"
+
+              echo "::group::Clippy workspace lint"
+              cargo clippy --locked --workspace --all-targets -- -D warnings
+              echo "::endgroup::"
+
               echo "::group::MLX FFI tests"
               cargo test --locked -p mlx-ffi --all-targets \
                 -- --test-threads=1
@@ -172,18 +186,32 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Node runtime
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '26.13.0'
           cache: npm
           cache-dependency-path: ts/cli/package-lock.json
 
+      - name: Inspect Homebrew host locks
+        run: node scripts/homebrew/host-check.mjs
+
+      - name: Retain early Homebrew host evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: homebrew-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/phase-1-acceptance/homebrew-host/
+          if-no-files-found: error
+          retention-days: 7
+
       - name: CLI and monitor tests
         working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs
+        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
 
       - name: Metal and unified tests
         shell: bash
@@ -293,11 +321,23 @@ jobs:
           node ts/cli/scripts/real-model-acceptance.mjs --summarize-m9 "$ALLOY_M9_OUTPUT"
           exit "$driver_status"
 
-      - name: Retain Phase 1 real-model acceptance evidence
+      - name: Homebrew installed CPU/Metal and real-model acceptance
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        shell: bash
+        run: exec node scripts/homebrew/ci.mjs
+
+      - name: Clean this run's owned Homebrew resources
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        shell: bash
+        run: exec node scripts/homebrew/ci.mjs --cleanup-owned
+
+      - name: Retain Phase 1 and Homebrew acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
         with:
           name: phase-1-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/phase-1-acceptance/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30

@@ -226,7 +226,7 @@ impl MlxLinear {
                     }
                     .into());
                 }
-                if cols % 8 != 0 || group_size == 0 || cols % group_size != 0 {
+                if !cols.is_multiple_of(8) || group_size == 0 || !cols.is_multiple_of(group_size) {
                     return Err(ModelError::InvalidConfig(
                         "affine4 cols must be divisible by 8 and group_size",
                     )
@@ -472,10 +472,10 @@ impl MlxQwen3Model {
 
             let mut failure = None;
             native.visit(|array| {
-                if let Err(error) = array.eval() {
-                    if failure.is_none() {
-                        failure = Some(error);
-                    }
+                if let Err(error) = array.eval()
+                    && failure.is_none()
+                {
+                    failure = Some(error);
                 }
             });
 
@@ -1076,7 +1076,7 @@ fn validate_weights(c: &Qwen3Config, weights: &Qwen3Weights) -> Result<u64, Mode
         }
     }
 
-    if c.q_heads % c.kv_heads != 0 || c.head_dim % 2 != 0 {
+    if !c.q_heads.is_multiple_of(c.kv_heads) || !c.head_dim.is_multiple_of(2) {
         return Err(ModelError::InvalidConfig(
             "MLX Qwen requires integral GQA groups and even head dimensions",
         ));

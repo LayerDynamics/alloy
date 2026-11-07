@@ -35,6 +35,36 @@ test("loadSettings returns null when missing", () => {
   assert.equal(loadSettings(home), null);
 });
 
+test("ALLOY_CONFIG_DIR consistently isolates settings and default state without changing explicit paths", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-config-dir-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "user-home");
+  const directory = path.join(root, "configuration with spaces");
+  const env = { ALLOY_CONFIG_DIR: directory };
+  assert.equal(alloyHome(home, env), directory);
+  assert.equal(settingsPath(home, env), path.join(directory, "settings.json"));
+  assert.equal(loadSettings(home, env), null);
+  const defaults = defaultSettings(home, env);
+  assert.equal(defaults.socket, path.join(directory, "alloyd.sock"));
+  assert.equal(defaults.db, path.join(directory, "sessions.sqlite"));
+  const explicit = { ...defaults, socket: path.join(root, "explicit.sock"), db: path.join(root, "explicit.sqlite"),
+    artifact: "/models/verified", alloyd_bin: "/custom/alloyd", corpus_models: "/custom/pins.json" };
+  saveSettings(explicit, home, env);
+  assert.deepEqual(loadSettings(home, env), explicit);
+  assert.equal(fs.statSync(settingsPath(home, env)).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(home), false, "configuration isolation must not create or change the user home");
+  assert.equal(alloyHome(home, {}), path.join(home, ".alloy"));
+});
+
+test("ALLOY_CONFIG_DIR resolves home and relative paths while rejecting malformed values", () => {
+  const home = path.resolve("/tmp/alloy-config-home");
+  assert.equal(alloyHome(home, { ALLOY_CONFIG_DIR: "~/custom alloy" }), path.join(home, "custom alloy"));
+  assert.equal(alloyHome(home, { ALLOY_CONFIG_DIR: "./custom-config" }), path.resolve("custom-config"));
+  for (const value of ["", "  ", "bad\npath", "bad\u0000path", "bad\u007fpath"]) {
+    assert.throws(() => defaultSettings(home, { ALLOY_CONFIG_DIR: value }), /ALLOY_CONFIG_DIR/);
+  }
+});
+
 test("malformed configuration reports its path and recovery action without rewriting it", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-invalid-settings-"));
   try {

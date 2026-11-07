@@ -505,7 +505,7 @@ impl StateEnvironment {
         }
 
         let tokenizer = Tokenizer::from_bytes(
-            &std::fs::read(directory.join("tokenizer.json")).expect("tokenizer source"),
+            std::fs::read(directory.join("tokenizer.json")).expect("tokenizer source"),
         )
         .expect("actual fixture tokenizer");
 

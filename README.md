@@ -7,17 +7,17 @@ engine in one process, with inference and data processing on-device. The
 TypeScript client (`alloy` CLI) is thin and talks to the daemon over a local
 JSON-RPC API on a Unix domain socket (`api_version=1`).
 
-**Status:** Phase 1 vertical slice in progress (SPEC-1). Phase 0 (vendored
-MLX bindgen, corpus, CI) is complete. Phase 1 delivers one family (Qwen3),
-one session path, and streamed chat: `alloy` → `alloyd` → engine → quantized
-Qwen3. See `docs/specs/PHASE-1-EXECUTION-PLAN.md`.
+**Status:** Phase 1 is accepted, including real Qwen3 streaming, process
+restart, unified CPU/Metal execution, and the memory-parity acceptance gates.
+See [the final exit review](docs/acceptance/phase-1-exit-review.md) and
+[issue #9](https://github.com/LayerDynamics/alloy/issues/9). Phase 2 tools
+and policy are planned; the first Homebrew installation is being prepared.
 
 - License: Apache-2.0 (see [LICENSE](LICENSE))
-- Spec: `docs/specs/SPEC-1-mlx-agent-harness.md.md` (v1.9 on `main` /
-  `7-ts-cli`; v1.10 oMLX memory amend on `memory-omlx-parity`)
+- Spec: `docs/specs/SPEC-1-mlx-agent-harness.md.md` (v1.10)
 - Phase 1 plan: `docs/specs/PHASE-1-EXECUTION-PLAN.md`
 - Decisions: `docs/decisions/` (DR-numbered)
-- Config directory: `~/.alloy/`
+- Config directory: `~/.alloy/` by default; `ALLOY_CONFIG_DIR` selects another directory
 
 ## What exists today
 
@@ -34,12 +34,12 @@ Qwen3. See `docs/specs/PHASE-1-EXECUTION-PLAN.md`.
 
 Merged foundations include the W6 CLI (#18), memory parity (#19), and M9
 residency/emergency cancellation with unified CPU/GPU validation (#22).
-The remaining closeout gates have reproducible drivers: real 4B/14B
+PR [#25](https://github.com/LayerDynamics/alloy/pull/25) completed real 4B/14B
 constrained-budget residency, incremental Qwen3 streaming, and daemon restart
-with durable history plus restored native SSD KV. The Mac workflow runs them
-from its checked-out commit and retains the evidence. Completion is recorded
-in [the Phase 1 exit review](docs/acceptance/phase-1-exit-review.md); wiring a
-test does not establish its result.
+with durable history plus restored native SSD KV. The Mac workflow runs these
+gates from its checked-out commit and retains the evidence. The
+[Phase 1 exit review](docs/acceptance/phase-1-exit-review.md) records the
+completed runs and their source identities.
 
 The daemon supports bounded hot RAM and persistent safetensors KV. See
 [the M10 storage contract](docs/designs/tiered-kv.md) for configuration,
@@ -61,16 +61,39 @@ reservation ownership, corruption handling, and restart semantics.
 | `bench/corpus/` | Frozen benchmark corpus |
 | `docs/` | Specs, designs, decision records |
 
-## First run from a checkout
+## Install with Homebrew
 
-Requires Node `26.13.0`, the pinned Rust toolchain (`rust-toolchain.toml`),
-CMake ≥ 3.16, and a C++20 compiler. From the repository root:
+Homebrew is the recommended installation on **Apple Silicon, macOS 14 or
+newer**. The first formula builds from a pinned source commit and requires
+Xcode 15 or newer with its command-line and Metal compiler tools. The first
+native build can take several minutes. Homebrew shows build stages; add
+`--verbose` to the install command for detailed compiler output.
+
+**Availability:** this source change and the matching
+[Homebrew tap](https://github.com/LayerDynamics/homebrew-alloy) formula must
+both merge before the following install command is available. This is a
+development preview; no prebuilt bottle or tagged binary release is claimed.
 
 ```bash
-npm --prefix ts/cli ci
-npm --prefix ts/cli run build
-node ts/cli/bin/alloy.js start
+brew install LayerDynamics/alloy/alloy
+alloy --version
+alloyd --check-native
+alloy start
 ```
+
+Use the fully qualified formula name to select this project's tap. It installs
+the `alloy` CLI, its matching `alloyd`, the Metal kernel library, and the
+unprivileged monitor together. Homebrew manages a private pinned Node runtime;
+your shell's Node version does not need to change. Installation downloads no
+model and starts no daemon or background service.
+
+`alloyd --check-native` checks both MLX CPU and Metal execution without a model.
+It does not establish model-generation acceptance. If another package already
+owns an `alloy` command, resolve that conflict before linking this formula;
+do not overwrite the other command blindly. See
+[the Homebrew installation contract](docs/designs/homebrew.md).
+
+### Start and use Alloy
 
 `start` checks for a compatible running daemon first. When a new daemon is
 needed, it checks that a launch command is available, verifies the configured
@@ -81,22 +104,19 @@ Qwen3-4B-4bit revision and file hashes. Existing model directories are never
 overwritten. Noninteractive invocations require a valid existing model or an
 explicit `--download`; they do not wait for input.
 
-After verification, settings are saved atomically in `~/.alloy/settings.json`.
-In a source checkout, `start` builds the current daemon with Cargo, then runs
-the executable Cargo reports, including with a custom `CARGO_TARGET_DIR`.
-The first build compiles vendored MLX; later builds are incremental. An explicit
-`--alloyd-bin /path/to/alloyd` selects a prebuilt daemon instead.
-Development builds optimize the SHA-256 dependency used for model integrity
-checks, and Apple Silicon enables its ARM SHA backend. Model verification
-still checks every expected digest.
+After verification, settings are saved atomically in the configuration
+directory. The Homebrew CLI selects its packaged daemon; it does not compile
+Rust during startup. An explicit `--alloyd-bin /path/to/alloyd` selects another
+daemon. Existing configuration, model files, sessions and KV cache remain
+outside Homebrew's Cellar, normally under `~/.alloy/`.
 
 Wait for **`READY — Alloy API 1`**, then keep that terminal open. In another
-terminal, from the repository root:
+terminal:
 
 ```bash
-node ts/cli/bin/alloy.js monitor
+alloy monitor
 # Or connect a chat client:
-node ts/cli/bin/alloy.js chat
+alloy chat
 ```
 
 Ctrl+C in the `start` terminal stops its owned daemon. An already-running
@@ -112,10 +132,10 @@ runtime warnings on stderr; one-shot stdout remains model text.
 These commands handle configuration and diagnostics independently:
 
 ```bash
-node ts/cli/bin/alloy.js setup --artifact /path/to/qwen3-4b-4bit
-node ts/cli/bin/alloy.js setup --download
-node ts/cli/bin/alloy.js doctor
-node ts/cli/bin/alloy.js doctor --json
+alloy setup --artifact /path/to/qwen3-4b-4bit
+alloy setup --download
+alloy doctor
+alloy doctor --json
 ```
 
 Choose the setup command for your source: a local artifact or an explicit
@@ -125,6 +145,39 @@ preflight, daemon API and launch readiness with a next action. It does not
 hash all weights, build the daemon, or prove generation. See
 [the startup contract](docs/designs/startup.md) for discovery paths, failure
 handling and validation limits.
+
+### Upgrade
+
+```bash
+brew update
+brew upgrade LayerDynamics/alloy/alloy
+```
+
+An upgrade does not replace a running daemon. Stop the existing foreground
+`start` with Ctrl+C, then run `alloy start` to use the updated daemon. A
+compatible listener is otherwise reused, even after the installed files
+change. Model files, configuration, sessions and cache are preserved. Use the
+same `ALLOY_CONFIG_DIR`, if set, in every Alloy terminal.
+
+## Contributor checkout
+
+For source development, install Node `26.13.0`, the pinned Rust toolchain
+(`rust-toolchain.toml`), CMake ≥ 3.16, a C++20 compiler, and the native Mac
+Metal build tools. From the repository root:
+
+```bash
+npm --prefix ts/cli ci
+npm --prefix ts/cli run build
+node ts/cli/bin/alloy.js start
+```
+
+Use `node ts/cli/bin/alloy.js` in place of `alloy` for the commands above.
+This source launcher builds the checkout's daemon with Cargo and runs the
+executable Cargo reports, including with a custom `CARGO_TARGET_DIR`. The
+first build compiles vendored MLX; later builds are incremental. An explicit
+`--alloyd-bin /path/to/alloyd` selects a prebuilt daemon instead. Development
+builds optimize SHA-256 verification, including the ARM SHA backend on Apple
+Silicon, while still checking every expected digest.
 
 ### Local pre-push checks
 
@@ -157,13 +210,12 @@ Run the same checks without pushing:
 bash scripts/hooks/pre-push </dev/null
 ```
 
-### Live system and Alloy monitor
+## Live system and Alloy monitor
 
-After building the CLI, open a separate terminal while `start` is running.
-From the repository root:
+Open a separate terminal while `alloy start` is running:
 
 ```bash
-node ts/cli/bin/alloy.js monitor
+alloy monitor
 ```
 
 The monitor has a colored, responsive TUI with separate system, accelerator
@@ -179,10 +231,11 @@ source freshness. Full panels need at least 60 columns and 22 terminal rows.
 
 On Apple Silicon, the default monitor reads GPU utilization, CPU/GPU/ANE
 power estimates, frequency states and thermal pressure as the current user.
-All hardware sampling is unprivileged and enabled by default. The CLI build
-compiles its bundled native sampler with the installed Xcode Command Line
-Tools; monitoring never builds or installs a helper at runtime. GPU utilization
-and native power samples keep independent status and timestamps.
+All hardware sampling is unprivileged and enabled by default. Homebrew
+installs the native sampler with the CLI; a contributor build compiles it
+with Xcode Command Line Tools. Monitoring never builds or installs a helper
+at runtime. GPU utilization and native power samples keep independent status
+and timestamps.
 
 The runtime panel shows the live admission budget, reserved memory, pressure,
 request and cached model-residency metadata. The monitor stays usable when
@@ -206,8 +259,8 @@ or `--socket /path/to/alloyd.sock` for another daemon socket. Capture one
 snapshot, or record a stream of JSON snapshots for comparison:
 
 ```bash
-node ts/cli/bin/alloy.js monitor --once --json
-node ts/cli/bin/alloy.js monitor --json > /tmp/alloy-monitor.ndjson
+alloy monitor --once --json
+alloy monitor --json > /tmp/alloy-monitor.ndjson
 ```
 
 Missing measurements are `null`, distinct from zero; stale readings carry
@@ -215,8 +268,8 @@ their age and errors. CPU/GPU share one physical memory capacity. Non-free
 system RAM includes reclaimable pages and is not an app-memory total.
 The monitor keeps these samples local. See
 [`docs/designs/live-monitor.md`](docs/designs/live-monitor.md) for the sources,
-units and validation contract. CLI tests run automatically on repository
-pushes and pull requests; the Mac lane also runs them on the native host.
+units and validation contract. CLI tests run automatically on pull requests
+and pushes to `main`; the Mac lane also runs them on the native host.
 
 For direct native-daemon development, the existing manual path remains:
 
@@ -227,7 +280,7 @@ cargo run --locked -p alloyd -- --artifact /path/to/qwen3-4b-4bit --profile qwen
 One-shot chat connects to an already-running daemon:
 
 ```bash
-node ts/cli/bin/alloy.js -m "hello"
+alloy -m "hello"
 ```
 
 `alloyd` also accepts `--memory-guard

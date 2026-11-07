@@ -94,7 +94,7 @@ fn digest(text: &str) -> AcceptanceResult<[u8; 32]> {
         "SHA-256 must be 64 lowercase hexadecimal characters",
     )?;
     let mut bytes = [0; 32];
-    for (i, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[i] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
     }
     Ok(bytes)
@@ -782,8 +782,10 @@ impl Drop for ObservedModel {
         if let Ok(mut observations) = self.evidence.observations.lock() {
             observations.live.remove(&self.artifact);
         }
-        if let Ok(sequence) = self.evidence.emit("native_model_destroyed", json!({"artifact_id": self.artifact, "real_model_drop_completed": true, "mlx": native_snapshot().ok()})) {
-            if let Ok(mut observations) = self.evidence.observations.lock() { observations.destroyed.entry(self.artifact.clone()).or_default().push(sequence); }
+        if let Ok(sequence) = self.evidence.emit("native_model_destroyed", json!({"artifact_id": self.artifact, "real_model_drop_completed": true, "mlx": native_snapshot().ok()}))
+            && let Ok(mut observations) = self.evidence.observations.lock()
+        {
+            observations.destroyed.entry(self.artifact.clone()).or_default().push(sequence);
         }
     }
 }

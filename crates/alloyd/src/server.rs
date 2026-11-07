@@ -22,9 +22,8 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// Default paths under `~/.alloy/` when HOME is available.
     pub fn default_paths() -> Result<Self, RpcError> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            RpcError::internal("HOME is required to derive ~/.alloy paths")
-        })?;
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| RpcError::internal("HOME is required to derive ~/.alloy paths"))?;
         let root = PathBuf::from(home).join(".alloy");
         Ok(Self {
             socket_path: root.join("alloyd.sock"),
@@ -36,9 +35,8 @@ impl DaemonConfig {
 /// Bind a Unix listener at `socket_path`, replacing a stale socket file only when safe.
 pub fn bind_listener(socket_path: &Path) -> Result<UnixListener, RpcError> {
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            RpcError::internal(format!("create socket parent: {error}"))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| RpcError::internal(format!("create socket parent: {error}")))?;
     }
     if socket_path.exists() {
         match UnixStream::connect(socket_path) {
@@ -49,18 +47,15 @@ pub fn bind_listener(socket_path: &Path) -> Result<UnixListener, RpcError> {
                 )));
             }
             Err(_) => {
-                std::fs::remove_file(socket_path).map_err(|error| {
-                    RpcError::internal(format!("remove stale socket: {error}"))
-                })?;
+                std::fs::remove_file(socket_path)
+                    .map_err(|error| RpcError::internal(format!("remove stale socket: {error}")))?;
             }
         }
     }
-    let listener = UnixListener::bind(socket_path).map_err(|error| {
-        RpcError::internal(format!("bind {}: {error}", socket_path.display()))
-    })?;
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
-        |error| RpcError::internal(format!("chmod socket: {error}")),
-    )?;
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|error| RpcError::internal(format!("bind {}: {error}", socket_path.display())))?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| RpcError::internal(format!("chmod socket: {error}")))?;
     Ok(listener)
 }
 

@@ -197,7 +197,7 @@ fn prompt_with_partial_last_block(environment: &PolicyEnvironment) -> (String, R
             rendered.token_count() > 64,
             "fixture must cross multiple SSD blocks"
         );
-        if (rendered.token_count() - 1) % 32 != 0 {
+        if !(rendered.token_count() - 1).is_multiple_of(32) {
             return (body, rendered);
         }
         // The byte-level tokenizer makes one additional ASCII byte a
@@ -328,8 +328,8 @@ fn tiered_finish_persists_native_blocks_and_zero_hot_cap_retains_only_weights() 
                     tensor.shape(),
                     [1, config.kv_heads, block_tokens, config.head_dim]
                 );
-                for value in tensor.data().chunks_exact(4) {
-                    let value = f32::from_le_bytes(value.try_into().unwrap());
+                for &value in tensor.data().as_chunks::<4>().0 {
+                    let value = f32::from_le_bytes(value);
                     assert!(value.is_finite());
                     nonzero |= value != 0.0;
                     scalar_count += 1;
@@ -1067,8 +1067,8 @@ fn tiered_actual_staged_write_failure_cleans_partial_files_and_preserves_native_
                                 block.spec.head_dim
                             ],
                         );
-                        for value in tensor.data().chunks_exact(4) {
-                            let value = f32::from_le_bytes(value.try_into().unwrap());
+                        for &value in tensor.data().as_chunks::<4>().0 {
+                            let value = f32::from_le_bytes(value);
                             assert!(value.is_finite());
                             nonzero |= value != 0.0;
                         }

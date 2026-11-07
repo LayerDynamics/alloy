@@ -349,10 +349,10 @@ fn seed_session_counter(store: &SessionStore) -> Result<u64, RpcError> {
         .map_err(|error| RpcError::internal(error.to_string()))?;
     let mut max = 0u64;
     for id in ids {
-        if let Some(suffix) = id.strip_prefix("sess-") {
-            if let Ok(value) = suffix.parse::<u64>() {
-                max = max.max(value);
-            }
+        if let Some(suffix) = id.strip_prefix("sess-")
+            && let Ok(value) = suffix.parse::<u64>()
+        {
+            max = max.max(value);
         }
     }
     Ok(max.saturating_add(1).max(1))
@@ -513,10 +513,10 @@ impl Engine for FixtureEngine {
         Box::pin(async move {
             let flag = Arc::new(AtomicBool::new(false));
             let key = request_id.as_str().to_owned();
-            if let Ok(mut pending) = pending_cancels.lock() {
-                if pending.remove(&key) {
-                    flag.store(true, Ordering::SeqCst);
-                }
+            if let Ok(mut pending) = pending_cancels.lock()
+                && pending.remove(&key)
+            {
+                flag.store(true, Ordering::SeqCst);
             }
             if let Ok(mut map) = per_request.lock() {
                 map.insert(key, Arc::clone(&flag));
@@ -552,16 +552,14 @@ impl Engine for FixtureEngine {
         self.cancelled.store(true, Ordering::SeqCst);
         let key = request_id.as_str().to_owned();
         let mut found = false;
-        if let Ok(map) = self.per_request.lock() {
-            if let Some(flag) = map.get(&key) {
-                flag.store(true, Ordering::SeqCst);
-                found = true;
-            }
+        if let Ok(map) = self.per_request.lock()
+            && let Some(flag) = map.get(&key)
+        {
+            flag.store(true, Ordering::SeqCst);
+            found = true;
         }
-        if !found {
-            if let Ok(mut pending) = self.pending_cancels.lock() {
-                pending.insert(key);
-            }
+        if !found && let Ok(mut pending) = self.pending_cancels.lock() {
+            pending.insert(key);
         }
         Box::pin(async { Ok(CancelOutcome::Requested) })
     }

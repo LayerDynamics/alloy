@@ -251,7 +251,7 @@ test("native collection launches only its colocated finite helper and retains st
   assert.equal(recovered.error, null);
 });
 
-test("a missing native helper requests a CLI rebuild and never launches an alternate backend", async () => {
+test("a missing native helper gives installation-neutral recovery and never launches an alternate backend", async () => {
   const commands: string[] = [];
   const collector = new PowerMetricsCollector({ enabled: true }, {
     platform: () => "darwin", architecture: () => "arm64",
@@ -264,7 +264,8 @@ test("a missing native helper requests a CLI rebuild and never launches an alter
   assert.equal(result.status, "unavailable");
   assert.equal(result.ane_power_mw, null);
   assert.equal(result.sampled_at_unix_ms, null);
-  assert.match(result.error!, /Rebuild.*npm --prefix ts\/cli run build/);
+  assert.match(result.error!, /Reinstall Alloy using your installation method/);
+  assert.match(result.error!, /source checkout users can rebuild/);
   assert.doesNotMatch(result.error!, /sudo|authoriz|password/i);
   assert.deepEqual(commands, [NATIVE_METRICS_HELPER]);
 });

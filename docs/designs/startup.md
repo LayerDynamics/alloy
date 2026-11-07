@@ -20,6 +20,34 @@ existing frozen `qwen3-4b-4bit` profile.
 From an uninstalled source checkout, use `node ts/cli/bin/alloy.js` in place
 of `alloy` after `npm --prefix ts/cli ci` and `npm --prefix ts/cli run build`.
 
+## Homebrew installation and persistent state
+
+Homebrew is the primary installed workflow:
+`brew install LayerDynamics/alloy/alloy`. The initial formula is a development
+preview built from an immutable source commit. It becomes available after
+both the source change and the matching tap formula merge; it is not a claim
+of a tagged release or a prebuilt bottle. See [the packaging contract](homebrew.md).
+
+The formula installs the CLI, matching daemon, `mlx.metallib`, and unprivileged
+native monitor as one unit. Its launcher uses a private pinned Node runtime
+and selects the paired daemon without finding a source checkout or requiring
+Cargo at runtime. An explicitly configured daemon or `ALLOYD` override keeps
+its existing precedence. The first source installation needs Apple's Metal
+build tools; normal `alloy start` does not rebuild native code.
+
+Installation does not provision a model, write user configuration, or start
+a service. Model download remains an explicit `setup --download` / `start --download`
+choice or prompt response, and `start` stays in the foreground. Default
+settings, models, database, socket and KV cache live outside the Cellar under
+`~/.alloy/`; `ALLOY_CONFIG_DIR` selects another state directory. Use that same
+environment setting for startup and every client. Existing explicit paths in
+saved settings remain authoritative.
+
+`brew upgrade LayerDynamics/alloy/alloy` updates the installed files without
+restarting a live daemon. Stop the old foreground `start` and invoke
+`alloy start` again to select the new daemon. A compatible existing listener
+is otherwise reused. Upgrade and uninstall do not remove external user state.
+
 ## Startup sequence
 
 1. Probe the selected socket with a bounded `daemon.status` request. API
@@ -29,9 +57,10 @@ of `alloy` after `npm --prefix ts/cli ci` and `npm --prefix ts/cli run build`.
    reported before starting another process or provisioning a model.
 2. Resolve an available launch command before provisioning. An explicit
    non-default `alloyd_bin` takes precedence, followed by `ALLOYD`. Otherwise
-   the CLI's source checkout selects Cargo; installed mode selects `alloyd`
-   from `PATH`. Missing tools produce an actionable failure. Finding Cargo
-   does not establish that native compilation will succeed.
+   the Homebrew launcher selects its paired daemon, the CLI's source checkout
+   selects Cargo, and an unpackaged installed CLI selects `alloyd` from `PATH`.
+   Missing tools produce an actionable failure. Finding Cargo does not
+   establish that native compilation will succeed.
 3. Verify the selected model against the bundled pinned runtime-file hashes.
    If unconfigured, try bounded local discovery, then ask for a local path,
    an explicit download, or cancellation. Noninteractive input never prompts
@@ -195,6 +224,9 @@ Installer tests use small injected pinned artifacts and transport streams;
 they do not download multi-GB weights in CI. API readiness is not proof of
 native weight loading or generation: a real chat request must validate those
 on the target host. Neither model provisioning nor this monitor/startup flow
-completes the representative two-large-model constrained-budget M9 acceptance.
-The broader release bootstrap, model registry, and Phase-5 environment and
+establishes representative two-large-model constrained-budget M9 acceptance;
+that gate has its own [completed evidence](../acceptance/phase-1-exit-review.md).
+The Homebrew formula's native check exercises CPU and Metal without weights;
+installed real-model generation needs separate validation. Release-binary
+download bootstrap, the model registry, and the Phase-5 environment and
 wired-limit doctor report remain separate work.

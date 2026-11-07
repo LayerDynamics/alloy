@@ -13,16 +13,24 @@ export type AlloySettings = {
   corpus_models: string | null;
 };
 
-export function alloyHome(home = os.homedir()): string {
+/** Configuration isolation does not change the user's home or explicit paths. */
+export function alloyHome(home = os.homedir(), env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.ALLOY_CONFIG_DIR;
+  if (configured !== undefined) {
+    if (!configured.trim() || /[\u0000-\u001f\u007f]/.test(configured)) {
+      throw new Error("ALLOY_CONFIG_DIR must be a nonempty directory path without control characters.");
+    }
+    return resolveSettingsPath(configured, home);
+  }
   return path.join(home, ".alloy");
 }
 
-export function settingsPath(home = os.homedir()): string {
-  return path.join(alloyHome(home), "settings.json");
+export function settingsPath(home = os.homedir(), env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(alloyHome(home, env), "settings.json");
 }
 
-export function defaultSettings(home = os.homedir()): AlloySettings {
-  const root = alloyHome(home);
+export function defaultSettings(home = os.homedir(), env: NodeJS.ProcessEnv = process.env): AlloySettings {
+  const root = alloyHome(home, env);
   return {
     version: 1,
     profile: "qwen3-4b-4bit",
@@ -54,8 +62,8 @@ export function normalizeSettingsPaths(settings: AlloySettings, home = os.homedi
   };
 }
 
-export function loadSettings(home = os.homedir()): AlloySettings | null {
-  const filePath = settingsPath(home);
+export function loadSettings(home = os.homedir(), env: NodeJS.ProcessEnv = process.env): AlloySettings | null {
+  const filePath = settingsPath(home, env);
   if (!fs.existsSync(filePath)) {
     return null;
   }
@@ -82,11 +90,11 @@ export function validateSettings(value: unknown): AlloySettings {
   return { ...raw, corpus_models: raw.corpus_models ?? null } as AlloySettings;
 }
 
-export function saveSettings(settings: AlloySettings, home = os.homedir()): void {
+export function saveSettings(settings: AlloySettings, home = os.homedir(), env: NodeJS.ProcessEnv = process.env): void {
   const validated = validateSettings(settings);
-  const root = alloyHome(home);
+  const root = alloyHome(home, env);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const filePath = settingsPath(home);
+  const filePath = settingsPath(home, env);
   const temporary = path.join(root, `.settings-${randomUUID()}.tmp`);
   try {
     fs.writeFileSync(temporary, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600, flag: "wx" });

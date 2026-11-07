@@ -332,13 +332,13 @@ impl Scheduler {
     pub fn request_state(&self, request_id: &RequestId) -> Result<RequestState, EngineError> {
         let state = self.shared.lock_state()?;
 
-        if let Some(active) = &state.active {
-            if &active.request_id == request_id {
-                return Ok(match active.phase {
-                    ActivePhase::Running => RequestState::Running,
-                    ActivePhase::CancellationRequested => RequestState::CancellationRequested,
-                });
-            }
+        if let Some(active) = &state.active
+            && &active.request_id == request_id
+        {
+            return Ok(match active.phase {
+                ActivePhase::Running => RequestState::Running,
+                ActivePhase::CancellationRequested => RequestState::CancellationRequested,
+            });
         }
 
         if state.finished.contains(request_id) {

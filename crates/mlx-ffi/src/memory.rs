@@ -342,10 +342,10 @@ pub fn clear_cache_after_synchronizing(streams: &[&Stream]) -> MemoryResult<Cach
     let mut failure = None;
 
     for (index, stream) in streams.iter().enumerate() {
-        if let Err(source) = stream.synchronize() {
-            if failure.is_none() {
-                failure = Some(MemoryError::StreamSynchronization { index, source });
-            }
+        if let Err(source) = stream.synchronize()
+            && failure.is_none()
+        {
+            failure = Some(MemoryError::StreamSynchronization { index, source });
         }
     }
 

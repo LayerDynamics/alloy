@@ -18,25 +18,25 @@ pub mod cancellation;
 pub mod error;
 pub mod family;
 pub mod generation;
-/// oMLX-method live memory guard (tiers, ceiling, watermarks).
-pub mod memory_guard;
 /// Live soft/hard enforcer poll tick (pool-drain grace, admission pause).
 pub mod memory_enforcer;
-/// Prefill admit-line checks and adaptive chunk shrink (M5–M6).
-pub mod prefill_admit;
+/// oMLX-method live memory guard (tiers, ceiling, watermarks).
+pub mod memory_guard;
 /// Unified CPU/Metal memory discovery and shared budgeting.
 pub mod platform;
+/// Prefill admit-line checks and adaptive chunk shrink (M5–M6).
+pub mod prefill_admit;
 /// Bounded unified-memory pressure and reclamation decisions.
 pub mod pressure;
-pub mod residency_policy;
-pub mod residency_pin;
 pub mod registry;
 pub mod rendering;
+pub mod residency_pin;
+pub mod residency_policy;
 pub mod runtime;
 pub mod scheduler;
-pub mod types;
 /// Bounded hot KV retention and atomic safetensors persistence.
 pub mod tiered_kv;
+pub mod types;
 
 #[cfg(test)]
 mod w3_acceptance;

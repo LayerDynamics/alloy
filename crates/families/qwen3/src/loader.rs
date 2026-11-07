@@ -479,7 +479,7 @@ impl OpenShard {
             }
             tensors.push((name, info.clone()));
         }
-        tensors.sort_unstable_by(|left, right| left.1.data_offsets.cmp(&right.1.data_offsets));
+        tensors.sort_unstable_by_key(|tensor| tensor.1.data_offsets);
         let mut offset = 0usize;
         for (name, info) in &tensors {
             let (start, end) = info.data_offsets;
@@ -586,10 +586,10 @@ fn validate_config(
         return Err(invalid("config mismatch: tie_word_embeddings"));
     }
 
-    if let Some(value) = data.get("hidden_act") {
-        if value.as_str() != Some("silu") {
-            return Err(invalid("only hidden_act=silu is supported"));
-        }
+    if let Some(value) = data.get("hidden_act")
+        && value.as_str() != Some("silu")
+    {
+        return Err(invalid("only hidden_act=silu is supported"));
     }
 
     if let Some(value) = data.get("rms_norm_eps") {
@@ -621,10 +621,10 @@ fn validate_config(
         return Err(invalid("rope scaling is unsupported"));
     }
 
-    if let Some(value) = data.get("attention_bias") {
-        if value.as_bool() != Some(false) {
-            return Err(invalid("attention_bias must be false"));
-        }
+    if let Some(value) = data.get("attention_bias")
+        && value.as_bool() != Some(false)
+    {
+        return Err(invalid("attention_bias must be false"));
     }
 
     let first = data.get("quantization").filter(|value| !value.is_null());
@@ -633,10 +633,10 @@ fn validate_config(
         .get("quantization_config")
         .filter(|value| !value.is_null());
 
-    if let (Some(first), Some(second)) = (first, second) {
-        if first != second {
-            return Err(invalid("conflicting quantization metadata"));
-        }
+    if let (Some(first), Some(second)) = (first, second)
+        && first != second
+    {
+        return Err(invalid("conflicting quantization metadata"));
     }
 
     if let Some(quantization) = first.or(second) {
@@ -646,10 +646,10 @@ fn validate_config(
             return Err(invalid("only affine four-bit quantization is supported"));
         }
 
-        if let Some(mode) = quantization.get("mode") {
-            if mode.as_str() != Some("affine") {
-                return Err(invalid("unsupported quantization mode"));
-            }
+        if let Some(mode) = quantization.get("mode")
+            && mode.as_str() != Some("affine")
+        {
+            return Err(invalid("unsupported quantization mode"));
         }
 
         let group = quantization
@@ -734,8 +734,8 @@ fn load_weights_impl<'a>(
         return Err(invalid("zero checkpoint dimension"));
     }
 
-    if config.q_heads % config.kv_heads != 0
-        || config.head_dim % 2 != 0
+    if !config.q_heads.is_multiple_of(config.kv_heads)
+        || !config.head_dim.is_multiple_of(2)
         || !config.rope_theta.is_finite()
         || config.rope_theta <= 0.0
     {
@@ -1671,7 +1671,7 @@ mod hardening_unit_tests {
             sha256: &pins,
             cancelled: &cancelled,
         };
-        let (shards, _) = open_test_shards(&[path.clone()], Some(&verification));
+        let (shards, _) = open_test_shards(std::slice::from_ref(&path), Some(&verification));
         std::fs::rename(&path, directory.0.join("original.safetensors")).expect("replace path");
         write_tensor_shard(&path, "value", Dtype::F32, 1, &9.0f32.to_le_bytes());
         let (mut tensors, _) =
