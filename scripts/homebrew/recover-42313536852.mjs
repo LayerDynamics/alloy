@@ -115,7 +115,7 @@ async function verifyTap() {
   const expected = path.join(fs.realpathSync(os.tmpdir()), "alloy-brew-OwVXSa", "tap");
   const origin = (await run("/usr/bin/git", ["-C", TAP_PATH, "remote", "get-url", "origin"])).stdout.trim();
   const originPath = origin.startsWith("file://") ? fileURLToPath(origin) : origin;
-  assert.equal(originPath, expected, "Tap origin is not the artifact-identified temporary repository");
+  assert(path.isAbsolute(originPath), "Tap origin must be the absolute recorded local repository");
   assert.equal(fs.realpathSync(originPath), expected, "Tap origin path was replaced");
   const filename = path.join(TAP_PATH, "Formula", `${NAME}.rb`);
   assert(fs.lstatSync(filename).isFile() && fs.statSync(filename).size < 1024 * 1024, "Invalid recorded formula file");
@@ -244,3 +244,4 @@ export async function main() {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 }
+
