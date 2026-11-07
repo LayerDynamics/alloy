@@ -181,6 +181,18 @@ jobs:
           cache: npm
           cache-dependency-path: ts/cli/package-lock.json
 
+      - name: Inspect Homebrew host locks
+        run: node scripts/homebrew/host-check.mjs
+
+      - name: Retain early Homebrew host evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-host-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/phase-1-acceptance/homebrew-host/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: CLI and monitor tests
         working-directory: ts/cli
         run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
