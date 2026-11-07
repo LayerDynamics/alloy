@@ -80,6 +80,9 @@ class Alloy < Formula
   test do
     ENV["ALLOY_CONFIG_DIR"] = (testpath/"config").to_s
     ENV["ALLOYD"] = nil
+    socket_path = (testpath/"config/alloyd.sock").to_s
+    assert_operator socket_path.bytesize, :<, 104,
+                    "Homebrew test socket exceeds macOS's path limit; use a short HOMEBREW_TEMP: #{socket_path}"
     alloy = (bin/"alloy").to_s.shellescape
     alloyd = (bin/"alloyd").to_s.shellescape
     assert_equal "alloy @@VERSION@@", shell_output("#{alloy} --version").strip
@@ -91,7 +94,7 @@ class Alloy < Formula
     assert_equal "passed", native.fetch("metal").fetch("status")
     assert_equal "passed", native.fetch("shared_arrays").fetch("status")
     doctor = JSON.parse(shell_output("#{alloy} doctor --json", 1))
-    assert_equal "setup_required", doctor.fetch("readiness")
+    assert_equal "setup_required", doctor.fetch("readiness"), JSON.pretty_generate(doctor)
     assert_equal "binary", doctor.fetch("launch").fetch("kind")
     assert_equal (opt_libexec/"native/alloyd").to_s, doctor.fetch("launch").fetch("command")
     system libexec/"cli/dist/native/alloy-metrics", "--self-test"

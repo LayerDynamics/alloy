@@ -324,7 +324,12 @@ export async function main() {
     fs.mkdirSync(brewTemp);
     result.original_build_tree_unavailable = true;
     save();
-    await execute(brew, ["test", formula], { env, log, timeoutMs: 180_000 });
+    // Homebrew creates and removes its own test directory here and grants its
+    // sandbox Unix-socket access there. Our deeper build root exceeds macOS's
+    // socket path limit once Homebrew appends the test name and config path.
+    await execute(brew, ["test", formula], {
+      env: { ...env, HOMEBREW_TEMP: fs.realpathSync("/tmp") }, log, timeoutMs: 180_000,
+    });
     const artifact = process.env.ALLOY_QWEN3_ARTIFACT || path.join(os.homedir(), "alloy-omlx-models/alloy-qwen3-4b-4bit");
     await execute(process.execPath, [path.join(ROOT, "scripts/homebrew/smoke.mjs"), "--prefix", result.prefix, "--expected-commit", commit, "--output", path.join(output, "installed"), "--artifact", artifact], { env, log, timeoutMs: 600_000, killGraceMs: 6000 });
     if (stopping) throw new Error("Homebrew acceptance cancelled");

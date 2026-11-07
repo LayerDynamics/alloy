@@ -139,6 +139,10 @@ The source repository's physical Mac job runs
 [`scripts/homebrew/ci.mjs`](../../scripts/homebrew/ci.mjs). It creates a unique
 temporary tap and a keg-only copy of the generated formula, changing only the
 formula name/class, adding `keg_only`, and selecting an owned local source URL.
+Its build uses the recorded owned temporary root; `brew test` uses Homebrew's
+normal short system temporary root so the test's Unix socket fits macOS's
+104-byte address field. Homebrew creates, permits and removes its own test
+directory there. The driver never searches or deletes the shared temporary root.
 [`source.mjs`](../../scripts/homebrew/source.mjs) creates an independent bare
 snapshot of the exact checked-out commit and tree, with a stable `candidate`
 ref and verified complete objects. This supports detached/shallow synthetic
