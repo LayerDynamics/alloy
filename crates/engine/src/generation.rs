@@ -1641,3 +1641,8 @@ mod w2_proposal_queue_tests {
         assert_eq!(state.buffered_text_bytes, 0);
     }
 }
+
+// W2_COMPLETION_GATE_TEST_MODULE_V1
+#[cfg(test)]
+#[path = "generation/w2_completion_gate_tests.rs"]
+mod w2_completion_gate_tests;

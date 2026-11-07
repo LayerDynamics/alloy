@@ -543,3 +543,9 @@ impl Drop for CancelOnDropStream {
 }
 
 // ALLOY_PRESSURE_STARTUP_INTEGRATION_V1
+
+// W2_COMPLETION_GATE_TEST_CONTEXT_V1
+#[cfg(test)]
+pub(crate) fn w2_test_execution_context(permit: ExecutionPermit) -> ExecutionContext {
+    ExecutionContext::new(permit)
+}
