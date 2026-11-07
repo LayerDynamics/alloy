@@ -840,3 +840,110 @@ pub struct Capabilities {
     /// Implemented decoding modes.
     pub decoding_modes: Vec<DecodingCapability>,
 }
+
+// W2_UNTRUSTED_GENERATION_OUTPUT_V1
+
+/// A model-proposed tool name and object arguments, not an invocation.
+///
+/// This value has no daemon call/session identity, registry version,
+/// implementation, approval, or policy. Construction does not resolve a
+/// registration, validate its schema, or authorize an effect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCallProposal {
+    name: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ToolCallProposal {
+    /// Check name structure while retaining arguments exactly as data.
+    /// Parser and runtime boundaries must separately enforce byte/count limits.
+    pub fn new(
+        name: impl Into<String>,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, EngineError> {
+        let name = name.into();
+        if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
+            return Err(EngineError::invalid_request(
+                "tool_call.name",
+                "tool name must be nonempty, unpadded, and contain no control characters",
+            ));
+        }
+        Ok(Self { name, arguments })
+    }
+
+    /// Untrusted name awaiting resolution against the registry.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Untrusted object awaiting registered-schema validation.
+    pub fn arguments(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.arguments
+    }
+
+    /// Transfer the proposed name and arguments without assigning identity.
+    pub fn into_parts(self) -> (String, serde_json::Map<String, serde_json::Value>) {
+        (self.name, self.arguments)
+    }
+}
+
+/// Family-independent parsed output, before daemon invocation binding.
+///
+/// A complete call proposal is not an incremental JSON delta or permission
+/// to execute. A producer must apply its protocol-completion and failure
+/// rules before publishing a proposal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenerationOutputBlock {
+    /// Assistant text with family control syntax already handled.
+    Text(String),
+    /// Complete untrusted name/arguments, with no daemon-issued call ID.
+    ToolCall(ToolCallProposal),
+}
+
+#[cfg(test)]
+mod w2_output_contract_tests {
+    use super::{GenerationOutputBlock, ToolCallProposal};
+    use serde_json::{Map, Value, json};
+
+    #[test]
+    fn proposal_preserves_nested_arguments_and_authority_shaped_data() {
+        let value = json!({
+            "path": "résumé/雪.txt",
+            "nested": [null, true, 7, {"x": "retained"}],
+            "approved": true,
+            "call_id": "argument-data-not-an-invocation-id"
+        });
+        let arguments = value.as_object().expect("object").clone();
+        let proposal = ToolCallProposal::new("fs.read", arguments.clone()).expect("proposal");
+        assert_eq!(proposal.name(), "fs.read");
+        assert_eq!(proposal.arguments(), &arguments);
+        let (name, restored) = proposal.into_parts();
+        assert_eq!(name, "fs.read");
+        assert_eq!(Value::Object(restored), value);
+    }
+
+    #[test]
+    fn proposal_rejects_empty_padded_and_control_names() {
+        for name in ["", " fs.read", "fs.read ", "fs\nread", "fs\0read"] {
+            assert!(ToolCallProposal::new(name, Map::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_name_is_only_a_proposal_not_registry_resolution() {
+        let proposal = ToolCallProposal::new("not.registered", Map::new()).expect("proposal");
+        assert_eq!(proposal.name(), "not.registered");
+        assert!(proposal.arguments().is_empty());
+    }
+
+    #[test]
+    fn output_blocks_keep_text_and_complete_proposals_distinct() {
+        let proposal = ToolCallProposal::new("fs.read", Map::new()).expect("proposal");
+        let blocks = [
+            GenerationOutputBlock::Text("Reading.".to_owned()),
+            GenerationOutputBlock::ToolCall(proposal.clone()),
+        ];
+        assert!(matches!(&blocks[0], GenerationOutputBlock::Text(text) if text == "Reading."));
+        assert!(matches!(&blocks[1], GenerationOutputBlock::ToolCall(call) if call == &proposal));
+    }
+}
