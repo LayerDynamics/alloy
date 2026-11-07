@@ -121,8 +121,8 @@ export async function verifyInstallation(prefix, expectedCommit) {
   return { prefix: realPrefix, manifest, manifest_sha256: createHash("sha256").update(raw).digest("hex"), files };
 }
 
-export async function processTable() {
-  const { stdout } = await execute("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
+export async function processTable(timeoutMs = 3000) {
+  const { stdout } = await execute("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="], { encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
   return stdout.split("\n").flatMap((line) => {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)/.exec(line);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), state: match[4] }] : [];
@@ -196,18 +196,28 @@ export class OwnedProcess {
     catch (error) { if (error.code !== "ESRCH") throw error; this.retired = true; }
   }
 
-  async wait(timeoutMs) {
+  async wait(timeoutMs, signal) {
     let timer;
+    let onAbort;
     try {
-      return await Promise.race([this.done, new Promise((_, reject) => {
+      signal?.throwIfAborted();
+      const pending = [this.done, new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`${this.label} timed out after ${timeoutMs} ms`)), timeoutMs);
-      })]);
-    } finally { clearTimeout(timer); }
+      })];
+      if (signal) pending.push(new Promise((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      }));
+      return await Promise.race(pending);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
-  async liveMembers() {
+  async liveMembers(timeoutMs = 3000) {
     if (this.retired || this.group === undefined) return [];
-    const members = (await processTable()).filter((entry) => entry.group === this.group && !entry.state.startsWith("Z"));
+    const members = (await processTable(timeoutMs)).filter((entry) => entry.group === this.group && !entry.state.startsWith("Z"));
     if (members.length === 0) this.retired = true;
     return members;
   }
@@ -229,6 +239,69 @@ export class OwnedProcess {
     const result = { label: this.label, process_group: this.group, escalated, remaining_live_pids: [] };
     appendJson(path.join(this.output, "cleanup.ndjson"), result);
     return result;
+  }
+
+  async stopAfterInterrupt() {
+    // All live groups use this same three-second budget concurrently. Escalation
+    // has its own timer so a delayed process-table probe cannot postpone SIGKILL.
+    const deadline = Date.now() + 3000;
+    let escalated = false;
+    let signalError;
+    const kill = () => {
+      if (this.retired) return;
+      escalated = true;
+      try { this.signal("SIGKILL"); } catch (error) { signalError ??= error; }
+    };
+    const escalation = setTimeout(kill, 1500);
+    try {
+      this.signal("SIGTERM");
+      while (true) {
+        const remaining = deadline - Date.now();
+        assert(remaining > 0, `Owned process group ${this.group} exceeded cancellation cleanup deadline`);
+        const members = await this.liveMembers(Math.min(500, remaining));
+        if (members.length === 0) break;
+        await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
+      }
+      await this.wait(Math.max(1, deadline - Date.now()));
+      if (signalError) throw signalError;
+      const result = { label: this.label, process_group: this.group, escalated, remaining_live_pids: [] };
+      appendJson(path.join(this.output, "cleanup.ndjson"), result);
+      return result;
+    } finally {
+      clearTimeout(escalation);
+      // A failed probe still must not leave a TERM-ignoring owned child alive.
+      if (!this.retired) kill();
+    }
+  }
+}
+
+/** Signal handling shared by installed acceptance and its subprocess test. */
+export class SmokeCancellation {
+  constructor(owned) {
+    this.owned = owned;
+    this.controller = new AbortController();
+    this.signal = this.controller.signal;
+    this.cleanup = null;
+    this.onInt = () => this.interrupt("SIGINT");
+    this.onTerm = () => this.interrupt("SIGTERM");
+    process.on("SIGINT", this.onInt);
+    process.on("SIGTERM", this.onTerm);
+  }
+
+  interrupt(signal) {
+    if (this.signal.aborted) return;
+    // Begin every owned group's cleanup before unwinding a pending command.
+    // Retired groups remain retired and receive no further signals.
+    this.cleanup = Promise.allSettled(this.owned.filter((child) => !child.retired || !child.closed)
+      .map((child) => child.stopAfterInterrupt()));
+    this.controller.abort(new Error(`Installed acceptance interrupted by ${signal}`));
+  }
+
+  check() { this.signal.throwIfAborted(); }
+
+  dispose() {
+    process.off("SIGINT", this.onInt);
+    process.off("SIGTERM", this.onTerm);
   }
 }
 
@@ -290,12 +363,8 @@ export async function runSmoke(options) {
     cwd, runtime_path: SYSTEM_PATH, artifact_requested: options.artifact ?? null, cleanup: [] };
   const resultFile = path.join(options.output, "result.json");
   jsonFile(resultFile, result);
-  let interrupted = null;
-  const onInt = () => { interrupted = "SIGINT"; for (const child of owned) child.signal("SIGTERM"); };
-  const onTerm = () => { interrupted = "SIGTERM"; for (const child of owned) child.signal("SIGTERM"); };
-  process.on("SIGINT", onInt);
-  process.on("SIGTERM", onTerm);
-  const check = () => assert(!interrupted, `Installed acceptance interrupted by ${interrupted}`);
+  const cancellation = new SmokeCancellation(owned);
+  const check = () => cancellation.check();
   const launch = (command, args, label, recordChunks = false) => {
     check();
     const process = new OwnedProcess(command, args, { cwd, env, output: options.output, label, recordChunks });
@@ -305,11 +374,16 @@ export async function runSmoke(options) {
   const command = async (file, args, label, { timeout = 30000, codes = [0], recordChunks = false } = {}) => {
     const process = launch(file, args, label, recordChunks);
     try {
-      const exit = await process.wait(timeout);
+      const exit = await process.wait(timeout, cancellation.signal);
       assert.equal(exit.error, null, `${label}: ${exit.error}`);
       assert(codes.includes(exit.code), `${label} failed (${exit.signal ?? exit.code}); see ${label}.stderr.log\n${process.stderr.slice(-2000)}`);
       return process;
-    } finally { result.cleanup.push(await process.stop()); }
+    } finally {
+      if (!cancellation.signal.aborted) {
+        const stopped = await process.stop();
+        if (!cancellation.signal.aborted) result.cleanup.push(stopped);
+      }
+    }
   };
   let failure;
   try {
@@ -409,7 +483,7 @@ export async function runSmoke(options) {
       // Interrupt only the CLI owner here. Group cleanup below is a failure
       // fallback, so this gate proves that ordinary `alloy start` stops its child.
       assert(owner.child.kill("SIGINT"), "Could not interrupt the owned foreground CLI");
-      const stopped = await owner.wait(15000);
+      const stopped = await owner.wait(15000, cancellation.signal);
       assert.equal(stopped.error, null);
       assert.equal(stopped.code, 130, "Foreground start did not preserve Ctrl+C exit status");
       assert.equal((await owner.liveMembers()).length, 0, "Foreground CLI left a live daemon/descendant after interruption");
@@ -425,11 +499,18 @@ export async function runSmoke(options) {
   } catch (error) { failure = error; }
   finally {
     for (const child of owned) {
+      if (cancellation.signal.aborted) break;
       try { if (!child.retired || !child.closed) result.cleanup.push(await child.stop()); }
       catch (error) { failure ??= error; }
     }
-    process.off("SIGINT", onInt);
-    process.off("SIGTERM", onTerm);
+    if (cancellation.signal.aborted) {
+      failure ??= cancellation.signal.reason;
+      for (const cleanup of await cancellation.cleanup) {
+        if (cleanup.status === "fulfilled") result.cleanup.push(cleanup.value);
+        else failure ??= cleanup.reason;
+      }
+    }
+    cancellation.dispose();
     try {
       const settingsFile = path.join(config, "settings.json");
       if (fs.existsSync(settingsFile)) fs.copyFileSync(settingsFile, path.join(options.output, "settings.json"));

@@ -134,3 +134,73 @@ test("cleanup stops orphaned descendants and a hung child while preserving anoth
   await unrelated.stop(500);
   assert.equal((await unrelated.liveMembers()).length, 0);
 });
+
+test("smoke cancellation interrupts its wait and removes TERM-ignoring groups within the outer six-second grace", { timeout: 20000 }, async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "alloy-smoke-cancellation-test-")));
+  const options = (label) => ({ cwd: root, env: process.env, output: root, label });
+  const runners = [];
+  const targetGroups = new Set();
+  const unrelated = new OwnedProcess(process.execPath, ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);"], options("unrelated"));
+  t.after(async () => {
+    try {
+      // These IDs come only from children created by the test fixture. Drop each
+      // as soon as its absence is verified, so retired groups are never signalled.
+      for (const group of targetGroups) {
+        try { process.kill(-group, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+      }
+      await Promise.all([...runners, unrelated].map((child) => child.stop(500)));
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const output = path.join(root, signal);
+    fs.mkdirSync(output);
+    const program = `
+      import assert from 'node:assert/strict';
+      import { OwnedProcess, SmokeCancellation } from ${JSON.stringify(new URL("./smoke.mjs", import.meta.url).href)};
+      const owned = [];
+      const cancellation = new SmokeCancellation(owned);
+      const target = new OwnedProcess(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 1000);'],
+        { cwd: ${JSON.stringify(root)}, env: process.env, output: ${JSON.stringify(output)}, label: 'target' });
+      owned.push(target);
+      const deadline = Date.now() + 4000;
+      while (!target.stdout.includes('ready')) {
+        assert(Date.now() < deadline && !target.closed, 'target did not become ready');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      process.stdout.write(JSON.stringify({ target_group: target.group }) + '\\n');
+      let interruption;
+      try { await target.wait(60000, cancellation.signal); }
+      catch (error) { interruption = error; }
+      assert.equal(interruption, cancellation.signal.reason, 'pending wait must reject with the interruption');
+      assert(cancellation.signal.aborted && !target.closed, 'wait must abort before the TERM-ignoring process exits');
+      const cleanup = await cancellation.cleanup;
+      cancellation.dispose();
+      assert(cleanup.every(item => item.status === 'fulfilled'), JSON.stringify(cleanup));
+      process.stdout.write(JSON.stringify({ cleanup: cleanup.map(item => item.value), wait_aborted_before_close: true }) + '\\n');
+      process.exitCode = 143;
+    `;
+    const runner = new OwnedProcess(process.execPath, ["--input-type=module", "-e", program], options(`runner-${signal.toLowerCase()}`));
+    runners.push(runner);
+    const readyDeadline = Date.now() + 5000;
+    while (!runner.stdout.includes("\n")) {
+      assert(Date.now() < readyDeadline && !runner.closed, `smoke subprocess did not become ready: ${runner.stderr}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const targetGroup = JSON.parse(runner.stdout.split("\n")[0]).target_group;
+    assert(Number.isSafeInteger(targetGroup) && targetGroup > 1);
+    targetGroups.add(targetGroup);
+    const started = performance.now();
+    assert(runner.child.kill(signal)); // Signal the smoke owner, not its detached target.
+    const exit = await runner.wait(5500);
+    assert.equal(exit.code, 143, runner.stderr);
+    assert(performance.now() - started < 6000, "smoke cleanup must finish before its outer owner escalates");
+    const report = JSON.parse(runner.stdout.trim().split("\n").at(-1));
+    assert.equal(report.wait_aborted_before_close, true);
+    assert.equal(report.cleanup.length, 1);
+    assert.equal(report.cleanup[0].escalated, true);
+    assert.deepEqual(report.cleanup[0].remaining_live_pids, []);
+    assert(!(await processTable()).some((entry) => entry.group === targetGroup && !entry.state.startsWith("Z")), "owned target survived smoke cancellation");
+    targetGroups.delete(targetGroup);
+    assert((await unrelated.liveMembers()).length > 0, "smoke cancellation signalled an unrelated group");
+  }
+});

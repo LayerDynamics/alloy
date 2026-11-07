@@ -66,7 +66,8 @@ reservation ownership, corruption handling, and restart semantics.
 Homebrew is the recommended installation on **Apple Silicon, macOS 14 or
 newer**. The first formula builds from a pinned source commit and requires
 Xcode 15 or newer with its command-line and Metal compiler tools. The first
-native build can take several minutes; build output remains visible.
+native build can take several minutes. Homebrew shows build stages; add
+`--verbose` to the install command for detailed compiler output.
 
 **Availability:** this source change and the matching
 [Homebrew tap](https://github.com/LayerDynamics/homebrew-alloy) formula must

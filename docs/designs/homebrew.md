@@ -135,7 +135,12 @@ source install and its installed-payload checks:
 The source repository's physical Mac job runs
 [`scripts/homebrew/ci.mjs`](../../scripts/homebrew/ci.mjs). It creates a unique
 temporary tap and a keg-only copy of the generated formula, changing only the
-formula name/class and adding `keg_only`. The production fetch, install and
+formula name/class, adding `keg_only`, and selecting an owned local source URL.
+[`source.mjs`](../../scripts/homebrew/source.mjs) creates an independent bare
+snapshot of the exact checked-out commit and tree, with a stable `candidate`
+ref and verified complete objects. This supports detached/shallow synthetic
+PR merge commits that GitHub may not serve as ordinary download revisions;
+the immutable commit pin is unchanged. The production fetch, install and
 test bodies stay identical. Actual `brew install --build-from-source` and
 `brew test` run against that owned formula. Its exclusive Homebrew build
 directory is moved out of the original path before native checks and the
@@ -145,8 +150,9 @@ removes only that unique keg/tap, with automatic update, cleanup and dependency
 autoremove disabled. The generated formula, source/installation identities,
 build/test logs and real-model result are retained as acceptance evidence.
 
-The tap's hosted ARM64 macOS job validates the canonical `alloy` formula,
-builds it and checks normal command linking and CLI/daemon selection. It does
+The canonical tap retains its HTTPS GitHub source URL. Its hosted ARM64 macOS
+job validates that public source download, builds the canonical `alloy`
+formula and checks normal command linking and CLI/daemon selection. It does
 not run the native acceptance test or claim Metal execution on the hosted VM.
 That packaging result complements the required physical CPU/Metal/shared-array
 and model run; neither substitutes for the other.

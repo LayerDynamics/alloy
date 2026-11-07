@@ -297,7 +297,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 90
         shell: bash
-        run: node scripts/homebrew/ci.mjs
+        run: exec node scripts/homebrew/ci.mjs
+
+      - name: Clean this run's owned Homebrew resources
+        if: ${{ always() }}
+        timeout-minutes: 5
+        shell: bash
+        run: exec node scripts/homebrew/ci.mjs --cleanup-owned
 
       - name: Retain Phase 1 and Homebrew acceptance evidence
         if: ${{ always() }}
