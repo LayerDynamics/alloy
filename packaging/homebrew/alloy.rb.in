@@ -91,7 +91,7 @@ class Alloy < Formula
     assert_equal "passed", native.fetch("metal").fetch("status")
     assert_equal "passed", native.fetch("shared_arrays").fetch("status")
     doctor = JSON.parse(shell_output("#{alloy} doctor --json", 1))
-    assert_equal "setup_required", doctor.fetch("readiness")
+    assert_equal "setup_required", doctor.fetch("readiness"), JSON.pretty_generate(doctor)
     assert_equal "binary", doctor.fetch("launch").fetch("kind")
     assert_equal (opt_libexec/"native/alloyd").to_s, doctor.fetch("launch").fetch("command")
     system libexec/"cli/dist/native/alloy-metrics", "--self-test"
