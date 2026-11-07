@@ -1167,8 +1167,10 @@ dependencies = [
  "minijinja",
  "mlx-ffi",
  "safetensors",
+ "serde",
  "serde_json",
  "sha2",
+ "tool-registry",
 ]
 
 [[package]]
