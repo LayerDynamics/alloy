@@ -335,7 +335,7 @@ impl ParserAllocation {
 
     /// Consume exclusive accounting ownership before allocating.
     ///
-    /// Sharing an Arc<MemoryReservation> is intentionally not accepted.
+    /// Sharing an `Arc<MemoryReservation>` is intentionally not accepted.
     pub fn from_reservation(
         reservation: MemoryReservation,
         limits: ParserAllocationLimits,

@@ -283,7 +283,7 @@ fn workspace_bound(
 ///
 /// Parser workspace/payload/descriptors are counted once by the parser slab's
 /// Layout. Other simultaneously live heap allocations must be supplied as
-/// actual Layouts, not size multipliers or size_of::<Arc<T>> guesses.
+/// actual Layouts, not size multipliers or `size_of::<Arc<T>>` guesses.
 /// Allocator rounding, RSS, and calibrated allocator headroom are not Layouts.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen3OutputMemoryPlan {
@@ -301,7 +301,7 @@ impl Qwen3OutputMemoryPlan {
     pub fn queued_text_bytes(&self) -> u64 { self.queued_text_bytes }
     /// One pending text delta, separate from queued text.
     pub fn pending_text_bytes(&self) -> u64 { self.pending_text_bytes }
-    /// Header allocation for the existing VecDeque<String> queue.
+    /// Header allocation for the existing `VecDeque<String>` queue.
     pub fn text_queue_header_bytes(&self) -> u64 { self.text_queue_header_bytes }
     /// Exact checked parser backing Layout, including its alignment padding.
     pub fn parser_slab_bytes(&self) -> u64 { self.parser_slab_bytes }
