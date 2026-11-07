@@ -82,7 +82,9 @@ impl EventKind {
             "run.started" => Ok(Self::RunStarted),
             "run.paused" => Ok(Self::RunPaused),
             "run.completed" => Ok(Self::RunCompleted),
-            other => Err(HarnessError::Invalid(format!("unknown event kind: {other}"))),
+            other => Err(HarnessError::Invalid(format!(
+                "unknown event kind: {other}"
+            ))),
         }
     }
 }
@@ -112,7 +114,9 @@ impl SessionStatus {
             "active" => Ok(Self::Active),
             "paused" => Ok(Self::Paused),
             "completed" => Ok(Self::Completed),
-            other => Err(HarnessError::Invalid(format!("unknown session status: {other}"))),
+            other => Err(HarnessError::Invalid(format!(
+                "unknown session status: {other}"
+            ))),
         }
     }
 }
@@ -162,9 +166,8 @@ impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> HarnessResult<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                HarnessError::Store(format!("create parent dir: {error}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| HarnessError::Store(format!("create parent dir: {error}")))?;
         }
         let conn = Connection::open(&path)?;
         let mut store = Self { path, conn };
@@ -440,12 +443,11 @@ fn append_event_in_tx(
     payload: Value,
     artifact_refs: Value,
 ) -> HarnessResult<EventRecord> {
-    let next_seq: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get(0),
-        )?;
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )?;
     let payload_json = serde_json::to_string(&payload)?;
     let artifact_refs_json = serde_json::to_string(&artifact_refs)?;
     tx.execute(

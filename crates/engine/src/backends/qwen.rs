@@ -1485,13 +1485,11 @@ fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
             "expected Qwen3ForCausalLM",
         ));
     }
-    for key in ["rope_scaling"] {
-        if value.get(key).is_some_and(|v| !v.is_null()) {
-            return Err(EngineError::unsupported(
-                "model configuration",
-                format!("{key} is not implemented"),
-            ));
-        }
+    if value.get("rope_scaling").is_some_and(|v| !v.is_null()) {
+        return Err(EngineError::unsupported(
+            "model configuration",
+            "rope_scaling is not implemented",
+        ));
     }
     for key in ["attention_bias", "mlp_bias", "use_sliding_window"] {
         if value.get(key).is_some_and(|v| v.as_bool() != Some(false)) {
@@ -1555,8 +1553,8 @@ fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
             .and_then(Value::as_bool)
             .ok_or_else(|| validation(None, "tie_word_embeddings must be explicit"))?,
     };
-    if config.q_heads % config.kv_heads != 0
-        || config.head_dim % 2 != 0
+    if !config.q_heads.is_multiple_of(config.kv_heads)
+        || !config.head_dim.is_multiple_of(2)
         || as_u64(config.vocab_size)? > u64::from(u32::MAX) + 1
     {
         return Err(validation(
@@ -2225,7 +2223,9 @@ mod shared_rendering_wiring_tests {
         group_size: usize,
     ) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
         assert_eq!(values.len(), rows.saturating_mul(cols));
-        assert!(cols > 0 && cols % 8 == 0 && group_size > 0 && cols % group_size == 0);
+        assert!(
+            cols > 0 && cols.is_multiple_of(8) && group_size > 0 && cols.is_multiple_of(group_size)
+        );
         let groups = cols / group_size;
         let mut packed = vec![0u32; rows * (cols / 8)];
         let mut scales = vec![0f32; rows * groups];

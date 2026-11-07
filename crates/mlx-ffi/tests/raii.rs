@@ -1,18 +1,27 @@
 //! Named tests 1, 2, 3, 5 (Phase 0 execution plan). Lane: Linux + Mac —
 //! every test here must pass on both CI lanes.
 //!
-//!   1. array_raii_roundtrip      — create/dispose through RAII guards,
-//!                                  no leaks (run under ASan or `leaks`)
-//!   2. device_and_stream_lifecycle — device + stream creation, sync,
-//!                                  default selection
-//!   3. closure_smoke             — mlx_closure create/call through FFI
-//!   5. lazy_eval_and_synchronize — lazy evaluation + stream sync hold
+//! - Test 1, `array_raii_roundtrip`: create/dispose through RAII guards,
+//!   no leaks (run under ASan or `leaks`).
+//! - Test 2, `device_and_stream_lifecycle`: device + stream creation, sync,
+//!   and default selection.
+//! - Test 3, `closure_smoke`: mlx_closure create/call through FFI.
+//! - Test 5, `lazy_eval_and_synchronize`: lazy evaluation + stream sync hold.
 //!
 //! Leak checking (test 1's "no leaks" clause) is external to the binary:
-//!   - Linux: MLX_FFI_ASAN=1 RUSTFLAGS="-Zsanitizer=address" \
-//!            cargo test -p mlx-ffi --test raii
-//!   - macOS: cargo test -p mlx-ffi --test raii && \
-//!            leaks -atExit -- cargo test -p mlx-ffi --test raii
+//!
+//! Linux:
+//! ```sh
+//! MLX_FFI_ASAN=1 RUSTFLAGS="-Zsanitizer=address" \
+//!   cargo test -p mlx-ffi --test raii
+//! ```
+//!
+//! macOS:
+//! ```sh
+//! cargo test -p mlx-ffi --test raii && \
+//!   leaks -atExit -- cargo test -p mlx-ffi --test raii
+//! ```
+//!
 //! The create/dispose churn loop below exists to give those tools a
 //! statistically meaningful number of allocation cycles.
 //!
@@ -118,7 +127,7 @@ fn device_and_stream_lifecycle() {
 #[test]
 fn closure_smoke() {
     let closure = Closure::wrap_fn(|inputs: &[Array]| {
-        let mut out: Vec<Array> = inputs.iter().map(|a| a.clone()).collect();
+        let mut out = inputs.to_vec();
         out.push(Array::from_f32(42.0).expect("closure scalar"));
         out
     })

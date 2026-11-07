@@ -229,7 +229,10 @@ pub enum MemoryGuardError {
 impl fmt::Display for MemoryGuardError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidTier => write!(formatter, "memory guard tier must be safe|balanced|aggressive|custom"),
+            Self::InvalidTier => write!(
+                formatter,
+                "memory guard tier must be safe|balanced|aggressive|custom"
+            ),
             Self::InvalidCustomCeiling => {
                 write!(formatter, "custom memory-guard ceiling must be positive")
             }
@@ -257,7 +260,9 @@ pub fn tier_reserve_bytes(tier: MemoryGuardTier, total_ram: u64) -> MemoryGuardR
         MemoryGuardTier::Custom => Ok(2 * GIB),
         MemoryGuardTier::Safe => clamp_share(total_ram, 0.20, 6 * GIB, 16 * GIB),
         MemoryGuardTier::Balanced => clamp_share(total_ram, 0.08, 3 * GIB, 8 * GIB),
-        MemoryGuardTier::Aggressive => clamp_share(total_ram, 0.02, (1.5 * GIB as f64) as u64, 4 * GIB),
+        MemoryGuardTier::Aggressive => {
+            clamp_share(total_ram, 0.02, (1.5 * GIB as f64) as u64, 4 * GIB)
+        }
     }
 }
 
@@ -339,8 +344,9 @@ pub fn ceiling_breakdown(
     let dynamic_bytes = match config.tier {
         MemoryGuardTier::Custom => config.custom_ceiling_bytes,
         _ => {
-            let reclaim = (host.other_apps_active_bytes as f64 * other_app_reclaim_ratio(config.tier))
-                .round() as u64;
+            let reclaim = (host.other_apps_active_bytes as f64
+                * other_app_reclaim_ratio(config.tier))
+            .round() as u64;
             alloy_usage_bytes
                 .saturating_add(host.free_bytes)
                 .saturating_add(host.inactive_bytes)
@@ -380,10 +386,7 @@ pub fn ceiling_breakdown(
 }
 
 /// Soft / hard / admit / abort bytes for a ceiling.
-pub fn watermark_bytes(
-    tier: MemoryGuardTier,
-    breakdown: CeilingBreakdown,
-) -> WatermarkBytes {
+pub fn watermark_bytes(tier: MemoryGuardTier, breakdown: CeilingBreakdown) -> WatermarkBytes {
     let hard_limit = breakdown.hard_limit_bytes;
     let soft = scale(hard_limit, soft_threshold(tier));
     let hard = scale(hard_limit, hard_threshold(tier));
@@ -456,10 +459,10 @@ mod tests {
             physical_memory_bytes: 36 * GIB,
             free_bytes: 10 * GIB,
             inactive_bytes: 4 * GIB,
-            active_file_bytes: 1 * GIB,
+            active_file_bytes: GIB,
             other_apps_active_bytes: 8 * GIB,
             phys_footprint_bytes: 2 * GIB,
-            graphics_footprint_bytes: 1 * GIB,
+            graphics_footprint_bytes: GIB,
             iogpu_wired_limit_bytes: 0,
             recommended_working_set_bytes: 27 * GIB,
             release_credit_bytes: 0,
@@ -501,7 +504,7 @@ mod tests {
     #[test]
     fn balanced_dynamic_can_bind_when_machine_is_busy() {
         let mut host = host_36g();
-        host.free_bytes = 1 * GIB;
+        host.free_bytes = GIB;
         host.inactive_bytes = 0;
         host.active_file_bytes = 0;
         host.other_apps_active_bytes = 0;
@@ -522,13 +525,12 @@ mod tests {
     fn balanced_dynamic_binds_when_reclaimable_pool_is_small() {
         let mut host = host_36g();
         host.free_bytes = 2 * GIB;
-        host.inactive_bytes = 1 * GIB;
+        host.inactive_bytes = GIB;
         host.active_file_bytes = 0;
         host.other_apps_active_bytes = 0;
         host.recommended_working_set_bytes = 100 * GIB;
         let alloy = 2 * GIB;
-        let breakdown =
-            ceiling_breakdown(MemoryGuardConfig::balanced(), host, alloy).unwrap();
+        let breakdown = ceiling_breakdown(MemoryGuardConfig::balanced(), host, alloy).unwrap();
         // dynamic = 2+2+1 - 3 = 2 GiB; static = 33; metal skipped as huge
         assert_eq!(breakdown.dynamic_bytes, 2 * GIB);
         assert_eq!(breakdown.hard_limit_bytes, 2 * GIB);
@@ -595,6 +597,9 @@ mod tests {
     #[test]
     fn tier_parse_rejects_unknown() {
         assert!(MemoryGuardTier::parse("turbo").is_err());
-        assert_eq!(MemoryGuardTier::parse("Balanced").unwrap(), MemoryGuardTier::Balanced);
+        assert_eq!(
+            MemoryGuardTier::parse("Balanced").unwrap(),
+            MemoryGuardTier::Balanced
+        );
     }
 }

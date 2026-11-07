@@ -64,9 +64,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
     }
 }
 
-fn next_event(
-    stream: &mut Pin<Box<dyn GenerationEventStream>>,
-) -> Option<GenerationEvent> {
+fn next_event(stream: &mut Pin<Box<dyn GenerationEventStream>>) -> Option<GenerationEvent> {
     block_on(poll_fn(|cx| stream.as_mut().poll_next(cx)))
 }
 
@@ -222,11 +220,8 @@ impl EngineRuntime for MockRuntime {
 fn mock_engine() -> (EngineCore<MockRuntime>, PathBuf, ModelProfileId, ArtifactId) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let stamp = NEXT.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "alloy-w3-mock-{}-{}",
-        std::process::id(),
-        stamp
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("alloy-w3-mock-{}-{}", std::process::id(), stamp));
     std::fs::create_dir_all(&directory).expect("temp artifact dir");
     std::fs::write(
         directory.join("config.json"),
@@ -282,10 +277,7 @@ fn mock_engine() -> (EngineCore<MockRuntime>, PathBuf, ModelProfileId, ArtifactI
     (engine, directory, profile_id, artifact_id)
 }
 
-fn request(
-    id: &str,
-    profile: &ModelProfileId,
-) -> GenerationRequest {
+fn request(id: &str, profile: &ModelProfileId) -> GenerationRequest {
     GenerationRequest::new(
         RequestId::new(id).expect("request"),
         profile.clone(),
@@ -320,8 +312,8 @@ fn engine_traits_documented() {
 fn stream_events_order() {
     let (engine, directory, profile, _artifact) = mock_engine();
 
-    let generation = block_on(engine.generate(request("stream-order", &profile)))
-        .expect("generate");
+    let generation =
+        block_on(engine.generate(request("stream-order", &profile))).expect("generate");
     let request_id = generation.request_id().clone();
     let mut events = generation.into_events();
 

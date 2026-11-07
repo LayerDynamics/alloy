@@ -390,13 +390,13 @@ impl GenerationOptions {
                     ));
                 }
 
-                if let Some(probability) = top_p {
-                    if !probability.is_finite() || *probability <= 0.0 || *probability > 1.0 {
-                        return Err(EngineError::invalid_request(
-                            "top_p",
-                            "must be finite and within (0, 1]",
-                        ));
-                    }
+                if let Some(probability) = top_p
+                    && (!probability.is_finite() || *probability <= 0.0 || *probability > 1.0)
+                {
+                    return Err(EngineError::invalid_request(
+                        "top_p",
+                        "must be finite and within (0, 1]",
+                    ));
                 }
             }
         }

@@ -287,6 +287,10 @@ impl CacheAllocationRequest {
 }
 
 /// Type-erased family-owned native cache; it need not cross threads.
+#[expect(
+    clippy::len_without_is_empty,
+    reason = "Keep the existing family adapter contract; the runtime checks logical token emptiness with len() == 0"
+)]
 pub trait FamilyCache: Any {
     /// Loaded model instance that owns this state.
     fn owner(&self) -> &ModelInstanceId;

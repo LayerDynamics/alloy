@@ -561,10 +561,10 @@ impl PressureAttempt {
 
         let options = self.policy.options;
 
-        if let Some(ceiling) = options.allocator_ceiling_bytes {
-            if observation.demand.additional_mlx_bytes > ceiling {
-                return Ok(self.reject(RejectReason::RequestExceedsAllocatorCeiling));
-            }
+        if let Some(ceiling) = options.allocator_ceiling_bytes
+            && observation.demand.additional_mlx_bytes > ceiling
+        {
+            return Ok(self.reject(RejectReason::RequestExceedsAllocatorCeiling));
         }
 
         let assessment = assess(options, observation)?;

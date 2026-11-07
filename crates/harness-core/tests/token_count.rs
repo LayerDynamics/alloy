@@ -5,10 +5,10 @@ use engine::rendering::{
     PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions, render_and_count,
 };
 use engine::types::{
-    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability,
-    ExecutionBackend, FinishReason, Generation, GenerationEvent, GenerationEventStream,
-    GenerationRequest, MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome,
-    SessionStateId, Usage, WeightRepresentation,
+    ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, DecodingCapability, ExecutionBackend,
+    FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationRequest,
+    MemoryBreakdown, MemoryEstimate, ModelProfileId, ReleaseOutcome, SessionStateId, Usage,
+    WeightRepresentation,
 };
 use harness_core::{ContextBuilder, EventKind, SessionStore};
 use serde_json::json;
@@ -72,7 +72,10 @@ impl Engine for ExactRenderEngine {
         ENGINE_API_VERSION
     }
 
-    fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, engine::types::RenderedContext> {
+    fn render_and_count(
+        &self,
+        context: ContextSnapshot,
+    ) -> EngineFuture<'_, engine::types::RenderedContext> {
         let profile = context.profile_id().clone();
         let binding = RenderingBinding {
             profile_id: &profile,
@@ -192,13 +195,8 @@ fn token_count_exact() {
         .expect("user");
 
     let events = store.list_events("tok-1").expect("events");
-    let snapshot = ContextBuilder::build_snapshot(
-        "tok-snap",
-        "harness-profile",
-        &events,
-        None,
-    )
-    .expect("snapshot");
+    let snapshot = ContextBuilder::build_snapshot("tok-snap", "harness-profile", &events, None)
+        .expect("snapshot");
 
     let engine = ExactRenderEngine::new();
     let rendered = ContextBuilder::render_and_count(&engine, snapshot).expect("render");
@@ -211,8 +209,6 @@ fn token_count_exact() {
     // Independent check against the same tokenizer JSON.
     let source = tokenizer_source();
     let tokenizer = tokenizers::Tokenizer::from_bytes(&source).expect("hf tokenizer");
-    let encoding = tokenizer
-        .encode("hello world", false)
-        .expect("encode");
+    let encoding = tokenizer.encode("hello world", false).expect("encode");
     assert_eq!(encoding.get_ids(), rendered.token_ids());
 }

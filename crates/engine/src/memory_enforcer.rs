@@ -389,12 +389,12 @@ impl MemoryEnforcer {
 
         self.publish_ceiling(ceiling, marks, usage);
 
-        if ceiling.hard_limit_bytes > 0 {
-            if let Err(error) = self.inner.admission.resize_budget(ceiling.hard_limit_bytes) {
-                // Budget below reserved is expected during a large load; keep
-                // the previous ledger budget and continue pressure handling.
-                let _ = error;
-            }
+        if ceiling.hard_limit_bytes > 0
+            && let Err(error) = self.inner.admission.resize_budget(ceiling.hard_limit_bytes)
+        {
+            // Budget below reserved is expected during a large load; keep
+            // the previous ledger budget and continue pressure handling.
+            let _ = error;
         }
 
         let previous = *self
@@ -698,7 +698,7 @@ mod tests {
     fn host_busy() -> HostMemorySnapshot {
         HostMemorySnapshot {
             physical_memory_bytes: 36 * GIB,
-            free_bytes: 1 * GIB,
+            free_bytes: GIB,
             inactive_bytes: 0,
             active_file_bytes: 0,
             other_apps_active_bytes: 0,
@@ -720,11 +720,11 @@ mod tests {
     #[test]
     fn ok_pressure_unpauses_admissions() {
         let mut host = host_busy();
-        host.phys_footprint_bytes = 1 * GIB;
+        host.phys_footprint_bytes = GIB;
         host.graphics_footprint_bytes = 0;
         host.free_bytes = 20 * GIB;
         host.inactive_bytes = 5 * GIB;
-        let enforcer = enforcer_with(host, 1 * GIB, 0);
+        let enforcer = enforcer_with(host, GIB, 0);
         enforcer.admission().set_admissions_paused(true);
         let tick = enforcer.tick().expect("tick");
         assert_eq!(tick.status.pressure, PressureLevel::Ok);

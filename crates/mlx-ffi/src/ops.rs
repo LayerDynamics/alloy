@@ -233,6 +233,10 @@ pub fn linear(input: &Array, weight: &Array, stream: &Stream) -> OperationResult
 /// `weight`: packed uint32 `[output_width, input_width * bits / 32]`.
 /// `scales` / `biases`: `[output_width, groups]` float32.
 /// `transpose`: true for the usual checkpoint layout `[out, in]`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors the native quantized matmul operands, quantization parameters, and stream"
+)]
 pub fn quantized_matmul(
     input: &Array,
     weight: &Array,

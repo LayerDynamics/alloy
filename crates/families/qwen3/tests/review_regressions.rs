@@ -83,7 +83,8 @@ fn untied_head_is_required_and_controls_logits() {
     let mut w = generate_fixture(&c);
     w.lm_head = Some(qwen3::fixture::MatrixWeight::f32(vec![
         0.0;
-        c.vocab_size * c.hidden_size
+        c.vocab_size
+            * c.hidden_size
     ]));
     let model = Qwen3Model::load(c, w).expect("untied model");
     assert!(

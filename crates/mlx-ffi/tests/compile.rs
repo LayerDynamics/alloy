@@ -32,8 +32,8 @@ fn mlx_compile_smoke() {
 
     // Wrap a trivial identity closure and compile it with shape
     // specialization.
-    let identity = Closure::wrap_fn(|inputs: &[Array]| inputs.iter().map(|a| a.clone()).collect())
-        .expect("wrap identity closure");
+    let identity =
+        Closure::wrap_fn(|inputs: &[Array]| inputs.to_vec()).expect("wrap identity closure");
 
     let compiled = identity.compile(false).expect("compile closure");
 

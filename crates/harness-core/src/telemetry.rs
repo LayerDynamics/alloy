@@ -145,12 +145,12 @@ fn assert_value_anonymous(value: &serde_json::Value, path: &str) -> HarnessResul
                 assert_value_anonymous(child, &format!("{path}[{index}]"))?;
             }
         }
-        serde_json::Value::String(text) => {
-            if text.contains('/') && (text.starts_with('/') || text.contains(":\\")) {
-                return Err(HarnessError::Telemetry(format!(
-                    "telemetry string looks like a filesystem path at {path}"
-                )));
-            }
+        serde_json::Value::String(text)
+            if text.contains('/') && (text.starts_with('/') || text.contains(":\\")) =>
+        {
+            return Err(HarnessError::Telemetry(format!(
+                "telemetry string looks like a filesystem path at {path}"
+            )));
         }
         _ => {}
     }
@@ -614,15 +614,15 @@ mod tests {
         }
     }
 
-    fn gated_transport(
-        fail_first: bool,
-    ) -> (
+    type GatedTransportParts = (
         Box<dyn TelemetryTransport>,
         Receiver<Post>,
         ReleaseOnDrop,
         Arc<AtomicUsize>,
         Receiver<()>,
-    ) {
+    );
+
+    fn gated_transport(fail_first: bool) -> GatedTransportParts {
         let (posts, received) = mpsc::channel();
         let (release, wait) = mpsc::sync_channel(1);
         let (dropped, destroyed) = mpsc::sync_channel(1);

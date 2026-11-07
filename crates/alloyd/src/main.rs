@@ -302,14 +302,14 @@ fn run_memory_enforcer_loop(
                         if let Some(error) = report.allocator_error {
                             eprintln!("alloyd: allocator drain failed: {error}");
                         }
-                        if let Some(cache) = report.allocator_cache {
-                            if cache.before.cache_bytes > cache.after.cache_bytes {
-                                eprintln!(
-                                    "alloyd: MLX pool drain {} -> {} MiB",
-                                    cache.before.cache_bytes / (1024 * 1024),
-                                    cache.after.cache_bytes / (1024 * 1024)
-                                );
-                            }
+                        if let Some(cache) = report.allocator_cache
+                            && cache.before.cache_bytes > cache.after.cache_bytes
+                        {
+                            eprintln!(
+                                "alloyd: MLX pool drain {} -> {} MiB",
+                                cache.before.cache_bytes / (1024 * 1024),
+                                cache.after.cache_bytes / (1024 * 1024)
+                            );
                         }
                         match report.model {
                             engine::runtime::IdleModelReclaim::Evicted(instance) => {

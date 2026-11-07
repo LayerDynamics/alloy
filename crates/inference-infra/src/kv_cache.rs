@@ -1125,10 +1125,10 @@ fn prefix_view(
 }
 
 fn record_native_failure(first: &mut Option<MlxError>, result: Result<(), MlxError>) {
-    if let Err(error) = result {
-        if first.is_none() {
-            *first = Some(error);
-        }
+    if let Err(error) = result
+        && first.is_none()
+    {
+        *first = Some(error);
     }
 }
 
