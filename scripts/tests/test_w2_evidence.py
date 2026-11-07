@@ -100,6 +100,22 @@ class EvidenceParsingTests(unittest.TestCase):
     def test_selftest_skips_are_not_accepted_as_full_coverage(self):
         self.assertTrue(w2.python_selftest_errors("Ran 32 tests in 0.1s\n\nOK (skipped=4)\n"))
 
+    def test_binary_target_selects_cargo_bin_not_integration_test(self):
+        gate = w2.TestGate("binary", "alloyd", "bin:alloyd", "rpc_transport_config::tests", ("example",))
+        command = gate.command(True)
+        self.assertIn("--bin", command)
+        self.assertEqual(command[command.index("--bin") + 1], "alloyd")
+        self.assertNotIn("--test", command)
+
+    def test_all_lower_layers_do_not_become_trained_model_evidence(self):
+        names = ["qwen-decoder-hooks", "slab-delivery", "runtime-slab-handoff", "rpc-borrowed-transport",
+                 "rpc-notification-dispatch", "rpc-write-failure-ownership", "daemon-transport-options",
+                 "daemon-transport-cli", "parser-shared-fixture-parity"]
+        boundary = w2.acceptance_boundary([{"gate": name, "passed": True} for name in names])
+        self.assertTrue(all(layer["passed"] for layer in boundary["layers"].values()))
+        self.assertTrue(all(not layer["trained_model_tool_loop_evidence"] for layer in boundary["layers"].values()))
+        self.assertEqual(boundary["candidate_built_trained_model_daemon_tool_loop"]["status"], "not_collected")
+
     def test_all_case_identifiers_are_unique(self):
         names = [g.name for g in w2.gates()]
         self.assertEqual(len(names), len(set(names)))

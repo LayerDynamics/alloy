@@ -26,6 +26,12 @@ SOURCE_PATHS = (
     "scripts/w2_evidence.py",
     "scripts/tests/test_w2_evidence.py",
     "docs/decisions/w2-tool-output-memory-contract.md",
+    "docs/decisions/w2-parser-placement-and-syntax.md",
+    "docs/acceptance/w2-deployed-path-boundary.md",
+    "crates/engine/src/slab_parser/parity.rs",
+    "crates/alloyd/src/main.rs",
+    "crates/alloyd/src/rpc_transport_config.rs",
+    "crates/alloyd/tests/rpc_transport_args.rs",
     "crates/engine/src/parser_allocation.rs",
     "crates/engine/src/slab_parser.rs",
     "crates/engine/src/runtime.rs",
@@ -57,7 +63,12 @@ class TestGate:
 
     def command(self, discovery: bool) -> list[str]:
         command = ["cargo", "test", "--locked", "--color", "never", "-p", self.package]
-        command += ["--lib"] if self.target == "lib" else ["--test", self.target]
+        if self.target == "lib":
+            command.append("--lib")
+        elif self.target.startswith("bin:"):
+            command += ["--bin", self.target.split(":", 1)[1]]
+        else:
+            command += ["--test", self.target]
         if self.selector:
             command.append(self.selector)
         command.append("--")
@@ -70,6 +81,19 @@ class TestGate:
 
 def gates() -> tuple[TestGate, ...]:
     return (
+        TestGate("parser-shared-fixture-parity", "engine", "lib", "slab_parser::parity::", (
+            "accepted_shared_fixtures_match_at_every_utf8_split",
+            "rejected_shared_fixtures_fail_in_both_streaming_parsers",
+            "alternate_coder_function_parameter_syntax_is_explicitly_unsupported",
+        ), minimum=6, evidence_kind="shared_fixture_semantic_projection_not_identical_publication_schedule"),
+        TestGate("daemon-transport-options", "alloyd", "bin:alloyd", "rpc_transport_config::tests::", (
+            "paired_options_preserve_exact_values",
+            "actual_service_configuration_helper_applies_only_the_supplied_policy",
+        ), minimum=8, evidence_kind="binary_configuration_and_actual_service_fixture"),
+        TestGate("daemon-transport-cli", "alloyd", "rpc_transport_args", "", (
+            "rpc_transport_valid_pair_reaches_the_existing_artifact_guard",
+            "rpc_transport_incomplete_pair_is_rejected_before_artifact_setup",
+        ), minimum=5, evidence_kind="candidate_built_binary_options_no_model_start"),
         TestGate("P2-03-compat", "qwen3", "tool_calls", "qwen3_tool_call_chunk_boundaries",
                  ("qwen3_tool_call_chunk_boundaries",), exact=True,
                  evidence_kind="legacy_family_byte_fragment_parser"),
@@ -355,17 +379,38 @@ def collect_test_gate(gate: TestGate, execute) -> dict:
 
 def acceptance_gaps() -> list[dict]:
     return [
-        {"id": "syntax-scope", "status": "review_pending",
-         "detail": "Review supported Qwen3/Coder syntax and legacy/slab parity; alternate function/parameter delimiters are rejected by the slab parser."},
+        {"id": "syntax-scope", "status": "candidate_evidence_pending",
+         "detail": "Shared-fixture parity and parser placement are documented and tested. Artifact-wide Qwen3/Coder scope is not inferred; alternate function/parameter syntax remains explicitly unsupported."},
         {"id": "mlx-schema-cache-restore", "status": "not_collected",
          "detail": "Host-reference cache tests and SSD-key unit tests do not establish native MLX retained-cache/SSD restore acceptance after schema changes."},
         {"id": "deployed-tool-path", "status": "not_collected",
          "detail": "Scripted inference, direct decoder tests, and Unix-socket fixtures are not one candidate-built trained-model daemon tool-loop acceptance run."},
-        {"id": "daemon-transport-policy", "status": "configuration_review_pending",
-         "detail": "The explicit transport-limits API exists; deployment configuration and the current fail-closed supervisor remain separate review items."},
+        {"id": "daemon-transport-policy", "status": "candidate_configuration_evidence_pending",
+         "detail": "Paired RPC transport flags are wired to the real daemon constructor. Actual deployment must supply both flags; tests do not attest a running model daemon or remove the fail-closed supervisor."},
         {"id": "final-review", "status": "pending",
          "detail": "A reviewer must reconcile source, gates, provenance, and remaining W2 requirements. This collector cannot self-sign W2 complete."},
     ]
+
+
+def acceptance_boundary(results: list[dict]) -> dict:
+    passed = {value["gate"] for value in results if value.get("passed")}
+    layers = {
+        "qwen_decoder_fixture": ["qwen-decoder-hooks"],
+        "production_worker_scripted_inference": ["slab-delivery", "runtime-slab-handoff"],
+        "notification_dispatch_and_unix_socket_fixtures": ["rpc-borrowed-transport", "rpc-notification-dispatch", "rpc-write-failure-ownership"],
+        "daemon_configuration_no_model_boot": ["daemon-transport-options", "daemon-transport-cli"],
+        "supported_shared_parser_fixtures": ["parser-shared-fixture-parity"],
+    }
+    return {
+        "layers": {name: {"gates": gates, "passed": set(gates) <= passed,
+                           "trained_model_tool_loop_evidence": False}
+                   for name, gates in layers.items()},
+        "candidate_built_trained_model_daemon_tool_loop": {
+            "status": "not_collected", "artifact": None,
+            "reason": "No required tool-aware supervisor/authorization execution evidence is produced by these test gates.",
+        },
+        "acceptance_sign_off": "pending_independent_review",
+    }
 
 
 def write_report(output: Path, report: dict) -> None:
@@ -470,6 +515,13 @@ def main(argv: list[str] | None = None) -> int:
                                    and report["recorded_tests_passed"] and report["quality_checks_passed"]
                                    and "collection_error" not in report
                                    and not report["missing_source_blobs"])
+    report["acceptance_boundary"] = acceptance_boundary(report["results"])
+    passed_ids = {value["gate"] for value in report["results"] if value.get("passed")}
+    for gap in report["remaining_required_review"]:
+        if gap["id"] == "syntax-scope" and "parser-shared-fixture-parity" in passed_ids:
+            gap["status"] = "fixture_parity_passed_artifact_scope_review_pending"
+        if gap["id"] == "daemon-transport-policy" and {"daemon-transport-options", "daemon-transport-cli"} <= passed_ids:
+            gap["status"] = "configuration_tests_passed_deployment_not_attested"
     report["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     write_report(output, report)
     print("Evidence:", output)

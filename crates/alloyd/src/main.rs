@@ -1,6 +1,7 @@
 //! `alloyd` binary entrypoint.
 
 mod native_check;
+mod rpc_transport_config;
 
 use alloyd::{
     BootRequest, DaemonConfig, DaemonService, LiveEngineMetrics, bind_listener, boot_qwen3,
@@ -70,6 +71,7 @@ fn run() -> Result<(), String> {
     let mut paged_ssd_cache_dir = None;
     let mut hot_cache_limit = HotCacheLimit::Percent(25);
     let mut hot_cache_only = false;
+    let mut rpc_transport = rpc_transport_config::TransportArgs::default();
 
     let mut index = 0;
     while index < args.len() {
@@ -124,6 +126,22 @@ fn run() -> Result<(), String> {
                         .map_err(|_| format!("invalid --admission-budget-bytes: {raw}"))?,
                 );
             }
+            "--rpc-max-notification-bytes" => {
+                index += 1;
+                rpc_transport.set_maximum(&require_value(
+                    &args,
+                    index,
+                    "--rpc-max-notification-bytes",
+                )?)?;
+            }
+            "--rpc-write-timeout-ms" => {
+                index += 1;
+                rpc_transport.set_timeout(&require_value(
+                    &args,
+                    index,
+                    "--rpc-write-timeout-ms",
+                )?)?;
+            }
             "--cpu" => prefer_metal = false,
             "--metal" => prefer_metal = true,
             "--paged-ssd-cache-dir" => {
@@ -153,6 +171,8 @@ fn run() -> Result<(), String> {
         }
         index += 1;
     }
+
+    let rpc_transport_limits = rpc_transport.finish()?;
 
     let artifact = artifact.ok_or_else(|| {
         "--artifact PATH is required (local mlx-community Qwen3-4B-4bit directory for profile qwen3-4b-4bit)".to_owned()
@@ -217,7 +237,7 @@ fn run() -> Result<(), String> {
         booted.engine.clone(),
         booted.memory_enforcer.clone(),
     ));
-    let service = Arc::new(
+    let service = Arc::new(rpc_transport_config::apply(
         DaemonService::open(
             &config.db_path,
             booted.engine,
@@ -228,7 +248,15 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.message)?
         .with_metrics_source(metrics),
-    );
+        rpc_transport_limits,
+    ));
+    if let Some(limits) = rpc_transport_limits {
+        eprintln!(
+            "alloyd: RPC slab transport max_bytes={} write_timeout_ms={} (tool policy unchanged)",
+            limits.max_notification_bytes(),
+            limits.write_timeout().as_millis()
+        );
+    }
 
     thread::Builder::new()
         .name("alloyd-memory-enforcer".to_owned())
@@ -381,6 +409,10 @@ OPTIONS:
   --metal                     Metal transformer operations with shared CPU/Metal memory
                               Default on native Apple Silicon; no silent CPU fallback
   --cpu                       MLX CPU transformer operations (default on other platforms)
+  --rpc-max-notification-bytes N  Full escaped slab notification limit, including newline
+  --rpc-write-timeout-ms N     Socket per-write timeout in milliseconds
+                              Supply both RPC flags or neither; no implicit policy
+                              These flags do not enable tools or approvals
   --telemetry-endpoint URL     FR-35 flush URL
   -V, --version               Show the daemon version without starting it
   --check-native              Check native CPU operations; on Apple Silicon also

@@ -752,3 +752,8 @@ mod tests {
 }
 
 // W2_SLAB_BACKED_DECODER_V1
+
+// W2_PARSER_PLACEMENT_PARITY_V1
+#[cfg(test)]
+#[path = "slab_parser/parity.rs"]
+mod parity;
