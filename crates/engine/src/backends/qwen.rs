@@ -36,6 +36,7 @@ use crate::{
         PrefillOutput, TokenLogits,
     },
     generation::GenerationLimits,
+    parser_allocation::{ParserAllocation, ParserAllocationLimits},
     registry::{ArtifactRegistration, FamilyRegistration, FamilyVersion, ModelProfile, Registry},
     rendering::{self, PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions},
     runtime::{FamilyRuntime, RetentionPolicy, RuntimeBackend, RuntimePlan, TextDecoder},
@@ -161,7 +162,7 @@ impl Qwen3BackendLimits {
                 "all size/count limits must be positive",
             ));
         }
-        output_bytes(self.generation)?;
+        self.output_memory_plan(None, &[])?;
         Ok(())
     }
 }
@@ -174,6 +175,8 @@ pub struct Qwen3Backend {
     limits: Qwen3BackendLimits,
     execution: Qwen3Execution,
     tool_call_parsing: bool,
+    // W2_QWEN_PARSER_CAPACITY_HOOKS_V1
+    parser_capacities: Option<ParserAllocationLimits>,
 }
 
 impl Qwen3Backend {
@@ -396,6 +399,7 @@ impl Qwen3Backend {
             limits,
             execution,
             tool_call_parsing: false,
+            parser_capacities: None,
         })
     }
 
@@ -406,9 +410,56 @@ impl Qwen3Backend {
     /// proposals that the generation driver publishes only after the whole
     /// generation succeeds. Reserved control syntax such as `<think>` in
     /// model output is then a protocol error instead of display text.
+    /// Generation also requires explicit capacities through
+    /// `with_parser_allocation_limits`; this flag alone selects no limits.
+    /// Rendering tool context does not allocate parser storage.
     pub fn with_tool_call_parsing(mut self, enabled: bool) -> Self {
         self.tool_call_parsing = enabled;
+        if !enabled {
+            self.parser_capacities = None;
+        }
         self
+    }
+
+    /// Enable tool parsing with explicit fixed parser/slab capacities.
+    ///
+    /// Validates the layout and output-plan arithmetic without allocating
+    /// parser storage or acquiring admission. No defaults are selected.
+    /// Disabling tool parsing clears this configuration.
+    ///
+    /// Until the storage-backed decoder is implemented, generation with this
+    /// configuration fails closed at decoder construction. It never falls
+    /// back to the legacy Map-based tool parser.
+    pub fn with_parser_allocation_limits(
+        mut self,
+        limits: ParserAllocationLimits,
+    ) -> Result<Self, EngineError> {
+        ParserAllocation::required_bytes(limits).map_err(|error| {
+            EngineError::invalid_request("parser_allocation_limits", error.to_string())
+        })?;
+        self.limits.output_memory_plan(Some(limits), &[])?;
+        self.parser_capacities = Some(limits);
+        self.tool_call_parsing = true;
+        Ok(self)
+    }
+
+    fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        match (self.tool_call_parsing, self.parser_capacities) {
+            (false, None) => Ok(None),
+            (true, Some(limits)) => Ok(Some(limits)),
+            (true, None) => Err(EngineError::invalid_request(
+                "parser_allocation_limits",
+                "tool generation requires explicit parser capacities via with_parser_allocation_limits",
+            )),
+            (false, Some(_)) => Err(internal("disabled tool parsing retained parser capacities")),
+        }
+    }
+
+    fn planned_output_bytes(&self) -> Result<u64, EngineError> {
+        Ok(self
+            .limits
+            .output_memory_plan(self.selected_parser_capacities()?, &[])?
+            .total_bytes())
     }
 
     fn tool_parser_limits(&self) -> qwen3::tool_calls::ParserLimits {
@@ -684,7 +735,7 @@ impl RuntimeBackend for Qwen3Backend {
                         .min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
                 )?,
-                output_bytes: output_bytes(self.limits.generation)?,
+                output_bytes: self.planned_output_bytes()?,
                 headroom_bytes: self.limits.execution_headroom_bytes,
                 prefill_chunk_tokens: self.limits.prefill_chunk_tokens,
             })
@@ -758,6 +809,12 @@ impl RuntimeBackend for Qwen3Backend {
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
         let resolved = registry.resolve_profile(profile)?;
         let data = self.data(resolved.artifact())?;
+        if self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "admitted parser storage",
+                "tool generation requires the storage-backed decoder construction hook",
+            ));
+        }
         let parser = if self.tool_call_parsing {
             Some(
                 qwen3::tool_calls::ToolCallParser::new(self.tool_parser_limits())
@@ -775,6 +832,49 @@ impl RuntimeBackend for Qwen3Backend {
             finished: false,
             parser,
         }))
+    }
+
+    fn parser_allocation_limits(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+    ) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        self.data(resolved.artifact())?;
+        self.selected_parser_capacities()
+    }
+
+    fn decoder_with_parser_allocation(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        self.data(resolved.artifact())?;
+        match (self.selected_parser_capacities()?, allocation) {
+            (None, None) => self.decoder(registry, profile),
+            (Some(limits), Some(allocation)) => {
+                let expected = ParserAllocation::required_bytes(limits).map_err(|error| {
+                    EngineError::invalid_request("parser_allocation_limits", error.to_string())
+                })?;
+                if allocation.reserved_bytes() != expected {
+                    return Err(internal(
+                        "Qwen parser allocation differs from the planned slab size",
+                    ));
+                }
+                // Intentionally no fallback, wrapper, or unused side slab.
+                // The decoder patch must replace this rejection with a
+                // constructor that actually parses in the supplied storage.
+                Err(EngineError::unsupported(
+                    "admitted parser storage",
+                    "Qwen storage-backed decoder integration is not implemented yet",
+                ))
+            }
+            _ => Err(internal(
+                "Qwen parser allocation presence differs from backend configuration",
+            )),
+        }
     }
 
     fn incremental_mlx_bytes(
@@ -1486,6 +1586,260 @@ mod shared_rendering_wiring_tests {
                 )
                 .expect("actual engine")
         }
+    }
+
+    fn explicit_parser_capacities() -> ParserAllocationLimits {
+        ParserAllocationLimits {
+            carry_bytes: 32,
+            call_bytes: 128,
+            decoded_bytes: 128,
+            depth: 8,
+            keys: 16,
+            nodes: 32,
+            proposal_bytes: 256,
+            calls: 4,
+        }
+    }
+
+    fn parser_capacity_tuple(limits: ParserAllocationLimits) -> [usize; 8] {
+        [
+            limits.carry_bytes,
+            limits.call_bytes,
+            limits.decoded_bytes,
+            limits.depth,
+            limits.keys,
+            limits.nodes,
+            limits.proposal_bytes,
+            limits.calls,
+        ]
+    }
+
+    #[test]
+    fn qwen_parser_hooks_text_only_plan_and_decoder_are_unchanged() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        assert!(
+            backend
+                .parser_allocation_limits(&registry, profile)
+                .expect("metadata")
+                .is_none()
+        );
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).expect("render");
+        let plan =
+            block_on(backend.plan(&registry, profile, rendered.token_count())).expect("plan");
+        assert_eq!(
+            plan.output_bytes,
+            output_bytes(fixture.limits.generation).expect("legacy output")
+        );
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, profile, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_flag_alone_does_not_invent_capacities() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_tool_call_parsing(true);
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        assert!(
+            backend
+                .parser_allocation_limits(&registry, profile)
+                .is_err()
+        );
+        assert!(block_on(backend.plan(&registry, profile, 1)).is_err());
+        // The non-admitted constructor cannot bypass the runtime hook.
+        assert!(backend.decoder(&registry, profile).is_err());
+    }
+
+    #[test]
+    fn qwen_parser_hooks_snapshot_all_explicit_capacities_and_plan_slab_once() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        let actual = backend
+            .parser_allocation_limits(&registry, profile)
+            .expect("metadata")
+            .expect("selected");
+        assert_eq!(
+            parser_capacity_tuple(actual),
+            parser_capacity_tuple(capacities)
+        );
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).expect("render");
+        let plan =
+            block_on(backend.plan(&registry, profile, rendered.token_count())).expect("plan");
+        let expected = fixture
+            .limits
+            .output_memory_plan(Some(capacities), &[])
+            .expect("memory plan");
+        assert_eq!(plan.output_bytes, expected.total_bytes());
+        assert_eq!(
+            plan.output_bytes - output_bytes(fixture.limits.generation).expect("legacy"),
+            ParserAllocation::required_bytes(capacities).expect("slab")
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_disabling_tools_clears_capacities() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(explicit_parser_capacities())
+                .expect("capacities")
+                .with_tool_call_parsing(false);
+        assert!(
+            backend
+                .selected_parser_capacities()
+                .expect("selection")
+                .is_none()
+        );
+        assert_eq!(
+            backend.planned_output_bytes().expect("plan"),
+            output_bytes(fixture.limits.generation).expect("legacy")
+        );
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_invalid_or_overflowing_capacities_are_rejected() {
+        for invalid in [0, usize::MAX] {
+            let fixture = Fixture::new();
+            let mut capacities = explicit_parser_capacities();
+            capacities.nodes = invalid;
+            let backend =
+                Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                    .expect("backend");
+            assert!(backend.with_parser_allocation_limits(capacities).is_err());
+        }
+    }
+
+    #[test]
+    fn qwen_parser_hooks_missing_slab_cannot_fall_back_to_legacy_parsing() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(explicit_parser_capacities())
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), None)
+                .is_err()
+        );
+        assert!(
+            backend
+                .decoder(&registry, fixture.context.profile_id())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_supplied_slab_is_rejected_and_released_until_decoder_lands() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let bytes = ParserAllocation::required_bytes(capacities).expect("bytes");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("parser", &[bytes]).expect("grant");
+        let allocation = ParserAllocation::from_grant(&mut grant, capacities).expect("slab");
+        assert_eq!(admission.snapshot().expect("live").reserved_bytes(), bytes);
+        let result = backend.decoder_with_parser_allocation(
+            &registry,
+            fixture.context.profile_id(),
+            Some(allocation),
+        );
+        match result {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("storage-backed decoder integration")
+            ),
+            Ok(_) => panic!("decoder must not claim storage-backed parsing yet"),
+        }
+        drop(grant);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("released")
+                .active_reservations(),
+            0
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_wrong_slab_size_is_rejected_and_released() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let mut different = capacities;
+        different.calls += 1;
+        let bytes = ParserAllocation::required_bytes(different).expect("bytes");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("parser", &[bytes]).expect("grant");
+        let allocation = ParserAllocation::from_grant(&mut grant, different).expect("slab");
+        match backend.decoder_with_parser_allocation(
+            &registry,
+            fixture.context.profile_id(),
+            Some(allocation),
+        ) {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("differs from the planned slab size")
+            ),
+            Ok(_) => panic!("wrong allocation accepted"),
+        }
+        drop(grant);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
     }
 
     #[test]
