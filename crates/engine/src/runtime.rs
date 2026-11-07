@@ -34,6 +34,9 @@
 //! Prefix-reuse capability reporting intentionally remains false until
 //! production-path verification has passed.
 
+use crate::parser_allocation::{
+    FrozenParserAllocation, ParserAllocation, ParserAllocationError, ParserAllocationLimits,
+};
 use crate::residency_pin::{ModelPinOwner, ModelResidencyPin};
 use crate::tiered_kv::{TieredKvConfig, TieredKvSnapshot, TieredKvStore};
 use crate::{
@@ -167,6 +170,13 @@ pub trait TextDecoder {
             Ok(vec![crate::types::GenerationOutputBlock::Text(text)])
         }
     }
+
+    /// Transfer a successfully finished parser batch, at most once.
+    /// Ownership must follow returned proposal views until consumer disposal.
+    /// The generation driver, not this method, applies the completion gate.
+    fn take_parser_proposals(&mut self) -> Option<FrozenParserAllocation> {
+        None
+    }
 }
 
 /// Required real backend services in addition to the actual family loader.
@@ -209,6 +219,34 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         registry: &Registry,
         profile: &ModelProfileId,
     ) -> Result<Box<dyn TextDecoder>, EngineError>;
+
+    /// Snapshot optional parser capacities before startup admission.
+    ///
+    /// None preserves text-only allocation behavior. Some requires `plan` to
+    /// include the exact slab Layout in output_bytes and requires an override
+    /// of decoder_with_parser_allocation. Metadata must remain immutable for
+    /// the request. This method must not allocate native/model/parser storage.
+    fn parser_allocation_limits(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+    ) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        Ok(None)
+    }
+
+    /// Construct a decoder with exclusive ownership of its admitted slab.
+    ///
+    /// A storage-backed decoder must retain/transfer this owner for every
+    /// live view. The default rejects Some instead of allocating a side slab
+    /// and silently continuing with the legacy Map/Value parser.
+    fn decoder_with_parser_allocation(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        legacy_decoder_with_parser(allocation, || self.decoder(registry, profile))
+    }
 
     /// Conservative incremental MLX allocation forecast for this plan.
     ///
@@ -922,6 +960,8 @@ impl EngineRuntime for FamilyRuntime {
             let backend = self.backend(registry, resolved.artifact())?;
             let plan = backend.plan(registry, &profile, input_tokens).await?;
             validate_plan(registry, &profile, input_tokens, &plan, self.limits)?;
+            let parser_limits = backend.parser_allocation_limits(registry, &profile)?;
+            validate_parser_output_budget(plan.output_bytes, self.limits, parser_limits)?;
 
             let pooling = lock_metadata(&self.worker.summary).pool_enabled;
             if pooling {
@@ -1069,10 +1109,15 @@ impl EngineRuntime for FamilyRuntime {
             )?;
             execution.check_cancelled()?;
 
+            let parser_limits =
+                backend.parser_allocation_limits(&registry, request.profile_id())?;
+            validate_parser_output_budget(plan.output_bytes, self.limits, parser_limits)?;
+
             let setup = Setup {
                 registry,
                 backend,
                 plan,
+                parser_limits,
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
                 pressure_policy: self.pressure_policy,
@@ -1150,9 +1195,17 @@ struct Setup {
     registry: Arc<Registry>,
     backend: Arc<dyn RuntimeBackend>,
     plan: RuntimePlan,
+    // W2_RUNTIME_PARSER_ALLOCATION_V1
+    // Immutable metadata snapshot; allocation remains native-worker owned.
+    parser_limits: Option<ParserAllocationLimits>,
     profile: ModelProfileId,
     options: GenerationOptions,
     pressure_policy: Option<crate::pressure::PressurePolicy>,
+}
+
+struct DecodedFinish {
+    blocks: Vec<crate::types::GenerationOutputBlock>,
+    proposals: Option<FrozenParserAllocation>,
 }
 
 struct Reply<T> {
@@ -1219,7 +1272,7 @@ enum Command {
     },
     Flush {
         request: RequestId,
-        reply: SyncSender<Reply<Vec<crate::types::GenerationOutputBlock>>>,
+        reply: SyncSender<Reply<DecodedFinish>>,
     },
     Finish {
         request: RequestId,
@@ -1293,6 +1346,7 @@ impl NativeWorker {
                         usage: Usage::default(),
                         started: true,
                         _output: output,
+                        parser_proposals: None,
                     };
 
                     let admitted = AdmittedStartup { session, execution };
@@ -1623,6 +1677,7 @@ struct NativeSession {
     usage: Usage,
     started: bool,
     _output: Arc<MemoryReservation>,
+    parser_proposals: Option<FrozenParserAllocation>,
 }
 
 impl GenerationSession for NativeSession {
@@ -1685,7 +1740,13 @@ impl GenerationSession for NativeSession {
     }
 
     fn finish_text(&mut self) -> Result<String, EngineError> {
-        blocks_to_text(self.finish_blocks()?)
+        let blocks = self.finish_blocks()?;
+        if self.parser_proposals.is_some() {
+            return Err(internal(
+                "slab proposals require structured session delivery",
+            ));
+        }
+        blocks_to_text(blocks)
     }
 
     fn finish_blocks(&mut self) -> Result<Vec<crate::types::GenerationOutputBlock>, EngineError> {
@@ -1694,7 +1755,13 @@ impl GenerationSession for NativeSession {
             reply,
         })?;
         self.usage = reply.usage;
-        reply.result
+        let finished = reply.result?;
+        self.parser_proposals = finished.proposals;
+        Ok(finished.blocks)
+    }
+
+    fn take_parser_proposals(&mut self) -> Option<FrozenParserAllocation> {
+        self.parser_proposals.take()
     }
 
     fn usage(&self) -> Usage {
@@ -2000,7 +2067,29 @@ struct Active {
 /// `prepare`, or released when pending startup is abandoned.
 struct PendingStartup {
     request_id: RequestId,
+    // Drop backing storage before releasing the remaining startup grant.
+    parser: Option<ParserAllocation>,
+    parser_limits: Option<ParserAllocationLimits>,
     grant: ReservationGrant,
+}
+
+impl PendingStartup {
+    fn take_parser(
+        &mut self,
+        expected: Option<ParserAllocationLimits>,
+    ) -> Result<Option<ParserAllocation>, EngineError> {
+        let required = expected
+            .map(ParserAllocation::required_bytes)
+            .transpose()
+            .map_err(parser_storage_error)?;
+        let actual = self.parser.as_ref().map(ParserAllocation::reserved_bytes);
+        if required != actual || !same_parser_configuration(self.parser_limits, expected) {
+            return Err(internal(
+                "pending parser allocation differs from admitted setup",
+            ));
+        }
+        Ok(self.parser.take())
+    }
 }
 
 // Deterministic idle-victim order: timestamp, owner class, pool index, state ID.
@@ -3467,81 +3556,87 @@ impl NativeState {
 
         let admission = self.admission.clone();
         let output_bytes = setup.plan.output_bytes;
-        let (output, grant) = admit_startup_after_reclaim(&admission, output_bytes, || {
-            let same_model = self
-                .resident
-                .as_ref()
-                .is_some_and(|resident| model_matches(resident, artifact, setup.backend.as_ref()));
+        let (output, parser, grant) = admit_startup_with_parser_after_reclaim(
+            &admission,
+            output_bytes,
+            setup.parser_limits,
+            || {
+                let same_model = self.resident.as_ref().is_some_and(|resident| {
+                    model_matches(resident, artifact, setup.backend.as_ref())
+                });
 
-            if !same_model {
-                self.switch_model(artifact, setup.backend.as_ref())?;
-            }
-            if let Some(resident) = &mut self.resident
-                && resident
-                    .cache
-                    .as_ref()
-                    .is_some_and(|cache| !cache_matches(cache, &setup.plan))
-            {
-                drop(resident.candidate.take());
-                drop(resident.cache.take());
-            }
-            // Keep compatible logical contents until prepare can
-            // inspect the exact newly rendered token sequence.
+                if !same_model {
+                    self.switch_model(artifact, setup.backend.as_ref())?;
+                }
+                if let Some(resident) = &mut self.resident
+                    && resident
+                        .cache
+                        .as_ref()
+                        .is_some_and(|cache| !cache_matches(cache, &setup.plan))
+                {
+                    drop(resident.candidate.take());
+                    drop(resident.cache.take());
+                }
+                // Keep compatible logical contents until prepare can
+                // inspect the exact newly rendered token sequence.
 
-            self.publish();
-            check_startup(control, abandoned)?;
-            // Reclaim only actual idle pool owners before pressure evaluation.
-            loop {
+                self.publish();
+                check_startup(control, abandoned)?;
+                // Reclaim only actual idle pool owners before pressure evaluation.
+                loop {
+                    let residency = self.pressure_residency(setup)?;
+                    let compatible_cache = residency.reusable_model
+                        && self
+                            .resident
+                            .as_ref()
+                            .and_then(|r| r.cache.as_ref())
+                            .is_some_and(|c| cache_matches(c, &setup.plan));
+                    let components = incremental_startup_components(
+                        &setup.plan,
+                        self.retention,
+                        &residency,
+                        compatible_cache,
+                    )?;
+                    let required = components.iter().try_fold(0u64, |n, b| add(n, *b))?;
+                    if self.admission.snapshot()?.available_bytes() >= required
+                        || !self.evict_one_pooled_model()
+                    {
+                        break;
+                    }
+                }
+                self.apply_startup_pressure(setup, control, abandoned)?;
+
+                // Size the grant from post-reclaim residency so pressure and
+                // admission cannot disagree about incremental demand.
                 let residency = self.pressure_residency(setup)?;
-                let compatible_cache = residency.reusable_model
+                let same_cache = residency.reusable_model
                     && self
                         .resident
                         .as_ref()
-                        .and_then(|r| r.cache.as_ref())
-                        .is_some_and(|c| cache_matches(c, &setup.plan));
+                        .and_then(|resident| resident.cache.as_ref())
+                        .is_some_and(|cache| cache_matches(cache, &setup.plan));
                 let components = incremental_startup_components(
                     &setup.plan,
                     self.retention,
                     &residency,
-                    compatible_cache,
+                    same_cache,
                 )?;
-                let required = components.iter().try_fold(0u64, |n, b| add(n, *b))?;
-                if self.admission.snapshot()?.available_bytes() >= required
-                    || !self.evict_one_pooled_model()
-                {
-                    break;
+                let required = components
+                    .iter()
+                    .try_fold(0u64, |total, bytes| add(total, *bytes))?;
+                while self.admission.snapshot()?.available_bytes() < required {
+                    if !self.evict_one_pooled_model() {
+                        break;
+                    }
                 }
-            }
-            self.apply_startup_pressure(setup, control, abandoned)?;
-
-            // Size the grant from post-reclaim residency so pressure and
-            // admission cannot disagree about incremental demand.
-            let residency = self.pressure_residency(setup)?;
-            let same_cache = residency.reusable_model
-                && self
-                    .resident
-                    .as_ref()
-                    .and_then(|resident| resident.cache.as_ref())
-                    .is_some_and(|cache| cache_matches(cache, &setup.plan));
-            let components = incremental_startup_components(
-                &setup.plan,
-                self.retention,
-                &residency,
-                same_cache,
-            )?;
-            let required = components
-                .iter()
-                .try_fold(0u64, |total, bytes| add(total, *bytes))?;
-            while self.admission.snapshot()?.available_bytes() < required {
-                if !self.evict_one_pooled_model() {
-                    break;
-                }
-            }
-            Ok(components)
-        })?;
+                Ok(components)
+            },
+        )?;
 
         self.pending = Some(PendingStartup {
             request_id: control.request_id().clone(),
+            parser,
+            parser_limits: setup.parser_limits,
             grant,
         });
         Ok(output)
@@ -3841,7 +3936,16 @@ impl NativeState {
         }
         check_cache_bytes(cache.cache.as_ref(), cache.reservation.bytes())?;
 
-        let decoder = setup.backend.decoder(&setup.registry, &setup.profile)?;
+        let parser = self
+            .pending
+            .as_mut()
+            .ok_or_else(|| internal("decoder construction lost its admitted startup"))?
+            .take_parser(setup.parser_limits)?;
+        let decoder = setup.backend.decoder_with_parser_allocation(
+            &setup.registry,
+            &setup.profile,
+            parser,
+        )?;
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
 
         let compatibility =
@@ -4062,10 +4166,7 @@ impl NativeState {
         })
     }
 
-    fn flush(
-        &mut self,
-        request: &RequestId,
-    ) -> Result<Vec<crate::types::GenerationOutputBlock>, EngineError> {
+    fn flush(&mut self, request: &RequestId) -> Result<DecodedFinish, EngineError> {
         let active = self
             .active
             .as_mut()
@@ -4080,7 +4181,8 @@ impl NativeState {
         let blocks = active.decoder.finish_blocks()?;
         active.control.check_cancelled()?;
         active.text_finished = true;
-        Ok(blocks)
+        let proposals = active.decoder.take_parser_proposals();
+        Ok(DecodedFinish { blocks, proposals })
     }
 
     fn finish(&mut self, request: &RequestId) -> Result<(), EngineError> {
@@ -4670,8 +4772,10 @@ fn validate_entry(entry: &StateEntry) -> Result<(), EngineError> {
 /// and transfer the output allowance into an independent reservation.
 ///
 /// `reclaim` must return the post-reclaim component vector. The first
-/// component should be `output_bytes`; remaining entries are workspace,
-/// optional loading peak, optional KV, and optional history.
+/// component covers total output storage; remaining entries cover workspace,
+/// optional loading peak, optional KV, and optional history. This helper takes
+/// output_bytes for delivery; a parser-aware caller may take less than the
+/// total output component and partition the slab from the same grant.
 fn admit_startup_after_reclaim(
     admission: &AdmissionController,
     output_bytes: u64,
@@ -4780,22 +4884,7 @@ fn validate_plan(
         ));
     }
 
-    let headers = limits
-        .event_capacity()
-        .checked_mul(std::mem::size_of::<String>())
-        .ok_or_else(|| internal("output header size overflow"))?;
-    let minimum = limits
-        .max_buffered_text_bytes()
-        .checked_add(limits.max_text_delta_bytes())
-        .and_then(|value| value.checked_add(headers))
-        .ok_or_else(|| internal("output budget size overflow"))?;
-
-    if plan.output_bytes < bytes_as_u64(minimum)? {
-        return Err(EngineError::invalid_request(
-            "output_bytes",
-            "does not cover queued text, a pending delta, and queue headers",
-        ));
-    }
+    validate_parser_output_budget(plan.output_bytes, limits, None)?;
 
     add(plan.temporary_bytes, plan.headroom_bytes)?;
     token_storage_bytes(plan.cache.capacity_tokens())?;
@@ -5078,6 +5167,8 @@ mod tests {
     fn test_pending(admission: &AdmissionController, id: &str) -> PendingStartup {
         PendingStartup {
             request_id: RequestId::new(id).expect("request"),
+            parser: None,
+            parser_limits: None,
             grant: admission
                 .reserve_grant("test pending startup", &[1])
                 .expect("grant"),
@@ -5334,6 +5425,8 @@ mod mlx_allocator_runtime_tests {
             .expect("reservation");
         let pending = PendingStartup {
             request_id: RequestId::new("pending-allocator-reclaim").expect("request"),
+            parser: None,
+            parser_limits: None,
             grant: admission
                 .reserve_grant("test pending startup", &[1])
                 .expect("grant"),
@@ -5406,6 +5499,8 @@ mod pressure_resource_reclamation_tests {
         let mut state = empty_state(admission.clone());
         state.pending = Some(PendingStartup {
             request_id: RequestId::new("pending-pressure").expect("ID"),
+            parser: None,
+            parser_limits: None,
             grant: admission
                 .reserve_grant("test pending startup", &[1])
                 .expect("grant"),
@@ -5740,5 +5835,429 @@ mod w2_tool_schema_cache_tests {
         );
         assert_ne!(first, schema_bound_disk_identity(identity.clone(), None));
         assert_eq!(first, schema_bound_disk_identity(identity, Some(&a)));
+    }
+}
+
+fn same_parser_configuration(
+    left: Option<ParserAllocationLimits>,
+    right: Option<ParserAllocationLimits>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            [
+                a.carry_bytes,
+                a.call_bytes,
+                a.decoded_bytes,
+                a.depth,
+                a.keys,
+                a.nodes,
+                a.proposal_bytes,
+                a.calls,
+            ] == [
+                b.carry_bytes,
+                b.call_bytes,
+                b.decoded_bytes,
+                b.depth,
+                b.keys,
+                b.nodes,
+                b.proposal_bytes,
+                b.calls,
+            ]
+        }
+        _ => false,
+    }
+}
+
+fn parser_storage_error(error: ParserAllocationError) -> EngineError {
+    match error {
+        ParserAllocationError::Admission(error) => error,
+        ParserAllocationError::AllocationFailed { requested_bytes } => {
+            EngineError::AllocationFailed {
+                operation: "allocate admitted parser/proposal slab",
+                requested_bytes: u64::try_from(requested_bytes).ok(),
+            }
+        }
+        other => EngineError::invalid_request("parser_allocation", other.to_string()),
+    }
+}
+
+fn validate_parser_output_budget(
+    output_bytes: u64,
+    limits: GenerationLimits,
+    parser: Option<ParserAllocationLimits>,
+) -> Result<(), EngineError> {
+    let headers = limits
+        .event_capacity()
+        .checked_mul(std::mem::size_of::<String>())
+        .ok_or_else(|| internal("output header size overflow"))?;
+    let text = limits
+        .max_buffered_text_bytes()
+        .checked_add(limits.max_text_delta_bytes())
+        .and_then(|value| value.checked_add(headers))
+        .ok_or_else(|| internal("output budget size overflow"))?;
+    let slab = parser
+        .map(ParserAllocation::required_bytes)
+        .transpose()
+        .map_err(parser_storage_error)?
+        .unwrap_or(0);
+    let minimum = add(bytes_as_u64(text)?, slab)?;
+    if output_bytes < minimum {
+        return Err(EngineError::invalid_request(
+            "output_bytes",
+            "does not cover queued text, a pending delta, queue headers, and the selected parser slab",
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_decoder_with_parser(
+    allocation: Option<ParserAllocation>,
+    construct: impl FnOnce() -> Result<Box<dyn TextDecoder>, EngineError>,
+) -> Result<Box<dyn TextDecoder>, EngineError> {
+    if allocation.is_some() {
+        return Err(EngineError::unsupported(
+            "admitted parser storage",
+            "backend must implement decoder_with_parser_allocation for its storage-backed parser",
+        ));
+    }
+    construct()
+}
+
+/// Admit the same incremental total as before, but transfer only non-parser
+/// output bytes to the stream and partition the slab from the SAME grant.
+/// Parser allocation occurs on the native worker, after pressure/reclaim and
+/// admission, and before pending startup is published.
+fn admit_startup_with_parser_after_reclaim(
+    admission: &AdmissionController,
+    output_bytes: u64,
+    parser_limits: Option<ParserAllocationLimits>,
+    reclaim: impl FnOnce() -> Result<Vec<u64>, EngineError>,
+) -> Result<
+    (
+        Arc<MemoryReservation>,
+        Option<ParserAllocation>,
+        ReservationGrant,
+    ),
+    EngineError,
+> {
+    let slab_bytes = parser_limits
+        .map(ParserAllocation::required_bytes)
+        .transpose()
+        .map_err(parser_storage_error)?
+        .unwrap_or(0);
+    let delivery_bytes = output_bytes
+        .checked_sub(slab_bytes)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            EngineError::invalid_request(
+                "output_bytes",
+                "parser slab must leave a positive text/delivery allowance",
+            )
+        })?;
+    let (output, mut grant) = admit_startup_after_reclaim(admission, delivery_bytes, || {
+        let components = reclaim()?;
+        if components.first().copied() != Some(output_bytes) {
+            return Err(internal(
+                "startup output component differs from the admitted output plan",
+            ));
+        }
+        Ok(components)
+    })?;
+    let parser = parser_limits
+        .map(|limits| ParserAllocation::from_grant(&mut grant, limits))
+        .transpose()
+        .map_err(parser_storage_error)?;
+    Ok((output, parser, grant))
+}
+
+#[cfg(test)]
+mod w2_runtime_parser_allocation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn parser_limits() -> ParserAllocationLimits {
+        ParserAllocationLimits {
+            carry_bytes: 3,
+            call_bytes: 5,
+            decoded_bytes: 7,
+            depth: 2,
+            keys: 3,
+            nodes: 5,
+            proposal_bytes: 11,
+            calls: 3,
+        }
+    }
+    fn limits() -> GenerationLimits {
+        GenerationLimits::new(2, 2048, 512).expect("limits")
+    }
+    fn text_minimum() -> u64 {
+        2048 + 512 + 2 * std::mem::size_of::<String>() as u64
+    }
+    fn empty_state(admission: AdmissionController) -> NativeState {
+        NativeState {
+            active: None,
+            pending: None,
+            resident: None,
+            states: HashMap::new(),
+            pool: Vec::new(),
+            pool_enabled: false,
+            pool_ttl: None,
+            tiered: None,
+            admission,
+            retention: RetentionPolicy {
+                retain_model: false,
+                retain_cache_buffers: false,
+            },
+            summary: Arc::new(Mutex::new(Summary::empty(true))),
+        }
+    }
+    fn admitted(
+        admission: &AdmissionController,
+        workspace: u64,
+    ) -> (Arc<MemoryReservation>, PendingStartup) {
+        let parser = parser_limits();
+        let slab = ParserAllocation::required_bytes(parser).expect("slab");
+        let output = text_minimum() + slab;
+        let (delivery, parser, grant) =
+            admit_startup_with_parser_after_reclaim(admission, output, Some(parser), || {
+                Ok(vec![output, workspace])
+            })
+            .expect("startup");
+        (
+            delivery,
+            PendingStartup {
+                request_id: RequestId::new("w2-parser-startup").expect("request"),
+                parser,
+                parser_limits: Some(parser_limits()),
+                grant,
+            },
+        )
+    }
+    struct OwningDecoder {
+        parser: ParserAllocation,
+    }
+    impl TextDecoder for OwningDecoder {
+        fn push(&mut self, _: u32) -> Result<String, EngineError> {
+            self.parser.workspaces().carry[0] = 7;
+            Ok(String::new())
+        }
+        fn finish(&mut self) -> Result<String, EngineError> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn selected_parser_must_be_covered_in_addition_to_text_storage() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        assert!(
+            validate_parser_output_budget(text_minimum(), limits(), Some(parser_limits())).is_err()
+        );
+        validate_parser_output_budget(text_minimum() + slab, limits(), Some(parser_limits()))
+            .expect("exact cover");
+        assert!(
+            validate_parser_output_budget(
+                text_minimum() + slab - 1,
+                limits(),
+                Some(parser_limits())
+            )
+            .is_err()
+        );
+        validate_parser_output_budget(text_minimum(), limits(), None).expect("legacy");
+    }
+    #[test]
+    fn one_atomic_grant_covers_delivery_parser_and_remainder() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab + 64).expect("controller");
+        let (delivery, pending) = admitted(&admission, 64);
+        assert_eq!(delivery.bytes(), text_minimum());
+        assert_eq!(
+            pending.parser.as_ref().expect("parser").reserved_bytes(),
+            slab
+        );
+        assert_eq!(pending.grant.remaining_bytes(), 64);
+        assert_eq!(
+            admission.snapshot().expect("ledger").reserved_bytes(),
+            text_minimum() + slab + 64
+        );
+        drop(pending);
+        assert_eq!(
+            admission.snapshot().expect("ledger").reserved_bytes(),
+            text_minimum()
+        );
+        drop(delivery);
+        assert_eq!(admission.snapshot().expect("ledger").reserved_bytes(), 0);
+        assert_eq!(
+            admission.snapshot().expect("ledger").active_reservations(),
+            0
+        );
+    }
+    #[test]
+    fn pending_finish_releases_slab_and_remainder_but_not_stream_output() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab + 64).expect("controller");
+        let (delivery, pending) = admitted(&admission, 64);
+        let request = pending.request_id.clone();
+        let mut state = empty_state(admission.clone());
+        state.pending = Some(pending);
+        state.finish(&request).expect("finish abandoned startup");
+        assert!(state.pending.is_none());
+        assert_eq!(
+            admission.snapshot().expect("ledger").reserved_bytes(),
+            delivery.bytes()
+        );
+        drop(delivery);
+        assert_eq!(admission.snapshot().expect("ledger").reserved_bytes(), 0);
+    }
+    #[test]
+    fn decoder_receives_exclusive_slab_ownership() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab + 64).expect("controller");
+        let (delivery, mut pending) = admitted(&admission, 64);
+        let parser = pending
+            .take_parser(Some(parser_limits()))
+            .expect("transfer")
+            .expect("parser");
+        assert!(pending.parser.is_none());
+        let mut decoder: Box<dyn TextDecoder> = Box::new(OwningDecoder { parser });
+        drop(pending);
+        drop(delivery);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("decoder owns slab")
+                .reserved_bytes(),
+            slab
+        );
+        decoder.push(0).expect("access storage");
+        drop(decoder);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+    #[test]
+    fn default_decoder_hook_rejects_slab_without_constructing_legacy_decoder() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab).expect("controller");
+        let (delivery, mut pending) = admitted(&admission, 0);
+        let parser = pending
+            .take_parser(Some(parser_limits()))
+            .expect("transfer");
+        let called = Cell::new(false);
+        let result = legacy_decoder_with_parser(parser, || {
+            called.set(true);
+            Err(internal("legacy constructor must not run"))
+        });
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("rejected slab released")
+                .reserved_bytes(),
+            delivery.bytes()
+        );
+        drop(pending);
+        drop(delivery);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+    #[test]
+    fn default_decoder_hook_preserves_none_and_calls_legacy_constructor() {
+        let called = Cell::new(false);
+        let result = legacy_decoder_with_parser(None, || {
+            called.set(true);
+            Err(internal("injected legacy constructor failure"))
+        });
+        assert!(result.is_err());
+        assert!(called.get());
+    }
+    #[test]
+    fn wrong_pending_parser_configuration_is_rejected_without_losing_owner() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab).expect("controller");
+        let (delivery, mut pending) = admitted(&admission, 0);
+        let mut changed = parser_limits();
+        changed.calls += 1;
+        assert!(pending.take_parser(Some(changed)).is_err());
+        assert!(pending.parser.is_some());
+        assert!(pending.take_parser(None).is_err());
+        assert!(pending.parser.is_some());
+        // Equal byte size does not mean equal capacities or interpretation.
+        let mut same_size = parser_limits();
+        same_size.carry_bytes += 1;
+        same_size.decoded_bytes -= 1;
+        assert_eq!(
+            ParserAllocation::required_bytes(same_size).expect("size"),
+            slab
+        );
+        assert!(pending.take_parser(Some(same_size)).is_err());
+        assert!(pending.parser.is_some());
+        drop(pending);
+        drop(delivery);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+    #[test]
+    fn invalid_layout_fails_before_reclaim_and_admission() {
+        let admission = AdmissionController::new(4096).expect("controller");
+        let called = Cell::new(false);
+        let mut parser = parser_limits();
+        parser.nodes = usize::MAX;
+        let result =
+            admit_startup_with_parser_after_reclaim(&admission, 4096, Some(parser), || {
+                called.set(true);
+                Ok(vec![4096])
+            });
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert_eq!(admission.snapshot().expect("ledger").reserved_bytes(), 0);
+    }
+    #[test]
+    fn inconsistent_output_component_is_rejected_before_grant_acquisition() {
+        let admission = AdmissionController::new(4096).expect("controller");
+        let result =
+            admit_startup_with_parser_after_reclaim(&admission, 100, None, || Ok(vec![99, 20]));
+        assert!(result.is_err());
+        assert_eq!(admission.snapshot().expect("ledger").reserved_bytes(), 0);
+    }
+    #[test]
+    fn insufficient_total_budget_leaves_no_parser_or_output_reservations() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let output = text_minimum() + slab;
+        let admission = AdmissionController::new(output + 64 - 1).expect("controller");
+        let result = admit_startup_with_parser_after_reclaim(
+            &admission,
+            output,
+            Some(parser_limits()),
+            || Ok(vec![output, 64]),
+        );
+        assert!(matches!(
+            result,
+            Err(EngineError::MemoryLimitExceeded { .. })
+        ));
+        assert_eq!(admission.snapshot().expect("ledger").reserved_bytes(), 0);
+        assert_eq!(
+            admission.snapshot().expect("ledger").active_reservations(),
+            0
+        );
+    }
+    #[test]
+    fn failed_decoder_construction_drops_the_transferred_slab() {
+        let slab = ParserAllocation::required_bytes(parser_limits()).expect("slab");
+        let admission = AdmissionController::new(text_minimum() + slab + 64).expect("controller");
+        let (delivery, mut pending) = admitted(&admission, 64);
+        let parser = pending
+            .take_parser(Some(parser_limits()))
+            .expect("transfer");
+        let construct =
+            |owned: Option<ParserAllocation>| -> Result<Box<dyn TextDecoder>, EngineError> {
+                let _owned = owned;
+                Err(internal("injected storage-backed constructor failure"))
+            };
+        assert!(construct(parser).is_err());
+        assert_eq!(
+            admission.snapshot().expect("ledger").reserved_bytes(),
+            text_minimum() + 64
+        );
+        drop(pending);
+        drop(delivery);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
     }
 }

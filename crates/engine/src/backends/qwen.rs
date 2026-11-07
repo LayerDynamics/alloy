@@ -427,9 +427,9 @@ impl Qwen3Backend {
     /// parser storage or acquiring admission. No defaults are selected.
     /// Disabling tool parsing clears this configuration.
     ///
-    /// Until the storage-backed decoder is implemented, generation with this
-    /// configuration fails closed at decoder construction. It never falls
-    /// back to the legacy Map-based tool parser.
+    /// Runtime construction supplies the admitted slab. Tool JSON validation
+    /// uses that fixed storage and completed proposals transfer as one owned
+    /// batch. There is no fallback to the legacy Map-based tool parser.
     pub fn with_parser_allocation_limits(
         mut self,
         limits: ParserAllocationLimits,
@@ -437,7 +437,10 @@ impl Qwen3Backend {
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
-        self.limits.output_memory_plan(Some(limits), &[])?;
+        self.limits.output_memory_plan(
+            Some(limits),
+            &[std::alloc::Layout::new::<Qwen3TextDecoder>()],
+        )?;
         self.parser_capacities = Some(limits);
         self.tool_call_parsing = true;
         Ok(self)
@@ -456,9 +459,16 @@ impl Qwen3Backend {
     }
 
     fn planned_output_bytes(&self) -> Result<u64, EngineError> {
+        let selected = self.selected_parser_capacities()?;
+        let owner = [std::alloc::Layout::new::<Qwen3TextDecoder>()];
+        let extra = if selected.is_some() {
+            owner.as_slice()
+        } else {
+            &[]
+        };
         Ok(self
             .limits
-            .output_memory_plan(self.selected_parser_capacities()?, &[])?
+            .output_memory_plan(selected, extra)?
             .total_bytes())
     }
 
@@ -831,6 +841,8 @@ impl RuntimeBackend for Qwen3Backend {
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
             parser,
+            slab: None,
+            completed_slab: None,
         }))
     }
 
@@ -863,13 +875,22 @@ impl RuntimeBackend for Qwen3Backend {
                         "Qwen parser allocation differs from the planned slab size",
                     ));
                 }
-                // Intentionally no fallback, wrapper, or unused side slab.
-                // The decoder patch must replace this rejection with a
-                // constructor that actually parses in the supplied storage.
-                Err(EngineError::unsupported(
-                    "admitted parser storage",
-                    "Qwen storage-backed decoder integration is not implemented yet",
-                ))
+                let data = self.data(resolved.artifact())?;
+                let slab = crate::slab_parser::SlabParser::new(
+                    allocation,
+                    self.tool_parser_limits().max_output_bytes,
+                )?;
+                output::box_slab_decoder(Qwen3TextDecoder {
+                    tokenizer: Arc::clone(&data.tokenizer),
+                    special_tokens: Arc::clone(&data.special_tokens),
+                    byte_decoder: Arc::clone(&data.byte_decoder),
+                    pending: Vec::new(),
+                    max_token_bytes: self.limits.max_token_bytes,
+                    finished: false,
+                    parser: None,
+                    slab: Some(slab),
+                    completed_slab: None,
+                })
             }
             _ => Err(internal(
                 "Qwen parser allocation presence differs from backend configuration",
@@ -1693,12 +1714,16 @@ mod shared_rendering_wiring_tests {
             block_on(backend.plan(&registry, profile, rendered.token_count())).expect("plan");
         let expected = fixture
             .limits
-            .output_memory_plan(Some(capacities), &[])
+            .output_memory_plan(
+                Some(capacities),
+                &[std::alloc::Layout::new::<Qwen3TextDecoder>()],
+            )
             .expect("memory plan");
         assert_eq!(plan.output_bytes, expected.total_bytes());
         assert_eq!(
             plan.output_bytes - output_bytes(fixture.limits.generation).expect("legacy"),
             ParserAllocation::required_bytes(capacities).expect("slab")
+                + std::mem::size_of::<Qwen3TextDecoder>() as u64
         );
     }
 
@@ -1768,7 +1793,7 @@ mod shared_rendering_wiring_tests {
     }
 
     #[test]
-    fn qwen_parser_hooks_supplied_slab_is_rejected_and_released_until_decoder_lands() {
+    fn qwen_parser_hooks_supplied_slab_decodes_and_outlives_the_decoder() {
         let fixture = Fixture::new();
         let capacities = explicit_parser_capacities();
         let backend =
@@ -1779,33 +1804,64 @@ mod shared_rendering_wiring_tests {
         let registry = backend
             .registry(vec![fixture.profile.clone()])
             .expect("registry");
-        let bytes = ParserAllocation::required_bytes(capacities).expect("bytes");
-        let admission = AdmissionController::new(bytes).expect("admission");
-        let mut grant = admission.reserve_grant("parser", &[bytes]).expect("grant");
-        let allocation = ParserAllocation::from_grant(&mut grant, capacities).expect("slab");
-        assert_eq!(admission.snapshot().expect("live").reserved_bytes(), bytes);
-        let result = backend.decoder_with_parser_allocation(
-            &registry,
-            fixture.context.profile_id(),
-            Some(allocation),
-        );
-        match result {
-            Err(error) => assert!(
-                error
-                    .to_string()
-                    .contains("storage-backed decoder integration")
-            ),
-            Ok(_) => panic!("decoder must not claim storage-backed parsing yet"),
+        let bytes = ParserAllocation::required_bytes(capacities).expect("size");
+        let owner_bytes = std::mem::size_of::<Qwen3TextDecoder>() as u64;
+        let admission = AdmissionController::new(bytes + owner_bytes).expect("admission");
+        let mut grant = admission
+            .reserve_grant("slab and decoder owner", &[bytes, owner_bytes])
+            .expect("grant");
+        let decoder_owner = grant
+            .take("decoder owner", owner_bytes)
+            .expect("partition")
+            .expect("positive");
+        let slab = ParserAllocation::from_grant(&mut grant, capacities).expect("allocation");
+        let mut decoder = backend
+            .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), Some(slab))
+            .expect("storage-backed decoder");
+        let data = backend
+            .data(
+                registry
+                    .resolve_profile(fixture.context.profile_id())
+                    .expect("profile")
+                    .artifact(),
+            )
+            .expect("data");
+        let tokens = data
+            .tokenizer
+            .tokenizer()
+            .encode(
+                "before<tool_call>{\"name\":\"fs.read\",\"arguments\":{}}</tool_call>after",
+                false,
+            )
+            .expect("tokens");
+        let mut text = String::new();
+        for &token in tokens.get_ids() {
+            for block in decoder.push_blocks(token).expect("decode") {
+                match block {
+                    crate::types::GenerationOutputBlock::Text(delta) => text.push_str(&delta),
+                    _ => panic!("slab decoding must not materialize owned proposal maps"),
+                }
+            }
         }
+        decoder.finish_blocks().expect("finish");
+        let batch = decoder.take_parser_proposals().expect("owned batch");
+        assert!(decoder.take_parser_proposals().is_none());
+        drop(decoder);
+        drop(decoder_owner);
         drop(grant);
-        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+        assert_eq!(text, "beforeafter");
+        assert_eq!(batch.proposal_count(), 1);
+        assert_eq!(batch.proposal(0).expect("call").name, "fs.read");
+        assert_eq!(batch.proposal(0).expect("call").arguments_json, "{}");
         assert_eq!(
             admission
                 .snapshot()
-                .expect("released")
-                .active_reservations(),
-            0
+                .expect("consumer retained")
+                .reserved_bytes(),
+            bytes
         );
+        drop(batch);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
     }
 
     #[test]

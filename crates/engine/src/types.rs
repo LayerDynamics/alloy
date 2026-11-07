@@ -701,6 +701,17 @@ pub enum GenerationEvent {
         proposal: ToolCallProposal,
     },
 
+    /// One owned batch of validated, untrusted slab-backed proposals.
+    ///
+    /// The backing reservation remains alive until this batch is dropped.
+    /// The producer withholds this event until successful generation
+    /// finalization. Consumers must still observe the successful terminal
+    /// event before executing effects, and must apply registry/policy checks.
+    ToolCallBatchProposed {
+        /// Immutable proposal views and their backing allocation owner.
+        proposals: crate::parser_allocation::FrozenParserAllocation,
+    },
+
     /// Nonterminal execution warning.
     RuntimeWarning {
         /// Stable machine-readable warning code.

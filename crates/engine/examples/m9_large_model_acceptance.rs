@@ -964,7 +964,9 @@ fn generate(
                     json!({"request_id": name, "code": code, "message": message}),
                 )?;
             }
-            GenerationEvent::ToolCallDelta { .. } | GenerationEvent::ToolCallProposed { .. } => {
+            GenerationEvent::ToolCallDelta { .. }
+            | GenerationEvent::ToolCallProposed { .. }
+            | GenerationEvent::ToolCallBatchProposed { .. } => {
                 return Err(
                     io::Error::other("unexpected tool call in text-only Qwen3 acceptance").into(),
                 );

@@ -277,6 +277,7 @@ impl Run {
                 proposals: VecDeque::new(),
                 buffered_text_bytes: 0,
                 proposal_reserved: 0,
+                slab_proposals: None,
                 terminal: None,
                 worker_finished: false,
                 receiver_dropped: false,

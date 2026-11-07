@@ -374,6 +374,7 @@ fn output_memory_plan_for(
 // Existing callers remain explicitly on the legacy text-only plan until the
 // runtime passes real parser capacities and partitions the startup grant.
 // Merely adding a slab charge here would not migrate the current Map parser.
+#[cfg(test)]
 fn output_bytes(limits: GenerationLimits) -> Result<u64, EngineError> {
     Ok(output_memory_plan_for(limits, None, &[])?.total_bytes())
 }

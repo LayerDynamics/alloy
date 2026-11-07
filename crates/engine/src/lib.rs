@@ -22,6 +22,7 @@ pub mod generation;
 pub mod memory_enforcer;
 /// oMLX-method live memory guard (tiers, ceiling, watermarks).
 pub mod memory_guard;
+pub mod parser_allocation;
 /// Unified CPU/Metal memory discovery and shared budgeting.
 pub mod platform;
 /// Prefill admit-line checks and adaptive chunk shrink (M5–M6).
@@ -40,3 +41,5 @@ pub mod types;
 
 #[cfg(test)]
 mod w3_acceptance;
+
+pub mod slab_parser;

@@ -217,7 +217,11 @@ impl<E: Engine> Supervisor<E> {
         while let Some(event) = next_event(&mut stream)? {
             // The text-only supervisor must not forward tool proposals to
             // callbacks or persist this turn as successfully completed.
-            if matches!(&event, GenerationEvent::ToolCallProposed { .. }) {
+            if matches!(
+                &event,
+                GenerationEvent::ToolCallProposed { .. }
+                    | GenerationEvent::ToolCallBatchProposed { .. }
+            ) {
                 return Err(HarnessError::Engine(
                     "tool-call proposals require a tool-aware supervisor".into(),
                 ));
@@ -229,7 +233,8 @@ impl<E: Engine> Supervisor<E> {
                 GenerationEvent::RequestFailed { error, .. } => {
                     return Err(error.into());
                 }
-                GenerationEvent::ToolCallProposed { .. } => {
+                GenerationEvent::ToolCallProposed { .. }
+                | GenerationEvent::ToolCallBatchProposed { .. } => {
                     return Err(HarnessError::Engine(
                         "tool-call proposals require a tool-aware supervisor".into(),
                     ));

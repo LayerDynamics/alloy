@@ -9,6 +9,7 @@ use crate::{
     runtime::TextDecoder,
     types::{GenerationOutputBlock, ToolCallProposal},
 };
+use crate::{parser_allocation::FrozenParserAllocation, slab_parser::SlabParser};
 use qwen3::tool_calls::{ParsedBlock, ToolCallParser, ToolParseError};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,6 +25,8 @@ pub(super) struct Qwen3TextDecoder {
     pub(super) finished: bool,
     /// Present only when tool-call parsing is enabled for this generation.
     pub(super) parser: Option<ToolCallParser>,
+    pub(super) slab: Option<SlabParser>,
+    pub(super) completed_slab: Option<FrozenParserAllocation>,
 }
 
 fn text_blocks(text: String) -> Vec<GenerationOutputBlock> {
@@ -135,6 +138,14 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn push_blocks(&mut self, token: u32) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let text = self.push(token)?;
+        if let Some(parser) = self.slab.as_mut() {
+            let mut emitted = String::new();
+            parser.push(&text, |part| {
+                emitted.push_str(part);
+                Ok(())
+            })?;
+            return Ok(text_blocks(emitted));
+        }
         let Some(parser) = self.parser.as_mut() else {
             return Ok(text_blocks(text));
         };
@@ -146,6 +157,15 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn finish_blocks(&mut self) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let tail = self.finish()?;
+        if let Some(mut parser) = self.slab.take() {
+            let mut emitted = String::new();
+            parser.push(&tail, |part| {
+                emitted.push_str(part);
+                Ok(())
+            })?;
+            self.completed_slab = Some(parser.finish()?);
+            return Ok(text_blocks(emitted));
+        }
         let Some(mut parser) = self.parser.take() else {
             return Ok(text_blocks(tail));
         };
@@ -155,6 +175,9 @@ impl TextDecoder for Qwen3TextDecoder {
         }
         parsed.extend(parser.finish().map_err(parse_error)?);
         output_blocks(parsed)
+    }
+    fn take_parser_proposals(&mut self) -> Option<FrozenParserAllocation> {
+        self.completed_slab.take()
     }
 }
 
@@ -191,6 +214,8 @@ mod w2_protocol_token_tests {
             max_token_bytes: 128,
             finished: false,
             parser: None,
+            slab: None,
+            completed_slab: None,
         }
     }
 
@@ -283,6 +308,8 @@ mod w2_structured_output_tests {
             max_token_bytes: 128,
             finished: false,
             parser: parsing.then(|| ToolCallParser::new(ParserLimits::default()).expect("parser")),
+            slab: None,
+            completed_slab: None,
         }
     }
 
@@ -383,5 +410,29 @@ mod w2_structured_output_tests {
             vec![GenerationOutputBlock::Text("<tool_call>".to_owned())],
         );
         assert!(decoder.finish_blocks().expect("finish").is_empty());
+    }
+}
+
+/// Allocate the decoder owner with exactly the Layout included in output planning.
+pub(super) fn box_slab_decoder(
+    value: Qwen3TextDecoder,
+) -> Result<Box<dyn TextDecoder>, EngineError> {
+    let layout = std::alloc::Layout::new::<Qwen3TextDecoder>();
+    // SAFETY: The type is non-zero-sized and Layout supplies its alignment.
+    // Runtime has admitted this owner layout before invoking the constructor.
+    let raw = unsafe { std::alloc::alloc(layout) };
+    let Some(pointer) = std::ptr::NonNull::new(raw.cast::<Qwen3TextDecoder>()) else {
+        // value (including its slab reservation) drops on this error path.
+        return Err(allocation(
+            "allocate slab decoder owner",
+            Some(layout.size()),
+        ));
+    };
+    // SAFETY: pointer is uniquely owned, properly aligned, and allocated by
+    // the global allocator for this exact type. Initialize once, then let Box
+    // run the destructor and deallocate with the matching Layout.
+    unsafe {
+        pointer.as_ptr().write(value);
+        Ok(Box::from_raw(pointer.as_ptr()))
     }
 }

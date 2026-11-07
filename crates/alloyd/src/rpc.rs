@@ -230,6 +230,7 @@ pub fn wire_event_name(event: &engine::types::GenerationEvent) -> &'static str {
         GenerationEvent::TextDelta { .. } => "text_delta",
         GenerationEvent::ToolCallDelta { .. } => "tool_call_delta",
         GenerationEvent::ToolCallProposed { .. } => "tool_call_proposed",
+        GenerationEvent::ToolCallBatchProposed { .. } => "tool_call_batch_proposed",
         GenerationEvent::RuntimeWarning { .. } => "runtime_warning",
         GenerationEvent::GenerationCompleted { .. } => "generation_completed",
         GenerationEvent::RequestFailed { .. } => "request_failed",
@@ -249,6 +250,14 @@ pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
                 "name": proposal.name(),
                 "arguments": proposal.arguments(),
             })
+        }
+        GenerationEvent::ToolCallBatchProposed { proposals } => {
+            // RPC materializes a transport response; this is not
+            // parser storage. Arguments stay validated JSON TEXT, not a second
+            // unaccounted argument-object tree. Consumers must budget decoding.
+            let calls: Vec<_> = (0..proposals.proposal_count()).filter_map(|index| proposals.proposal(index))
+                .map(|proposal| json!({"name":proposal.name,"arguments_json":proposal.arguments_json})).collect();
+            json!({"encoding":"validated_json_text","calls":calls})
         }
         GenerationEvent::RuntimeWarning { code, message } => {
             json!({ "code": code, "message": message })
@@ -321,5 +330,66 @@ mod w2_proposal_wire_tests {
         assert_eq!(decoded["method"], "session.event");
         assert_eq!(decoded["params"]["event"], "tool_call_proposed");
         assert_eq!(decoded["params"]["body"], body);
+    }
+}
+
+#[cfg(test)]
+mod w2_slab_wire_tests {
+    use super::*;
+    use engine::{
+        admission::AdmissionController,
+        parser_allocation::{ParserAllocation, ParserAllocationLimits},
+        types::GenerationEvent,
+    };
+    #[test]
+    fn batch_codec_preserves_validated_json_text_without_assigning_authority() {
+        let limits = ParserAllocationLimits {
+            carry_bytes: 32,
+            call_bytes: 128,
+            decoded_bytes: 128,
+            depth: 8,
+            keys: 16,
+            nodes: 32,
+            proposal_bytes: 256,
+            calls: 4,
+        };
+        let bytes = ParserAllocation::required_bytes(limits).expect("layout");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("slab", &[bytes]).expect("grant");
+        let mut storage = ParserAllocation::from_grant(&mut grant, limits).expect("storage");
+        let args = br#"{"call_id":"argument-data","approved":true}"#;
+        {
+            let work = storage.workspaces();
+            work.decoded[..7].copy_from_slice(b"fs.read");
+            work.call[..args.len()].copy_from_slice(args);
+        }
+        storage
+            .commit_validated_call(7, 0..7, args.len(), 0..args.len())
+            .expect("commit validated fixture");
+        let event = GenerationEvent::ToolCallBatchProposed {
+            proposals: storage.freeze(),
+        };
+        assert_eq!(wire_event_name(&event), "tool_call_batch_proposed");
+        let body = wire_event_body(&event);
+        assert_eq!(body["encoding"], "validated_json_text");
+        assert_eq!(body["calls"][0]["name"], "fs.read");
+        assert_eq!(
+            body["calls"][0]["arguments_json"],
+            std::str::from_utf8(args).expect("UTF-8")
+        );
+        assert!(body["calls"][0].get("call_id").is_none());
+        assert!(body["calls"][0].get("approved").is_none());
+        assert_eq!(
+            admission.snapshot().expect("owner live").reserved_bytes(),
+            bytes
+        );
+        drop(event);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("owner released")
+                .reserved_bytes(),
+            0
+        );
     }
 }
