@@ -268,8 +268,8 @@ their age and errors. CPU/GPU share one physical memory capacity. Non-free
 system RAM includes reclaimable pages and is not an app-memory total.
 The monitor keeps these samples local. See
 [`docs/designs/live-monitor.md`](docs/designs/live-monitor.md) for the sources,
-units and validation contract. CLI tests run automatically on repository
-pushes and pull requests; the Mac lane also runs them on the native host.
+units and validation contract. CLI tests run automatically on pull requests
+and pushes to `main`; the Mac lane also runs them on the native host.
 
 For direct native-daemon development, the existing manual path remains:
 
