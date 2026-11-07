@@ -4,6 +4,9 @@ use sha2::{Digest, Sha256};
 /// Embedded, versioned text-only, non-thinking chat serialization.
 /// Tool calls and multimodal messages are deliberately unsupported.
 pub const CHAT_TEMPLATE: &str = include_str!("../fixture/chat_template.jinja");
+
+/// Versioned tool-aware, non-thinking template. The text-only pin is unchanged.
+pub const TOOL_CHAT_TEMPLATE: &str = include_str!("../fixture/tool_chat_template.jinja");
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateError {
     InvalidMessages,

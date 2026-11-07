@@ -578,17 +578,34 @@ impl RuntimeBackend for Qwen3Backend {
             let resolved = registry.resolve_profile(context.profile_id())?;
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
+            let tool_mode = context.tool_context().is_some();
+            if tool_mode && !self.tool_call_parsing {
+                return Err(EngineError::unsupported(
+                    "tool context",
+                    "enable tool-call parsing before rendering tool context",
+                ));
+            }
+            let template = if tool_mode {
+                qwen3::template::TOOL_CHAT_TEMPLATE
+            } else {
+                CHAT_TEMPLATE
+            };
+            let template_hash = if tool_mode {
+                digest(template.as_bytes())
+            } else {
+                data.specification.template_sha256
+            };
             let binding = RenderingBinding {
                 profile_id: context.profile_id(),
                 artifact_id: &data.specification.id,
-                template: CHAT_TEMPLATE,
-                template_sha256: data.specification.template_sha256,
+                template,
+                template_sha256: template_hash,
                 artifact_manifest_sha256: data.manifest_sha256,
             };
             let limits = RenderingLimits::new(
                 self.limits.max_messages,
                 self.limits.max_input_bytes,
-                CHAT_TEMPLATE.len(),
+                template.len(),
                 self.limits.max_rendered_bytes,
                 profile.context_limit_tokens(),
             )?;
@@ -1469,6 +1486,104 @@ mod shared_rendering_wiring_tests {
                 )
                 .expect("actual engine")
         }
+    }
+
+    #[test]
+    fn tool_context_reaches_the_production_qwen_renderer() {
+        use crate::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+        let mut fixture = Fixture::new();
+        // Rendering needs more context than the tiny execution fixture. Change
+        // and re-pin the actual config; do not bypass profile/context checks.
+        let path = fixture.directory.0.join("config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("JSON");
+        config["max_position_embeddings"] = serde_json::json!(8192);
+        let bytes = serde_json::to_vec(&config).expect("config JSON");
+        std::fs::write(&path, &bytes).expect("config write");
+        fixture.specification.files.insert(
+            "config.json".to_owned(),
+            FilePin {
+                bytes: bytes.len() as u64,
+                sha256: digest(&bytes),
+            },
+        );
+        fixture.limits.context_limit_tokens = 8192;
+        fixture.profile = ModelProfile::new(
+            fixture.context.profile_id().clone(),
+            fixture.specification.id.clone(),
+            8192,
+            4,
+            8,
+            GenerationOptions::greedy(4).expect("options"),
+        )
+        .expect("profile");
+        let metadata = RenderingTool::new(
+            "fs.read".into(),
+            "1.0.0".into(),
+            "Read file".into(),
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        )
+        .expect("metadata");
+        let history = vec![
+            ToolHistoryBlock::AssistantCall {
+                call_id: "call-1".into(),
+                tool_id: "fs.read".into(),
+                arguments: serde_json::json!({"path":"file.txt"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            },
+            ToolHistoryBlock::ToolResult {
+                call_id: "call-1".into(),
+                content: "result data".into(),
+                is_error: false,
+            },
+        ];
+        let tool_context = ToolContext::new(
+            vec![metadata],
+            history,
+            ToolContextLimits {
+                max_tools: 4,
+                max_history_blocks: 8,
+                max_json_bytes: 4096,
+            },
+        )
+        .expect("tool context");
+        let context = fixture.context.clone().with_tool_context(tool_context);
+        assert!(
+            block_on(fixture.engine().render_and_count(context.clone())).is_err(),
+            "text-only backend accepted tools"
+        );
+        let engine = Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+            .expect("backend")
+            .with_tool_call_parsing(true)
+            .into_engine(
+                vec![fixture.profile.clone()],
+                AdmissionController::new(16 * 1024 * 1024).expect("admission"),
+                Scheduler::new(8).expect("scheduler"),
+                RetentionPolicy {
+                    retain_model: false,
+                    retain_cache_buffers: false,
+                },
+            )
+            .expect("engine");
+        let rendered =
+            block_on(engine.render_and_count(context)).expect("production tool rendering");
+        assert!(rendered.text().contains("\"name\":\"fs.read\""));
+        assert!(rendered.text().contains("result data"));
+        assert!(rendered.tool_schema_hash().is_some());
+        let source = std::fs::read(fixture.directory.0.join("tokenizer.json")).expect("tokenizer");
+        let tokenizer = PinnedTokenizer::from_pinned_json(
+            &source,
+            fixture.specification.files["tokenizer.json"].sha256,
+            fixture.limits.max_tokenizer_bytes,
+        )
+        .expect("pin");
+        let expected = tokenizer
+            .tokenizer()
+            .encode(rendered.text(), false)
+            .expect("encode");
+        assert_eq!(rendered.token_ids(), expected.get_ids());
     }
 
     #[test]

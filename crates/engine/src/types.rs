@@ -5,12 +5,15 @@
 //! Those checks belong to the registry and concrete engine implementation.
 
 use crate::error::EngineError;
+#[path = "types/tool_context.rs"]
+mod tool_context;
 use std::{
     fmt,
     num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
 };
+pub use tool_context::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
 
 /// Maximum byte length of a textual engine identifier.
 pub const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -205,6 +208,7 @@ pub struct ContextSnapshot {
     snapshot_id: ContextSnapshotId,
     profile_id: ModelProfileId,
     messages: Vec<Message>,
+    tool_context: Option<ToolContext>,
 }
 
 impl ContextSnapshot {
@@ -225,6 +229,7 @@ impl ContextSnapshot {
             snapshot_id,
             profile_id,
             messages,
+            tool_context: None,
         })
     }
 
@@ -241,6 +246,19 @@ impl ContextSnapshot {
     /// Borrow the ordered message sequence.
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Attach immutable model-facing schemas and an ordered historical tail.
+    /// Callers source metadata from validated registrations and bind historical
+    /// IDs before construction. This does not authorize new effects.
+    pub fn with_tool_context(mut self, context: ToolContext) -> Self {
+        self.tool_context = Some(context);
+        self
+    }
+
+    /// Borrow optional model-facing tool schemas and linked history.
+    pub fn tool_context(&self) -> Option<&ToolContext> {
+        self.tool_context.as_ref()
     }
 }
 
@@ -267,6 +285,7 @@ pub struct RenderedContext {
     pub(crate) token_ids: Vec<u32>,
     pub(crate) render_hash: [u8; 32],
     pub(crate) template_hash: [u8; 32],
+    pub(crate) tool_schema_hash: Option<[u8; 32]>,
     pub(crate) tokenizer_id: TokenizerId,
     pub(crate) renderer: RendererIdentity,
 }
@@ -313,6 +332,12 @@ impl RenderedContext {
     /// Borrow the SHA-256 digest of the exact template source bytes.
     pub fn template_hash(&self) -> &[u8; 32] {
         &self.template_hash
+    }
+
+    /// Model-visible tool schema identity, independent of output token collisions.
+    /// None preserves text-only compatibility and identity behavior.
+    pub fn tool_schema_hash(&self) -> Option<&[u8; 32]> {
+        self.tool_schema_hash.as_ref()
     }
 
     /// Return the tokenizer identity.

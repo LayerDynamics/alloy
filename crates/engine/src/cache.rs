@@ -52,6 +52,7 @@ struct Compatibility {
     profile_id: ModelProfileId,
     tokenizer_id: TokenizerId,
     template_hash: [u8; 32],
+    tool_schema_hash: Option<[u8; 32]>,
     renderer: RendererIdentity,
     family_impl_version: u32,
     engine_api_version: u32,
@@ -65,6 +66,7 @@ impl Compatibility {
             profile_id: context.profile_id().clone(),
             tokenizer_id: context.tokenizer_id().clone(),
             template_hash: *context.template_hash(),
+            tool_schema_hash: context.tool_schema_hash().copied(),
             renderer: context.renderer().clone(),
             family_impl_version: IMPL_VERSION,
             engine_api_version: ENGINE_API_VERSION,
@@ -529,6 +531,7 @@ mod tests {
             token_ids: tokens.to_vec(),
             render_hash: [0; 32],
             template_hash: [1; 32],
+            tool_schema_hash: None,
             tokenizer_id: TokenizerId::new("tiny-tokenizer").expect("tokenizer ID"),
             renderer: RendererIdentity {
                 implementation: "minijinja".to_owned(),
@@ -595,6 +598,49 @@ mod tests {
         session.clear();
         assert!(session.is_empty());
         assert!(session.last_logits().is_none());
+    }
+
+    #[test]
+    fn tool_schema_change_invalidates_actual_retained_prefix() {
+        let model = loaded_model();
+        let mut retained = cache(model.clone());
+        let mut first = context(&[3, 41]);
+        first.tool_schema_hash = Some([7; 32]);
+        let initial = retained.prefill(&first).expect("initial schema");
+        assert_eq!(initial.reused_prefix_tokens(), 0);
+        let same = retained.prefill(&first).expect("unchanged schema");
+        assert_eq!(same.reused_prefix_tokens(), 2);
+        assert_eq!(same.processed_input_tokens(), 0);
+
+        // Exact token IDs and every other identity stay unchanged.
+        let mut changed = first.clone();
+        changed.tool_schema_hash = Some([8; 32]);
+        let rebuilt = retained.prefill(&changed).expect("changed schema");
+        assert_eq!(rebuilt.reused_prefix_tokens(), 0);
+        assert_eq!(rebuilt.processed_input_tokens(), 2);
+        let full = model.forward(&[3, 41]).expect("full forward");
+        assert_close(rebuilt.logits(), full.last().expect("last logits"));
+    }
+
+    #[test]
+    fn adding_and_removing_tool_schemas_invalidates_actual_retained_prefix() {
+        let model = loaded_model();
+        let mut retained = cache(model);
+        let text_only = context(&[3, 41]);
+        retained.prefill(&text_only).expect("text-only prefill");
+        let mut with_tools = text_only.clone();
+        with_tools.tool_schema_hash = Some([7; 32]);
+        let added = retained.prefill(&with_tools).expect("added schemas");
+        assert_eq!(added.reused_prefix_tokens(), 0);
+        assert_eq!(added.processed_input_tokens(), 2);
+        let removed = retained.prefill(&text_only).expect("removed schemas");
+        assert_eq!(removed.reused_prefix_tokens(), 0);
+        assert_eq!(removed.processed_input_tokens(), 2);
+        let repeated = retained
+            .prefill(&text_only)
+            .expect("stable text-only context");
+        assert_eq!(repeated.reused_prefix_tokens(), 2);
+        assert_eq!(repeated.processed_input_tokens(), 0);
     }
 
     #[test]

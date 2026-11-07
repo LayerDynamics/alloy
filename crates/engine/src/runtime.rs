@@ -256,6 +256,8 @@ pub struct RetainedSessionState {
     pub tokenizer_id: TokenizerId,
     /// Exact initial prompt template digest.
     pub template_hash: [u8; 32],
+    /// Model-visible tool schemas associated with this retained state.
+    pub tool_schema_hash: Option<[u8; 32]>,
     /// Exact initial prompt rendering digest.
     pub render_hash: [u8; 32],
     /// Exact renderer identity.
@@ -1886,6 +1888,7 @@ struct Compatibility {
     profile_id: ModelProfileId,
     tokenizer_id: TokenizerId,
     template_hash: [u8; 32],
+    tool_schema_hash: Option<[u8; 32]>,
     renderer: RendererIdentity,
     cache_mode: CacheMode,
 }
@@ -1900,6 +1903,7 @@ impl Compatibility {
             profile_id: context.profile_id().clone(),
             tokenizer_id: context.tokenizer_id().clone(),
             template_hash: *context.template_hash(),
+            tool_schema_hash: context.tool_schema_hash().copied(),
             renderer: context.renderer().clone(),
             cache_mode: cache.mode().clone(),
         }
@@ -1920,6 +1924,7 @@ impl Compatibility {
             && self.profile_id == *context.profile_id()
             && self.tokenizer_id == *context.tokenizer_id()
             && self.template_hash == *context.template_hash()
+            && tool_schema_compatible(self.tool_schema_hash.as_ref(), context.tool_schema_hash())
             && self.renderer == *context.renderer()
             && self.cache_mode == *cache.mode()
             && cache.representation() == &self.cache_mode.representation
@@ -3597,7 +3602,7 @@ impl NativeState {
                     "cache_representation": setup.plan.cache.mode().representation.as_str(),
                     "cache_kind": "full",
                 });
-                crate::tiered_kv::digest(identity.to_string().as_bytes())
+                schema_bound_disk_identity(identity, context.tool_schema_hash())
             })
         } else {
             None
@@ -4269,6 +4274,7 @@ impl NativeState {
             profile_id: compatibility.profile_id.clone(),
             tokenizer_id: compatibility.tokenizer_id.clone(),
             template_hash: compatibility.template_hash,
+            tool_schema_hash: compatibility.tool_schema_hash,
             render_hash: candidate.render_hash,
             renderer: compatibility.renderer.clone(),
             cache_mode: cache.cache.mode().clone(),
@@ -5687,5 +5693,52 @@ mod w2_block_bridge_tests {
         let proposal = ToolCallProposal::new("fs.read", Map::new()).expect("proposal");
         let blocks = vec![GenerationOutputBlock::ToolCall(proposal)];
         assert!(blocks_to_text(blocks).is_err());
+    }
+}
+
+fn tool_schema_compatible(retained: Option<&[u8; 32]>, requested: Option<&[u8; 32]>) -> bool {
+    retained == requested
+}
+
+fn schema_bound_disk_identity(
+    mut identity: serde_json::Value,
+    schema: Option<&[u8; 32]>,
+) -> String {
+    if let Some(schema) = schema {
+        identity["tool_schema_sha256"] =
+            serde_json::Value::String(crate::tiered_kv::digest(schema));
+    }
+    crate::tiered_kv::digest(identity.to_string().as_bytes())
+}
+
+#[cfg(test)]
+mod w2_tool_schema_cache_tests {
+    use super::{schema_bound_disk_identity, tool_schema_compatible};
+    #[test]
+    fn changed_or_removed_schemas_fail_the_production_compatibility_gate() {
+        let a = [1; 32];
+        let b = [2; 32];
+        assert!(tool_schema_compatible(None, None));
+        assert!(tool_schema_compatible(Some(&a), Some(&a)));
+        assert!(!tool_schema_compatible(Some(&a), Some(&b)));
+        assert!(!tool_schema_compatible(Some(&a), None));
+        assert!(!tool_schema_compatible(None, Some(&a)));
+    }
+    #[test]
+    fn disk_keys_bind_schema_identity_and_preserve_the_text_only_key() {
+        let identity = serde_json::json!({"format":"fixture", "template":"fixed"});
+        let a = [1; 32];
+        let b = [2; 32];
+        assert_eq!(
+            schema_bound_disk_identity(identity.clone(), None),
+            crate::tiered_kv::digest(identity.to_string().as_bytes())
+        );
+        let first = schema_bound_disk_identity(identity.clone(), Some(&a));
+        assert_ne!(
+            first,
+            schema_bound_disk_identity(identity.clone(), Some(&b))
+        );
+        assert_ne!(first, schema_bound_disk_identity(identity.clone(), None));
+        assert_eq!(first, schema_bound_disk_identity(identity, Some(&a)));
     }
 }
