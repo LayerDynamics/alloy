@@ -1,327 +1,38 @@
-name: ci
+name: Recover owned Homebrew CI installer
 
 on:
-  pull_request:
   push:
-  workflow_dispatch:
+    branches: [ci/recover-homebrew-42313536852]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: recover-homebrew-42313536852
+  cancel-in-progress: false
 
 jobs:
-  cli:
-    name: cli
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: checkout
-        uses: actions/checkout@v4
-      - name: Node runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: '26.13.0'
-          cache: npm
-          cache-dependency-path: ts/cli/package-lock.json
-      - name: CLI and monitor tests
-        working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
-
-  linux:
-    name: linux-arm64
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
-
-    steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: pins and corpus
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-jsonschema
-
-          bash scripts/pins_check.sh --test
-          bash bench/corpus/validate.sh
-
-      - name: bindgen image and test 10
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker build --platform linux/arm64 \
-            -t alloy-builder:phase0 \
-            -f scripts/docker/Dockerfile \
-            scripts/docker
-
-          bash scripts/bindgen_check.sh --test
-
-      - name: inventory gate
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash scripts/coverage_inventory.sh --test
-
-      - name: build native test image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker build --platform linux/arm64 \
-            -t alloy-native-builder:phase0 \
-            -f scripts/docker/Dockerfile.repro \
-            scripts/docker
-
-      - name: native build reproducibility
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
-            bash scripts/repro_check.sh --test
-
-      - name: FFI, infrastructure, Qwen3, engine, harness-core, and alloyd verification
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD":/src:ro \
-            -e CARGO_TERM_COLOR=never \
-            -w /work \
-            alloy-native-builder:phase0 \
-            bash -euo pipefail -c '
-              # Compile from a writable copy, preserving the read-only
-              # source checkout and excluding previous build artifacts.
-              tar -C /src \
-                --exclude=target \
-                --exclude=.git \
-                -cf - . |
-                tar -C /work -xf -
-
-              echo "::group::MLX FFI tests"
-              cargo test --locked -p mlx-ffi --all-targets \
-                -- --test-threads=1
-              echo "::endgroup::"
-
-              echo "::group::Inference infrastructure tests"
-              cargo test --locked -p inference-infra --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Qwen3 tests"
-              cargo test --locked -p qwen3 --all-targets
-              cargo test --locked -p qwen3 --doc
-              echo "::endgroup::"
-
-              echo "::group::Engine all-target check"
-              cargo check --locked -p engine --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Engine all-target tests"
-              cargo test --locked -p engine --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Engine documentation tests"
-              cargo test --locked -p engine --doc
-              echo "::endgroup::"
-
-              echo "::group::Engine documentation build"
-              RUSTDOCFLAGS="-D warnings" \
-                cargo doc --locked -p engine --no-deps
-              echo "::endgroup::"
-
-              echo "::group::Harness-core all-target tests"
-              cargo test --locked -p harness-core --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Harness-core documentation tests"
-              cargo test --locked -p harness-core --doc
-              echo "::endgroup::"
-
-              echo "::group::Alloyd all-target tests"
-              cargo test --locked -p alloyd --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Alloyd documentation tests"
-              cargo test --locked -p alloyd --doc
-              echo "::endgroup::"
-            '
-
-  mac:
-    name: mac-metal
-
-    # Every repository push and same-repository PR validates the unified
-    # CPU/GPU path. Fork PRs do not execute on the persistent Mac runner.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-
+  recover:
+    name: Verify and retire abandoned Alloy test installer
+    if: github.repository == 'LayerDynamics/alloy'
     runs-on: [self-hosted, macOS, arm64]
-    timeout-minutes: 180
-    env:
-      # A pre-provisioned flat artifact directory; empty uses the documented local default.
-      ALLOY_QWEN3_ARTIFACT: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
-      ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
-
+    timeout-minutes: 5
     steps:
-      - name: checkout
+      - name: Check out recovery evidence and script
         uses: actions/checkout@v4
-
+        with:
+          persist-credentials: false
       - name: Node runtime
         uses: actions/setup-node@v4
         with:
           node-version: '26.13.0'
-          cache: npm
-          cache-dependency-path: ts/cli/package-lock.json
-
-      - name: Inspect Homebrew host locks
-        run: node scripts/homebrew/host-check.mjs
-
-      - name: Retain early Homebrew host evidence
-        if: ${{ always() }}
+      - name: Recover only the verified cancelled installer
+        run: node scripts/homebrew/recover-42313536852.mjs
+      - name: Retain recovery evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: homebrew-host-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/phase-1-acceptance/homebrew-host/
+          name: homebrew-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/homebrew-recovery/
           if-no-files-found: warn
           retention-days: 7
-
-      - name: CLI and monitor tests
-        working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
-
-      - name: Metal and unified tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p mlx-ffi \
-            --no-fail-fast \
-            -- --test-threads=1
-
-      - name: Native infrastructure and KV block transfers
-        shell: bash
-        run: cargo test --locked -p inference-infra --all-targets
-
-      - name: Qwen3 tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p qwen3 --all-targets
-          cargo test --locked -p qwen3 --doc
-
-      - name: engine all-target check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo check --locked -p engine --all-targets
-
-      - name: engine all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --all-targets
-
-      - name: engine documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --doc
-
-      - name: engine documentation build
-        shell: bash
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          set -euo pipefail
-
-          cargo doc --locked -p engine --no-deps
-
-      - name: harness-core all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p harness-core --all-targets
-
-      - name: harness-core documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p harness-core --doc
-
-      - name: alloyd all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --all-targets
-
-      - name: alloyd documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --doc
-
-      - name: "Test 13: real Qwen3 incremental CLI stream"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 35
-        shell: bash
-        run: bash ts/cli/scripts/qwen3_end_to_end_stream.sh
-
-      - name: "Test 14: real daemon restart, history, and SSD KV restore"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 40
-        shell: bash
-        run: bash ts/cli/scripts/session_restart_real_model.sh
-
-      - name: "M9: real 4B and 14B memory acceptance"
-        if: ${{ !cancelled() }}
-        timeout-minutes: 45
-        shell: bash
-        env:
-          ALLOY_M9_MODEL_A_DIR: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
-          ALLOY_M9_MODEL_B_DIR: ${{ vars.ALLOY_M9_MODEL_B_DIR }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$ALLOY_ACCEPTANCE_OUTPUT_DIR"
-          evidence_dir="$(mktemp -d "$ALLOY_ACCEPTANCE_OUTPUT_DIR/m9-large-model-XXXXXX")"
-          export ALLOY_M9_OUTPUT="$evidence_dir/acceptance.jsonl"
-          driver_status=0
-          bash scripts/m9_large_model_acceptance.sh 2>&1 | tee "$evidence_dir/driver.log" || driver_status=$?
-          node ts/cli/scripts/real-model-acceptance.mjs --summarize-m9 "$ALLOY_M9_OUTPUT"
-          exit "$driver_status"
-
-      - name: Homebrew installed CPU/Metal and real-model acceptance
-        if: ${{ !cancelled() }}
-        timeout-minutes: 90
-        shell: bash
-        run: exec node scripts/homebrew/ci.mjs
-
-      - name: Clean this run's owned Homebrew resources
-        if: ${{ always() }}
-        timeout-minutes: 5
-        shell: bash
-        run: exec node scripts/homebrew/ci.mjs --cleanup-owned
-
-      - name: Retain Phase 1 and Homebrew acceptance evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase-1-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/phase-1-acceptance/
-          if-no-files-found: warn
-          retention-days: 30
