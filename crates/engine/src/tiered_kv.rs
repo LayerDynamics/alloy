@@ -698,7 +698,7 @@ fn write_block(
     // create_new establishes ownership; serialize_to_file opens only this newly
     // created path inside the private, unpublished snapshot directory.
     drop(private_create(path)?);
-    serialize_to_file(views, &Some(metadata), path).map_err(|error| invalid(error.to_string()))?;
+    serialize_to_file(views, Some(metadata), path).map_err(|error| invalid(error.to_string()))?;
     File::open(path)
         .map_err(io_error)?
         .sync_all()

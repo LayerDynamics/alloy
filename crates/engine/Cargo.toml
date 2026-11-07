@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 serde_json = "=1.0.145"
-safetensors = "=0.4.3"
+safetensors = "=0.8.0"
 qwen3 = { path = "../families/qwen3" }
 minijinja = { workspace = true }
 sha2 = "=0.10.9"

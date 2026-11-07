@@ -341,7 +341,7 @@ fn write_checkpoint(directory: &Path, config: &Qwen3Config, weights: &Qwen3Weigh
         })
         .collect();
 
-    let bytes = serialize(views, &None).expect("serialize actual safetensors");
+    let bytes = serialize(views, None).expect("serialize actual safetensors");
 
     std::fs::write(directory.join("model.safetensors"), bytes).expect("write checkpoint");
 

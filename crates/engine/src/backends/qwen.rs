@@ -2420,7 +2420,7 @@ mod shared_rendering_wiring_tests {
                 )
             })
             .collect();
-        serialize(views, &None).expect("actual safetensors checkpoint")
+        serialize(views, None).expect("actual safetensors checkpoint")
     }
 
     fn tokenizer_bytes() -> Vec<u8> {
