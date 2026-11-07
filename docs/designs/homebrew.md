@@ -78,6 +78,17 @@ dependencies and Rust crates follow their checked-in lockfiles. Source
 fetching includes the pinned vendored native dependencies; no runtime code is
 downloaded on the first invocation.
 
+Installation builds start from an empty per-build `CARGO_HOME`, so the
+network-enabled fetch phase downloads the full crate set on every install.
+The formula hardens that path rather than caching across builds: Cargo's
+HTTP multiplexing is disabled and its retry count and transfer timeout are
+raised (`CARGO_HTTP_MULTIPLEXING=false`, `CARGO_NET_RETRY=10`,
+`CARGO_HTTP_TIMEOUT=120`). Lockfile hashes still govern all fetched content.
+Two CI acceptance failures came from transient registry stalls on an
+otherwise healthy network; if such stalls persist, vendoring the crate set
+into the source snapshot — matching the offline toolchain resources — is the
+recorded follow-up, not a per-user cache.
+
 Static MLX linkage does not embed `mlx.metallib`. Vendored MLX first searches
 beside its binary, then other resource locations and a build-time fallback.
 Packaging only `alloyd` can therefore appear to work while the build directory

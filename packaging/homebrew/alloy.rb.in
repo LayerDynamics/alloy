@@ -42,6 +42,12 @@ class Alloy < Formula
     ENV["CARGO_TARGET_DIR"] = (buildpath/"target/homebrew/cargo-target").to_s
     ENV["CARGO_BUILD_JOBS"] = "2"
     ENV["CMAKE_BUILD_PARALLEL_LEVEL"] = "2"
+    # Every install starts from an empty CARGO_HOME and downloads all crates.
+    # Tolerate transient stalls instead of failing the fetch: two CI
+    # acceptance failures were low-speed aborts on a healthy network.
+    ENV["CARGO_HTTP_MULTIPLEXING"] = "false"
+    ENV["CARGO_NET_RETRY"] = "10"
+    ENV["CARGO_HTTP_TIMEOUT"] = "120"
     ENV["npm_config_cache"] = (buildpath/"target/homebrew/npm-cache").to_s
     node_root
   end
