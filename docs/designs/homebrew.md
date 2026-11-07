@@ -7,7 +7,7 @@ formula packages the existing CLI, daemon and unprivileged monitor together
 from one immutable Git commit. It is a development preview using the project's
 `0.1.0` version, not a claim that a tagged release or bottle has been published.
 The source change and the corresponding
-[tap formula](https://github.com/LayerDynamics/homebrew-alloy/blob/main/Formula/alloy.rb)
+[tap formula](https://github.com/LayerDynamics/homebrew-alloy/blob/main/alloy.rb)
 must both merge before the public installation command works.
 
 This brings a usable source formula forward from the distribution roadmap.
@@ -32,6 +32,9 @@ alloyd --check-native
 alloy start
 ```
 
+The Ruby formula lives at `alloy.rb` in the tap repository root. Its location
+does not change Homebrew's `owner/tap/formula` naming: `LayerDynamics/alloy`
+names the tap, while `LayerDynamics/alloy/alloy` names the installable formula.
 The fully qualified name selects this project's formula. Homebrew maps the
 `LayerDynamics/alloy` tap to `LayerDynamics/homebrew-alloy`; another tap's
 formula with the same short name is a different package. An existing `alloy`
