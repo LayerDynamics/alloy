@@ -5,8 +5,10 @@
 //! daemon call/context/invocation types, assigns identities, authorizes,
 //! registers implementations, or executes tools.
 //!
-//! Parsing commits output only at end of generation. A malformed later block
-//! therefore cannot leave an earlier call available for execution.
+//! Atomic `push` keeps output until completion. Incremental `push_stream`
+//! emits text and complete untrusted proposals before completion. Streamed
+//! proposals MUST remain non-executable until successful generation finish;
+//! a later protocol error invalidates the whole generation's proposals.
 //!
 //! Supported syntax:
 //! <tool_call>{"name":"fs.read","arguments":{"path":"file"}}</tool_call>
@@ -94,14 +96,25 @@ impl fmt::Display for ToolParseError {
 
 impl std::error::Error for ToolParseError {}
 
-/// Byte-fragment accumulator with atomic end-of-generation parsing.
+/// Bounded parser with atomic and incremental consumption modes.
 ///
-/// No parsed call is exposed by `push`. `finish` consumes the parser, so
-/// completed output cannot be emitted twice from the same instance.
+/// `push` retains the original atomic API: `finish` returns all blocks.
+/// `push_stream` emits text and complete untrusted call proposals as soon
+/// as they are recognizable; `finish` then returns only any remaining tail.
+/// Modes cannot be mixed on the same parser.
+///
+/// Incremental proposals are tentative until successful generation finish.
+/// Consumers must not execute them before that completion gate. A later
+/// error invalidates every proposal from this generation. Previously
+/// displayed text cannot be retracted and is not evidence of success.
 pub struct ToolCallParser {
     limits: ParserLimits,
     bytes: Vec<u8>,
     failed: bool,
+    streaming: Option<bool>,
+    received: usize,
+    in_call: bool,
+    calls: usize,
 }
 
 impl ToolCallParser {
@@ -113,43 +126,229 @@ impl ToolCallParser {
         {
             return Err(ToolParseError::InvalidLimits);
         }
-
         Ok(Self {
             limits,
             bytes: Vec::new(),
             failed: false,
+            streaming: None,
+            received: 0,
+            in_call: false,
+            calls: 0,
         })
     }
 
-    /// Accept any byte boundary, including a split inside a UTF-8 character.
+    /// Atomic compatibility API. Do not mix with `push_stream`.
     pub fn push(&mut self, fragment: &[u8]) -> Result<(), ToolParseError> {
+        self.select_mode(false)?;
+        self.accept(fragment)
+    }
+
+    /// Consume arbitrary bytes and emit ordered incremental blocks.
+    ///
+    /// UTF-8 and delimiter fragments are held until complete. Call JSON is
+    /// validated at its closing delimiter, not at end of generation.
+    /// Returned calls contain no identity or authority and remain tentative
+    /// until `finish` succeeds. An error permanently poisons the parser.
+    pub fn push_stream(&mut self, fragment: &[u8]) -> Result<Vec<ParsedBlock>, ToolParseError> {
+        self.select_mode(true)?;
+        self.accept(fragment)?;
+        match self.process_stream(false) {
+            Ok(blocks) => Ok(blocks),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Validate completion. Streaming mode returns only un-emitted tail.
+    ///
+    /// Success commits protocol validity, not registry validity, approval,
+    /// or permission to execute. Cancellation must drop the parser instead.
+    pub fn finish(mut self) -> Result<Vec<ParsedBlock>, ToolParseError> {
         if self.failed {
             return Err(ToolParseError::FailedParser);
         }
+        if self.streaming == Some(true) {
+            self.process_stream(true)
+        } else {
+            let text = std::str::from_utf8(&self.bytes).map_err(|_| ToolParseError::InvalidUtf8)?;
+            parse_complete(text, self.limits)
+        }
+    }
 
-        let fits = self
-            .bytes
-            .len()
-            .checked_add(fragment.len())
-            .is_some_and(|length| length <= self.limits.max_output_bytes);
+    fn select_mode(&mut self, streaming: bool) -> Result<(), ToolParseError> {
+        if self.failed || self.streaming.is_some_and(|mode| mode != streaming) {
+            self.failed = true;
+            return Err(ToolParseError::FailedParser);
+        }
+        self.streaming = Some(streaming);
+        Ok(())
+    }
 
-        if !fits {
+    fn accept(&mut self, fragment: &[u8]) -> Result<(), ToolParseError> {
+        let Some(total) = self.received.checked_add(fragment.len()) else {
+            self.failed = true;
+            return Err(ToolParseError::OutputLimit);
+        };
+        if total > self.limits.max_output_bytes {
             self.failed = true;
             return Err(ToolParseError::OutputLimit);
         }
-
+        self.received = total;
         self.bytes.extend_from_slice(fragment);
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Vec<ParsedBlock>, ToolParseError> {
-        if self.failed {
-            return Err(ToolParseError::FailedParser);
+    fn process_stream(&mut self, eof: bool) -> Result<Vec<ParsedBlock>, ToolParseError> {
+        const FORBIDDEN: &[&[u8]] = &[
+            b"<|",
+            b"<think>",
+            b"</think>",
+            b"<tool_response",
+            b"</tool_response",
+            b"<function=",
+            b"<parameter=",
+        ];
+        let mut output = Vec::new();
+        while !self.bytes.is_empty() {
+            if self.in_call {
+                let closing = self
+                    .bytes
+                    .windows(CLOSE.len())
+                    .position(|window| window == CLOSE.as_bytes());
+                if let Some(end) = closing {
+                    if end > self.limits.max_call_bytes {
+                        return Err(ToolParseError::CallTooLarge);
+                    }
+                    if self.calls >= self.limits.max_calls {
+                        return Err(ToolParseError::CallLimit);
+                    }
+                    let body = std::str::from_utf8(&self.bytes[..end])
+                        .map_err(|_| ToolParseError::InvalidUtf8)?;
+                    // Reuse the strict envelope/duplicate-key validation.
+                    let envelope = format!("{OPEN}{body}{CLOSE}");
+                    let blocks = parse_complete(&envelope, self.limits)?;
+                    output.extend(blocks);
+                    self.calls += 1;
+                    self.bytes.drain(..end + CLOSE.len());
+                    self.in_call = false;
+                    continue;
+                }
+                if self
+                    .bytes
+                    .windows(OPEN.len())
+                    .any(|window| window == OPEN.as_bytes())
+                {
+                    return Err(ToolParseError::MalformedDelimiter);
+                }
+                // A partial closing delimiter is syntax, not body bytes.
+                let held = (1..CLOSE.len())
+                    .rev()
+                    .find(|&length| self.bytes.ends_with(&CLOSE.as_bytes()[..length]))
+                    .unwrap_or(0);
+                if self.bytes.len() - held > self.limits.max_call_bytes {
+                    return Err(ToolParseError::CallTooLarge);
+                }
+                break;
+            }
+
+            let marker = self.bytes.iter().position(|&byte| byte == b'<');
+            match marker {
+                Some(0) => {
+                    if self.bytes.starts_with(OPEN.as_bytes()) {
+                        self.bytes.drain(..OPEN.len());
+                        self.in_call = true;
+                        continue;
+                    }
+                    if self.bytes.starts_with(b"</tool_call") {
+                        return Err(ToolParseError::MalformedDelimiter);
+                    }
+                    if self.bytes.starts_with(b"<tool_call") && self.bytes.len() >= OPEN.len() {
+                        return Err(ToolParseError::MalformedDelimiter);
+                    }
+                    if FORBIDDEN
+                        .iter()
+                        .any(|marker| self.bytes.starts_with(marker))
+                    {
+                        return Err(ToolParseError::ReservedControlSyntax);
+                    }
+                    let partial = OPEN.as_bytes().starts_with(&self.bytes)
+                        || CLOSE.as_bytes().starts_with(&self.bytes)
+                        || FORBIDDEN
+                            .iter()
+                            .any(|marker| marker.starts_with(&self.bytes));
+                    if partial {
+                        if eof {
+                            return Err(ToolParseError::MalformedDelimiter);
+                        }
+                        break;
+                    }
+                    // Batch ordinary '<' characters rather than repeatedly
+                    // draining the front of a large literal-text fragment.
+                    let next = (1..self.bytes.len())
+                        .find(|&index| {
+                            if self.bytes[index] != b'<' {
+                                return false;
+                            }
+                            let tail = &self.bytes[index..];
+                            OPEN.as_bytes().starts_with(tail)
+                                || tail.starts_with(b"<tool_call")
+                                || CLOSE.as_bytes().starts_with(tail)
+                                || tail.starts_with(b"</tool_call")
+                                || FORBIDDEN.iter().any(|marker| {
+                                    marker.starts_with(tail) || tail.starts_with(marker)
+                                })
+                        })
+                        .unwrap_or(self.bytes.len());
+                    let valid = match std::str::from_utf8(&self.bytes[..next]) {
+                        Ok(_) => next,
+                        Err(error)
+                            if error.error_len().is_none() && !eof && next == self.bytes.len() =>
+                        {
+                            error.valid_up_to()
+                        }
+                        Err(_) => return Err(ToolParseError::InvalidUtf8),
+                    };
+                    if valid == 0 {
+                        break;
+                    }
+                    self.emit_text(valid, &mut output)?;
+                }
+                Some(length) => self.emit_text(length, &mut output)?,
+                None => {
+                    let valid = match std::str::from_utf8(&self.bytes) {
+                        Ok(_) => self.bytes.len(),
+                        Err(error) if error.error_len().is_none() && !eof => error.valid_up_to(),
+                        Err(_) => return Err(ToolParseError::InvalidUtf8),
+                    };
+                    if valid == 0 {
+                        break;
+                    }
+                    self.emit_text(valid, &mut output)?;
+                }
+            }
         }
+        if eof && self.in_call {
+            return Err(ToolParseError::IncompleteCall);
+        }
+        Ok(output)
+    }
 
-        let text = std::str::from_utf8(&self.bytes).map_err(|_| ToolParseError::InvalidUtf8)?;
-
-        parse_complete(text, self.limits)
+    fn emit_text(
+        &mut self,
+        length: usize,
+        output: &mut Vec<ParsedBlock>,
+    ) -> Result<(), ToolParseError> {
+        let text =
+            std::str::from_utf8(&self.bytes[..length]).map_err(|_| ToolParseError::InvalidUtf8)?;
+        if let Some(ParsedBlock::Text(previous)) = output.last_mut() {
+            previous.push_str(text);
+        } else {
+            output.push(ParsedBlock::Text(text.to_owned()));
+        }
+        self.bytes.drain(..length);
+        Ok(())
     }
 }
 
@@ -462,5 +661,201 @@ mod tests {
             }
             _ => panic!("expected calls"),
         }
+    }
+}
+
+// W2_INCREMENTAL_PARSER_TESTS_V1
+#[cfg(test)]
+mod incremental_stream_tests {
+    use super::*;
+
+    fn normalize(blocks: Vec<ParsedBlock>) -> Vec<ParsedBlock> {
+        let mut result = Vec::new();
+        for block in blocks {
+            match block {
+                ParsedBlock::Text(text) => {
+                    if let Some(ParsedBlock::Text(previous)) = result.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        result.push(ParsedBlock::Text(text));
+                    }
+                }
+                other => result.push(other),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn text_is_available_before_finish_and_not_retained() {
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        assert_eq!(
+            parser.push_stream(b"hello ").expect("text"),
+            vec![ParsedBlock::Text("hello ".into())]
+        );
+        assert!(parser.bytes.is_empty());
+        assert_eq!(
+            parser.push_stream("雪".as_bytes()).expect("unicode"),
+            vec![ParsedBlock::Text("雪".into())]
+        );
+        assert!(parser.bytes.is_empty());
+        assert!(parser.finish().expect("completion").is_empty());
+    }
+
+    #[test]
+    fn call_is_emitted_only_when_its_closing_delimiter_arrives() {
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        assert!(
+            parser
+                .push_stream(br#"<tool_call>{"name":"fs.read","arguments":{}}"#)
+                .expect("body")
+                .is_empty()
+        );
+        let output = parser.push_stream(b"</tool_call>").expect("close");
+        assert!(
+            matches!(output.as_slice(), [ParsedBlock::ToolCall(call)] if call.name == "fs.read")
+        );
+        assert!(parser.bytes.is_empty());
+        assert!(parser.finish().expect("completion").is_empty());
+    }
+
+    #[test]
+    fn every_two_chunk_split_matches_atomic_output() {
+        let text = concat!(
+            "Reading 雪. ",
+            "<tool_call>",
+            r#"{"name":"fs.read","arguments":{"path":"résumé.txt"}}"#,
+            "</tool_call>",
+            " done < 7"
+        );
+        let mut atomic = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        atomic.push(text.as_bytes()).expect("input");
+        let expected = atomic.finish().expect("atomic");
+        for split in 0..=text.len() {
+            let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+            let mut output = parser
+                .push_stream(&text.as_bytes()[..split])
+                .expect("first");
+            output.extend(
+                parser
+                    .push_stream(&text.as_bytes()[split..])
+                    .expect("second"),
+            );
+            output.extend(parser.finish().expect("completion"));
+            assert_eq!(normalize(output), expected, "split {split}");
+        }
+    }
+
+    #[test]
+    fn one_byte_chunks_preserve_multiple_calls_and_text_order() {
+        let text = concat!(
+            "雪",
+            "<tool_call>",
+            r#"{"name":"a","arguments":{}}"#,
+            "</tool_call>",
+            "middle",
+            "<tool_call>",
+            r#"{"name":"b","arguments":{}}"#,
+            "</tool_call>",
+            "tail"
+        );
+        let mut atomic = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        atomic.push(text.as_bytes()).expect("atomic input");
+        let expected = atomic.finish().expect("atomic");
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        let mut output = Vec::new();
+        for byte in text.as_bytes() {
+            output.extend(
+                parser
+                    .push_stream(std::slice::from_ref(byte))
+                    .expect("byte"),
+            );
+        }
+        output.extend(parser.finish().expect("completion"));
+        assert_eq!(normalize(output), expected);
+    }
+
+    #[test]
+    fn a_later_error_prevents_the_generation_commit_gate() {
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        let proposals = parser
+            .push_stream(br#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#)
+            .expect("tentative proposal");
+        assert_eq!(proposals.len(), 1);
+        assert!(
+            parser
+                .push_stream(b"<tool_call>{broken}</tool_call>")
+                .is_err()
+        );
+        let committed = parser.finish().is_ok();
+        // This models the required consumer gate, not a real executor test.
+        let effects = if committed { proposals.len() } else { 0 };
+        assert_eq!(effects, 0);
+    }
+
+    #[test]
+    fn incomplete_call_and_control_prefix_fail_at_completion() {
+        for text in [
+            b"<tool_call>{".as_slice(),
+            b"<tool_".as_slice(),
+            b"<thi".as_slice(),
+        ] {
+            let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+            parser.push_stream(text).expect("pending");
+            assert!(parser.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn total_output_limit_counts_already_emitted_bytes() {
+        let mut parser = ToolCallParser::new(ParserLimits {
+            max_output_bytes: 4,
+            max_call_bytes: 4,
+            max_calls: 1,
+        })
+        .expect("limits");
+        parser.push_stream(b"1234").expect("four bytes");
+        assert!(parser.bytes.is_empty());
+        assert_eq!(parser.push_stream(b"5"), Err(ToolParseError::OutputLimit));
+        assert_eq!(parser.finish(), Err(ToolParseError::FailedParser));
+    }
+
+    #[test]
+    fn streaming_and_atomic_consumption_cannot_be_mixed() {
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        parser.push_stream(b"hello").expect("streaming");
+        assert_eq!(parser.push(b"world"), Err(ToolParseError::FailedParser));
+    }
+
+    #[test]
+    fn call_byte_limit_handles_a_split_closing_delimiter() {
+        let body = r#"{"name":"a","arguments":{}}"#;
+        let mut parser = ToolCallParser::new(ParserLimits {
+            max_output_bytes: 1024,
+            max_call_bytes: body.len(),
+            max_calls: 1,
+        })
+        .expect("limits");
+        parser
+            .push_stream(format!("{OPEN}{body}</tool_").as_bytes())
+            .expect("partial close");
+        assert!(matches!(
+            parser.push_stream(b"call>").expect("close").as_slice(),
+            [ParsedBlock::ToolCall(_)]
+        ));
+        parser.finish().expect("completion");
+    }
+
+    #[test]
+    fn malformed_json_fails_at_close_without_waiting_for_finish() {
+        let mut parser = ToolCallParser::new(ParserLimits::default()).expect("parser");
+        assert_eq!(
+            parser.push_stream(b"<tool_call>{broken}</tool_call>"),
+            Err(ToolParseError::InvalidJson)
+        );
+        assert_eq!(
+            parser.push_stream(b"later"),
+            Err(ToolParseError::FailedParser)
+        );
     }
 }
