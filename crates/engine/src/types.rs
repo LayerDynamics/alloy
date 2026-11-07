@@ -661,6 +661,21 @@ pub enum GenerationEvent {
         delta: String,
     },
 
+    /// Complete untrusted tool-call proposal from a finished generation.
+    ///
+    /// A producer publishes proposals only after the family protocol parser
+    /// has accepted the whole generation and the engine has reached a
+    /// `GenerationCompleted` outcome. Proposals follow every text delta and
+    /// precede that terminal event. A consumer that observes any other
+    /// terminal event must discard proposals it already received.
+    ///
+    /// The proposal has no daemon-issued call ID, registration, approval,
+    /// or permission to execute.
+    ToolCallProposed {
+        /// Name and arguments exactly as proposed by the model.
+        proposal: ToolCallProposal,
+    },
+
     /// Nonterminal execution warning.
     RuntimeWarning {
         /// Stable machine-readable warning code.
@@ -945,5 +960,29 @@ mod w2_output_contract_tests {
         ];
         assert!(matches!(&blocks[0], GenerationOutputBlock::Text(text) if text == "Reading."));
         assert!(matches!(&blocks[1], GenerationOutputBlock::ToolCall(call) if call == &proposal));
+    }
+}
+
+#[cfg(test)]
+mod w2_proposal_event_tests {
+    use super::{FinishReason, GenerationEvent, ToolCallProposal, Usage};
+    use serde_json::Map;
+
+    #[test]
+    fn proposal_event_is_nonterminal_and_carries_no_identity() {
+        let proposal = ToolCallProposal::new("fs.read", Map::new()).expect("proposal");
+        let event = GenerationEvent::ToolCallProposed { proposal };
+        assert!(!event.is_terminal());
+        assert!(matches!(
+            event,
+            GenerationEvent::ToolCallProposed { proposal } if proposal.name() == "fs.read"
+        ));
+        assert!(
+            GenerationEvent::GenerationCompleted {
+                finish_reason: FinishReason::EndOfSequence,
+                usage: Usage::default(),
+            }
+            .is_terminal()
+        );
     }
 }

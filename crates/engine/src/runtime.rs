@@ -46,7 +46,7 @@ use crate::{
         CacheAllocationRequest, ExecutionControl, FamilyCache, LoadedModel, ModelFamily,
         ModelInstanceId, ModelLoadLimits, ModelLoadRequest, TokenLogits,
     },
-    generation::{self, GenerationLimits, GenerationSession, TokenStep},
+    generation::{self, BlockStep, GenerationLimits, GenerationSession, TokenStep},
     registry::{ArtifactRegistration, FamilyVersion, Registry},
     types::{
         ArtifactId, CacheKind, CacheMode, CancelOutcome, Capabilities, ContextSnapshot,
@@ -1213,11 +1213,11 @@ enum Command {
     },
     Decode {
         request: RequestId,
-        reply: SyncSender<Reply<TokenStep>>,
+        reply: SyncSender<Reply<BlockStep>>,
     },
     Flush {
         request: RequestId,
-        reply: SyncSender<Reply<String>>,
+        reply: SyncSender<Reply<Vec<crate::types::GenerationOutputBlock>>>,
     },
     Finish {
         request: RequestId,
@@ -1656,6 +1656,19 @@ impl GenerationSession for NativeSession {
         options: &GenerationOptions,
         cancellation: &CancellationToken,
     ) -> Result<TokenStep, EngineError> {
+        let step = self.decode_next_blocks(options, cancellation)?;
+        Ok(TokenStep {
+            token_id: step.token_id,
+            text_delta: blocks_to_text(step.blocks)?,
+            end_of_sequence: step.end_of_sequence,
+        })
+    }
+
+    fn decode_next_blocks(
+        &mut self,
+        options: &GenerationOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<BlockStep, EngineError> {
         cancellation.check_cancelled(&self.request_id)?;
         if options != &self.options {
             return Err(internal("session generation options changed"));
@@ -1670,6 +1683,10 @@ impl GenerationSession for NativeSession {
     }
 
     fn finish_text(&mut self) -> Result<String, EngineError> {
+        blocks_to_text(self.finish_blocks()?)
+    }
+
+    fn finish_blocks(&mut self) -> Result<Vec<crate::types::GenerationOutputBlock>, EngineError> {
         let reply = self.worker.call(|reply| Command::Flush {
             request: self.request_id.clone(),
             reply,
@@ -1681,6 +1698,21 @@ impl GenerationSession for NativeSession {
     fn usage(&self) -> Usage {
         self.usage
     }
+}
+
+/// Legacy text-only view of parsed blocks. Structured proposals must use
+/// the block methods, so this fails closed instead of dropping a call.
+fn blocks_to_text(blocks: Vec<crate::types::GenerationOutputBlock>) -> Result<String, EngineError> {
+    let mut text = String::new();
+    for block in blocks {
+        match block {
+            crate::types::GenerationOutputBlock::Text(part) => text.push_str(&part),
+            crate::types::GenerationOutputBlock::ToolCall(_) => {
+                return Err(internal("structured output requires block delivery"));
+            }
+        }
+    }
+    Ok(text)
 }
 
 impl Drop for NativeSession {
@@ -3945,7 +3977,7 @@ impl NativeState {
         active.control.check_cancelled()
     }
 
-    fn decode(&mut self, request: &RequestId) -> Result<TokenStep, EngineError> {
+    fn decode(&mut self, request: &RequestId) -> Result<BlockStep, EngineError> {
         let active = self
             .active
             .as_mut()
@@ -4012,20 +4044,23 @@ impl NativeState {
         active.logits = Some(next);
 
         let end_of_sequence = active.eos.contains(&token);
-        let text_delta = if end_of_sequence {
-            String::new()
+        let blocks = if end_of_sequence {
+            Vec::new()
         } else {
-            active.decoder.push(token)?
+            active.decoder.push_blocks(token)?
         };
 
-        Ok(TokenStep {
+        Ok(BlockStep {
             token_id: token,
-            text_delta,
+            blocks,
             end_of_sequence,
         })
     }
 
-    fn flush(&mut self, request: &RequestId) -> Result<String, EngineError> {
+    fn flush(
+        &mut self,
+        request: &RequestId,
+    ) -> Result<Vec<crate::types::GenerationOutputBlock>, EngineError> {
         let active = self
             .active
             .as_mut()
@@ -4037,10 +4072,10 @@ impl NativeState {
             return Err(internal("text completion requested twice"));
         }
 
-        let text = active.decoder.finish()?;
+        let blocks = active.decoder.finish_blocks()?;
         active.control.check_cancelled()?;
         active.text_finished = true;
-        Ok(text)
+        Ok(blocks)
     }
 
     fn finish(&mut self, request: &RequestId) -> Result<(), EngineError> {
@@ -5629,5 +5664,28 @@ mod w2_decoder_contract_tests {
             vec![GenerationOutputBlock::Text("résumé 雪".to_owned())],
         );
         assert!(decoder.push_blocks(99).is_err());
+    }
+}
+
+#[cfg(test)]
+mod w2_block_bridge_tests {
+    use super::blocks_to_text;
+    use crate::types::{GenerationOutputBlock, ToolCallProposal};
+    use serde_json::Map;
+
+    #[test]
+    fn text_blocks_concatenate_for_legacy_sessions() {
+        let blocks = vec![
+            GenerationOutputBlock::Text("a".to_owned()),
+            GenerationOutputBlock::Text("雪".to_owned()),
+        ];
+        assert_eq!(blocks_to_text(blocks).expect("text"), "a雪");
+    }
+
+    #[test]
+    fn legacy_text_view_rejects_instead_of_dropping_a_call() {
+        let proposal = ToolCallProposal::new("fs.read", Map::new()).expect("proposal");
+        let blocks = vec![GenerationOutputBlock::ToolCall(proposal)];
+        assert!(blocks_to_text(blocks).is_err());
     }
 }

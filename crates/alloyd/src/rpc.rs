@@ -229,6 +229,7 @@ pub fn wire_event_name(event: &engine::types::GenerationEvent) -> &'static str {
     match event {
         GenerationEvent::TextDelta { .. } => "text_delta",
         GenerationEvent::ToolCallDelta { .. } => "tool_call_delta",
+        GenerationEvent::ToolCallProposed { .. } => "tool_call_proposed",
         GenerationEvent::RuntimeWarning { .. } => "runtime_warning",
         GenerationEvent::GenerationCompleted { .. } => "generation_completed",
         GenerationEvent::RequestFailed { .. } => "request_failed",
@@ -242,6 +243,12 @@ pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
         GenerationEvent::TextDelta { text } => json!({ "text": text }),
         GenerationEvent::ToolCallDelta { call_id, delta } => {
             json!({ "call_id": call_id, "delta": delta })
+        }
+        GenerationEvent::ToolCallProposed { proposal } => {
+            json!({
+                "name": proposal.name(),
+                "arguments": proposal.arguments(),
+            })
         }
         GenerationEvent::RuntimeWarning { code, message } => {
             json!({ "code": code, "message": message })
@@ -270,5 +277,49 @@ pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
                 "output_tokens": partial_usage.output_tokens,
             }
         }),
+    }
+}
+
+// W2_RPC_PROPOSAL_CODEC_V1
+#[cfg(test)]
+mod w2_proposal_wire_tests {
+    use super::*;
+    use engine::types::{GenerationEvent, ToolCallProposal};
+
+    #[test]
+    fn proposal_wire_payload_preserves_data_without_inventing_authority() {
+        let arguments = json!({
+            "path": "file.txt",
+            "nested": [null, true, {"x": 7}],
+            "approved": true,
+            "call_id": "argument-data-only"
+        });
+        let proposal =
+            ToolCallProposal::new("fs.read", arguments.as_object().expect("object").clone())
+                .expect("proposal");
+        let event = GenerationEvent::ToolCallProposed { proposal };
+
+        assert_eq!(wire_event_name(&event), "tool_call_proposed");
+        assert!(!event.is_terminal());
+
+        let body = wire_event_body(&event);
+        assert_eq!(
+            body,
+            json!({
+                "name": "fs.read",
+                "arguments": arguments,
+            })
+        );
+        assert!(body.get("call_id").is_none());
+        assert!(body.get("approved").is_none());
+        assert!(body.get("delta").is_none());
+
+        let notification =
+            RpcNotification::session_event(wire_event_name(&event), "session-test", body.clone());
+        let encoded = encode_line(&notification).expect("encode");
+        let decoded: Value = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded["method"], "session.event");
+        assert_eq!(decoded["params"]["event"], "tool_call_proposed");
+        assert_eq!(decoded["params"]["body"], body);
     }
 }

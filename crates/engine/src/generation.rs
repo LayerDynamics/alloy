@@ -25,7 +25,7 @@ use crate::{
     scheduler::ExecutionOutcome,
     types::{
         FinishReason, Generation, GenerationEvent, GenerationEventStream, GenerationOptions,
-        RenderedContext, RequestId, Usage,
+        GenerationOutputBlock, RenderedContext, RequestId, ToolCallProposal, Usage,
     },
 };
 use std::{
@@ -57,6 +57,28 @@ pub struct TokenStep {
 
     /// Whether this token satisfies the profile's EOS condition.
     pub end_of_sequence: bool,
+}
+
+/// One decoded token with ordered, parsed output blocks.
+///
+/// Complete tool-call proposals in `blocks` are tentative. The generation
+/// driver withholds them until the whole generation has succeeded.
+#[derive(Debug)]
+pub struct BlockStep {
+    /// Actual selected token ID.
+    pub token_id: u32,
+    /// Output newly available after this token, in model order.
+    pub blocks: Vec<GenerationOutputBlock>,
+    /// Whether this token satisfies the profile's EOS condition.
+    pub end_of_sequence: bool,
+}
+
+fn text_blocks(text: String) -> Vec<GenerationOutputBlock> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![GenerationOutputBlock::Text(text)]
+    }
 }
 
 /// Actual family-owned execution state for one generation.
@@ -107,6 +129,33 @@ pub trait GenerationSession: Send + 'static {
     /// replacement output.
     fn finish_text(&mut self) -> Result<String, EngineError>;
 
+    /// Select and process one token, returning ordered output blocks.
+    ///
+    /// The default adapts text-only sessions through `decode_next`.
+    /// Protocol-aware sessions override this and `finish_blocks` together.
+    /// Returned proposals stay tentative; the driver publishes them only
+    /// after the entire generation has completed successfully.
+    fn decode_next_blocks(
+        &mut self,
+        options: &GenerationOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<BlockStep, EngineError> {
+        let step = self.decode_next(options, cancellation)?;
+        Ok(BlockStep {
+            token_id: step.token_id,
+            blocks: text_blocks(step.text_delta),
+            end_of_sequence: step.end_of_sequence,
+        })
+    }
+
+    /// Finish the decoder and return any remaining ordered output blocks.
+    ///
+    /// Like `finish_text`, this must not execute another model step or
+    /// change token usage. Truncated protocol output must be an error.
+    fn finish_blocks(&mut self) -> Result<Vec<GenerationOutputBlock>, EngineError> {
+        Ok(text_blocks(self.finish_text()?))
+    }
+
     /// Return usage measured by actual execution.
     ///
     /// This must remain available after an execution error so partial usage
@@ -120,6 +169,10 @@ pub trait GenerationSession: Send + 'static {
 /// Explicit buffering policy for one generation.
 ///
 /// The text budget covers String capacities retained in the event queue.
+/// It also covers tool-call proposals held or queued for the generation:
+/// their estimated retained bytes are reserved against the same budget, and
+/// at most `max_buffered_text_bytes - max_text_delta_bytes` may be reserved.
+/// A policy with no such headroom therefore rejects tool calls (fail closed).
 /// A producer may additionally retain one pending delta, bounded by
 /// max_text_delta_bytes.
 ///
@@ -323,7 +376,13 @@ struct Shared {
 
 struct ChannelState {
     text: VecDeque<String>,
+    // W2_STRUCTURED_OUTPUT_WIRING_V1
+    // Proposals are enqueued only after the generation succeeded, so they
+    // always follow every queued text delta.
+    proposals: VecDeque<HeldProposal>,
+    // Text capacity plus reserved proposal bytes, against one budget.
     buffered_text_bytes: usize,
+    proposal_reserved: usize,
     terminal: Option<GenerationEvent>,
     worker_finished: bool,
     receiver_dropped: bool,
@@ -403,7 +462,9 @@ pub fn start_generation(
     let shared = Arc::new(Shared {
         state: Mutex::new(ChannelState {
             text,
+            proposals: VecDeque::new(),
             buffered_text_bytes: 0,
+            proposal_reserved: 0,
             terminal: None,
             worker_finished: false,
             receiver_dropped: false,
@@ -463,6 +524,8 @@ fn run_worker(
     };
 
     let mut usage = UsageTracker::default();
+    // Tentative proposals live only here until the terminal outcome is known.
+    let mut proposals: Vec<HeldProposal> = Vec::new();
 
     let execution_result = catch_unwind(AssertUnwindSafe(|| {
         drive_generation(
@@ -471,6 +534,7 @@ fn run_worker(
             &options,
             &mut producer,
             &mut usage,
+            &mut proposals,
         )
     }));
 
@@ -539,6 +603,22 @@ fn run_worker(
         },
     };
 
+    // Completion gate: proposals become visible only when the arbitrated
+    // terminal outcome is success. Failure and cancellation drop them
+    // unpublished. Publication consults only receiver liveness, so a
+    // late cancellation cannot leave a truncated proposal list.
+    let mut terminal = terminal;
+    if matches!(terminal, GenerationEvent::GenerationCompleted { .. }) {
+        if let Err(error) = producer.publish_proposals(proposals) {
+            terminal = GenerationEvent::RequestFailed {
+                error,
+                partial_usage: latest_usage,
+            };
+        }
+    } else {
+        drop(proposals);
+    }
+
     // Terminal delivery has its own single reserved slot. It cannot block
     // the worker behind a full text queue after model execution has stopped.
     producer.publish_terminal(terminal);
@@ -550,6 +630,7 @@ fn drive_generation(
     options: &GenerationOptions,
     producer: &mut Producer,
     usage: &mut UsageTracker,
+    proposals: &mut Vec<HeldProposal>,
 ) -> Result<FinishReason, EngineError> {
     producer.check_running()?;
 
@@ -566,7 +647,7 @@ fn drive_generation(
     for index in 0..options.max_output_tokens() {
         producer.check_running()?;
 
-        let step = session.decode_next(options, &producer.cancellation)?;
+        let step = session.decode_next_blocks(options, &producer.cancellation)?;
 
         let expected_output_tokens = index.checked_add(1).ok_or_else(|| EngineError::Internal {
             message: "generation token counter overflow".to_owned(),
@@ -578,7 +659,7 @@ fn drive_generation(
             expected_output_tokens,
         )?;
 
-        producer.send_text(step.text_delta)?;
+        producer.dispatch_blocks(step.blocks, proposals)?;
 
         if step.end_of_sequence {
             finish_reason = FinishReason::EndOfSequence;
@@ -588,14 +669,129 @@ fn drive_generation(
 
     producer.check_running()?;
 
-    let remaining_text = session.finish_text()?;
+    let remaining = session.finish_blocks()?;
 
     usage.validate_text_finish(session.usage())?;
 
-    producer.send_text(remaining_text)?;
+    producer.dispatch_blocks(remaining, proposals)?;
     producer.check_running()?;
 
     Ok(finish_reason)
+}
+
+/// Complete proposal held until the generation outcome is known.
+struct HeldProposal {
+    proposal: ToolCallProposal,
+    charge: usize,
+}
+
+/// Conservative retained-size estimate for a proposal and its queue slot.
+fn proposal_charge(proposal: &ToolCallProposal) -> usize {
+    use serde_json::Value;
+
+    // Allowance for map-node and key bookkeeping per object entry.
+    const ENTRY_OVERHEAD: usize = 64;
+
+    fn entry_bytes(key: &str, value: &Value) -> usize {
+        ENTRY_OVERHEAD
+            .saturating_add(key.len())
+            .saturating_add(std::mem::size_of::<Value>())
+            .saturating_add(heap_bytes(value))
+    }
+
+    fn heap_bytes(value: &Value) -> usize {
+        match value {
+            Value::String(text) => text.capacity(),
+            Value::Array(items) => items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(items.iter().map(heap_bytes).fold(0, usize::saturating_add)),
+            Value::Object(entries) => entries
+                .iter()
+                .map(|(key, item)| entry_bytes(key, item))
+                .fold(0, usize::saturating_add),
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        }
+    }
+
+    let arguments = proposal
+        .arguments()
+        .iter()
+        .map(|(key, item)| entry_bytes(key, item))
+        .fold(0, usize::saturating_add);
+
+    std::mem::size_of::<HeldProposal>()
+        .saturating_add(proposal.name().len())
+        .saturating_add(arguments)
+}
+
+enum ProposalReservation {
+    Reserved,
+    Wait,
+    TooLarge {
+        required_bytes: usize,
+        available_bytes: usize,
+    },
+}
+
+/// Reserve proposal bytes without waiting. Reserved proposal bytes never
+/// exceed the budget minus one maximum text delta, so queued text can always
+/// make progress once the consumer drains it.
+fn try_reserve_proposal(
+    shared: &Shared,
+    charge: usize,
+) -> Result<ProposalReservation, EngineError> {
+    let budget = shared.limits.max_buffered_text_bytes;
+    let allowance = budget.saturating_sub(shared.limits.max_text_delta_bytes);
+    let mut state = lock(&shared.state);
+
+    let reserved =
+        state
+            .proposal_reserved
+            .checked_add(charge)
+            .ok_or_else(|| EngineError::Internal {
+                message: "pending proposal size arithmetic overflow".to_owned(),
+            })?;
+    if reserved > allowance {
+        return Ok(ProposalReservation::TooLarge {
+            required_bytes: reserved,
+            available_bytes: allowance,
+        });
+    }
+
+    let buffered = state
+        .buffered_text_bytes
+        .checked_add(charge)
+        .ok_or_else(|| EngineError::Internal {
+            message: "queued proposal size arithmetic overflow".to_owned(),
+        })?;
+    if buffered > budget {
+        return Ok(ProposalReservation::Wait);
+    }
+
+    state.proposal_reserved = reserved;
+    state.buffered_text_bytes = buffered;
+    Ok(ProposalReservation::Reserved)
+}
+
+enum ProposalEnqueue {
+    Queued(Option<Waker>),
+    Full(HeldProposal),
+    ReceiverDropped,
+}
+
+fn try_enqueue_proposal(shared: &Shared, held: HeldProposal) -> ProposalEnqueue {
+    let mut state = lock(&shared.state);
+
+    if state.receiver_dropped {
+        return ProposalEnqueue::ReceiverDropped;
+    }
+    if state.text.len().saturating_add(state.proposals.len()) >= shared.limits.event_capacity {
+        return ProposalEnqueue::Full(held);
+    }
+
+    state.proposals.push_back(held);
+    ProposalEnqueue::Queued(state.consumer_waker.take())
 }
 
 impl Producer {
@@ -689,6 +885,103 @@ impl Producer {
         }
     }
 
+    fn dispatch_blocks(
+        &mut self,
+        blocks: Vec<GenerationOutputBlock>,
+        held: &mut Vec<HeldProposal>,
+    ) -> Result<(), EngineError> {
+        for block in blocks {
+            match block {
+                GenerationOutputBlock::Text(text) => self.send_text(text)?,
+                GenerationOutputBlock::ToolCall(proposal) => self.hold_proposal(held, proposal)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn hold_proposal(
+        &mut self,
+        held: &mut Vec<HeldProposal>,
+        proposal: ToolCallProposal,
+    ) -> Result<(), EngineError> {
+        let charge = proposal_charge(&proposal);
+
+        held.try_reserve(1)
+            .map_err(|_| EngineError::AllocationFailed {
+                operation: "allocate pending tool-call proposals",
+                requested_bytes: u64::try_from(std::mem::size_of::<HeldProposal>()).ok(),
+            })?;
+
+        loop {
+            self.check_running()?;
+
+            match try_reserve_proposal(&self.shared, charge)? {
+                ProposalReservation::Reserved => {
+                    held.push(HeldProposal { proposal, charge });
+                    return Ok(());
+                }
+                ProposalReservation::TooLarge {
+                    required_bytes,
+                    available_bytes,
+                } => {
+                    return Err(EngineError::MemoryLimitExceeded {
+                        operation: "buffer tool-call proposals",
+                        required_bytes: bytes_as_u64(required_bytes)?,
+                        available_bytes: bytes_as_u64(available_bytes)?,
+                        reason: MemoryLimitReason::BufferLimit,
+                    });
+                }
+                // Queue consumption, stream disposal, or cancellation
+                // unparks this thread.
+                ProposalReservation::Wait => thread::park(),
+            }
+        }
+    }
+
+    /// Publish held proposals after a successful terminal outcome.
+    ///
+    /// Reservation already happened. Only receiver liveness can stop this.
+    fn publish_proposals(&mut self, held: Vec<HeldProposal>) -> Result<(), EngineError> {
+        if held.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut state = lock(&self.shared.state);
+            state
+                .proposals
+                .try_reserve(held.len())
+                .map_err(|_| EngineError::AllocationFailed {
+                    operation: "allocate tool-call proposal queue",
+                    requested_bytes: u64::try_from(
+                        held.len()
+                            .saturating_mul(std::mem::size_of::<HeldProposal>()),
+                    )
+                    .ok(),
+                })?;
+        }
+
+        for mut pending in held {
+            loop {
+                match try_enqueue_proposal(&self.shared, pending) {
+                    ProposalEnqueue::Queued(waker) => {
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                        break;
+                    }
+                    ProposalEnqueue::ReceiverDropped => return Err(self.cancelled_error()),
+                    ProposalEnqueue::Full(returned) => {
+                        pending = returned;
+                        thread::park();
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn publish_terminal(self, terminal: GenerationEvent) {
         let consumer_to_wake;
         let mut discarded_terminal = Some(terminal);
@@ -748,6 +1041,17 @@ impl GenerationEventStream for EventStream {
                 old_waker = state.consumer_waker.take();
 
                 result = Poll::Ready(Some(GenerationEvent::TextDelta { text }));
+            } else if let Some(held) = state.proposals.pop_front() {
+                state.buffered_text_bytes = state.buffered_text_bytes.saturating_sub(held.charge);
+                state.proposal_reserved = state.proposal_reserved.saturating_sub(held.charge);
+
+                // Consuming a queued proposal frees an event position.
+                producer_to_wake = state.worker_thread.clone();
+                old_waker = state.consumer_waker.take();
+
+                result = Poll::Ready(Some(GenerationEvent::ToolCallProposed {
+                    proposal: held.proposal,
+                }));
             } else if let Some(terminal) = state.terminal.take() {
                 // Terminal publication occurs after execution stops;
                 // no producer needs to resume to deliver this event.
@@ -794,6 +1098,7 @@ impl Drop for EventStream {
         let worker;
         let old_waker;
         let queued;
+        let queued_proposals;
         let terminal;
 
         {
@@ -803,12 +1108,15 @@ impl Drop for EventStream {
             state.buffered_text_bytes = 0;
 
             queued = std::mem::take(&mut state.text);
+            queued_proposals = std::mem::take(&mut state.proposals);
+            state.proposal_reserved = 0;
             terminal = state.terminal.take();
             old_waker = state.consumer_waker.take();
             worker = state.worker_thread.clone();
         }
 
         drop(queued);
+        drop(queued_proposals);
         drop(terminal);
         drop(old_waker);
 
@@ -1115,5 +1423,221 @@ mod tests {
 
         assert_eq!(tracker.latest, Usage::default());
         assert!(tracker.inconsistent);
+    }
+}
+
+#[cfg(test)]
+mod w2_proposal_queue_tests {
+    use super::*;
+    use serde_json::{Map, json};
+    use std::task::Waker;
+
+    fn shared(event_capacity: usize, budget: usize, delta: usize) -> Arc<Shared> {
+        Arc::new(Shared {
+            state: Mutex::new(ChannelState {
+                text: VecDeque::new(),
+                proposals: VecDeque::new(),
+                buffered_text_bytes: 0,
+                proposal_reserved: 0,
+                terminal: None,
+                worker_finished: false,
+                receiver_dropped: false,
+                consumer_waker: None,
+                worker_thread: None,
+            }),
+            limits: GenerationLimits::new(event_capacity, budget, delta).expect("limits"),
+        })
+    }
+
+    fn held(name: &str) -> HeldProposal {
+        let proposal = ToolCallProposal::new(name, Map::new()).expect("proposal");
+        let charge = proposal_charge(&proposal);
+        HeldProposal { proposal, charge }
+    }
+
+    fn reserve(shared: &Shared, held: &HeldProposal) {
+        assert!(matches!(
+            try_reserve_proposal(shared, held.charge).expect("reservation"),
+            ProposalReservation::Reserved
+        ));
+    }
+
+    fn poll(stream: &mut EventStream) -> Option<GenerationEvent> {
+        let mut context = Context::from_waker(Waker::noop());
+        match Pin::new(stream).poll_next(&mut context) {
+            Poll::Ready(event) => event,
+            Poll::Pending => panic!("stream unexpectedly pending"),
+        }
+    }
+
+    struct TextOnlySession;
+
+    impl GenerationSession for TextOnlySession {
+        fn prefill(
+            &mut self,
+            _: &RenderedContext,
+            _: &GenerationOptions,
+            _: &CancellationToken,
+        ) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn decode_next(
+            &mut self,
+            _: &GenerationOptions,
+            _: &CancellationToken,
+        ) -> Result<TokenStep, EngineError> {
+            Err(EngineError::Internal {
+                message: "unused".to_owned(),
+            })
+        }
+
+        fn finish_text(&mut self) -> Result<String, EngineError> {
+            Ok(" tail".to_owned())
+        }
+
+        fn usage(&self) -> Usage {
+            Usage::default()
+        }
+    }
+
+    #[test]
+    fn default_finish_blocks_preserves_text_only_sessions() {
+        let mut session = TextOnlySession;
+        assert_eq!(
+            session.finish_blocks().expect("finish"),
+            vec![GenerationOutputBlock::Text(" tail".to_owned())],
+        );
+    }
+
+    #[test]
+    fn charge_grows_with_nested_argument_data() {
+        let small = ToolCallProposal::new("fs.read", Map::new()).expect("small");
+        let payload = "x".repeat(4096);
+        let value = json!({"items": [payload, {"nested": [1, 2, 3]}]});
+        let large = ToolCallProposal::new("fs.read", value.as_object().expect("object").clone())
+            .expect("large");
+        assert!(proposal_charge(&large) >= proposal_charge(&small) + 4096);
+    }
+
+    #[test]
+    fn reservation_stays_below_the_text_budget_headroom() {
+        let channel = shared(4, 1000, 400);
+        assert!(matches!(
+            try_reserve_proposal(&channel, 500).expect("first"),
+            ProposalReservation::Reserved
+        ));
+        assert!(matches!(
+            try_reserve_proposal(&channel, 500).expect("second"),
+            ProposalReservation::TooLarge {
+                required_bytes: 1000,
+                available_bytes: 600
+            }
+        ));
+        let state = lock(&channel.state);
+        assert_eq!(state.proposal_reserved, 500);
+        assert_eq!(state.buffered_text_bytes, 500);
+    }
+
+    #[test]
+    fn reservation_waits_while_queued_text_holds_the_budget() {
+        let channel = shared(4, 1000, 400);
+        lock(&channel.state).buffered_text_bytes = 800;
+        assert!(matches!(
+            try_reserve_proposal(&channel, 250).expect("reservation"),
+            ProposalReservation::Wait
+        ));
+        assert_eq!(lock(&channel.state).proposal_reserved, 0);
+    }
+
+    #[test]
+    fn proposals_follow_text_and_precede_the_terminal_event() {
+        let channel = shared(8, 4096, 1024);
+        {
+            let mut state = lock(&channel.state);
+            state.text.push_back("hi".to_owned());
+            state.buffered_text_bytes = state.text[0].capacity();
+        }
+        for name in ["a", "b"] {
+            let item = held(name);
+            reserve(&channel, &item);
+            assert!(matches!(
+                try_enqueue_proposal(&channel, item),
+                ProposalEnqueue::Queued(_)
+            ));
+        }
+        {
+            let mut state = lock(&channel.state);
+            state.terminal = Some(GenerationEvent::GenerationCompleted {
+                finish_reason: FinishReason::EndOfSequence,
+                usage: Usage::default(),
+            });
+            state.worker_finished = true;
+        }
+
+        let mut stream = EventStream {
+            shared: Arc::clone(&channel),
+            exhausted: false,
+        };
+        assert!(matches!(
+            poll(&mut stream),
+            Some(GenerationEvent::TextDelta { text }) if text == "hi"
+        ));
+        for expected in ["a", "b"] {
+            match poll(&mut stream) {
+                Some(GenerationEvent::ToolCallProposed { proposal }) => {
+                    assert_eq!(proposal.name(), expected);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            poll(&mut stream),
+            Some(GenerationEvent::GenerationCompleted { .. })
+        ));
+        assert!(poll(&mut stream).is_none());
+
+        let state = lock(&channel.state);
+        assert_eq!(state.buffered_text_bytes, 0);
+        assert_eq!(state.proposal_reserved, 0);
+    }
+
+    #[test]
+    fn full_queue_returns_the_unpublished_proposal() {
+        let channel = shared(2, 4096, 1024);
+        lock(&channel.state).text.push_back("hi".to_owned());
+        assert!(matches!(
+            try_enqueue_proposal(&channel, held("a")),
+            ProposalEnqueue::Queued(_)
+        ));
+        match try_enqueue_proposal(&channel, held("b")) {
+            ProposalEnqueue::Full(returned) => assert_eq!(returned.proposal.name(), "b"),
+            _ => panic!("queue should be full"),
+        }
+    }
+
+    #[test]
+    fn dropping_the_stream_discards_queued_proposals_and_reservations() {
+        let channel = shared(4, 4096, 1024);
+        let item = held("a");
+        reserve(&channel, &item);
+        assert!(matches!(
+            try_enqueue_proposal(&channel, item),
+            ProposalEnqueue::Queued(_)
+        ));
+
+        drop(EventStream {
+            shared: Arc::clone(&channel),
+            exhausted: false,
+        });
+
+        assert!(matches!(
+            try_enqueue_proposal(&channel, held("b")),
+            ProposalEnqueue::ReceiverDropped
+        ));
+        let state = lock(&channel.state);
+        assert!(state.proposals.is_empty());
+        assert_eq!(state.proposal_reserved, 0);
+        assert_eq!(state.buffered_text_bytes, 0);
     }
 }

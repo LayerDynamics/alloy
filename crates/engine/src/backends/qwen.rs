@@ -173,6 +173,7 @@ pub struct Qwen3Backend {
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
     execution: Qwen3Execution,
+    tool_call_parsing: bool,
 }
 
 impl Qwen3Backend {
@@ -394,7 +395,35 @@ impl Qwen3Backend {
             artifacts,
             limits,
             execution,
+            tool_call_parsing: false,
         })
+    }
+
+    /// Enable or disable Qwen tool-call parsing for new generations.
+    ///
+    /// Disabled by default, which preserves the text-only decoder. When
+    /// enabled, `<tool_call>` blocks are parsed incrementally into untrusted
+    /// proposals that the generation driver publishes only after the whole
+    /// generation succeeds. Reserved control syntax such as `<think>` in
+    /// model output is then a protocol error instead of display text.
+    pub fn with_tool_call_parsing(mut self, enabled: bool) -> Self {
+        self.tool_call_parsing = enabled;
+        self
+    }
+
+    fn tool_parser_limits(&self) -> qwen3::tool_calls::ParserLimits {
+        let defaults = qwen3::tool_calls::ParserLimits::default();
+        // Output cannot exceed context tokens times the largest token spelling.
+        let output = self
+            .limits
+            .max_token_bytes
+            .saturating_mul(self.limits.context_limit_tokens)
+            .max(1);
+        qwen3::tool_calls::ParserLimits {
+            max_output_bytes: output,
+            max_call_bytes: defaults.max_call_bytes.min(output),
+            max_calls: defaults.max_calls,
+        }
     }
 
     /// Construct a registry whose family metadata matches this executable
@@ -712,6 +741,14 @@ impl RuntimeBackend for Qwen3Backend {
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
         let resolved = registry.resolve_profile(profile)?;
         let data = self.data(resolved.artifact())?;
+        let parser = if self.tool_call_parsing {
+            Some(
+                qwen3::tool_calls::ToolCallParser::new(self.tool_parser_limits())
+                    .map_err(|error| execution_error("tool call parser", error.to_string()))?,
+            )
+        } else {
+            None
+        };
         Ok(Box::new(Qwen3TextDecoder {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
@@ -719,6 +756,7 @@ impl RuntimeBackend for Qwen3Backend {
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
+            parser,
         }))
     }
 
