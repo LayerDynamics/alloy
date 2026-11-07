@@ -120,6 +120,11 @@ jobs:
               cargo clippy --locked --workspace --all-targets -- -D warnings
               echo "::endgroup::"
 
+              echo "::group::Tool registry tests"
+              cargo test --locked -p tool-registry --all-targets
+              cargo test --locked -p tool-registry --doc
+              echo "::endgroup::"
+
               echo "::group::MLX FFI tests"
               cargo test --locked -p mlx-ffi --all-targets \
                 -- --test-threads=1
@@ -212,6 +217,13 @@ jobs:
       - name: CLI and monitor tests
         working-directory: ts/cli
         run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
+
+      - name: Tool registry tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tool-registry --all-targets
+          cargo test --locked -p tool-registry --doc
 
       - name: Metal and unified tests
         shell: bash
