@@ -97,8 +97,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p target/w4-acceptance/linux
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
+            -v "$PWD/target/w4-acceptance/linux":/evidence \
+            -e ALLOY_W4_OUTPUT=/evidence \
+            -e ALLOY_W4_CANDIDATE="${{ github.sha }}" \
             -e CARGO_TERM_COLOR=never \
             -w /work \
             alloy-native-builder:phase0 \
@@ -171,7 +175,21 @@ jobs:
               echo "::group::Alloyd documentation tests"
               cargo test --locked -p alloyd --doc
               echo "::endgroup::"
+
+              echo "::group::W4 named gates and evidence"
+              RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
+              bash scripts/w4_acceptance.sh
+              echo "::endgroup::"
             '
+
+      - name: Retain W4 Linux evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w4-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w4-acceptance/linux/
+          if-no-files-found: warn
+          retention-days: 30
 
   mac:
     name: mac-metal
@@ -275,6 +293,27 @@ jobs:
           set -euo pipefail
 
           cargo doc --locked -p engine --no-deps
+
+      - name: W4 scoped named gates and candidate evidence
+        shell: bash
+        env:
+          ALLOY_W4_CANDIDATE: ${{ github.sha }}
+          ALLOY_W4_OUTPUT: ${{ github.workspace }}/target/w4-acceptance/macos
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
+          bash scripts/w4_acceptance.sh
+
+      - name: Retain W4 macOS evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w4-acceptance/macos/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: harness-core all-target tests
         shell: bash
