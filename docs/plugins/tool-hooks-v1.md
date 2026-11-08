@@ -1,6 +1,8 @@
 # Tool hooks V1 — W5 candidate
 
-Status: proposed implementation; NOT native-validated or sandbox-reviewed.
+Status: implementation plus follow-up hardening awaiting candidate-bound
+Linux/macOS results and explicit sandbox reviewer sign-off. The prior Mac run
+passed the earlier canonical-file fixture; it does not validate this follow-up.
 
 Transport: one JSON-RPC 2.0 request/response per newline, UTF-8 JSON, strictly
 matching u64 IDs, no notifications, no batching, no retries. initialize declares
@@ -40,15 +42,16 @@ Trusted is explicit and offers no sandbox claim. Linux does not implement the
 Mac policy and rejects it. Runtime reads must be explicitly declared; the Mac
 positive/negative test is mandatory, not ignored/skipped on a Mac runner.
 
-Security review still required: Seatbelt platform/runtime compatibility; profile
+See `w5-security-review.md` for the tightened V1 restrictions and review record.
+Remaining deployment/security assumptions must be confirmed by the reviewer: Seatbelt platform/runtime compatibility; profile
 rights minimization; executable identity/TOCTOU; descriptor inheritance; process
 escape via new sessions/groups; duplicate annotation-key handling and strict JSON
-edge cases; hostile resource exhaustion. Group kill reaps the direct child, not
-arbitrary escaped descendants. Do not advertise containment of untrusted code or
+edge cases; hostile resource exhaustion. Trusted mode does not contain malicious descendants. Sandboxed V1 denies fork
+and restricts exec to the configured executable; tests exercise that boundary. Do not advertise containment of untrusted code or
 close P2-11 until these are reviewed and the necessary hardening is implemented.
 
 Tests launch an actual compiled Rust fixture child. They demonstrate host IPC and
 caller-side zero-dispatch after veto, NOT a deployed tool-loop or W3 integration.
-The cancellation test checks the host outcome, not independent OS-level PID
-absence; add independent owned-process observations before acceptance sign-off.
+Follow-up tests independently check ESRCH/ECHILD for child cleanup and run
+allowed/denied I/O, network and fork probes inside the actual sandboxed host.
 No real-model or full Phase 2 completion is claimed by this patch.

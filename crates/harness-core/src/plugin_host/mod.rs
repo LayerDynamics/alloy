@@ -3,7 +3,9 @@
 //! invoke after hooks only for attempted execution, retaining the original result.
 mod process;
 mod protocol;
+mod requests;
 pub mod sandbox;
+mod strict_json;
 use process::Process;
 use protocol::{AFTER, AfterReply, BEFORE, BeforeReply, Handshake, VERSION};
 pub use protocol::{Decision, HookInvocation};
@@ -105,7 +107,12 @@ impl PluginHost {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Self, HostError> {
-        if limits.message_bytes < 2
+        if configs.len() > 64
+            || limits.message_bytes > 8 * 1024 * 1024
+            || limits.diagnostic_bytes > 1024 * 1024
+            || limits.annotation_bytes > limits.message_bytes
+            || limits.reason_bytes > limits.message_bytes
+            || limits.message_bytes < 2
             || limits.diagnostic_bytes == 0
             || limits.annotation_bytes == 0
             || limits.timeout.is_zero()
@@ -168,12 +175,10 @@ impl PluginHost {
             if !plugin.hooks.contains(BEFORE) {
                 continue;
             }
-            let response: Result<BeforeReply, HostError> = plugin.process.rpc(
-                BEFORE,
-                serde_json::json!({"protocol_version":VERSION,"invocation":call}),
-                deadline,
-                cancel,
-            );
+            let response: Result<BeforeReply, HostError> =
+                plugin
+                    .process
+                    .rpc(BEFORE, requests::before(call), deadline, cancel);
             let mut receipt = receipt(plugin, call, BEFORE);
             match response.and_then(|r| {
                 validate(&r.annotations, &plugin.config.id, self.limits)?;
@@ -236,8 +241,7 @@ impl PluginHost {
             }
             let response: Result<AfterReply, HostError> = plugin.process.rpc(
                 AFTER,
-                serde_json::json!({"protocol_version":VERSION,"invocation":call,
-                    "result":result,"duration_ms":duration_ms}),
+                requests::after(call, result, duration_ms),
                 deadline,
                 cancel,
             );

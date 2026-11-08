@@ -62,3 +62,5 @@ fn plugin_protocol_timeout_and_sandbox() {
     );
     assert!(negative.stdout.is_empty());
 }
+
+include!("plugin_sandbox_hardening.inc");

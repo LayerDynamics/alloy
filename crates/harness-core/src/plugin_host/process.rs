@@ -14,6 +14,7 @@ use tool_registry::execution::CancellationToken;
 unsafe extern "C" {
     fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
     fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+    fn getdtablesize() -> std::ffi::c_int;
 }
 fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
@@ -31,6 +32,13 @@ fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
     }
     Ok(())
 }
+#[derive(Serialize)]
+struct Request<'a, T> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'a str,
+    params: T,
+}
 struct LimitedWriter {
     bytes: Vec<u8>,
     max: usize,
@@ -40,6 +48,9 @@ impl Write for LimitedWriter {
         if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
             return Err(io::Error::other("request byte limit"));
         }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| io::Error::other("request allocation failed"))?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -60,6 +71,25 @@ pub(crate) struct Process {
 impl Process {
     pub fn spawn(config: &PluginConfig, limits: Limits) -> Result<Self, HostError> {
         let mut cmd = sandbox::command(config)?;
+        // SAFETY: getdtablesize has no pointer inputs and observes the descriptor limit.
+        let fd_limit = unsafe { getdtablesize() };
+        if fd_limit < 3 {
+            return Err(HostError::new("invalid descriptor limit"));
+        }
+        // SAFETY: this callback calls only async-signal-safe fcntl. It allocates
+        // nothing and marks inherited descriptors CLOEXEC rather than closing
+        // Rust's exec-error pipe before exec can report an error.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in 3..fd_limit {
+                    let flags = fcntl(fd, 1);
+                    if flags >= 0 && fcntl(fd, 2, flags | 1) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         let child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -101,7 +131,22 @@ impl Process {
             kill(-(self.child.id() as i32), 9);
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        loop {
+            match self.child.wait() {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    let note = b"; child wait failed: cleanup not established";
+                    let keep = note.len().min(
+                        self.limits
+                            .diagnostic_bytes
+                            .saturating_sub(self.diagnostics.len()),
+                    );
+                    self.diagnostics.extend_from_slice(&note[..keep]);
+                    break;
+                }
+            }
+        }
         self.output.take();
         self.stderr.take();
     }
@@ -116,10 +161,38 @@ impl Process {
         cancel: &CancellationToken,
     ) -> Result<T, HostError> {
         let result = self.exchange(method, params, deadline, cancel);
-        if result.is_err() {
-            self.stop();
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Preserve available startup diagnostics before stop closes pipes.
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let remaining = self
+                        .limits
+                        .diagnostic_bytes
+                        .saturating_sub(self.diagnostics.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = remaining.min(buffer.len());
+                    let Some(stderr) = self.stderr.as_mut() else {
+                        break;
+                    };
+                    match stderr.read(&mut buffer[..take]) {
+                        Ok(0) => break,
+                        Ok(n) => self.diagnostics.extend_from_slice(&buffer[..n]),
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                self.stop();
+                Err(HostError::new(&format!(
+                    "{}; retained plugin stderr: {}",
+                    error,
+                    String::from_utf8_lossy(&self.diagnostics)
+                )))
+            }
         }
-        result
     }
     fn exchange<T: DeserializeOwned>(
         &mut self,
@@ -130,6 +203,9 @@ impl Process {
     ) -> Result<T, HostError> {
         if self.dead {
             return Err(HostError::new("plugin is stopped"));
+        }
+        if cancel.is_cancelled() || Instant::now() >= outer_deadline {
+            return Err(HostError::new("hook cancelled/expired before encoding"));
         }
         let deadline = Instant::now()
             .checked_add(self.limits.timeout)
@@ -145,9 +221,12 @@ impl Process {
         };
         serde_json::to_writer(
             &mut writer,
-            &serde_json::json!({
-                "jsonrpc":"2.0", "id":self.next_id, "method":method, "params":params
-            }),
+            &Request {
+                jsonrpc: "2.0",
+                id: self.next_id,
+                method,
+                params,
+            },
         )
         .map_err(|_| HostError::new("request encoding/byte limit"))?;
         writer.bytes.push(b'\n');
@@ -206,8 +285,7 @@ impl Process {
                             return Err(HostError::new("unsolicited or multiple response frames"));
                         }
                         let reply: super::protocol::Envelope<T> =
-                            serde_json::from_slice(&received[..end])
-                                .map_err(|_| HostError::new("invalid hook response"))?;
+                            super::strict_json::decode(&received[..end])?;
                         if reply.jsonrpc != "2.0" || reply.id != self.next_id {
                             return Err(HostError::new("response identity mismatch"));
                         }

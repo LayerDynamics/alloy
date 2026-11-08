@@ -219,3 +219,5 @@ fn cancellation_reaps_and_after_failure_cannot_mutate_original_result() {
     );
     assert_eq!(serde_json::to_value(&result).unwrap(), saved);
 }
+
+include!("plugin_host_hardening.inc");
