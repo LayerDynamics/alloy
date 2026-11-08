@@ -158,11 +158,12 @@ pub struct EventRecord {
 /// SQLite-backed B.4 session store.
 pub struct SessionStore {
     path: PathBuf,
-    conn: Connection,
-    _ownership: durable::StoreOwnership,
+    pub(crate) conn: Connection,
+    _ownership: std::sync::Arc<durable::StoreOwnership>,
     epoch: String,
     live: std::collections::HashMap<(String, String), durable::LiveIntent>,
     claim_deadlines: std::collections::HashMap<(String, String), std::time::Instant>,
+    pub(crate) artifact_state: Option<std::sync::Arc<crate::artifact::Shared>>,
 }
 
 impl SessionStore {
@@ -202,10 +203,11 @@ impl SessionStore {
         let mut store = Self {
             path,
             conn,
-            _ownership: ownership,
+            _ownership: std::sync::Arc::new(ownership),
             epoch,
             live: std::collections::HashMap::new(),
             claim_deadlines: std::collections::HashMap::new(),
+            artifact_state: None,
         };
         store.recover_tools()?;
         Ok(store)
@@ -466,3 +468,48 @@ fn now_ms() -> HarnessResult<i64> {
 
 mod durable;
 pub use durable::{AuthorizedInvocation, IntentAdmission, StartedInvocation};
+
+impl SessionStore {
+    pub(crate) fn artifact_lease(&self) -> std::sync::Arc<dyn Send + Sync> {
+        self._ownership.clone()
+    }
+}
+
+pub(crate) fn commit_artifact(
+    store: &mut SessionStore,
+    metadata: &crate::artifact::ArtifactMetadata,
+    json: &str,
+    epoch: &str,
+) -> HarnessResult<()> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let owner: Option<(String, String)> = tx
+        .query_row(
+            "SELECT state,daemon_epoch FROM tool_intents WHERE session_id=?1 AND call_id=?2",
+            params![metadata.session_id, metadata.call_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if owner
+        .as_ref()
+        .map(|(state, owner)| (state.as_str(), owner.as_str()))
+        != Some(("Started", epoch))
+        || epoch != store.epoch
+    {
+        return Err(HarnessError::Invalid(
+            "artifact origin is not a current Started invocation".into(),
+        ));
+    }
+    tx.execute("INSERT INTO tool_artifacts(artifact_ref,session_id,call_id,metadata_json) VALUES(?1,?2,?3,?4)",params![metadata.artifact_ref,metadata.session_id,metadata.call_id,json])?;
+    append_event_in_tx(
+        &tx,
+        &metadata.session_id,
+        metadata.created_at_unix_ms,
+        EventKind::ArtifactCreated,
+        serde_json::to_value(metadata)?,
+        serde_json::json!([metadata.artifact_ref]),
+    )?;
+    tx.commit()?;
+    Ok(())
+}

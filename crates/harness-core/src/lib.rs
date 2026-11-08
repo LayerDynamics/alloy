@@ -1,11 +1,12 @@
-//! Harness core: session supervision, event storage, telemetry, and W3 preparation.
+//! Harness core: supervision, durable sessions, W3 policy/approvals and artifacts.
 //!
-//! The active supervisor remains text-only. Policy/binding preparation does not
-//! enable effects, durable approval grants, hooks, or the integrated tool loop.
+//! The active supervisor remains text-only. These reusable daemon APIs do not
+//! enable builtin execution, plugin hosting, live approval RPC or the tool loop.
 
 #![deny(missing_docs)]
 
 pub mod approval;
+pub mod artifact;
 pub mod context;
 pub mod error;
 pub mod policy;
