@@ -984,6 +984,30 @@ fn read_adapter_error(call: &str, failure: ReadAdapterFailure) -> crate::result:
     })
 }
 impl crate::registry::ToolImplementation for FileReadTool {
+    fn execute_file_read(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<ReadReport, ReadError> {
+        let result = (|| {
+            context.check()?;
+            if invocation.call.tool_id != "fs.read" {
+                return Err(ReadError::Policy("fs.read identity required"));
+            }
+            let args: FileReadArguments = serde_json::from_value(serde_json::Value::Object(
+                invocation.call.arguments.clone(),
+            ))
+            .map_err(|_| ReadError::Policy("invalid fs.read arguments"))?;
+            let request = ReadRequest::new(&args.path, args.offset, args.length)?;
+            self.scope.read_into(&request, context, output)
+        })();
+        if result.is_err() {
+            output.abort();
+        }
+        result
+    }
+
     fn execute(&self, invocation: &crate::call::ToolInvocation) -> crate::result::ToolResult {
         read_adapter_error(
             &invocation.call.call_id,

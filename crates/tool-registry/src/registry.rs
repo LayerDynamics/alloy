@@ -35,6 +35,21 @@ pub trait ToolImplementation: Send + Sync {
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
 
+    /// Stream raw fs.read bytes after durable-start authorization. Other backends
+    /// fail closed; this does not fall back to legacy or inline execution.
+    #[cfg(unix)]
+    fn execute_file_read(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::ReadReport, crate::builtins::fs::ReadError> {
+        output.abort();
+        Err(crate::builtins::fs::ReadError::Policy(
+            "raw file-read backend required",
+        ))
+    }
+
     /// W4 context-aware boundary. Legacy implementations fail closed here rather
     /// than silently ignoring deadlines/cancellation/output bounds. A future
     /// harness dispatch bridge must require a valid durable start receipt before

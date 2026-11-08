@@ -8,6 +8,10 @@
 //! and W5 hooks remain separate obligations, not implemented here.
 
 use crate::{HarnessError, HarnessResult, SessionStore, store::StartedInvocation};
+/// Receipt-owned raw file-read output and canonical artifact completion.
+#[cfg(unix)]
+pub mod file_read;
+
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
