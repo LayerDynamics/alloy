@@ -1,4 +1,4 @@
-//! Scoped W4 file-read primitive. This module does not grant call authorization.
+//! Scoped W4 read/list primitives. This module does not grant call authorization.
 //!
 //! A trusted caller supplies the root capability; a future harness bridge must
 //! also require the unchanged W3 StartedInvocation. No live dispatch is enabled.
@@ -198,5 +198,202 @@ impl ReadScope {
         Ok(ReadReport {
             bytes_read: accepted,
         })
+    }
+}
+
+/// Validated directory path and maximum complete entry count; not approval.
+/// "." names the pinned scope root; all other paths are normal relative names.
+#[derive(Debug)]
+pub struct ListRequest {
+    path: String,
+    max_entries: u64,
+}
+impl ListRequest {
+    /// No normalization, recursive traversal, implicit defaults or pagination.
+    /// Exceeding max_entries fails the whole listing rather than choosing an
+    /// arbitrary filesystem-order prefix and claiming it is complete.
+    pub fn new(path: &str, max_entries: u64) -> Result<Self, ReadError> {
+        if max_entries == 0 {
+            return Err(ReadError::Policy("max_entries must be positive"));
+        }
+        let path = if path == "." {
+            path.to_owned()
+        } else {
+            ReadRequest::new(path, 0, 1)?.path
+        };
+        Ok(Self { path, max_entries })
+    }
+}
+
+/// Complete bounded listing; valid only after the final context check succeeds.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ListReport {
+    /// Number of non-dot directory entries; directories/symlinks are names only.
+    pub entries: u64,
+    /// Exact serialized UTF-8 JSON byte count accepted by the sink.
+    pub output_bytes: u64,
+}
+
+impl ReadScope {
+    /// List a policy-approved directory after independent durable-start
+    /// authorization. Output is JSON {"entries":[{"name_bytes":[...],
+    /// "name_utf8":string_or_null},...]}, sorted lexicographically by raw name
+    /// bytes. No entry target is opened or followed, even for symlinks.
+    ///
+    /// Count and serialized-byte limits bound collection before sorting. Any
+    /// failure aborts the sink. Only Ok permits later artifact/inline completion.
+    /// Like readdir, this observes a live directory, not a transactional snapshot;
+    /// reproducible ordering is guaranteed for the names actually observed, not
+    /// stable membership under concurrent filesystem changes.
+    pub fn list_into(
+        &self,
+        request: &ListRequest,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<ListReport, ReadError> {
+        let result = self.list_inner(request, context, output);
+        if result.is_err() {
+            output.abort();
+        }
+        result
+    }
+
+    fn list_directory(
+        &self,
+        request: &ListRequest,
+        context: &ExecutionContext,
+    ) -> Result<File, ReadError> {
+        context.check()?;
+        let mut directory = self.root.try_clone()?;
+        if request.path != "." {
+            for component in request.path.split('/') {
+                context.check()?;
+                let opened = File::from(
+                    openat(
+                        &directory,
+                        component,
+                        OFlags::RDONLY
+                            | OFlags::DIRECTORY
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC
+                            | OFlags::NONBLOCK,
+                        Mode::empty(),
+                    )
+                    .map_err(os)?,
+                );
+                let metadata = opened.metadata()?;
+                if !metadata.is_dir() || metadata.dev() != self.device {
+                    return Err(ReadError::Policy("same-device scoped directory required"));
+                }
+                directory = opened;
+            }
+        }
+        context.check()?;
+        Ok(directory)
+    }
+
+    fn list_inner(
+        &self,
+        request: &ListRequest,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<ListReport, ReadError> {
+        const PREFIX: &[u8] = b"{\"entries\":[";
+        const SUFFIX: &[u8] = b"]}";
+        context.check()?;
+        let mut size = (PREFIX.len() + SUFFIX.len()) as u64;
+        if size > context.max_output_bytes() {
+            return Err(ExecutionError::OutputLimit.into());
+        }
+        let directory = self.list_directory(request, context)?;
+        // read_from creates an independent cursor; do not enumerate via an
+        // ambient pathname or share the root descriptor's directory offset.
+        let mut iterator = rustix::fs::Dir::read_from(&directory).map_err(os)?;
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        loop {
+            context.check()?;
+            let item = match iterator.next() {
+                Some(item) => item.map_err(os)?,
+                None => break,
+            };
+            context.check()?;
+            let name = item.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if entries.len() as u64 >= request.max_entries {
+                return Err(ReadError::Policy("directory exceeds requested max_entries"));
+            }
+            let encoded = encode_list_name(name)?;
+            let comma = u64::from(!entries.is_empty());
+            size = size
+                .checked_add(encoded.len() as u64)
+                .and_then(|n| n.checked_add(comma))
+                .ok_or(ExecutionError::OutputLimit)?;
+            if size > context.max_output_bytes() {
+                return Err(ExecutionError::OutputLimit.into());
+            }
+            entries
+                .try_reserve(1)
+                .map_err(|_| ExecutionError::AllocationFailed)?;
+            entries.push((name.to_vec(), encoded));
+        }
+        context.check()?;
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        context.check()?;
+        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ReadError::Policy("duplicate observed directory name"));
+        }
+        output.write_chunk(PREFIX)?;
+        for (index, (_, encoded)) in entries.iter().enumerate() {
+            context.check()?;
+            if index != 0 {
+                output.write_chunk(b",")?;
+            }
+            context.check()?;
+            output.write_chunk(encoded)?;
+        }
+        context.check()?;
+        output.write_chunk(SUFFIX)?;
+        context.check()?;
+        Ok(ListReport {
+            entries: entries.len() as u64,
+            output_bytes: size,
+        })
+    }
+}
+
+// Pure representation boundary, independently testable on filesystems which
+// cannot construct every valid Unix byte-string filename.
+fn encode_list_name(name: &[u8]) -> Result<Vec<u8>, ReadError> {
+    serde_json::to_vec(&serde_json::json!({
+        "name_bytes": name,
+        "name_utf8": std::str::from_utf8(name).ok(),
+    }))
+    .map_err(|error| ReadError::Io(io::Error::other(error)))
+}
+
+#[cfg(test)]
+mod list_name_encoding_tests {
+    use super::encode_list_name;
+
+    #[test]
+    fn non_utf8_name_bytes_are_preserved() {
+        let raw = [b'x', 0xff];
+        let bytes = encode_list_name(&raw).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let decoded: Vec<u8> = serde_json::from_value(value["name_bytes"].clone()).unwrap();
+        assert_eq!(decoded, raw);
+        assert!(value["name_utf8"].is_null());
+    }
+
+    #[test]
+    fn escaped_name_encoding_is_lossless() {
+        let name = "a\"\n\\";
+        let bytes = encode_list_name(name.as_bytes()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let decoded: Vec<u8> = serde_json::from_value(value["name_bytes"].clone()).unwrap();
+        assert_eq!(decoded, name.as_bytes());
+        assert_eq!(value["name_utf8"].as_str(), Some(name));
     }
 }
