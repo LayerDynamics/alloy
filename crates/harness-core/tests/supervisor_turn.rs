@@ -327,3 +327,4 @@ fn supervisor_completes_two_turns_while_telemetry_transport_is_blocked() {
 }
 
 include!("w6_turn_boundary.inc");
+include!("w6_tool_round.inc");
