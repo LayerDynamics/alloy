@@ -1,0 +1,101 @@
+{
+  "scope": "W3 Step C finite failure/recovery matrix",
+  "baseline_sha": "47068b96dd991d468aa60a7433e9301c6a883608",
+  "contract_version": "alloy.w3/1",
+  "implementation_status": "candidate",
+  "execution_status": "pending_actual_validation",
+  "new_unit_tests": [
+    "store::durable::failure_recovery::intent_statement_and_commit_failures_publish_no_authority",
+    "store::durable::failure_recovery::denied_intent_failure_rolls_back_request_and_terminal_event",
+    "store::durable::failure_recovery::allow_and_deny_statement_and_commit_failures_are_atomic",
+    "store::durable::failure_recovery::claim_statement_and_commit_failures_return_no_handle",
+    "store::durable::failure_recovery::start_statement_and_commit_failures_return_no_execution_receipt",
+    "store::durable::failure_recovery::completion_statement_and_commit_failures_never_regrant_execution",
+    "store::durable::failure_recovery::expire_failure_is_atomic_and_expired_authority_never_escapes",
+    "store::durable::failure_recovery::withdrawal_failure_does_not_falsely_acknowledge_revocation",
+    "store::durable::failure_recovery::pause_failure_rolls_back_status_and_withdrawal_together",
+    "store::durable::failure_recovery::veto_failure_consumes_claim_without_restoring_ready",
+    "store::durable::failure_recovery::duplicate_start_attempts_do_not_admit_a_second_effect",
+    "store::durable::failure_recovery::duplicate_completion_attempt_cannot_append_a_second_terminal_result",
+    "store::durable::failure_recovery::every_registered_definition_change_invalidates_final_start",
+    "store::durable::failure_recovery::policy_change_rejection_has_zero_marker_effects",
+    "store::durable::failure_recovery::claimed_hook_gap_retains_no_sqlite_transaction",
+    "store::durable::failure_recovery::recovery_statement_and_commit_failures_preserve_prior_epoch_and_history",
+    "store::durable::failure_recovery::migration_commit_failure_rolls_back_ddl_version_and_raw_history",
+    "store::durable::failure_recovery::crash_child_probe",
+    "store::durable::failure_recovery::process_exit_before_and_after_each_commit_preserves_single_use_recovery",
+    "store::durable::failure_recovery::post_start_pause_does_not_claim_nonexecution_or_reissue_authority",
+    "store::durable::failure_recovery::exact_file_and_byte_reservation_failures_release_capacity_without_orphans"
+  ],
+  "statement_and_deferred_commit_failure_groups": [
+    "intent",
+    "policy-denied intent",
+    "allow and deny decisions",
+    "claim",
+    "start",
+    "completion",
+    "expiry in all three pre-start states",
+    "withdrawal",
+    "pause/status + withdrawal",
+    "hook veto",
+    "epoch recovery"
+  ],
+  "lifecycle_process_exit_stages": [
+    "intent.before_commit",
+    "intent.after_commit",
+    "decision.before_commit",
+    "decision.after_commit",
+    "claim.before_commit",
+    "claim.after_commit",
+    "start.before_commit",
+    "start.after_commit",
+    "complete.before_commit",
+    "complete.after_commit"
+  ],
+  "registration_mutations": [
+    "version",
+    "description",
+    "schema",
+    "origin",
+    "timeout",
+    "output limit",
+    "effect",
+    "approval"
+  ],
+  "reuse_existing_gates": {
+    "artifact_unit": {
+      "count": 9,
+      "purpose": "collisions, publication fault/process-exit recovery, eight streamers, buffers and limits"
+    },
+    "artifact_integration": {
+      "count": 34,
+      "required": [
+        "oversized_tool_result_artifact_roundtrip",
+        "completion_tests::completion_event_failure_rolls_back_and_recovers_without_reexecution"
+      ],
+      "purpose": "artifact completion, ownership, integrity, quota, orphan and path checks"
+    },
+    "policy": {
+      "required": [
+        "destructive_effect_requires_bound_approval"
+      ]
+    },
+    "durable_unit": {
+      "required": [
+        "store::durable::tests::migration_preserves_raw_historical_rows",
+        "store::durable::tests::racing_decisions_and_claims_have_one_winner",
+        "store::durable::tests::ownership_blocks_another_process"
+      ]
+    },
+    "contract": {
+      "purpose": "canonical golden fixtures and exhaustive pure state-transition matrix"
+    }
+  },
+  "limitations": [
+    "process exit and SQL fault injection do not simulate arbitrary power loss or every filesystem/SQLite I/O failure",
+    "same-user malicious directory replacement remains outside trusted storage assumptions",
+    "final Linux/macOS candidate-bound acceptance and API review are Step D",
+    "no W4 builtin execution or W5/W6 integration claimed"
+  ],
+  "w3_complete": false
+}

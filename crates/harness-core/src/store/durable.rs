@@ -319,7 +319,11 @@ impl SessionStore {
                 reason.as_deref().unwrap_or("policy_denied"),
             )?;
         }
+        #[cfg(test)]
+        failure_recovery::checkpoint("intent.before_commit");
         tx.commit()?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("intent.after_commit");
         if let Some(binding) = binding {
             self.live.insert(
                 (session, call),
@@ -356,7 +360,11 @@ impl SessionStore {
         if !allow {
             terminal(&tx, session, call, "Denied", "human_denied")?;
         }
+        #[cfg(test)]
+        failure_recovery::checkpoint("decision.before_commit");
         tx.commit()?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("decision.after_commit");
         if !allow {
             self.live.remove(&(session.into(), call.into()));
         }
@@ -385,7 +393,11 @@ impl SessionStore {
             EventKind::ToolRequested,
             serde_json::json!({"transition":"Claimed"}),
         )?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("claim.before_commit");
         tx.commit()?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("claim.after_commit");
         let live = self
             .live
             .remove(&k)
@@ -459,7 +471,11 @@ impl SessionStore {
             EventKind::ToolStarted,
             serde_json::json!({"binding_digest":b.digest()}),
         )?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("start.before_commit");
         tx.commit()?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("start.after_commit");
         self.claim_deadlines.remove(&(session, call));
         Ok(StartedInvocation {
             binding: handle.binding,
@@ -547,7 +563,11 @@ impl SessionStore {
             serde_json::json!({"contract_version":CONTRACT_VERSION,"call_id":call,"state":"Completed","result":value}),
             refs,
         )?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("complete.before_commit");
         tx.commit()?;
+        #[cfg(test)]
+        failure_recovery::checkpoint("complete.after_commit");
         Ok(())
     }
 
@@ -1338,3 +1358,6 @@ INSERT INTO events VALUES(17,'s',1,123,'user.message','{ \"old\": true }','[ \"l
         let _reopened = owned_file(&path).expect("replacement owner must release its lock on drop");
     }
 }
+
+#[cfg(test)]
+mod failure_recovery;
