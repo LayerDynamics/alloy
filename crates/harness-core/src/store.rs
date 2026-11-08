@@ -1,4 +1,4 @@
-//! B.4 append-only SQLite event log and sessions table (schema v1).
+//! B.4 append-only SQLite history, schema-v2 projections and exclusive ownership.
 
 use crate::error::{HarnessError, HarnessResult};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Schema version understood by this crate. Readers reject newer versions.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Spec version recorded in the meta row for forward-only migrations.
 pub const SPEC_VERSION: &str = "SPEC-1/B.4/v1";
@@ -159,86 +159,61 @@ pub struct EventRecord {
 pub struct SessionStore {
     path: PathBuf,
     conn: Connection,
+    _ownership: durable::StoreOwnership,
+    epoch: String,
+    live: std::collections::HashMap<(String, String), durable::LiveIntent>,
+    claim_deadlines: std::collections::HashMap<(String, String), std::time::Instant>,
 }
 
 impl SessionStore {
-    /// Open or create a store at `path`, migrating to schema v1 as needed.
+    /// Open/create a schema-v2 store with exclusive mutating daemon ownership.
     pub fn open(path: impl AsRef<Path>) -> HarnessResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| HarnessError::Store(format!("create parent dir: {error}")))?;
+        let requested = path.as_ref();
+        let name = requested
+            .file_name()
+            .ok_or_else(|| HarnessError::Invalid("database file name required".into()))?;
+        let parent = requested
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| HarnessError::Store(format!("create parent dir: {e}")))?;
+        let parent = std::fs::canonicalize(parent)
+            .map_err(|e| HarnessError::Store(format!("canonicalize parent: {e}")))?;
+        let path = parent.join(name);
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.file_type().is_symlink() || !m.is_file())
+        {
+            return Err(HarnessError::Invalid(
+                "database must be a regular non-symlink file".into(),
+            ));
         }
-        let conn = Connection::open(&path)?;
-        let mut store = Self { path, conn };
-        store.migrate()?;
+        let ownership = durable::owned_file(&path)?;
+        let mut conn = Connection::open(&path)?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        durable::migrate(&mut conn)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(HarnessError::Store("WAL unavailable".into()));
+        }
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let epoch: String =
+            conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+        let mut store = Self {
+            path,
+            conn,
+            _ownership: ownership,
+            epoch,
+            live: std::collections::HashMap::new(),
+            claim_deadlines: std::collections::HashMap::new(),
+        };
+        store.recover_tools()?;
         Ok(store)
     }
 
     /// Filesystem path of the SQLite database.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    fn migrate(&mut self) -> HarnessResult<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS meta (
-              schema_version INTEGER NOT NULL,
-              spec_version   TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-              session_id  TEXT PRIMARY KEY,
-              status      TEXT NOT NULL,
-              created_ts  INTEGER NOT NULL,
-              updated_ts  INTEGER NOT NULL,
-              profile_id  TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS events (
-              id            INTEGER PRIMARY KEY,
-              session_id    TEXT NOT NULL,
-              seq           INTEGER NOT NULL,
-              ts            INTEGER NOT NULL,
-              kind          TEXT NOT NULL,
-              payload_json  TEXT NOT NULL,
-              artifact_refs TEXT NOT NULL DEFAULT '[]'
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_seq
-              ON events(session_id, seq);
-            "#,
-        )?;
-
-        let meta: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT schema_version, spec_version FROM meta LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        match meta {
-            None => {
-                self.conn.execute(
-                    "INSERT INTO meta (schema_version, spec_version) VALUES (?1, ?2)",
-                    params![SCHEMA_VERSION, SPEC_VERSION],
-                )?;
-            }
-            Some((version, _)) if version > SCHEMA_VERSION => {
-                return Err(HarnessError::Store(format!(
-                    "event log schema_version {version} is newer than supported {SCHEMA_VERSION}"
-                )));
-            }
-            Some((version, _)) if version < SCHEMA_VERSION => {
-                return Err(HarnessError::Store(format!(
-                    "event log schema_version {version} requires a forward migration (none shipped)"
-                )));
-            }
-            Some(_) => {}
-        }
-        Ok(())
     }
 
     /// Create a new active session and append `session.created`.
@@ -297,6 +272,9 @@ impl SessionStore {
                 "unknown session_id: {session_id}"
             )));
         }
+        if !matches!(status, SessionStatus::Active) {
+            durable::withdraw_in_tx(&tx, session_id)?;
+        }
         if matches!(status, SessionStatus::Paused) {
             append_event_in_tx(
                 &tx,
@@ -308,6 +286,10 @@ impl SessionStore {
             )?;
         }
         tx.commit()?;
+        if !matches!(status, SessionStatus::Active) {
+            self.live.retain(|(s, _), _| s != session_id);
+            self.claim_deadlines.retain(|(s, _), _| s != session_id);
+        }
         self.get_session(session_id)?
             .ok_or_else(|| HarnessError::Store(format!("session vanished: {session_id}")))
     }
@@ -481,3 +463,6 @@ fn now_ms() -> HarnessResult<i64> {
     i64::try_from(duration.as_millis())
         .map_err(|_| HarnessError::Store("timestamp overflow".into()))
 }
+
+mod durable;
+pub use durable::{AuthorizedInvocation, IntentAdmission, StartedInvocation};

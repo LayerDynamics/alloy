@@ -607,3 +607,65 @@ fn allowed_argument_changes_are_bound_without_policy_revision_change() {
     assert_ne!(first.digest(), second.digest());
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
+
+// W3 storage admission fixture only. Not W4 shell or W6 tool-loop acceptance.
+#[test]
+fn destructive_effect_requires_bound_approval() {
+    use harness_core::store::{IntentAdmission, SessionStore};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SessionStore::open(dir.path().join("approvals.db")).unwrap();
+    store.create_session("session-1", "fixture").unwrap();
+    let (registry, count) = registered(definition(
+        "shell.run",
+        ToolEffect::Destructive,
+        ApprovalRequirement::Always,
+    ));
+    let policy = policy(rule("shell.run", false));
+    let mut request = invocation("shell.run", json!({"path":"fixture.txt"}));
+    assert_eq!(
+        store
+            .admit_tool(&registry, &policy, request.clone())
+            .unwrap(),
+        IntentAdmission::AwaitingApproval
+    );
+    assert!(store.claim_tool("session-1", "call-1").is_err());
+    assert!(store.decide_tool("wrong-session", "call-1", true).is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    store.decide_tool("session-1", "call-1", false).unwrap();
+    assert!(store.claim_tool("session-1", "call-1").is_err());
+    assert!(store.decide_tool("session-1", "call-1", true).is_err());
+    assert!(
+        store
+            .admit_tool(&registry, &policy, request.clone())
+            .is_err()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    request.call.call_id = "call-2".into();
+    store
+        .admit_tool(&registry, &policy, request.clone())
+        .unwrap();
+    store.decide_tool("session-1", "call-2", true).unwrap();
+    let handle = store.claim_tool("session-1", "call-2").unwrap();
+    assert!(store.claim_tool("session-1", "call-2").is_err());
+    let receipt = store.start_tool(handle, &registry, &policy).unwrap();
+    let result = CountingTool(Arc::clone(&count)).execute(receipt.binding().invocation());
+    store.complete_tool(receipt, result).unwrap();
+    assert!(store.claim_tool("session-1", "call-2").is_err());
+    assert!(store.decide_tool("session-1", "call-2", true).is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    request.call.call_id = "call-3".into();
+    request
+        .call
+        .arguments
+        .insert("path".into(), json!("changed.txt"));
+    assert_eq!(
+        store.admit_tool(&registry, &policy, request).unwrap(),
+        IntentAdmission::Rejected
+    );
+    assert!(store.claim_tool("session-1", "call-3").is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    drop(store);
+    let mut reopened = SessionStore::open(dir.path().join("approvals.db")).unwrap();
+    assert!(reopened.claim_tool("session-1", "call-2").is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
