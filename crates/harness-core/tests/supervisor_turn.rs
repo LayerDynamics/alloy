@@ -325,3 +325,5 @@ fn supervisor_completes_two_turns_while_telemetry_transport_is_blocked() {
     turns.join().unwrap();
     drop(release);
 }
+
+include!("w6_turn_boundary.inc");

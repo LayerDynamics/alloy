@@ -158,7 +158,7 @@ impl<E: Engine> Supervisor<E> {
             return Err(HarnessError::Invalid("user text must be non-empty".into()));
         }
 
-        let (profile_id, snapshot, input_tokens_hint) = {
+        let (profile_id, snapshot, request_id) = {
             let mut guard = lock_store(store)?;
             let session = guard
                 .get_session(session_id)?
@@ -175,7 +175,7 @@ impl<E: Engine> Supervisor<E> {
                 serde_json::json!({ "content": user_text, "role": MessageRole::User.as_str() }),
                 serde_json::json!([]),
             )?;
-            guard.append_event(
+            let turn_started = guard.append_event(
                 session_id,
                 EventKind::RunStarted,
                 serde_json::json!({}),
@@ -183,18 +183,15 @@ impl<E: Engine> Supervisor<E> {
             )?;
 
             let history = guard.list_events(session_id)?;
+            let request_id = round_request_id(session_id, turn_started.seq, 0)?;
             let snapshot = ContextBuilder::build_snapshot(
-                format!(
-                    "{session_id}-turn-{}",
-                    history.last().map(|event| event.seq).unwrap_or(0)
-                ),
+                request_id.as_str(),
                 &session.profile_id,
                 &history,
                 None,
             )?;
-            (session.profile_id.clone(), snapshot, history.len())
+            (session.profile_id.clone(), snapshot, request_id)
         };
-        let _ = input_tokens_hint;
 
         let rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
         // Re-check Active after render so a concurrent pause aborts before generate.
@@ -202,8 +199,6 @@ impl<E: Engine> Supervisor<E> {
         let profile = ModelProfileId::new(profile_id.clone())
             .map_err(|error| HarnessError::Invalid(format!("profile_id: {error}")))?;
         let options = GenerationOptions::greedy(max_output_tokens).map_err(HarnessError::from)?;
-        let request_id = RequestId::new(format!("{session_id}-req-{}", rendered.token_count()))
-            .map_err(|error| HarnessError::Invalid(format!("request_id: {error}")))?;
         on_started(&request_id)?;
         // Pause may have raced between ensure and on_started; re-check once registered.
         ensure_session_active(store, session_id)?;
@@ -213,6 +208,7 @@ impl<E: Engine> Supervisor<E> {
         let generation = block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;
         let mut stream = generation.into_events();
         let mut assistant = String::new();
+        let mut completed = false;
 
         while let Some(event) = next_event(&mut stream)? {
             // The text-only supervisor must not forward tool proposals to
@@ -221,6 +217,7 @@ impl<E: Engine> Supervisor<E> {
                 &event,
                 GenerationEvent::ToolCallProposed { .. }
                     | GenerationEvent::ToolCallBatchProposed { .. }
+                    | GenerationEvent::ToolCallDelta { .. }
             ) {
                 return Err(HarnessError::Engine(
                     "tool-call proposals require a tool-aware supervisor".into(),
@@ -229,20 +226,29 @@ impl<E: Engine> Supervisor<E> {
             on_event(&event)?;
             match event {
                 GenerationEvent::TextDelta { text } => assistant.push_str(&text),
-                GenerationEvent::GenerationCompleted { .. } => break,
+                GenerationEvent::GenerationCompleted { .. } => {
+                    completed = true;
+                    break;
+                }
                 GenerationEvent::RequestFailed { error, .. } => {
                     return Err(error.into());
                 }
                 GenerationEvent::ToolCallProposed { .. }
-                | GenerationEvent::ToolCallBatchProposed { .. } => {
+                | GenerationEvent::ToolCallBatchProposed { .. }
+                | GenerationEvent::ToolCallDelta { .. } => {
                     return Err(HarnessError::Engine(
                         "tool-call proposals require a tool-aware supervisor".into(),
                     ));
                 }
-                GenerationEvent::ToolCallDelta { .. } | GenerationEvent::RuntimeWarning { .. } => {}
+                GenerationEvent::RuntimeWarning { .. } => {}
             }
         }
 
+        if !completed {
+            return Err(HarnessError::Engine(
+                "generation stream ended before successful terminal event".into(),
+            ));
+        }
         if assistant.is_empty() {
             return Err(HarnessError::Engine(
                 "generation completed without assistant text".into(),
@@ -353,4 +359,49 @@ fn next_event(
     stream: &mut Pin<Box<dyn engine::types::GenerationEventStream>>,
 ) -> HarnessResult<Option<GenerationEvent>> {
     block_on(poll_fn(|cx| stream.as_mut().poll_next(cx)))
+}
+
+// This is tracing/cancellation identity, never a KV cache identity or authority.
+fn round_request_id(session_id: &str, turn_seq: i64, round: u64) -> HarnessResult<RequestId> {
+    use sha2::{Digest, Sha256};
+    if turn_seq <= 0 {
+        return Err(HarnessError::Invalid(
+            "turn sequence must be positive".into(),
+        ));
+    }
+    let length = u64::try_from(session_id.len())
+        .map_err(|_| HarnessError::Invalid("session identity length overflow".into()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"alloy.w6.generation.v1\0");
+    digest.update(length.to_be_bytes());
+    digest.update(session_id.as_bytes());
+    digest.update(turn_seq.to_be_bytes());
+    digest.update(round.to_be_bytes());
+    RequestId::new(format!("gen-{:x}", digest.finalize())).map_err(HarnessError::from)
+}
+
+#[cfg(test)]
+mod w6_request_identity_tests {
+    use super::*;
+    #[test]
+    fn round_identity_binds_session_durable_sequence_and_round() {
+        let first = round_request_id("session", 2, 0).unwrap();
+        for other in [
+            round_request_id("other", 2, 0).unwrap(),
+            round_request_id("session", 3, 0).unwrap(),
+            round_request_id("session", 2, 1).unwrap(),
+        ] {
+            assert_ne!(first, other);
+        }
+        assert_eq!(first, round_request_id("session", 2, 0).unwrap());
+        assert!(round_request_id("session", 0, 0).is_err());
+        assert!(round_request_id("session", -1, 0).is_err());
+        assert_eq!(
+            round_request_id(&"long / unicode-é".repeat(100), 2, u64::MAX)
+                .unwrap()
+                .as_str()
+                .len(),
+            68
+        );
+    }
 }
