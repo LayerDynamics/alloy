@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod approval;
 pub mod context;
 pub mod error;
 pub mod store;
