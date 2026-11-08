@@ -14,10 +14,40 @@ fn scope(origin: &str, redirects: u32, body: u64) -> HttpScope {
         redirects,
         body,
         8192,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+}
+fn timing_scope(origin: &str, redirects: u32, body: u64) -> HttpScope {
+    HttpScope::new(
+        vec![HttpDestination::new(origin, "127.0.0.1".parse::<IpAddr>().unwrap()).unwrap()],
+        redirects,
+        body,
+        8192,
         Duration::from_millis(300),
     )
     .unwrap()
 }
+
+// Test setup only. Keep first-use work outside the stalled-exchange test.
+fn warm_http_transport() {
+    let server = Server::new(|_, stream, _| response(stream, 200, "", b"warm"));
+    let ctx = context(5000, 65536, CancellationToken::default());
+    let mut output = BoundedOutput::new(&ctx, 65536).unwrap();
+
+    let report = scope(&server.origin, 0, 4096)
+        .fetch(
+            &HttpRequest::new(&server.origin, "GET").unwrap(),
+            &ctx,
+            &mut output,
+        )
+        .expect("HTTP fixture warm-up must succeed");
+
+    assert_eq!(report.status, 200);
+    output.finish().unwrap();
+    assert_eq!(server.calls.lock().unwrap().len(), 1);
+}
+
 fn context(ms: u64, maximum: u64, token: CancellationToken) -> ExecutionContext {
     ExecutionContext::new(
         &ToolPolicy {
@@ -283,6 +313,7 @@ fn named_origin_uses_only_configured_address() {
 #[test]
 fn cancellation_during_stalled_headers_releases_owned_socket() {
     let _http_timing_guard = fixture::http_timing_test_guard();
+    warm_http_transport();
     use std::{
         io::Read,
         sync::{
@@ -320,7 +351,7 @@ fn cancellation_during_stalled_headers_releases_owned_socket() {
     });
     let ctx = context(5000, 65536, token);
     let mut out = BoundedOutput::new(&ctx, 65536).unwrap();
-    let error = scope(&server.origin, 0, 4096)
+    let error = timing_scope(&server.origin, 0, 4096)
         .fetch(
             &HttpRequest::new(&server.origin, "GET").unwrap(),
             &ctx,
@@ -439,6 +470,7 @@ fn head_is_preserved_across_redirects() {
 #[test]
 fn stalled_body_timeout_releases_socket_without_background_worker() {
     let _http_timing_guard = fixture::http_timing_test_guard();
+    warm_http_transport();
     use std::{
         io::{Read, Write},
         sync::{
@@ -470,7 +502,7 @@ fn stalled_body_timeout_releases_socket_without_background_worker() {
     let mut out = BoundedOutput::new(&ctx, 65536).unwrap();
     let start = Instant::now();
     assert!(
-        scope(&server.origin, 0, 4096)
+        timing_scope(&server.origin, 0, 4096)
             .fetch(
                 &HttpRequest::new(&server.origin, "GET").unwrap(),
                 &ctx,
