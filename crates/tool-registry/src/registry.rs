@@ -34,6 +34,23 @@ pub trait ToolImplementation: Send + Sync {
     /// Implementations must preserve the originating call identity in the
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
+
+    /// W4 context-aware boundary. Legacy implementations fail closed here rather
+    /// than silently ignoring deadlines/cancellation/output bounds. A future
+    /// harness dispatch bridge must require a valid durable start receipt before
+    /// calling this; this method itself is not authorization.
+    fn execute_with_context(
+        &self,
+        invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        _output: &mut dyn crate::execution::OutputSink,
+    ) -> ToolResult {
+        ToolResult::Inline(crate::result::InlineToolResult {
+            call_id: invocation.call.call_id.clone(),
+            content: serde_json::json!({"kind":"execution","message":"Context-aware execution is not implemented","details":{"reason":"execution_context_required"}}),
+            is_error: true,
+        })
+    }
 }
 
 struct RegisteredTool {
