@@ -348,10 +348,17 @@ pub fn render_chat(
 
         value.insert("content".to_owned(), Value::String(message.content.clone()));
 
+        value.insert("kind".to_owned(), Value::String("text".to_owned()));
         messages.push(Value::Object(value));
+    }
+    if let Some(tools) = context.tool_context() {
+        messages.extend(tools.messages());
     }
 
     let mut variables = Map::new();
+    if let Some(tools) = context.tool_context() {
+        variables.insert("tools_json".to_owned(), Value::String(tools.tools_json()?));
+    }
 
     variables.insert("messages".to_owned(), Value::Array(messages));
 
@@ -474,6 +481,7 @@ pub fn render_and_count(
         token_ids,
         render_hash,
         template_hash: binding.template_sha256,
+        tool_schema_hash: context.tool_context().map(|tools| *tools.schema_hash()),
         tokenizer_id: tokenizer.identity.clone(),
         renderer: RendererIdentity {
             implementation: "minijinja".to_owned(),
@@ -510,7 +518,16 @@ fn validate_render_input(
         });
     }
 
-    if context.messages().len() > limits.max_messages {
+    let message_count = context
+        .messages()
+        .len()
+        .checked_add(
+            context
+                .tool_context()
+                .map_or(0, |tools| tools.history_len()),
+        )
+        .ok_or_else(|| internal("tool message count overflow"))?;
+    if message_count > limits.max_messages {
         return Err(EngineError::invalid_request(
             "messages",
             "message count exceeds the rendering limit",
@@ -526,7 +543,19 @@ fn validate_render_input(
         }
     }
 
-    let mut input_bytes = 0_usize;
+    let mut input_bytes = context
+        .tool_context()
+        .map_or(0, |tools| tools.input_bytes());
+    if input_bytes > limits.max_input_bytes {
+        return Err(memory_limit(
+            "accept tool rendering input",
+            input_bytes,
+            limits.max_input_bytes,
+        )?);
+    }
+    if let Some(tools) = context.tool_context() {
+        tools.validate_spellings(options.reserved_spellings)?;
+    }
 
     for message in context.messages() {
         input_bytes = input_bytes
@@ -568,6 +597,10 @@ fn compute_render_hash(
 
     hash.update(b"alloy.engine.render.v1\0");
     hash.update(RENDER_HASH_VERSION.to_le_bytes());
+    if let Some(tools) = context.tool_context() {
+        hash_field(&mut hash, b"alloy.render.tool-context.v1")?;
+        hash_field(&mut hash, tools.schema_hash())?;
+    }
 
     for field in [
         context.profile_id().as_str().as_bytes(),

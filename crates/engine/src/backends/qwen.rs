@@ -23,6 +23,9 @@
 //! Affine4 residency and greedy decoding are advertised. Rotating caches,
 //! stochastic sampling, thinking mode, and public prefix reuse are not.
 
+mod output;
+use self::output::Qwen3TextDecoder;
+
 use crate::{
     admission::AdmissionController,
     api::{EngineCore, EngineFuture},
@@ -33,6 +36,7 @@ use crate::{
         PrefillOutput, TokenLogits,
     },
     generation::GenerationLimits,
+    parser_allocation::{ParserAllocation, ParserAllocationLimits},
     registry::{ArtifactRegistration, FamilyRegistration, FamilyVersion, ModelProfile, Registry},
     rendering::{self, PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions},
     runtime::{FamilyRuntime, RetentionPolicy, RuntimeBackend, RuntimePlan, TextDecoder},
@@ -102,55 +106,7 @@ impl Qwen3Execution {
     }
 }
 
-/// A file identity obtained through the caller's trusted artifact policy.
-/// Do not create these pins from an untrusted manifest and call that verification.
-#[derive(Clone, Debug)]
-pub struct FilePin {
-    /// Exact source-file length.
-    pub bytes: u64,
-    /// SHA-256 of the complete file contents.
-    pub sha256: [u8; 32],
-}
-
-/// Explicitly pinned local artifact and template selection.
-#[derive(Clone, Debug)]
-pub struct Qwen3Artifact {
-    /// Identifier that profiles will reference.
-    pub id: ArtifactId,
-    /// Existing artifact directory; canonicalized during construction.
-    pub directory: PathBuf,
-    /// Basenames only. Include config.json, tokenizer.json, every consumed
-    /// weight shard/index, and any selected EOS configuration file.
-    pub files: BTreeMap<String, FilePin>,
-    /// Trusted digest of qwen3::template::CHAT_TEMPLATE for this profile path.
-    pub template_sha256: [u8; 32],
-}
-
-impl Qwen3Artifact {
-    /// Fingerprint the trusted manifest record used for render identity.
-    ///
-    /// Encoding: the NUL-terminated domain below, u64-LE file count, then
-    /// each BTreeMap entry in UTF-8 name order as u64-LE name byte length,
-    /// UTF-8 name, u64-LE pinned file size, and the 32-byte SHA-256 pin.
-    /// Finally append the 32-byte trusted compiled-template digest.
-    ///
-    /// The artifact ID is framed separately by the shared renderer. Local
-    /// directory paths are intentionally excluded. This function performs
-    /// no I/O and does not itself verify that files match these pins.
-    pub fn manifest_sha256(&self) -> Result<[u8; 32], EngineError> {
-        let mut hash = Sha256::new();
-        hash.update(b"alloy.qwen3.artifact-manifest.v1\0");
-        hash.update(as_u64(self.files.len())?.to_le_bytes());
-        for (name, pin) in &self.files {
-            hash.update(as_u64(name.len())?.to_le_bytes());
-            hash.update(name.as_bytes());
-            hash.update(pin.bytes.to_le_bytes());
-            hash.update(pin.sha256);
-        }
-        hash.update(self.template_sha256);
-        Ok(hash.finalize().into())
-    }
-}
+include!("qwen/artifact.rs");
 
 /// Explicit bounds; no model, output, or memory policy is silently selected.
 #[derive(Clone, Debug)]
@@ -206,23 +162,9 @@ impl Qwen3BackendLimits {
                 "all size/count limits must be positive",
             ));
         }
-        output_bytes(self.generation)?;
+        self.output_memory_plan(None, &[])?;
         Ok(())
     }
-}
-
-struct ArtifactData {
-    specification: Qwen3Artifact,
-    config: Qwen3Config,
-    tokenizer: Arc<PinnedTokenizer>,
-    special_tokens: Arc<BTreeSet<u32>>,
-    byte_decoder: Arc<BTreeMap<char, u8>>,
-    manifest_sha256: [u8; 32],
-    eos: Vec<u32>,
-    source_bytes: u64,
-    resident_bound: u64,
-    decoded_bound: u64,
-    checksums: BTreeMap<PathBuf, [u8; 32]>,
 }
 
 /// Real Qwen3 backend. Normal metadata/factories may cross threads;
@@ -232,6 +174,9 @@ pub struct Qwen3Backend {
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
     execution: Qwen3Execution,
+    tool_call_parsing: bool,
+    // W2_QWEN_PARSER_CAPACITY_HOOKS_V1
+    parser_capacities: Option<ParserAllocationLimits>,
 }
 
 impl Qwen3Backend {
@@ -453,7 +398,93 @@ impl Qwen3Backend {
             artifacts,
             limits,
             execution,
+            tool_call_parsing: false,
+            parser_capacities: None,
         })
+    }
+
+    /// Enable or disable Qwen tool-call parsing for new generations.
+    ///
+    /// Disabled by default, which preserves the text-only decoder. When
+    /// enabled, `<tool_call>` blocks are parsed incrementally into untrusted
+    /// proposals that the generation driver publishes only after the whole
+    /// generation succeeds. Reserved control syntax such as `<think>` in
+    /// model output is then a protocol error instead of display text.
+    /// Generation also requires explicit capacities through
+    /// `with_parser_allocation_limits`; this flag alone selects no limits.
+    /// Rendering tool context does not allocate parser storage.
+    pub fn with_tool_call_parsing(mut self, enabled: bool) -> Self {
+        self.tool_call_parsing = enabled;
+        if !enabled {
+            self.parser_capacities = None;
+        }
+        self
+    }
+
+    /// Enable tool parsing with explicit fixed parser/slab capacities.
+    ///
+    /// Validates the layout and output-plan arithmetic without allocating
+    /// parser storage or acquiring admission. No defaults are selected.
+    /// Disabling tool parsing clears this configuration.
+    ///
+    /// Runtime construction supplies the admitted slab. Tool JSON validation
+    /// uses that fixed storage and completed proposals transfer as one owned
+    /// batch. There is no fallback to the legacy Map-based tool parser.
+    pub fn with_parser_allocation_limits(
+        mut self,
+        limits: ParserAllocationLimits,
+    ) -> Result<Self, EngineError> {
+        ParserAllocation::required_bytes(limits).map_err(|error| {
+            EngineError::invalid_request("parser_allocation_limits", error.to_string())
+        })?;
+        self.limits.output_memory_plan(
+            Some(limits),
+            &[std::alloc::Layout::new::<Qwen3TextDecoder>()],
+        )?;
+        self.parser_capacities = Some(limits);
+        self.tool_call_parsing = true;
+        Ok(self)
+    }
+
+    fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        match (self.tool_call_parsing, self.parser_capacities) {
+            (false, None) => Ok(None),
+            (true, Some(limits)) => Ok(Some(limits)),
+            (true, None) => Err(EngineError::invalid_request(
+                "parser_allocation_limits",
+                "tool generation requires explicit parser capacities via with_parser_allocation_limits",
+            )),
+            (false, Some(_)) => Err(internal("disabled tool parsing retained parser capacities")),
+        }
+    }
+
+    fn planned_output_bytes(&self) -> Result<u64, EngineError> {
+        let selected = self.selected_parser_capacities()?;
+        let owner = [std::alloc::Layout::new::<Qwen3TextDecoder>()];
+        let extra = if selected.is_some() {
+            owner.as_slice()
+        } else {
+            &[]
+        };
+        Ok(self
+            .limits
+            .output_memory_plan(selected, extra)?
+            .total_bytes())
+    }
+
+    fn tool_parser_limits(&self) -> qwen3::tool_calls::ParserLimits {
+        let defaults = qwen3::tool_calls::ParserLimits::default();
+        // Output cannot exceed context tokens times the largest token spelling.
+        let output = self
+            .limits
+            .max_token_bytes
+            .saturating_mul(self.limits.context_limit_tokens)
+            .max(1);
+        qwen3::tool_calls::ParserLimits {
+            max_output_bytes: output,
+            max_call_bytes: defaults.max_call_bytes.min(output),
+            max_calls: defaults.max_calls,
+        }
     }
 
     /// Construct a registry whose family metadata matches this executable
@@ -590,142 +621,7 @@ impl Qwen3Backend {
     }
 }
 
-impl ModelFamily for Qwen3Backend {
-    fn registration(&self) -> &FamilyRegistration {
-        &self.registration
-    }
-
-    fn load(&self, request: ModelLoadRequest<'_>) -> Result<Box<dyn LoadedModel>, EngineError> {
-        let control = request.control();
-        control.check_cancelled()?;
-        let data = self.data(request.artifact())?;
-        let decoded_bound = data.decoded_bound;
-        // Headroom covers group-size variance (planning assumes 64; some
-        // fixtures/checkpoints use smaller groups with larger scale tables).
-        let weight_charge_limit = sum(&[decoded_bound, self.limits.loader_headroom_bytes])?;
-        let required_peak = loading_peak_bound(data, &self.limits)?;
-        if request.limits().max_source_bytes() < data.source_bytes
-            || request.limits().max_resident_bytes() < data.resident_bound
-            || request.limits().max_load_peak_bytes() < required_peak
-        {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "MLX Qwen loading overlap",
-                required_bytes: required_peak,
-                available_bytes: request.limits().max_load_peak_bytes(),
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-
-        let cpu_device = Device::new(DeviceType::Cpu, 0)
-            .map_err(|e| execution_error("create MLX CPU device", e.to_string()))?;
-        if !cpu_device
-            .is_available()
-            .map_err(|e| execution_error("query MLX CPU", e.to_string()))?
-        {
-            return Err(EngineError::unsupported(
-                "MLX CPU",
-                "requested device is unavailable",
-            ));
-        }
-        let loading_stream = Stream::new(&cpu_device)
-            .map_err(|e| execution_error("create MLX loading stream", e.to_string()))?;
-        let execution_stream = match self.execution {
-            Qwen3Execution::MlxCpu => Rc::new(loading_stream),
-            Qwen3Execution::MlxMetal => {
-                if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                    return Err(EngineError::unsupported(
-                        "MLX Metal",
-                        "requires an Apple-Silicon macOS worker",
-                    ));
-                }
-                let gpu = Device::new(DeviceType::Gpu, 0)
-                    .map_err(|e| execution_error("create MLX Metal device", e.to_string()))?;
-                if !gpu
-                    .is_available()
-                    .map_err(|e| execution_error("query MLX Metal", e.to_string()))?
-                {
-                    return Err(EngineError::unsupported(
-                        "MLX Metal",
-                        "requested device is unavailable; no CPU fallback",
-                    ));
-                }
-                // Array construction copies decoded source buffers; the
-                // model subsequently evaluates its arrays on this worker.
-                // The unused CPU setup stream has no submitted operations.
-                drop(loading_stream);
-                Rc::new(
-                    Stream::new(&gpu)
-                        .map_err(|e| execution_error("create MLX Metal stream", e.to_string()))?,
-                )
-            }
-        };
-        control.check_cancelled()?;
-        let cancelled = || control.is_cancelled();
-        let verification = CheckpointVerification {
-            sha256: &data.checksums,
-            cancelled: &cancelled,
-        };
-        let result = load_weights_verified(
-            &data.config,
-            &data.specification.directory,
-            LoadOptions {
-                // Enforce the source limit used by the workspace plan even
-                // when a caller offers a larger grant. Mutated files must
-                // not expand metadata beyond that bound before hash failure.
-                max_file_bytes: as_usize(data.source_bytes)?,
-                max_weight_bytes: as_usize(weight_charge_limit)?,
-            },
-            &verification,
-        );
-        control.check_cancelled()?;
-        let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
-        let decoded = weight_memory(&weights)?;
-        if decoded.allocated_bytes() > weight_charge_limit {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "decoded MLX Qwen weight buffers",
-                required_bytes: decoded.allocated_bytes(),
-                available_bytes: weight_charge_limit,
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-        let model = MlxQwen3Model::from_weights(
-            data.config.clone(),
-            weights,
-            request.limits().max_resident_bytes(),
-            execution_stream.as_ref(),
-        )
-        .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
-        control.check_cancelled()?;
-        let payload = model.weight_payload_bytes();
-        let measured = model
-            .weight_buffer_bytes()
-            .map_err(|e| mlx_model_error(e, control, "measure MLX Qwen weights"))?;
-        if measured > request.limits().max_resident_bytes() {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "measured MLX Qwen weight buffers",
-                required_bytes: measured,
-                available_bytes: request.limits().max_resident_bytes(),
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-        let mut capabilities = self.registration.capabilities().clone();
-        capabilities.context_limit_tokens = capabilities
-            .context_limit_tokens
-            .min(data.config.max_context);
-        Ok(Box::new(Qwen3Loaded {
-            model,
-            stream: execution_stream,
-            artifact: request.artifact().id().clone(),
-            instance: ModelInstanceId::new(),
-            registration: self.registration.clone(),
-            capabilities,
-            memory: BufferMemoryUsage::new(measured, payload)?,
-            vocabulary: data.config.vocab_size,
-            max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: logits_payload_bound(&data.config)?,
-        }))
-    }
-}
+include!("qwen/loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn cache_manifest_digest(
@@ -743,17 +639,34 @@ impl RuntimeBackend for Qwen3Backend {
             let resolved = registry.resolve_profile(context.profile_id())?;
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
+            let tool_mode = context.tool_context().is_some();
+            if tool_mode && !self.tool_call_parsing {
+                return Err(EngineError::unsupported(
+                    "tool context",
+                    "enable tool-call parsing before rendering tool context",
+                ));
+            }
+            let template = if tool_mode {
+                qwen3::template::TOOL_CHAT_TEMPLATE
+            } else {
+                CHAT_TEMPLATE
+            };
+            let template_hash = if tool_mode {
+                digest(template.as_bytes())
+            } else {
+                data.specification.template_sha256
+            };
             let binding = RenderingBinding {
                 profile_id: context.profile_id(),
                 artifact_id: &data.specification.id,
-                template: CHAT_TEMPLATE,
-                template_sha256: data.specification.template_sha256,
+                template,
+                template_sha256: template_hash,
                 artifact_manifest_sha256: data.manifest_sha256,
             };
             let limits = RenderingLimits::new(
                 self.limits.max_messages,
                 self.limits.max_input_bytes,
-                CHAT_TEMPLATE.len(),
+                template.len(),
                 self.limits.max_rendered_bytes,
                 profile.context_limit_tokens(),
             )?;
@@ -832,7 +745,7 @@ impl RuntimeBackend for Qwen3Backend {
                         .min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
                 )?,
-                output_bytes: output_bytes(self.limits.generation)?,
+                output_bytes: self.planned_output_bytes()?,
                 headroom_bytes: self.limits.execution_headroom_bytes,
                 prefill_chunk_tokens: self.limits.prefill_chunk_tokens,
             })
@@ -906,6 +819,20 @@ impl RuntimeBackend for Qwen3Backend {
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
         let resolved = registry.resolve_profile(profile)?;
         let data = self.data(resolved.artifact())?;
+        if self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "admitted parser storage",
+                "tool generation requires the storage-backed decoder construction hook",
+            ));
+        }
+        let parser = if self.tool_call_parsing {
+            Some(
+                qwen3::tool_calls::ToolCallParser::new(self.tool_parser_limits())
+                    .map_err(|error| execution_error("tool call parser", error.to_string()))?,
+            )
+        } else {
+            None
+        };
         Ok(Box::new(Qwen3TextDecoder {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
@@ -913,7 +840,62 @@ impl RuntimeBackend for Qwen3Backend {
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
+            parser,
+            slab: None,
+            completed_slab: None,
         }))
+    }
+
+    fn parser_allocation_limits(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+    ) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        self.data(resolved.artifact())?;
+        self.selected_parser_capacities()
+    }
+
+    fn decoder_with_parser_allocation(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        self.data(resolved.artifact())?;
+        match (self.selected_parser_capacities()?, allocation) {
+            (None, None) => self.decoder(registry, profile),
+            (Some(limits), Some(allocation)) => {
+                let expected = ParserAllocation::required_bytes(limits).map_err(|error| {
+                    EngineError::invalid_request("parser_allocation_limits", error.to_string())
+                })?;
+                if allocation.reserved_bytes() != expected {
+                    return Err(internal(
+                        "Qwen parser allocation differs from the planned slab size",
+                    ));
+                }
+                let data = self.data(resolved.artifact())?;
+                let slab = crate::slab_parser::SlabParser::new(
+                    allocation,
+                    self.tool_parser_limits().max_output_bytes,
+                )?;
+                output::box_slab_decoder(Qwen3TextDecoder {
+                    tokenizer: Arc::clone(&data.tokenizer),
+                    special_tokens: Arc::clone(&data.special_tokens),
+                    byte_decoder: Arc::clone(&data.byte_decoder),
+                    pending: Vec::new(),
+                    max_token_bytes: self.limits.max_token_bytes,
+                    finished: false,
+                    parser: None,
+                    slab: Some(slab),
+                    completed_slab: None,
+                })
+            }
+            _ => Err(internal(
+                "Qwen parser allocation presence differs from backend configuration",
+            )),
+        }
     }
 
     fn incremental_mlx_bytes(
@@ -966,392 +948,7 @@ impl RuntimeBackend for Qwen3Backend {
     }
 }
 
-struct Qwen3Loaded {
-    model: MlxQwen3Model,
-    stream: Rc<Stream>,
-    artifact: ArtifactId,
-    instance: ModelInstanceId,
-    registration: FamilyRegistration,
-    capabilities: Capabilities,
-    // Tracks float32 tensor payload, not allocator cache or process RSS.
-    memory: BufferMemoryUsage,
-    vocabulary: usize,
-    max_prefill_tokens: usize,
-    logits_payload_bytes: u64,
-}
-
-impl LoadedModel for Qwen3Loaded {
-    fn instance_id(&self) -> &ModelInstanceId {
-        &self.instance
-    }
-    fn artifact_id(&self) -> &ArtifactId {
-        &self.artifact
-    }
-    fn registration(&self) -> &FamilyRegistration {
-        &self.registration
-    }
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
-    }
-    fn memory_usage(&self) -> Result<BufferMemoryUsage, EngineError> {
-        Ok(self.memory)
-    }
-    fn autoregressive(&mut self) -> Option<&mut dyn AutoregressiveModel> {
-        Some(self)
-    }
-}
-
-impl Drop for Qwen3Loaded {
-    fn drop(&mut self) {
-        // Normal model operations already synchronize on every return.
-        // This is best-effort teardown, not native device-failure recovery.
-        let _ = self.stream.synchronize();
-    }
-}
-
-struct Qwen3NativeCache {
-    inner: MlxKvCache,
-    owner: ModelInstanceId,
-    mlx_owner: MlxModelId,
-    mode: CacheMode,
-    capacity: usize,
-    stream: Rc<Stream>,
-}
-
-impl FamilyCache for Qwen3NativeCache {
-    fn kv_block_spec(&self) -> Option<KvCacheSpec> {
-        Some(self.inner.spec())
-    }
-    fn export_kv_block(
-        &mut self,
-        start: usize,
-        end: usize,
-    ) -> Result<inference_infra::kv_cache::KvBlock, EngineError> {
-        self.inner
-            .export_block(&self.mlx_owner, start, end, self.stream.as_ref())
-            .map_err(|error| cache_error(error, "export MLX Qwen KV block"))
-    }
-    fn restore_kv_block(
-        &mut self,
-        block: &inference_infra::kv_cache::KvBlock,
-    ) -> Result<usize, EngineError> {
-        self.inner
-            .restore_block(&self.mlx_owner, block, self.stream.as_ref())
-            .map_err(|error| cache_error(error, "restore MLX Qwen KV block"))
-    }
-    fn owner(&self) -> &ModelInstanceId {
-        &self.owner
-    }
-    fn representation(&self) -> &CacheRepresentationId {
-        &self.mode.representation
-    }
-    fn mode(&self) -> &CacheMode {
-        &self.mode
-    }
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-    fn retained_tokens(&self) -> usize {
-        self.inner.len()
-    }
-    fn capacity_tokens(&self) -> usize {
-        self.capacity
-    }
-    fn memory_usage(&self) -> Result<BufferMemoryUsage, EngineError> {
-        // Measured current backing buffers, not allocator cache or
-        // older external views. Used bytes remain logical KV payload.
-        let allocated = self
-            .inner
-            .buffer_bytes()
-            .map_err(|e| cache_error(e, "measure committed MLX Qwen KV buffers"))?;
-        let spec = self.inner.spec();
-        let used = product(
-            product(
-                product(
-                    product(as_u64(spec.layers)?, as_u64(spec.kv_heads)?)?,
-                    as_u64(spec.head_dim)?,
-                )?,
-                as_u64(self.inner.len())?,
-            )?,
-            8,
-        )?;
-        BufferMemoryUsage::new(allocated, used)
-    }
-    fn supports_truncation(&self) -> bool {
-        true
-    }
-    fn reset(&mut self) -> Result<(), EngineError> {
-        self.inner
-            .reset(&self.mlx_owner)
-            .map_err(|e| cache_error(e, "reset MLX Qwen KV"))
-    }
-    fn truncate(&mut self, tokens: usize) -> Result<(), EngineError> {
-        self.inner
-            .truncate(&self.mlx_owner, tokens)
-            .map_err(|e| cache_error(e, "truncate MLX Qwen KV"))
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
-impl Drop for Qwen3NativeCache {
-    fn drop(&mut self) {
-        let _ = self.stream.synchronize();
-    }
-}
-
-impl Qwen3Loaded {
-    fn owned_cache<'a>(
-        &self,
-        cache: &'a mut dyn FamilyCache,
-    ) -> Result<&'a mut Qwen3NativeCache, EngineError> {
-        if cache.owner() != &self.instance || cache.mode() != &cache_mode()? {
-            return Err(EngineError::invalid_request(
-                "cache",
-                "cache belongs to another model or representation",
-            ));
-        }
-        let cache = cache
-            .as_any_mut()
-            .downcast_mut::<Qwen3NativeCache>()
-            .ok_or_else(|| {
-                EngineError::invalid_request("cache", "cache has a different family type")
-            })?;
-        if !cache.inner.owner().same_instance(self.model.instance_id())
-            || !cache.mlx_owner.same_instance(self.model.instance_id())
-        {
-            return Err(EngineError::invalid_request(
-                "cache",
-                "native MLX cache belongs to another model load",
-            ));
-        }
-        Ok(cache)
-    }
-}
-
-impl AutoregressiveModel for Qwen3Loaded {
-    fn vocabulary_size(&self) -> usize {
-        self.vocabulary
-    }
-    fn allocate_cache(
-        &mut self,
-        request: &CacheAllocationRequest,
-        control: &ExecutionControl,
-    ) -> Result<Box<dyn FamilyCache>, EngineError> {
-        control.check_cancelled()?;
-        if request.mode() != &cache_mode()? {
-            return Err(EngineError::unsupported(
-                "cache mode",
-                "only full MLX float32 KV is implemented",
-            ));
-        }
-        if request.capacity_tokens() > self.capabilities.context_limit_tokens {
-            return Err(EngineError::ContextLimitExceeded {
-                input_tokens: request.capacity_tokens(),
-                output_reserve_tokens: 0,
-                safety_margin_tokens: 0,
-                limit_tokens: self.capabilities.context_limit_tokens,
-            });
-        }
-        let required = cache_bound(self.model.config(), request.capacity_tokens())?;
-        if required > request.max_cache_bytes() {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "MLX Qwen KV update overlap",
-                required_bytes: required,
-                available_bytes: request.max_cache_bytes(),
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-        let inner = self
-            .model
-            .new_cache(
-                request.capacity_tokens(),
-                request.max_cache_bytes(),
-                self.stream.as_ref(),
-            )
-            .map_err(|e| mlx_model_error(e, control, "allocate MLX Qwen KV"))?;
-        control.check_cancelled()?;
-        Ok(Box::new(Qwen3NativeCache {
-            inner,
-            owner: self.instance.clone(),
-            mlx_owner: self.model.instance_id().clone(),
-            mode: request.mode().clone(),
-            capacity: request.capacity_tokens(),
-            stream: Rc::clone(&self.stream),
-        }))
-    }
-    fn prefill(
-        &mut self,
-        tokens: &[u32],
-        cache: &mut dyn FamilyCache,
-        control: &ExecutionControl,
-    ) -> Result<PrefillOutput, EngineError> {
-        let cache = self.owned_cache(cache)?;
-        control.check_cancelled()?;
-        if tokens.is_empty() || tokens.len() > self.max_prefill_tokens {
-            return Err(EngineError::invalid_request(
-                "tokens",
-                "prefill must be nonempty and fit the planned chunk bound",
-            ));
-        }
-        let end = cache
-            .inner
-            .len()
-            .checked_add(tokens.len())
-            .ok_or_else(|| internal("prefill position overflow"))?;
-        if end > cache.capacity {
-            return Err(EngineError::ContextLimitExceeded {
-                input_tokens: end,
-                output_reserve_tokens: 0,
-                safety_margin_tokens: 0,
-                limit_tokens: cache.capacity,
-            });
-        }
-        let result = self
-            .model
-            .prefill_cancellable(
-                tokens,
-                &mut cache.inner,
-                self.logits_payload_bytes,
-                self.stream.as_ref(),
-                || control.is_cancelled(),
-            )
-            .map_err(|e| mlx_model_error(e, control, "MLX Qwen prefill"))
-            .and_then(|output| TokenLogits::new(output.into_values()))
-            .and_then(|logits| PrefillOutput::new(tokens.len(), logits));
-        if result.is_err() {
-            let _ = cache.inner.reset(&cache.mlx_owner);
-        }
-        result
-    }
-    fn decode(
-        &mut self,
-        token: u32,
-        cache: &mut dyn FamilyCache,
-        control: &ExecutionControl,
-    ) -> Result<TokenLogits, EngineError> {
-        let cache = self.owned_cache(cache)?;
-        control.check_cancelled()?;
-        if cache.inner.is_empty() {
-            return Err(EngineError::invalid_request(
-                "cache",
-                "prefill before decoding a continuation",
-            ));
-        }
-        let end = cache
-            .inner
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| internal("decode position overflow"))?;
-        if end > cache.capacity {
-            return Err(EngineError::ContextLimitExceeded {
-                input_tokens: end,
-                output_reserve_tokens: 0,
-                safety_margin_tokens: 0,
-                limit_tokens: cache.capacity,
-            });
-        }
-        // Use the cancellable one-token path, not the noncancellable
-        // convenience decode method. It has identical model semantics.
-        let result = self
-            .model
-            .prefill_cancellable(
-                &[token],
-                &mut cache.inner,
-                self.logits_payload_bytes,
-                self.stream.as_ref(),
-                || control.is_cancelled(),
-            )
-            .map_err(|e| mlx_model_error(e, control, "MLX Qwen decode"))
-            .and_then(|output| TokenLogits::new(output.into_values()));
-        if result.is_err() {
-            let _ = cache.inner.reset(&cache.mlx_owner);
-        }
-        result
-    }
-}
-
-struct Qwen3TextDecoder {
-    tokenizer: Arc<PinnedTokenizer>,
-    special_tokens: Arc<BTreeSet<u32>>,
-    byte_decoder: Arc<BTreeMap<char, u8>>,
-    pending: Vec<u8>,
-    max_token_bytes: usize,
-    finished: bool,
-}
-
-impl TextDecoder for Qwen3TextDecoder {
-    fn push(&mut self, token: u32) -> Result<String, EngineError> {
-        if self.finished {
-            return Err(internal("token supplied after decoder completion"));
-        }
-        if self.special_tokens.contains(&token) {
-            return Ok(String::new());
-        }
-        let spelling = self
-            .tokenizer
-            .tokenizer()
-            .id_to_token(token)
-            .ok_or_else(|| {
-                execution_error(
-                    "detokenize",
-                    "model selected an ID absent from the tokenizer",
-                )
-            })?;
-        if spelling.len() > self.max_token_bytes {
-            return Err(execution_error(
-                "detokenize",
-                "token exceeds the pinned decoder bound",
-            ));
-        }
-        self.pending
-            .try_reserve_exact(spelling.chars().count())
-            .map_err(|_| allocation("incremental UTF-8 bytes", Some(spelling.len())))?;
-        for ch in spelling.chars() {
-            self.pending
-                .push(*self.byte_decoder.get(&ch).ok_or_else(|| {
-                    execution_error(
-                        "detokenize",
-                        "token is outside the verified ByteLevel alphabet",
-                    )
-                })?);
-        }
-        let valid = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => {
-                return Err(execution_error(
-                    "detokenize",
-                    "model output contains invalid UTF-8 bytes",
-                ));
-            }
-        };
-        if valid == 0 {
-            return Ok(String::new());
-        }
-        let suffix = self.pending.split_off(valid);
-        let complete = std::mem::replace(&mut self.pending, suffix);
-        String::from_utf8(complete).map_err(|_| internal("validated UTF-8 conversion failed"))
-    }
-
-    fn finish(&mut self) -> Result<String, EngineError> {
-        if self.finished {
-            return Ok(String::new());
-        }
-        self.finished = true;
-        if !self.pending.is_empty() {
-            return Err(execution_error(
-                "detokenize",
-                "generation ended with an incomplete UTF-8 sequence",
-            ));
-        }
-        Ok(String::new())
-    }
-}
+include!("qwen/cache.rs");
 
 fn registration(
     context_limit: usize,
@@ -1383,237 +980,6 @@ fn registration(
             decoding_modes: vec![DecodingCapability::Greedy],
         },
     )
-}
-
-fn cache_mode() -> Result<CacheMode, EngineError> {
-    Ok(CacheMode {
-        representation: CacheRepresentationId::new(QWEN3_MLX_CACHE_REPRESENTATION)?,
-        kind: CacheKind::Full,
-    })
-}
-
-fn component_path(spec: &Qwen3Artifact, name: &str) -> Result<PathBuf, EngineError> {
-    let path = Path::new(name);
-    if path.components().count() != 1
-        || !matches!(path.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(validation(
-            Some(&spec.id),
-            "manifest paths must be simple basenames",
-        ));
-    }
-    let supplied = spec.directory.join(path);
-    let resolved = supplied
-        .canonicalize()
-        .map_err(|e| EngineError::checkpoint_io("canonicalize pinned component", &supplied, e))?;
-    if resolved.parent() != Some(spec.directory.as_path()) {
-        return Err(validation(
-            Some(&spec.id),
-            "artifact component escapes its directory",
-        ));
-    }
-    Ok(resolved)
-}
-
-fn read_metadata(spec: &Qwen3Artifact, name: &str, limit: usize) -> Result<Vec<u8>, EngineError> {
-    let pin = spec
-        .files
-        .get(name)
-        .ok_or_else(|| validation(Some(&spec.id), "required metadata lacks a trusted pin"))?;
-    if pin.bytes > as_u64(limit)? {
-        return Err(EngineError::MemoryLimitExceeded {
-            operation: "read Qwen3 metadata",
-            required_bytes: pin.bytes,
-            available_bytes: as_u64(limit)?,
-            reason: MemoryLimitReason::BufferLimit,
-        });
-    }
-    let path = component_path(spec, name)?;
-    let mut file = File::open(&path)
-        .map_err(|e| EngineError::checkpoint_io("open Qwen3 metadata", &path, e))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| EngineError::checkpoint_io("stat Qwen3 metadata", &path, e))?;
-    if !meta.is_file() || meta.len() != pin.bytes {
-        return Err(validation(
-            Some(&spec.id),
-            "metadata length or type disagrees with its pin",
-        ));
-    }
-    let length = as_usize(pin.bytes)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| allocation("Qwen3 metadata", Some(length)))?;
-    bytes.resize(length, 0);
-    file.read_exact(&mut bytes)
-        .map_err(|e| EngineError::checkpoint_io("read Qwen3 metadata", &path, e))?;
-    let mut probe = [0_u8; 1];
-    if file
-        .read(&mut probe)
-        .map_err(|e| EngineError::checkpoint_io("check Qwen3 metadata length", &path, e))?
-        != 0
-        || digest(&bytes) != pin.sha256
-    {
-        return Err(validation(
-            Some(&spec.id),
-            "metadata changed or failed its trusted digest",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn parse_json(path: &Path, bytes: &[u8]) -> Result<Value, EngineError> {
-    serde_json::from_slice(bytes)
-        .map_err(|e| EngineError::checkpoint_format("json", Some(path.to_owned()), e))
-}
-
-fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
-    if value.get("model_type").and_then(Value::as_str) != Some("qwen3") {
-        return Err(EngineError::unsupported(
-            "architecture",
-            "only dense Qwen3 causal LM is implemented",
-        ));
-    }
-    let architectures = value
-        .get("architectures")
-        .and_then(Value::as_array)
-        .ok_or_else(|| validation(None, "missing architectures"))?;
-    if architectures.len() != 1 || architectures[0].as_str() != Some("Qwen3ForCausalLM") {
-        return Err(EngineError::unsupported(
-            "architecture",
-            "expected Qwen3ForCausalLM",
-        ));
-    }
-    if value.get("rope_scaling").is_some_and(|v| !v.is_null()) {
-        return Err(EngineError::unsupported(
-            "model configuration",
-            "rope_scaling is not implemented",
-        ));
-    }
-    for key in ["attention_bias", "mlp_bias", "use_sliding_window"] {
-        if value.get(key).is_some_and(|v| v.as_bool() != Some(false)) {
-            return Err(EngineError::unsupported(
-                "model configuration",
-                format!("{key} must be false when present"),
-            ));
-        }
-    }
-    if value
-        .get("hidden_act")
-        .is_some_and(|v| v.as_str() != Some("silu"))
-    {
-        return Err(EngineError::unsupported(
-            "hidden_act",
-            "only silu is implemented",
-        ));
-    }
-    if value.get("rms_norm_eps").is_some_and(|v| {
-        v.as_f64()
-            .is_none_or(|n| !n.is_finite() || (n - 1e-6).abs() > 1e-12)
-    }) {
-        return Err(EngineError::unsupported(
-            "rms_norm_eps",
-            "only 1e-6 is implemented",
-        ));
-    }
-    let dimension = |name: &str| -> Result<usize, EngineError> {
-        value
-            .get(name)
-            .and_then(Value::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
-            .filter(|&v| v > 0)
-            .ok_or_else(|| {
-                validation(
-                    None,
-                    format!("missing or invalid positive dimension: {name}"),
-                )
-            })
-    };
-    let theta = value
-        .get("rope_theta")
-        .and_then(Value::as_f64)
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| validation(None, "missing rope_theta"))? as f32;
-    if !theta.is_finite() || theta <= 0.0 {
-        return Err(validation(None, "rope_theta is not representable as f32"));
-    }
-    let config = Qwen3Config {
-        hidden_size: dimension("hidden_size")?,
-        num_layers: dimension("num_hidden_layers")?,
-        q_heads: dimension("num_attention_heads")?,
-        kv_heads: dimension("num_key_value_heads")?,
-        head_dim: dimension("head_dim")?,
-        intermediate_size: dimension("intermediate_size")?,
-        vocab_size: dimension("vocab_size")?,
-        max_context: dimension("max_position_embeddings")?,
-        rope_theta: theta,
-        tie_embeddings: value
-            .get("tie_word_embeddings")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| validation(None, "tie_word_embeddings must be explicit"))?,
-    };
-    if !config.q_heads.is_multiple_of(config.kv_heads)
-        || !config.head_dim.is_multiple_of(2)
-        || as_u64(config.vocab_size)? > u64::from(u32::MAX) + 1
-    {
-        return Err(validation(
-            None,
-            "invalid attention dimensions or token-ID range",
-        ));
-    }
-    for dimension in [
-        config.hidden_size,
-        config.num_layers,
-        config.q_heads,
-        config.kv_heads,
-        config.head_dim,
-        config.intermediate_size,
-        config.vocab_size,
-        config.max_context,
-    ] {
-        if i32::try_from(dimension).is_err() {
-            return Err(validation(None, "MLX model dimension exceeds C int"));
-        }
-    }
-    let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
-    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    if q > i32::MAX as u64 || kv > i32::MAX as u64 {
-        return Err(validation(None, "MLX projection width exceeds C int"));
-    }
-    resident_bound(&config)?;
-    cache_bound(&config, 1)?;
-    Ok(config)
-}
-
-fn parse_eos(value: Option<&Value>) -> Result<Vec<u32>, EngineError> {
-    let value = value.ok_or_else(|| {
-        validation(
-            None,
-            "EOS must be explicit in pinned config or generation_config",
-        )
-    })?;
-    let raw = match value {
-        Value::Array(values) => values.clone(),
-        Value::Number(_) => vec![value.clone()],
-        _ => {
-            return Err(validation(
-                None,
-                "EOS must be an integer or an explicit integer array",
-            ));
-        }
-    };
-    let mut eos = Vec::new();
-    for value in raw {
-        let id = value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| validation(None, "invalid EOS token ID"))?;
-        if !eos.contains(&id) {
-            eos.push(id);
-        }
-    }
-    Ok(eos)
 }
 
 fn qwen3_rendering_options() -> RenderingOptions<'static> {
@@ -1655,326 +1021,8 @@ fn byte_decoder_map() -> BTreeMap<char, u8> {
 /// has not been opened yet (MLX Qwen3-4bit community artifacts use 64).
 const AFFINE4_GROUP_SIZE: u64 = 64;
 
-fn layer_projection_elements(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let h = as_u64(config.hidden_size)?;
-    let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
-    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    let i = as_u64(config.intermediate_size)?;
-    sum(&[
-        product(2, product(q, h)?)?,  // q, o
-        product(2, product(kv, h)?)?, // k, v
-        product(3, product(i, h)?)?,  // gate, up, down
-    ])
-}
+include!("qwen/memory.rs");
 
-fn norm_bytes(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let h = as_u64(config.hidden_size)?;
-    let head = as_u64(config.head_dim)?;
-    let per_layer = sum(&[
-        product(2, h)?,    // input + post attention
-        product(2, head)?, // q/k norm
-    ])?;
-    let elements = sum(&[
-        product(as_u64(config.num_layers)?, per_layer)?,
-        h, // final layernorm
-    ])?;
-    product(elements, 4)
-}
-
-/// Host-side Affine4 payload estimate (packed codes + scales/biases for every
-/// matrix, including embed/lm_head). Used for loader charge before MLX upload.
-fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let h = as_u64(config.hidden_size)?;
-    let v = as_u64(config.vocab_size)?;
-    let matrix_elements = sum(&[
-        product(v, h)?, // embed
-        product(
-            as_u64(config.num_layers)?,
-            layer_projection_elements(config)?,
-        )?,
-        if config.tie_embeddings {
-            0
-        } else {
-            product(v, h)?
-        },
-    ])?;
-    let matrix_bytes = affine4_matrix_bytes(matrix_elements, AFFINE4_GROUP_SIZE)?;
-    let workspace = product(matrix_bytes / 32 + 1, 1)?;
-    sum(&[norm_bytes(config)?, matrix_bytes, workspace])
-}
-
-/// MLX resident estimate after upload: every Affine4 matrix stays packed.
-/// Embedding lookup dequantizes only the requested rows, and the output
-/// projection consumes packed weights through quantized matmul.
-fn resident_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    host_affine4_bound(config)
-}
-
-/// Largest possible individual source vector copied during native upload.
-/// Use dense float32 widths even for a quantized checkpoint: mixed dense
-/// matrices can be accepted within the decoded-weight allowance. Each
-/// vector is dropped as soon as `mlx_array_new_data` has copied it.
-fn largest_upload_buffer_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let hidden = as_u64(config.hidden_size)?;
-    let query = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
-    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    let elements = [
-        product(as_u64(config.vocab_size)?, hidden)?,
-        product(hidden, query)?,
-        product(hidden, kv)?,
-        product(hidden, as_u64(config.intermediate_size)?)?,
-        hidden,
-        as_u64(config.head_dim)?,
-    ]
-    .into_iter()
-    .max()
-    .ok_or_else(|| internal("missing Qwen3 upload dimensions"))?;
-    product(elements, 4)
-}
-
-/// Source decoding and native upload are separate ownership phases.
-///
-/// The streaming loader retains bounded metadata/scratch plus decoded
-/// vectors, verifies every consumed byte, and drops its source state before
-/// returning. Upload then replaces one host vector at a time with its native
-/// array; only that vector's copy can overlap both representations. Native
-/// vocabulary matrices remain packed rather than creating dense graphs.
-fn loading_peak_bound(
-    data: &ArtifactData,
-    limits: &Qwen3BackendLimits,
-) -> Result<u64, EngineError> {
-    let host_limit = sum(&[data.decoded_bound, limits.loader_headroom_bytes])?;
-    let workspace = qwen3::loader::streaming_workspace_bound(as_usize(data.source_bytes)?)
-        .map_err(|error| model_error(error, "plan streaming Qwen loader"))?;
-    let decode_peak = sum(&[host_limit, as_u64(workspace)?])?;
-    let upload_peak = sum(&[
-        host_limit.max(data.resident_bound),
-        largest_upload_buffer_bound(&data.config)?,
-    ])?;
-    sum(&[decode_peak.max(upload_peak), limits.loader_headroom_bytes])
-}
-
-fn affine4_matrix_bytes(elements: u64, group_size: u64) -> Result<u64, EngineError> {
-    if group_size == 0 {
-        return Err(EngineError::invalid_request(
-            "group_size",
-            "affine4 group size must be positive",
-        ));
-    }
-    // packed u32: 8 nibbles per word → elements/8 words * 4 bytes = elements/2
-    let packed = elements / 2;
-    // scales + biases: 2 * (elements / group_size) * 4 bytes
-    let params = product(elements / group_size, 8)?;
-    sum(&[packed, params])
-}
-
-// Dense matrix payload, shared by host decoding and MLX residency.
-fn dense_weight_payload_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    let embedding = product(as_u64(config.vocab_size)?, as_u64(config.hidden_size)?)?;
-    let projections = product(
-        as_u64(config.num_layers)?,
-        layer_projection_elements(config)?,
-    )?;
-    let elements = sum(&[
-        embedding,
-        projections,
-        if config.tie_embeddings { 0 } else { embedding },
-    ])?;
-    sum(&[product(elements, 4)?, norm_bytes(config)?])
-}
-
-fn dense_decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    sum(&[
-        dense_weight_payload_bound(config)?,
-        product(
-            as_u64(config.num_layers)?,
-            as_u64(std::mem::size_of::<LayerWeights>())?,
-        )?,
-    ])
-}
-
-fn decoded_weight_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    // Loader charges host Affine4 (or f32) buffers before MLX upload.
-    sum(&[
-        host_affine4_bound(config)?,
-        product(
-            as_u64(config.num_layers)?,
-            as_u64(std::mem::size_of::<LayerWeights>())?,
-        )?,
-    ])
-}
-
-fn weight_memory_add_f32(
-    allocated: &mut u64,
-    used: &mut u64,
-    values: &Vec<f32>,
-) -> Result<(), EngineError> {
-    *allocated = sum(&[*allocated, product(as_u64(values.capacity())?, 4)?])?;
-    *used = sum(&[*used, product(as_u64(values.len())?, 4)?])?;
-    Ok(())
-}
-
-fn weight_memory_add_bytes(
-    allocated: &mut u64,
-    used: &mut u64,
-    bytes: u64,
-) -> Result<(), EngineError> {
-    *allocated = sum(&[*allocated, bytes])?;
-    *used = sum(&[*used, bytes])?;
-    Ok(())
-}
-
-fn weight_memory(weights: &Qwen3Weights) -> Result<BufferMemoryUsage, EngineError> {
-    let mut allocated = product(
-        as_u64(weights.layers.capacity())?,
-        as_u64(std::mem::size_of::<LayerWeights>())?,
-    )?;
-    let mut used = product(
-        as_u64(weights.layers.len())?,
-        as_u64(std::mem::size_of::<LayerWeights>())?,
-    )?;
-    weight_memory_add_bytes(
-        &mut allocated,
-        &mut used,
-        as_u64(weights.embed_tokens.resident_bytes())?,
-    )?;
-    weight_memory_add_f32(&mut allocated, &mut used, &weights.final_layernorm)?;
-    if let Some(head) = &weights.lm_head {
-        weight_memory_add_bytes(&mut allocated, &mut used, as_u64(head.resident_bytes())?)?;
-    }
-    for layer in &weights.layers {
-        weight_memory_add_f32(&mut allocated, &mut used, &layer.input_layernorm)?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.q_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.k_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.v_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_f32(&mut allocated, &mut used, &layer.q_norm)?;
-        weight_memory_add_f32(&mut allocated, &mut used, &layer.k_norm)?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.o_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_f32(&mut allocated, &mut used, &layer.post_attention_layernorm)?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.gate_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.up_proj.resident_bytes())?,
-        )?;
-        weight_memory_add_bytes(
-            &mut allocated,
-            &mut used,
-            as_u64(layer.down_proj.resident_bytes())?,
-        )?;
-    }
-    BufferMemoryUsage::new(allocated, used)
-}
-
-fn cache_spec(config: &Qwen3Config, capacity: usize) -> KvCacheSpec {
-    KvCacheSpec {
-        layers: config.num_layers,
-        batch: 1,
-        kv_heads: config.kv_heads,
-        capacity_tokens: capacity,
-        head_dim: config.head_dim,
-    }
-}
-
-fn cache_bound(config: &Qwen3Config, capacity: usize) -> Result<u64, EngineError> {
-    cache_spec(config, capacity)
-        .payload_plan()
-        .map(|plan| plan.update_overlap_bytes)
-        .map_err(|e| cache_error(e, "plan MLX Qwen KV overlap"))
-}
-
-fn logits_payload_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
-    // The model's last-row API admits projection, possible contiguous
-    // output, and host result. Four rows' bytes leave capacity headroom.
-    product(as_u64(config.vocab_size)?, 16)
-}
-
-/// Conservative f32 graph-payload allowance for the selected chunk bound.
-/// Counts per-layer projection/normalization/MLP intermediates, possible
-/// attention score/softmax buffers, and prefix-layout temporaries.
-///
-/// KV old/new overlap is separately reserved in cache_bound, not here.
-/// MLX allocator internals, kernels' hidden workspace, caches and alignment
-/// are not a certified hard bound: execution_headroom_bytes must be sized
-/// and calibrated for the supported MLX pin/device/model. This adapter does
-/// not claim OS OOM prevention or allocator-pressure discovery.
-fn workspace_bound(
-    config: &Qwen3Config,
-    capacity: usize,
-    chunk_tokens: usize,
-    token_bytes: usize,
-) -> Result<u64, EngineError> {
-    let layers = as_u64(config.num_layers)?;
-    let t = as_u64(chunk_tokens.min(capacity).max(1))?;
-    let s = as_u64(capacity)?;
-    let h = as_u64(config.hidden_size)?;
-    let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
-    let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
-    let i = as_u64(config.intermediate_size)?;
-    let per_layer_elements = sum(&[
-        product(12, product(t, h)?)?,
-        product(12, product(t, q)?)?,
-        product(12, product(t, kv)?)?,
-        product(10, product(t, i)?)?,
-        product(8, product(product(as_u64(config.q_heads)?, t)?, s)?)?,
-        product(4, product(s, kv)?)?,
-    ])?;
-    sum(&[
-        product(product(layers, per_layer_elements)?, 4)?,
-        product(product(t, h)?, 16)?,
-        logits_payload_bound(config)?,
-        product(as_u64(token_bytes)?, 8)?,
-        product(sum(&[layers, 64])?, 256)?,
-        32,
-    ])
-}
-
-fn output_bytes(limits: GenerationLimits) -> Result<u64, EngineError> {
-    sum(&[
-        as_u64(limits.max_buffered_text_bytes())?,
-        as_u64(limits.max_text_delta_bytes())?,
-        product(
-            as_u64(limits.event_capacity())?,
-            as_u64(std::mem::size_of::<String>())?,
-        )?,
-    ])
-}
-fn sum(values: &[u64]) -> Result<u64, EngineError> {
-    values.iter().try_fold(0_u64, |a, &b| {
-        a.checked_add(b)
-            .ok_or_else(|| internal("Qwen3 size arithmetic overflow"))
-    })
-}
-fn product(a: u64, b: u64) -> Result<u64, EngineError> {
-    a.checked_mul(b)
-        .ok_or_else(|| internal("Qwen3 size arithmetic overflow"))
-}
-fn as_u64(value: usize) -> Result<u64, EngineError> {
-    u64::try_from(value).map_err(|_| internal("Qwen3 size exceeds u64"))
-}
-fn as_usize(value: u64) -> Result<usize, EngineError> {
-    usize::try_from(value).map_err(|_| internal("Qwen3 size exceeds platform usize"))
-}
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -2559,6 +1607,393 @@ mod shared_rendering_wiring_tests {
                 )
                 .expect("actual engine")
         }
+    }
+
+    fn explicit_parser_capacities() -> ParserAllocationLimits {
+        ParserAllocationLimits {
+            carry_bytes: 32,
+            call_bytes: 128,
+            decoded_bytes: 128,
+            depth: 8,
+            keys: 16,
+            nodes: 32,
+            proposal_bytes: 256,
+            calls: 4,
+        }
+    }
+
+    fn parser_capacity_tuple(limits: ParserAllocationLimits) -> [usize; 8] {
+        [
+            limits.carry_bytes,
+            limits.call_bytes,
+            limits.decoded_bytes,
+            limits.depth,
+            limits.keys,
+            limits.nodes,
+            limits.proposal_bytes,
+            limits.calls,
+        ]
+    }
+
+    #[test]
+    fn qwen_parser_hooks_text_only_plan_and_decoder_are_unchanged() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        assert!(
+            backend
+                .parser_allocation_limits(&registry, profile)
+                .expect("metadata")
+                .is_none()
+        );
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).expect("render");
+        let plan =
+            block_on(backend.plan(&registry, profile, rendered.token_count())).expect("plan");
+        assert_eq!(
+            plan.output_bytes,
+            output_bytes(fixture.limits.generation).expect("legacy output")
+        );
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, profile, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_flag_alone_does_not_invent_capacities() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_tool_call_parsing(true);
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        assert!(
+            backend
+                .parser_allocation_limits(&registry, profile)
+                .is_err()
+        );
+        assert!(block_on(backend.plan(&registry, profile, 1)).is_err());
+        // The non-admitted constructor cannot bypass the runtime hook.
+        assert!(backend.decoder(&registry, profile).is_err());
+    }
+
+    #[test]
+    fn qwen_parser_hooks_snapshot_all_explicit_capacities_and_plan_slab_once() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let profile = fixture.context.profile_id();
+        let actual = backend
+            .parser_allocation_limits(&registry, profile)
+            .expect("metadata")
+            .expect("selected");
+        assert_eq!(
+            parser_capacity_tuple(actual),
+            parser_capacity_tuple(capacities)
+        );
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).expect("render");
+        let plan =
+            block_on(backend.plan(&registry, profile, rendered.token_count())).expect("plan");
+        let expected = fixture
+            .limits
+            .output_memory_plan(
+                Some(capacities),
+                &[std::alloc::Layout::new::<Qwen3TextDecoder>()],
+            )
+            .expect("memory plan");
+        assert_eq!(plan.output_bytes, expected.total_bytes());
+        assert_eq!(
+            plan.output_bytes - output_bytes(fixture.limits.generation).expect("legacy"),
+            ParserAllocation::required_bytes(capacities).expect("slab")
+                + std::mem::size_of::<Qwen3TextDecoder>() as u64
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_disabling_tools_clears_capacities() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(explicit_parser_capacities())
+                .expect("capacities")
+                .with_tool_call_parsing(false);
+        assert!(
+            backend
+                .selected_parser_capacities()
+                .expect("selection")
+                .is_none()
+        );
+        assert_eq!(
+            backend.planned_output_bytes().expect("plan"),
+            output_bytes(fixture.limits.generation).expect("legacy")
+        );
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_invalid_or_overflowing_capacities_are_rejected() {
+        for invalid in [0, usize::MAX] {
+            let fixture = Fixture::new();
+            let mut capacities = explicit_parser_capacities();
+            capacities.nodes = invalid;
+            let backend =
+                Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                    .expect("backend");
+            assert!(backend.with_parser_allocation_limits(capacities).is_err());
+        }
+    }
+
+    #[test]
+    fn qwen_parser_hooks_missing_slab_cannot_fall_back_to_legacy_parsing() {
+        let fixture = Fixture::new();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(explicit_parser_capacities())
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), None)
+                .is_err()
+        );
+        assert!(
+            backend
+                .decoder(&registry, fixture.context.profile_id())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn qwen_parser_hooks_supplied_slab_decodes_and_outlives_the_decoder() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let bytes = ParserAllocation::required_bytes(capacities).expect("size");
+        let owner_bytes = std::mem::size_of::<Qwen3TextDecoder>() as u64;
+        let admission = AdmissionController::new(bytes + owner_bytes).expect("admission");
+        let mut grant = admission
+            .reserve_grant("slab and decoder owner", &[bytes, owner_bytes])
+            .expect("grant");
+        let decoder_owner = grant
+            .take("decoder owner", owner_bytes)
+            .expect("partition")
+            .expect("positive");
+        let slab = ParserAllocation::from_grant(&mut grant, capacities).expect("allocation");
+        let mut decoder = backend
+            .decoder_with_parser_allocation(&registry, fixture.context.profile_id(), Some(slab))
+            .expect("storage-backed decoder");
+        let data = backend
+            .data(
+                registry
+                    .resolve_profile(fixture.context.profile_id())
+                    .expect("profile")
+                    .artifact(),
+            )
+            .expect("data");
+        let tokens = data
+            .tokenizer
+            .tokenizer()
+            .encode(
+                "before<tool_call>{\"name\":\"fs.read\",\"arguments\":{}}</tool_call>after",
+                false,
+            )
+            .expect("tokens");
+        let mut text = String::new();
+        for &token in tokens.get_ids() {
+            for block in decoder.push_blocks(token).expect("decode") {
+                match block {
+                    crate::types::GenerationOutputBlock::Text(delta) => text.push_str(&delta),
+                    _ => panic!("slab decoding must not materialize owned proposal maps"),
+                }
+            }
+        }
+        decoder.finish_blocks().expect("finish");
+        let batch = decoder.take_parser_proposals().expect("owned batch");
+        assert!(decoder.take_parser_proposals().is_none());
+        drop(decoder);
+        drop(decoder_owner);
+        drop(grant);
+        assert_eq!(text, "beforeafter");
+        assert_eq!(batch.proposal_count(), 1);
+        assert_eq!(batch.proposal(0).expect("call").name, "fs.read");
+        assert_eq!(batch.proposal(0).expect("call").arguments_json, "{}");
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("consumer retained")
+                .reserved_bytes(),
+            bytes
+        );
+        drop(batch);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn qwen_parser_hooks_wrong_slab_size_is_rejected_and_released() {
+        let fixture = Fixture::new();
+        let capacities = explicit_parser_capacities();
+        let backend =
+            Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+                .expect("backend")
+                .with_parser_allocation_limits(capacities)
+                .expect("capacities");
+        let registry = backend
+            .registry(vec![fixture.profile.clone()])
+            .expect("registry");
+        let mut different = capacities;
+        different.calls += 1;
+        let bytes = ParserAllocation::required_bytes(different).expect("bytes");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("parser", &[bytes]).expect("grant");
+        let allocation = ParserAllocation::from_grant(&mut grant, different).expect("slab");
+        match backend.decoder_with_parser_allocation(
+            &registry,
+            fixture.context.profile_id(),
+            Some(allocation),
+        ) {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("differs from the planned slab size")
+            ),
+            Ok(_) => panic!("wrong allocation accepted"),
+        }
+        drop(grant);
+        assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn tool_context_reaches_the_production_qwen_renderer() {
+        use crate::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+        let mut fixture = Fixture::new();
+        // Rendering needs more context than the tiny execution fixture. Change
+        // and re-pin the actual config; do not bypass profile/context checks.
+        let path = fixture.directory.0.join("config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("JSON");
+        config["max_position_embeddings"] = serde_json::json!(8192);
+        let bytes = serde_json::to_vec(&config).expect("config JSON");
+        std::fs::write(&path, &bytes).expect("config write");
+        fixture.specification.files.insert(
+            "config.json".to_owned(),
+            FilePin {
+                bytes: bytes.len() as u64,
+                sha256: digest(&bytes),
+            },
+        );
+        fixture.limits.context_limit_tokens = 8192;
+        fixture.profile = ModelProfile::new(
+            fixture.context.profile_id().clone(),
+            fixture.specification.id.clone(),
+            8192,
+            4,
+            8,
+            GenerationOptions::greedy(4).expect("options"),
+        )
+        .expect("profile");
+        let metadata = RenderingTool::new(
+            "fs.read".into(),
+            "1.0.0".into(),
+            "Read file".into(),
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        )
+        .expect("metadata");
+        let history = vec![
+            ToolHistoryBlock::AssistantCall {
+                call_id: "call-1".into(),
+                tool_id: "fs.read".into(),
+                arguments: serde_json::json!({"path":"file.txt"})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            },
+            ToolHistoryBlock::ToolResult {
+                call_id: "call-1".into(),
+                content: "result data".into(),
+                is_error: false,
+            },
+        ];
+        let tool_context = ToolContext::new(
+            vec![metadata],
+            history,
+            ToolContextLimits {
+                max_tools: 4,
+                max_history_blocks: 8,
+                max_json_bytes: 4096,
+            },
+        )
+        .expect("tool context");
+        let context = fixture.context.clone().with_tool_context(tool_context);
+        assert!(
+            block_on(fixture.engine().render_and_count(context.clone())).is_err(),
+            "text-only backend accepted tools"
+        );
+        let engine = Qwen3Backend::new(vec![fixture.specification.clone()], fixture.limits.clone())
+            .expect("backend")
+            .with_tool_call_parsing(true)
+            .into_engine(
+                vec![fixture.profile.clone()],
+                AdmissionController::new(16 * 1024 * 1024).expect("admission"),
+                Scheduler::new(8).expect("scheduler"),
+                RetentionPolicy {
+                    retain_model: false,
+                    retain_cache_buffers: false,
+                },
+            )
+            .expect("engine");
+        let rendered =
+            block_on(engine.render_and_count(context)).expect("production tool rendering");
+        assert!(rendered.text().contains("\"name\":\"fs.read\""));
+        assert!(rendered.text().contains("result data"));
+        assert!(rendered.tool_schema_hash().is_some());
+        let source = std::fs::read(fixture.directory.0.join("tokenizer.json")).expect("tokenizer");
+        let tokenizer = PinnedTokenizer::from_pinned_json(
+            &source,
+            fixture.specification.files["tokenizer.json"].sha256,
+            fixture.limits.max_tokenizer_bytes,
+        )
+        .expect("pin");
+        let expected = tokenizer
+            .tokenizer()
+            .encode(rendered.text(), false)
+            .expect("encode");
+        assert_eq!(rendered.token_ids(), expected.get_ids());
     }
 
     #[test]

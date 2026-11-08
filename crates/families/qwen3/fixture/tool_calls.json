@@ -1,0 +1,101 @@
+[
+  {
+    "name": "ordinary_text",
+    "output": "The fixture contains ordinary assistant text.",
+    "expected": [
+      {
+        "kind": "text",
+        "text": "The fixture contains ordinary assistant text."
+      }
+    ]
+  },
+  {
+    "name": "empty_generation",
+    "output": "",
+    "expected": []
+  },
+  {
+    "name": "file_read",
+    "output": "<tool_call>\n{\"name\":\"fs.read\",\"arguments\":{\"path\":\"fixtures/notes.txt\"}}\n</tool_call>",
+    "expected": [
+      {
+        "kind": "call",
+        "name": "fs.read",
+        "arguments": {
+          "path": "fixtures/notes.txt"
+        }
+      }
+    ]
+  },
+  {
+    "name": "mixed_unicode_and_calls",
+    "output": "Reading 雪.\n<tool_call>{\"name\":\"fs.read\",\"arguments\":{\"path\":\"résumé.txt\"}}</tool_call>\nThen list.\n<tool_call>{\"name\":\"fs.list\",\"arguments\":{\"path\":\"fixtures\"}}</tool_call>",
+    "expected": [
+      {
+        "kind": "text",
+        "text": "Reading 雪.\n"
+      },
+      {
+        "kind": "call",
+        "name": "fs.read",
+        "arguments": {
+          "path": "résumé.txt"
+        }
+      },
+      {
+        "kind": "text",
+        "text": "\nThen list.\n"
+      },
+      {
+        "kind": "call",
+        "name": "fs.list",
+        "arguments": {
+          "path": "fixtures"
+        }
+      }
+    ]
+  },
+  {
+    "name": "escaped_json",
+    "output": "<tool_call>{\"name\":\"fixture.echo\",\"arguments\":{\"text\":\"quote: \\\"; slash: \\\\; newline:\\n; tag: \\u003ctool_call\\u003e\"}}</tool_call>",
+    "expected": [
+      {
+        "kind": "call",
+        "name": "fixture.echo",
+        "arguments": {
+          "text": "quote: \"; slash: \\; newline:\n; tag: <tool_call>"
+        }
+      }
+    ]
+  },
+  {
+    "name": "model_claimed_call_id",
+    "output": "<tool_call>{\"name\":\"fs.read\",\"arguments\":{},\"call_id\":\"trusted-looking-id\"}</tool_call>",
+    "error": "invalid_envelope"
+  },
+  {
+    "name": "string_arguments",
+    "output": "<tool_call>{\"name\":\"fs.read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}</tool_call>",
+    "error": "invalid_envelope"
+  },
+  {
+    "name": "nested_duplicate_key",
+    "output": "<tool_call>{\"name\":\"fixture.echo\",\"arguments\":{\"nested\":{\"x\":1,\"x\":2}}}</tool_call>",
+    "error": "invalid_json"
+  },
+  {
+    "name": "truncated_call",
+    "output": "<tool_call>{\"name\":\"fs.read\",\"arguments\":{}}",
+    "error": "incomplete_call"
+  },
+  {
+    "name": "valid_then_malformed",
+    "output": "<tool_call>{\"name\":\"fs.read\",\"arguments\":{}}</tool_call><tool_call>{bad}</tool_call>",
+    "error": "invalid_json"
+  },
+  {
+    "name": "unsupported_coder_syntax",
+    "output": "<tool_call><function=fs.read><parameter=path>a</parameter></function></tool_call>",
+    "error": "invalid_json"
+  }
+]

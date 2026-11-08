@@ -5,6 +5,7 @@ use crate::rpc::{
     API_VERSION, ErrorKind, RpcError, RpcNotification, RpcRequest, RpcResponse, encode_line,
     validate_request, wire_event_body, wire_event_name,
 };
+use crate::rpc::{RpcTransportLimits, write_slab_session_event};
 use engine::api::{ENGINE_API_VERSION, Engine, EngineFuture};
 use engine::error::EngineError;
 use engine::rendering::{
@@ -45,6 +46,7 @@ pub struct DaemonService<E: Engine> {
     models_resident: u64,
     memory_reserved: u64,
     metrics: Option<Arc<dyn MetricsSource>>,
+    notification_limits: Option<RpcTransportLimits>,
 }
 
 impl<E: Engine> DaemonService<E> {
@@ -69,6 +71,7 @@ impl<E: Engine> DaemonService<E> {
             models_resident,
             memory_reserved,
             metrics: None,
+            notification_limits: None,
         })
     }
 
@@ -76,6 +79,19 @@ impl<E: Engine> DaemonService<E> {
     pub fn with_metrics_source(mut self, metrics: Arc<dyn MetricsSource>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Configure explicit slab-notification byte and per-write timeout limits.
+    /// This does not enable tools or relax the supervisor completion gate.
+    /// Without configuration, slab-batch transport is rejected before writing.
+    pub fn with_rpc_transport_limits(mut self, limits: RpcTransportLimits) -> Self {
+        self.notification_limits = Some(limits);
+        self
+    }
+
+    /// Configured notification policy, also applied to server socket writes.
+    pub fn rpc_transport_limits(&self) -> Option<RpcTransportLimits> {
+        self.notification_limits
     }
 
     /// Handle one JSON-RPC request, writing stream notifications to `writer` as needed.
@@ -221,21 +237,7 @@ impl<E: Engine> DaemonService<E> {
                 Ok(())
             },
             |event| {
-                let notification = RpcNotification::session_event(
-                    wire_event_name(event),
-                    &session_id,
-                    wire_event_body(event),
-                );
-                let line = encode_line(&notification).map_err(|error| {
-                    HarnessError::Engine(format!("encode session.event: {}", error.message))
-                })?;
-                writer
-                    .write_all(line.as_bytes())
-                    .and_then(|_| writer.flush())
-                    .map_err(|error| {
-                        HarnessError::Engine(format!("stream notify write failed: {error}"))
-                    })?;
-                Ok(())
+                write_generation_notification(writer, &session_id, event, self.notification_limits)
             },
         );
         {
@@ -638,5 +640,105 @@ impl GenerationEventStream for CancellableStream {
             this.emitted = this.emitted.saturating_add(1);
         }
         Poll::Ready(next)
+    }
+}
+
+fn write_generation_notification<W: Write>(
+    writer: &mut W,
+    session_id: &str,
+    event: &GenerationEvent,
+    limits: Option<RpcTransportLimits>,
+) -> Result<(), HarnessError> {
+    if let GenerationEvent::ToolCallBatchProposed { proposals } = event {
+        let limits = limits.ok_or_else(|| {
+            HarnessError::Engine("slab notifications require explicit RPC transport limits".into())
+        })?;
+        write_slab_session_event(writer, session_id, proposals, limits).map_err(|error| {
+            HarnessError::Engine(format!(
+                "stream slab notification failed: {}",
+                error.message,
+            ))
+        })?;
+        return Ok(());
+    }
+    let notification =
+        RpcNotification::session_event(wire_event_name(event), session_id, wire_event_body(event));
+    let line = encode_line(&notification).map_err(|error| {
+        HarnessError::Engine(format!("encode session.event: {}", error.message))
+    })?;
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|error| HarnessError::Engine(format!("stream notify write failed: {error}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod w2_notification_dispatch_tests {
+    use super::*;
+    use engine::{
+        admission::AdmissionController,
+        parser_allocation::{ParserAllocation, ParserAllocationLimits},
+    };
+    use std::time::Duration;
+    fn batch() -> GenerationEvent {
+        let limits = ParserAllocationLimits {
+            carry_bytes: 32,
+            call_bytes: 128,
+            decoded_bytes: 128,
+            depth: 8,
+            keys: 16,
+            nodes: 32,
+            proposal_bytes: 256,
+            calls: 4,
+        };
+        let bytes = ParserAllocation::required_bytes(limits).expect("layout");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("parser", &[bytes]).expect("grant");
+        let mut storage = ParserAllocation::from_grant(&mut grant, limits).expect("storage");
+        {
+            let w = storage.workspaces();
+            w.decoded[0] = b'a';
+            w.call[..2].copy_from_slice(b"{}");
+        }
+        storage
+            .commit_validated_call(1, 0..1, 2, 0..2)
+            .expect("validated fixture");
+        GenerationEvent::ToolCallBatchProposed {
+            proposals: storage.freeze(),
+        }
+    }
+    #[test]
+    fn real_notification_dispatch_requires_explicit_slab_transport_limits() {
+        let mut bytes = Vec::new();
+        let event = batch();
+        assert!(write_generation_notification(&mut bytes, "s", &event, None).is_err());
+        assert!(bytes.is_empty());
+    }
+    #[test]
+    fn real_notification_dispatch_routes_slab_batches_to_borrowed_writer() {
+        let mut bytes = Vec::new();
+        let event = batch();
+        let limits = RpcTransportLimits::new(4096, Duration::from_secs(1)).expect("limits");
+        write_generation_notification(&mut bytes, "s", &event, Some(limits)).expect("write");
+        let wire: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(wire["params"]["event"], "tool_call_batch_proposed");
+        assert_eq!(wire["params"]["body"]["calls"][0]["arguments_json"], "{}");
+        let tiny =
+            RpcTransportLimits::new(bytes.len() - 1, Duration::from_secs(1)).expect("tiny limit");
+        let mut refused = Vec::new();
+        assert!(write_generation_notification(&mut refused, "s", &event, Some(tiny)).is_err());
+        assert!(refused.is_empty());
+    }
+    #[test]
+    fn real_notification_dispatch_preserves_legacy_text_wire_format() {
+        let mut bytes = Vec::new();
+        let event = GenerationEvent::TextDelta {
+            text: "hello".into(),
+        };
+        write_generation_notification(&mut bytes, "s", &event, None).expect("legacy write");
+        let wire: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(wire["params"]["event"], "text_delta");
+        assert_eq!(wire["params"]["body"], json!({"text":"hello"}));
     }
 }

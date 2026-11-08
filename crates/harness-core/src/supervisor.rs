@@ -215,12 +215,29 @@ impl<E: Engine> Supervisor<E> {
         let mut assistant = String::new();
 
         while let Some(event) = next_event(&mut stream)? {
+            // The text-only supervisor must not forward tool proposals to
+            // callbacks or persist this turn as successfully completed.
+            if matches!(
+                &event,
+                GenerationEvent::ToolCallProposed { .. }
+                    | GenerationEvent::ToolCallBatchProposed { .. }
+            ) {
+                return Err(HarnessError::Engine(
+                    "tool-call proposals require a tool-aware supervisor".into(),
+                ));
+            }
             on_event(&event)?;
             match event {
                 GenerationEvent::TextDelta { text } => assistant.push_str(&text),
                 GenerationEvent::GenerationCompleted { .. } => break,
                 GenerationEvent::RequestFailed { error, .. } => {
                     return Err(error.into());
+                }
+                GenerationEvent::ToolCallProposed { .. }
+                | GenerationEvent::ToolCallBatchProposed { .. } => {
+                    return Err(HarnessError::Engine(
+                        "tool-call proposals require a tool-aware supervisor".into(),
+                    ));
                 }
                 GenerationEvent::ToolCallDelta { .. } | GenerationEvent::RuntimeWarning { .. } => {}
             }

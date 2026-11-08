@@ -1,5 +1,11 @@
 //! JSON-RPC 2.0 codec, `api_version` gate, and Phase-1 error registry.
 
+#[path = "rpc/slab_transport.rs"]
+mod slab_transport;
+pub use slab_transport::{
+    RpcTransportLimits, measure_slab_session_event, write_slab_session_event,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -229,19 +235,39 @@ pub fn wire_event_name(event: &engine::types::GenerationEvent) -> &'static str {
     match event {
         GenerationEvent::TextDelta { .. } => "text_delta",
         GenerationEvent::ToolCallDelta { .. } => "tool_call_delta",
+        GenerationEvent::ToolCallProposed { .. } => "tool_call_proposed",
+        GenerationEvent::ToolCallBatchProposed { .. } => "tool_call_batch_proposed",
         GenerationEvent::RuntimeWarning { .. } => "runtime_warning",
         GenerationEvent::GenerationCompleted { .. } => "generation_completed",
         GenerationEvent::RequestFailed { .. } => "request_failed",
     }
 }
 
-/// JSON body for a streamed session event notification.
+/// Compatibility/fixture JSON body for a session event.
+///
+/// This helper materializes a Value tree. Production slab-batch notifications
+/// must use write_slab_session_event, which borrows the slab directly.
+/// Non-batch callers retain their existing encoding behavior.
 pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
     use engine::types::GenerationEvent;
     match event {
         GenerationEvent::TextDelta { text } => json!({ "text": text }),
         GenerationEvent::ToolCallDelta { call_id, delta } => {
             json!({ "call_id": call_id, "delta": delta })
+        }
+        GenerationEvent::ToolCallProposed { proposal } => {
+            json!({
+                "name": proposal.name(),
+                "arguments": proposal.arguments(),
+            })
+        }
+        GenerationEvent::ToolCallBatchProposed { proposals } => {
+            // RPC materializes a transport response; this is not
+            // parser storage. Arguments stay validated JSON TEXT, not a second
+            // unaccounted argument-object tree. Consumers must budget decoding.
+            let calls: Vec<_> = (0..proposals.proposal_count()).filter_map(|index| proposals.proposal(index))
+                .map(|proposal| json!({"name":proposal.name,"arguments_json":proposal.arguments_json})).collect();
+            json!({"encoding":"validated_json_text","calls":calls})
         }
         GenerationEvent::RuntimeWarning { code, message } => {
             json!({ "code": code, "message": message })
@@ -270,5 +296,110 @@ pub fn wire_event_body(event: &engine::types::GenerationEvent) -> Value {
                 "output_tokens": partial_usage.output_tokens,
             }
         }),
+    }
+}
+
+// W2_RPC_PROPOSAL_CODEC_V1
+#[cfg(test)]
+mod w2_proposal_wire_tests {
+    use super::*;
+    use engine::types::{GenerationEvent, ToolCallProposal};
+
+    #[test]
+    fn proposal_wire_payload_preserves_data_without_inventing_authority() {
+        let arguments = json!({
+            "path": "file.txt",
+            "nested": [null, true, {"x": 7}],
+            "approved": true,
+            "call_id": "argument-data-only"
+        });
+        let proposal =
+            ToolCallProposal::new("fs.read", arguments.as_object().expect("object").clone())
+                .expect("proposal");
+        let event = GenerationEvent::ToolCallProposed { proposal };
+
+        assert_eq!(wire_event_name(&event), "tool_call_proposed");
+        assert!(!event.is_terminal());
+
+        let body = wire_event_body(&event);
+        assert_eq!(
+            body,
+            json!({
+                "name": "fs.read",
+                "arguments": arguments,
+            })
+        );
+        assert!(body.get("call_id").is_none());
+        assert!(body.get("approved").is_none());
+        assert!(body.get("delta").is_none());
+
+        let notification =
+            RpcNotification::session_event(wire_event_name(&event), "session-test", body.clone());
+        let encoded = encode_line(&notification).expect("encode");
+        let decoded: Value = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded["method"], "session.event");
+        assert_eq!(decoded["params"]["event"], "tool_call_proposed");
+        assert_eq!(decoded["params"]["body"], body);
+    }
+}
+
+#[cfg(test)]
+mod w2_slab_wire_tests {
+    use super::*;
+    use engine::{
+        admission::AdmissionController,
+        parser_allocation::{ParserAllocation, ParserAllocationLimits},
+        types::GenerationEvent,
+    };
+    #[test]
+    fn batch_codec_preserves_validated_json_text_without_assigning_authority() {
+        let limits = ParserAllocationLimits {
+            carry_bytes: 32,
+            call_bytes: 128,
+            decoded_bytes: 128,
+            depth: 8,
+            keys: 16,
+            nodes: 32,
+            proposal_bytes: 256,
+            calls: 4,
+        };
+        let bytes = ParserAllocation::required_bytes(limits).expect("layout");
+        let admission = AdmissionController::new(bytes).expect("admission");
+        let mut grant = admission.reserve_grant("slab", &[bytes]).expect("grant");
+        let mut storage = ParserAllocation::from_grant(&mut grant, limits).expect("storage");
+        let args = br#"{"call_id":"argument-data","approved":true}"#;
+        {
+            let work = storage.workspaces();
+            work.decoded[..7].copy_from_slice(b"fs.read");
+            work.call[..args.len()].copy_from_slice(args);
+        }
+        storage
+            .commit_validated_call(7, 0..7, args.len(), 0..args.len())
+            .expect("commit validated fixture");
+        let event = GenerationEvent::ToolCallBatchProposed {
+            proposals: storage.freeze(),
+        };
+        assert_eq!(wire_event_name(&event), "tool_call_batch_proposed");
+        let body = wire_event_body(&event);
+        assert_eq!(body["encoding"], "validated_json_text");
+        assert_eq!(body["calls"][0]["name"], "fs.read");
+        assert_eq!(
+            body["calls"][0]["arguments_json"],
+            std::str::from_utf8(args).expect("UTF-8")
+        );
+        assert!(body["calls"][0].get("call_id").is_none());
+        assert!(body["calls"][0].get("approved").is_none());
+        assert_eq!(
+            admission.snapshot().expect("owner live").reserved_bytes(),
+            bytes
+        );
+        drop(event);
+        assert_eq!(
+            admission
+                .snapshot()
+                .expect("owner released")
+                .reserved_bytes(),
+            0
+        );
     }
 }

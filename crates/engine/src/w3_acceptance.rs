@@ -152,6 +152,7 @@ impl EngineRuntime for MockRuntime {
                 token_ids: vec![1],
                 render_hash: [2; 32],
                 template_hash: [3; 32],
+                tool_schema_hash: None,
                 tokenizer_id: TokenizerId::new("mock-tokenizer").expect("tokenizer"),
                 renderer: RendererIdentity {
                     implementation: "mock".to_owned(),
