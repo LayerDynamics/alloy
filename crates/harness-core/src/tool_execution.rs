@@ -23,6 +23,31 @@ use tool_registry::{
     result::{InlineToolResult, ToolErrorKind, ToolResult},
 };
 
+/// Required daemon-supplied executable implementations for the builtin set.
+/// No field is optional and no placeholder/default implementation is supplied.
+/// The caller must configure resource-scoped implementations; this bundle alone
+/// neither authorizes calls nor establishes filesystem/network scope enforcement.
+/// ```compile_fail
+/// use harness_core::tool_execution::BuiltinImplementations;
+/// use std::sync::Arc;
+/// use tool_registry::registry::ToolImplementation;
+/// fn incomplete(read: Arc<dyn ToolImplementation>) {
+///     let _ = BuiltinImplementations { fs_read: read };
+/// }
+/// ```
+pub struct BuiltinImplementations {
+    /// Implementation assigned exclusively to the fs.read registration.
+    pub fs_read: Arc<dyn ToolImplementation>,
+    /// Implementation assigned exclusively to the fs.list registration.
+    pub fs_list: Arc<dyn ToolImplementation>,
+    /// Implementation assigned exclusively to the fs.write registration.
+    pub fs_write: Arc<dyn ToolImplementation>,
+    /// Implementation assigned exclusively to the shell.run registration.
+    pub shell_run: Arc<dyn ToolImplementation>,
+    /// Implementation assigned exclusively to the http.fetch registration.
+    pub http_fetch: Arc<dyn ToolImplementation>,
+}
+
 /// Daemon-owned registration facade with a private index of the same W1 Arcs.
 /// Existing IDs cannot be replaced; registration never invokes an implementation.
 #[derive(Default)]
@@ -31,6 +56,47 @@ pub struct ReceiptExecutor {
     implementations: BTreeMap<String, Arc<dyn ToolImplementation>>,
 }
 impl ReceiptExecutor {
+    /// Build a complete five-entry executable catalogue using the existing
+    /// builtin definition/schema factory and its exact effect/approval defaults.
+    /// Limits are trusted daemon inputs, not new implicit defaults. This returns
+    /// either the whole catalogue or an error; it never mutates a live executor.
+    /// Registration performs no execution and grants no W3 admission/approval.
+    /// Callers must supply all five real backends before operational use; this
+    /// constructor does not implement any missing backend or wire W6 dispatch.
+    pub fn with_builtins(
+        timeout_ms: u64,
+        max_output_bytes: u64,
+        implementations: BuiltinImplementations,
+    ) -> Result<Self, RegistryError> {
+        let mut definitions: BTreeMap<_, _> =
+            tool_registry::builtins::definitions(timeout_ms, max_output_bytes)?
+                .into_iter()
+                .map(|definition| (definition.id.clone(), definition))
+                .collect();
+        if definitions.len() != 5 {
+            return Err(RegistryError::Validation(
+                tool_registry::ValidationError::InvalidSchema(
+                    "builtin definition set must contain five unique entries".into(),
+                ),
+            ));
+        }
+        let entries = [
+            ("fs.read", implementations.fs_read),
+            ("fs.list", implementations.fs_list),
+            ("fs.write", implementations.fs_write),
+            ("shell.run", implementations.shell_run),
+            ("http.fetch", implementations.http_fetch),
+        ];
+        let mut executor = Self::new();
+        for (id, implementation) in entries {
+            let definition = definitions
+                .remove(id)
+                .ok_or_else(|| RegistryError::UnknownTool(id.into()))?;
+            executor.register(definition, implementation)?;
+        }
+        Ok(executor)
+    }
+
     /// Construct an empty facade; this does not register builtin placeholders.
     pub fn new() -> Self {
         Self::default()

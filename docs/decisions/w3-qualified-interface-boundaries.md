@@ -91,3 +91,25 @@ This generic registry/receipt bridge does not complete builtin registrations,
 resource-scope adapters, streaming artifact finalization, W5 hooks, W6 dispatch,
 or P2-07/P2-09 acceptance. Their existing W4 tasks remain open. Inline/artifact
 wire shapes and W3 provenance checks are unchanged.
+
+
+## W4-01.03 complete-catalogue registration entrypoint
+
+ReceiptExecutor::with_builtins uses the existing tool-registry builtin definition
+factory and registers each definition with its corresponding daemon-supplied
+implementation through the same W1/private-index registration path. The required
+BuiltinImplementations bundle has five nonoptional fields and no Default or
+placeholder implementation. Initialization returns the entire fresh executor or
+an error; it does not partially mutate a live catalogue or execute a tool.
+Effect/approval defaults and schema identities are not duplicated or lowered by
+this constructor. Limits remain explicit trusted inputs, tightened later by W3.
+
+The registration tests supply explicitly identified counter backends and run W3
+admission/approval/start/receipt dispatch for all five entries. They establish
+registration/default/selection and authorization-boundary behavior, not actual
+filesystem/process/network resource enforcement or P2-07/P2-09 acceptance.
+Operational setup must supply all five configured concrete adapters. Missing
+HTTP implementation cannot be hidden by a successful four-entry catalogue or
+an automatically substituted not-implemented handler. Per-builtin resource and
+canonical output adapters remain the subsequent W4 tasks; W6 admission is not
+activated by this constructor.
