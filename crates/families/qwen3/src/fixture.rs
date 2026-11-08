@@ -133,10 +133,10 @@ pub struct LayerWeights {
     pub k_proj: MatrixWeight,
     pub v_proj: MatrixWeight,
     /// Learned RMSNorm scale over each query head's last dimension.
-    /// Shape: [head_dim], shared across query heads.
+    /// Shape: `[head_dim]`, shared across query heads.
     pub q_norm: Vec<f32>,
     /// Learned RMSNorm scale over each key head's last dimension.
-    /// Shape: [head_dim], shared across key heads.
+    /// Shape: `[head_dim]`, shared across key heads.
     pub k_norm: Vec<f32>,
     pub o_proj: MatrixWeight,
     pub post_attention_layernorm: Vec<f32>,
