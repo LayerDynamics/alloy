@@ -1,4 +1,4 @@
-//! Scoped W4 read/list primitives. This module does not grant call authorization.
+//! Scoped W4 filesystem primitives. This module does not grant call authorization.
 //!
 //! A trusted caller supplies the root capability; a future harness bridge must
 //! also require the unchanged W3 StartedInvocation. No live dispatch is enabled.
@@ -397,3 +397,445 @@ mod list_name_encoding_tests {
         assert_eq!(value["name_utf8"].as_str(), Some(name));
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod scoped_write {
+    use super::*;
+    use rustix::fs::{AtFlags, RenameFlags, renameat_with, statat, unlinkat};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Exact UTF-8 contents and unchanged relative destination; not approval.
+    #[derive(Debug)]
+    pub struct WriteRequest {
+        path: String,
+        content: String,
+    }
+    impl WriteRequest {
+        /// This candidate creates new files only. Internal staging names are
+        /// reserved; existing destinations are never replaced.
+        pub fn new(path: &str, content: String) -> Result<Self, ReadError> {
+            let path = ReadRequest::new(path, 0, 1)?.path;
+            if path
+                .split('/')
+                .any(|part| part.starts_with(".alloy-write-"))
+            {
+                return Err(ReadError::Policy("reserved staging path component"));
+            }
+            Ok(Self { path, content })
+        }
+    }
+
+    /// Publication state, distinct from whether staging effects were attempted.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WritePublication {
+        /// Destination was not published; temporary staging may have occurred.
+        NotPublished,
+        /// The publication syscall failed; do not infer no effect or retry.
+        Unknown,
+        /// Destination was published, even if result delivery later failed.
+        Published,
+    }
+
+    /// Internal failure that preserves effect status and cleanup diagnostics.
+    #[derive(Debug)]
+    pub struct WriteFailure {
+        /// Destination publication status, not a new tool-result wire category.
+        pub publication: WritePublication,
+        /// Original failure.
+        pub cause: ReadError,
+        /// Cleanup failed; an uncommitted staging file may remain.
+        pub cleanup_error: Option<io::Error>,
+    }
+    impl fmt::Display for WriteFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "file write {:?}: {}", self.publication, self.cause)?;
+            if let Some(error) = &self.cleanup_error {
+                write!(f, "; staging cleanup failed: {error}")?;
+            }
+            Ok(())
+        }
+    }
+    impl std::error::Error for WriteFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.cause)
+        }
+    }
+
+    /// Confirmed publication of an exact UTF-8 payload, not crash durability.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct WriteReport {
+        /// Exact relative destination supplied by the caller.
+        pub path: String,
+        /// Content byte count, not Unicode scalar count.
+        pub bytes_written: u64,
+    }
+
+    /// Separately configured writable root and input ceiling, not execution
+    /// authorization. Read roots are not implicitly promoted to writable roots.
+    ///
+    /// Requires a local trusted directory tree: untrusted OS processes must not
+    /// be able to replace staging names or mutate ancestors during publication.
+    /// Scope handles pin directory objects, not their current ambient locations.
+    /// A future harness bridge must independently require immutable W3 approval
+    /// and StartedInvocation before calling this primitive. Live dispatch stays
+    /// disabled. Cancellation is cooperative around potentially blocking I/O.
+    pub struct WriteScope {
+        scope: ReadScope,
+        max_content_bytes: u64,
+    }
+    impl WriteScope {
+        /// Trusted daemon configuration, separate from max_output_bytes.
+        pub fn open(root: impl AsRef<Path>, max_content_bytes: u64) -> Result<Self, ReadError> {
+            if max_content_bytes == 0 {
+                return Err(ExecutionError::InvalidLimits.into());
+            }
+            Ok(Self {
+                scope: ReadScope::open(root)?,
+                max_content_bytes,
+            })
+        }
+
+        /// Stage, sync and atomically publish a new file with no replacement.
+        /// No automatic parent creation, overwrite, chmod of existing objects,
+        /// shell expansion, or fallback to an overwriting rename is permitted.
+        /// Output JSON identifies path/bytes_written, not an artifact reference.
+        /// A Published/Unknown failure must not trigger an automatic retry.
+        /// Successful file sync does not promise directory/power-loss durability.
+        pub fn write_into(
+            &self,
+            request: &WriteRequest,
+            context: &ExecutionContext,
+            output: &mut dyn OutputSink,
+        ) -> Result<WriteReport, WriteFailure> {
+            let mut publication = WritePublication::NotPublished;
+            let mut staged = None;
+            let result = self.write_inner(request, context, output, &mut publication, &mut staged);
+            let cleanup_error = staged.as_mut().and_then(|stage| stage.cleanup().err());
+            match result {
+                Ok(report) => Ok(report),
+                Err(cause) => {
+                    output.abort();
+                    Err(WriteFailure {
+                        publication,
+                        cause,
+                        cleanup_error,
+                    })
+                }
+            }
+        }
+
+        fn write_inner(
+            &self,
+            request: &WriteRequest,
+            context: &ExecutionContext,
+            output: &mut dyn OutputSink,
+            publication: &mut WritePublication,
+            staged: &mut Option<StagedWrite>,
+        ) -> Result<WriteReport, ReadError> {
+            context.check()?;
+            let bytes = request.content.as_bytes();
+            if bytes.len() as u64 > self.max_content_bytes {
+                return Err(ReadError::Policy(
+                    "content exceeds configured write-input limit",
+                ));
+            }
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "path": &request.path, "bytes_written": bytes.len() as u64,
+            }))
+            .map_err(|error| ReadError::Io(io::Error::other(error)))?;
+            if encoded.len() as u64 > context.max_output_bytes() {
+                return Err(ExecutionError::OutputLimit.into());
+            }
+            let (parent, name) = request
+                .path
+                .rsplit_once('/')
+                .unwrap_or((".", &request.path));
+            let parent = self
+                .scope
+                .list_directory(&ListRequest::new(parent, 1)?, context)?;
+            match statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => {
+                    return Err(ReadError::Policy(
+                        "destination already exists; overwrite disabled",
+                    ));
+                }
+                Err(rustix::io::Errno::NOENT) => (),
+                Err(error) => return Err(os(error)),
+            }
+            context.check()?;
+            *staged = Some(StagedWrite::new(parent, context)?);
+            let stage = staged
+                .as_mut()
+                .ok_or(ReadError::Policy("missing staging ownership"))?;
+            write_contents(&mut stage.file, bytes, context)?;
+            context.check()?;
+            stage.file.sync_all()?;
+            context.check()?;
+            let held = rustix::fs::fstat(&stage.file).map_err(os)?;
+            let named = statat(
+                &stage.parent,
+                stage.name.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(os)?;
+            if named.st_dev != held.st_dev || named.st_ino != held.st_ino || named.st_nlink != 1 {
+                return Err(ReadError::Policy("staging identity changed"));
+            }
+            context.check()?;
+            stage.publish(name, context, publication)?;
+            context.check()?;
+            output.write_chunk(&encoded)?;
+            context.check()?;
+            Ok(WriteReport {
+                path: request.path.clone(),
+                bytes_written: bytes.len() as u64,
+            })
+        }
+    }
+
+    struct StagedWrite {
+        parent: File,
+        file: File,
+        name: String,
+        armed: bool,
+    }
+    impl StagedWrite {
+        fn new(parent: File, context: &ExecutionContext) -> Result<Self, ReadError> {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            for _ in 0..64 {
+                context.check()?;
+                let name = format!(
+                    ".alloy-write-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                );
+                match openat(
+                    &parent,
+                    name.as_str(),
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                ) {
+                    Ok(fd) => {
+                        return Ok(Self {
+                            parent,
+                            file: File::from(fd),
+                            name,
+                            armed: true,
+                        });
+                    }
+                    Err(rustix::io::Errno::EXIST) => continue,
+                    Err(error) => return Err(os(error)),
+                }
+            }
+            Err(ReadError::Policy("bounded staging-name retries exhausted"))
+        }
+        fn publish(
+            &mut self,
+            name: &str,
+            context: &ExecutionContext,
+            publication: &mut WritePublication,
+        ) -> Result<(), ReadError> {
+            context.check()?;
+            *publication = WritePublication::Unknown;
+            match renameat_with(
+                &self.parent,
+                self.name.as_str(),
+                &self.parent,
+                name,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    self.armed = false;
+                    *publication = WritePublication::Published;
+                    Ok(())
+                }
+                Err(rustix::io::Errno::EXIST) => {
+                    *publication = WritePublication::NotPublished;
+                    Err(ReadError::Policy(
+                        "destination appeared; overwrite disabled",
+                    ))
+                }
+                Err(error) => Err(os(error)),
+            }
+        }
+        fn cleanup(&mut self) -> io::Result<()> {
+            if !self.armed {
+                return Ok(());
+            }
+            match unlinkat(&self.parent, self.name.as_str(), AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {
+                    self.armed = false;
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+    impl Drop for StagedWrite {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
+    fn write_contents<W: io::Write>(
+        writer: &mut W,
+        bytes: &[u8],
+        context: &ExecutionContext,
+    ) -> Result<(), ReadError> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            context.check()?;
+            let end = offset + (bytes.len() - offset).min(64 * 1024);
+            match writer.write(&bytes[offset..end]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "staging write returned zero",
+                    )
+                    .into());
+                }
+                Ok(n) => offset += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        context.check()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{
+            definition::{ApprovalRequirement, ToolEffect, ToolPolicy},
+            execution::CancellationToken,
+        };
+        fn context(token: CancellationToken) -> ExecutionContext {
+            ExecutionContext::new(
+                &ToolPolicy {
+                    effect: ToolEffect::Write,
+                    approval: ApprovalRequirement::Policy,
+                    timeout_ms: 60000,
+                    max_output_bytes: 4096,
+                },
+                60000,
+                4096,
+                token,
+            )
+            .unwrap()
+        }
+        struct CancelWriter {
+            token: CancellationToken,
+            calls: usize,
+        }
+        impl io::Write for CancelWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        #[test]
+        fn write_cancellation_stops_between_chunks() {
+            let token = CancellationToken::default();
+            let c = context(token.clone());
+            let mut writer = CancelWriter { token, calls: 0 };
+            assert!(write_contents(&mut writer, &vec![1; 150000], &c).is_err());
+            assert_eq!(writer.calls, 1);
+        }
+        struct ShortWriter {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let n = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        #[test]
+        fn short_and_interrupted_writes_preserve_exact_content() {
+            let c = context(CancellationToken::default());
+            let mut writer = ShortWriter {
+                calls: 0,
+                bytes: Vec::new(),
+            };
+            write_contents(&mut writer, b"exact bytes", &c).unwrap();
+            assert_eq!(writer.bytes, b"exact bytes");
+        }
+
+        struct TempDirectory(std::path::PathBuf);
+        impl TempDirectory {
+            fn new() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                loop {
+                    let path = std::env::temp_dir().join(format!(
+                        "alloy-w4-write-unit-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    ));
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => return Self(path),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => panic!("fixture: {error}"),
+                    }
+                }
+            }
+        }
+        impl Drop for TempDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        #[test]
+        fn publication_does_not_replace_destination_created_after_staging() {
+            let dir = TempDirectory::new();
+            let c = context(CancellationToken::default());
+            let mut stage = StagedWrite::new(File::open(&dir.0).unwrap(), &c).unwrap();
+            io::Write::write_all(&mut stage.file, b"staged").unwrap();
+            std::fs::write(dir.0.join("target"), b"late destination").unwrap();
+            let mut publication = WritePublication::NotPublished;
+            assert!(stage.publish("target", &c, &mut publication).is_err());
+            assert_eq!(publication, WritePublication::NotPublished);
+            assert_eq!(
+                std::fs::read(dir.0.join("target")).unwrap(),
+                b"late destination"
+            );
+            stage.cleanup().unwrap();
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        }
+        #[test]
+        fn cancellation_before_publication_allows_staging_cleanup() {
+            let dir = TempDirectory::new();
+            let token = CancellationToken::default();
+            let c = context(token.clone());
+            let mut stage = StagedWrite::new(File::open(&dir.0).unwrap(), &c).unwrap();
+            io::Write::write_all(&mut stage.file, b"partial staging").unwrap();
+            token.cancel();
+            let mut publication = WritePublication::NotPublished;
+            assert!(stage.publish("target", &c, &mut publication).is_err());
+            assert_eq!(publication, WritePublication::NotPublished);
+            stage.cleanup().unwrap();
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+        }
+    }
+}
+
+/// Linux/macOS scoped create-only write primitives; no live dispatch enabled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use scoped_write::{WriteFailure, WritePublication, WriteReport, WriteRequest, WriteScope};
