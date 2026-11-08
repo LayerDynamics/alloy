@@ -8,9 +8,9 @@
     "W1",
     "W3"
   ],
-  "status": "not_started",
+  "status": "in_progress",
   "supersedes": "Earlier 16-stage / 125-task W4 tracker; replaced by this issue-scoped plan. Task IDs are intentionally reset.",
-  "candidate_sha": null,
+  "candidate_sha": "877b448398a9e405feb6c4e9f6e9c875cbb6be82",
   "pr_url": null,
   "statuses": [
     "not_started",
@@ -90,9 +90,11 @@
     {
       "id": "W4-01",
       "title": "Shared execution contract",
-      "status": "not_started",
-      "commit": null,
-      "evidence": [],
+      "status": "in_progress",
+      "commit": "030561bb18030d2a7bfdcff1b622f29b1f221369",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/030561bb18030d2a7bfdcff1b622f29b1f221369"
+      ],
       "tasks": [
         {
           "id": "W4-01.01",
@@ -102,7 +104,7 @@
         {
           "id": "W4-01.02",
           "description": "Extend execution context with cancellation, deadline and byte limits; preserve the existing result/error contracts.",
-          "done": false
+          "done": true
         },
         {
           "id": "W4-01.03",
@@ -114,9 +116,11 @@
     {
       "id": "W4-02",
       "title": "fs.read",
-      "status": "not_started",
-      "commit": null,
-      "evidence": [],
+      "status": "in_progress",
+      "commit": "20bfced20cac167d9021db25e96a36544e2eca36",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/20bfced20cac167d9021db25e96a36544e2eca36"
+      ],
       "tasks": [
         {
           "id": "W4-02.01",
@@ -133,9 +137,11 @@
     {
       "id": "W4-03",
       "title": "fs.list",
-      "status": "not_started",
-      "commit": null,
-      "evidence": [],
+      "status": "in_progress",
+      "commit": "d42e988265feda5781d8da460736600865488474",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/d42e988265feda5781d8da460736600865488474"
+      ],
       "tasks": [
         {
           "id": "W4-03.01",
@@ -145,16 +151,18 @@
         {
           "id": "W4-03.02",
           "description": "Return deterministic results with bounded entry count, output and execution time.",
-          "done": false
+          "done": true
         }
       ]
     },
     {
       "id": "W4-04",
       "title": "fs.write",
-      "status": "not_started",
-      "commit": null,
-      "evidence": [],
+      "status": "in_progress",
+      "commit": "7b9300de60c7c7a2b9831741af2f6b2169168fe3",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/7b9300de60c7c7a2b9831741af2f6b2169168fe3"
+      ],
       "tasks": [
         {
           "id": "W4-04.01",
@@ -164,16 +172,18 @@
         {
           "id": "W4-04.02",
           "description": "Enforce limits and cancellation; clean owned incomplete writes and report any effect honestly.",
-          "done": false
+          "done": true
         }
       ]
     },
     {
       "id": "W4-05",
       "title": "shell.run",
-      "status": "not_started",
-      "commit": null,
-      "evidence": [],
+      "status": "in_progress",
+      "commit": "877b448398a9e405feb6c4e9f6e9c875cbb6be82",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/877b448398a9e405feb6c4e9f6e9c875cbb6be82"
+      ],
       "tasks": [
         {
           "id": "W4-05.01",
@@ -219,7 +229,7 @@
     {
       "id": "W4-07",
       "title": "Cancellation and resource cleanup",
-      "status": "not_started",
+      "status": "in_progress",
       "commit": null,
       "evidence": [],
       "tasks": [
@@ -243,7 +253,7 @@
     {
       "id": "W4-08",
       "title": "Acceptance and closeout",
-      "status": "not_started",
+      "status": "in_progress",
       "commit": null,
       "evidence": [],
       "tasks": [
