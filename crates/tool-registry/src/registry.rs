@@ -34,6 +34,103 @@ pub trait ToolImplementation: Send + Sync {
     /// Implementations must preserve the originating call identity in the
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
+
+    /// Execute HTTP through an explicit scoped backend after durable start.
+    /// Unsupported registrations fail closed without fallback or network work.
+    fn execute_http_fetch(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::http::HttpReport, crate::builtins::http::HttpFailure> {
+        output.abort();
+        Err(crate::builtins::http::HttpFailure {
+            cause: crate::builtins::http::HttpError::Policy("scoped HTTP backend required"),
+            requests_attempted: 0,
+        })
+    }
+
+    /// Run the approved shell invocation after a durable start, preserving spawn
+    /// and cleanup status. Unsupported backends never fall back to other methods.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_shell_run(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::shell::ShellReport, crate::builtins::shell::ShellFailure> {
+        output.abort();
+        Err(crate::builtins::shell::ShellFailure {
+            started: false,
+            pid: None,
+            cause: crate::builtins::shell::ShellError::Policy("scoped shell backend required"),
+            cleanup_errors: Vec::new(),
+        })
+    }
+
+    /// Execute scoped fs.write after durable-start authorization, retaining typed
+    /// publication status. Unsupported backends fail closed without fallback.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_file_write(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::WriteReport, crate::builtins::fs::WriteFailure> {
+        output.abort();
+        Err(crate::builtins::fs::WriteFailure {
+            publication: crate::builtins::fs::WritePublication::NotPublished,
+            cause: crate::builtins::fs::ReadError::Policy("scoped file-write backend required"),
+            cleanup_error: None,
+        })
+    }
+
+    /// Stream canonical fs.list JSON after independent durable-start authorization.
+    /// Unsupported backends fail closed without invoking any other entrypoint.
+    #[cfg(unix)]
+    fn execute_file_list(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::ListReport, crate::builtins::fs::ReadError> {
+        output.abort();
+        Err(crate::builtins::fs::ReadError::Policy(
+            "raw file-list backend required",
+        ))
+    }
+
+    /// Stream raw fs.read bytes after durable-start authorization. Other backends
+    /// fail closed; this does not fall back to legacy or inline execution.
+    #[cfg(unix)]
+    fn execute_file_read(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::ReadReport, crate::builtins::fs::ReadError> {
+        output.abort();
+        Err(crate::builtins::fs::ReadError::Policy(
+            "raw file-read backend required",
+        ))
+    }
+
+    /// W4 context-aware boundary. Legacy implementations fail closed here rather
+    /// than silently ignoring deadlines/cancellation/output bounds. A future
+    /// harness dispatch bridge must require a valid durable start receipt before
+    /// calling this; this method itself is not authorization.
+    fn execute_with_context(
+        &self,
+        invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        _output: &mut dyn crate::execution::OutputSink,
+    ) -> ToolResult {
+        ToolResult::Inline(crate::result::InlineToolResult {
+            call_id: invocation.call.call_id.clone(),
+            content: serde_json::json!({"kind":"execution","message":"Context-aware execution is not implemented","details":{"reason":"execution_context_required"}}),
+            is_error: true,
+        })
+    }
 }
 
 struct RegisteredTool {

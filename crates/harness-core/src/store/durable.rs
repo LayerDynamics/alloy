@@ -47,8 +47,14 @@ impl AuthorizedInvocation {
 #[derive(Debug)]
 pub struct StartedInvocation {
     binding: InvocationBinding,
+    execution_started_at: Instant,
 }
 impl StartedInvocation {
+    /// Process-local start observation; dispatch must not renew this deadline anchor.
+    pub fn execution_started_at(&self) -> Instant {
+        self.execution_started_at
+    }
+
     /// Exact invocation whose tool.started transaction committed.
     pub fn binding(&self) -> &InvocationBinding {
         &self.binding
@@ -244,6 +250,32 @@ fn committed_artifact_for_completion(
 }
 
 impl SessionStore {
+    /// Check an existing start receipt in a short read before detached W4
+    /// execution. This does not create, renew or replay execution authority.
+    pub(crate) fn verify_started_execution(
+        &self,
+        receipt: &StartedInvocation,
+    ) -> HarnessResult<()> {
+        let b = receipt.binding();
+        let (session, call) = key(b);
+        let row: Option<(String, String, String, String)> = self.conn.query_row(
+            "SELECT t.state,t.daemon_epoch,t.binding_digest,s.status FROM tool_intents t JOIN sessions s ON s.session_id=t.session_id WHERE t.session_id=?1 AND t.call_id=?2",
+            params![session, call], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional()?;
+        let row = row.ok_or_else(|| invalid("unknown started receipt"))?;
+        if row.0 != "Started"
+            || row.1 != self.epoch
+            || row.2 != b.digest()
+            || row.3 != "active"
+            || field(b, "daemon_epoch")? != self.epoch
+        {
+            return Err(invalid(
+                "started receipt state, session, epoch or binding mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Current exclusively-owned daemon epoch. Not a client-controlled identity.
     pub fn daemon_epoch(&self) -> &str {
         &self.epoch
@@ -460,6 +492,7 @@ impl SessionStore {
             self.claim_deadlines.remove(&(session, call));
             return Err(invalid("final authorization failed"));
         }
+        let execution_started_at = Instant::now();
         tx.execute(
             "UPDATE tool_intents SET state='Started' WHERE session_id=?1 AND call_id=?2",
             params![session, call],
@@ -479,6 +512,7 @@ impl SessionStore {
         self.claim_deadlines.remove(&(session, call));
         Ok(StartedInvocation {
             binding: handle.binding,
+            execution_started_at,
         })
     }
 

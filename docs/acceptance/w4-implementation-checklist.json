@@ -1,0 +1,297 @@
+{
+  "version": 3,
+  "title": "Phase 2 W4 — builtin tools and cancellation",
+  "issue": 31,
+  "issue_url": "https://github.com/LayerDynamics/alloy/issues/31",
+  "repository": "LayerDynamics/alloy",
+  "dependencies": [
+    "W1",
+    "W3"
+  ],
+  "status": "in_progress",
+  "supersedes": "Earlier 16-stage / 125-task W4 tracker; replaced by this issue-scoped plan. Task IDs are intentionally reset.",
+  "candidate_sha": null,
+  "pr_url": null,
+  "statuses": [
+    "not_started",
+    "in_progress",
+    "implemented",
+    "validated"
+  ],
+  "production_files": [
+    "crates/tool-registry/src/execution.rs",
+    "crates/tool-registry/src/builtins/mod.rs",
+    "crates/tool-registry/src/builtins/fs.rs",
+    "crates/tool-registry/src/builtins/shell.rs",
+    "crates/tool-registry/src/builtins/http.rs"
+  ],
+  "builtin_defaults": [
+    {
+      "id": "fs.read",
+      "effect": "read",
+      "approval": "never"
+    },
+    {
+      "id": "fs.list",
+      "effect": "read",
+      "approval": "never"
+    },
+    {
+      "id": "fs.write",
+      "effect": "write",
+      "approval": "policy"
+    },
+    {
+      "id": "shell.run",
+      "effect": "destructive",
+      "approval": "always"
+    },
+    {
+      "id": "http.fetch",
+      "effect": "read",
+      "approval": "policy"
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "P2-07",
+      "test": "builtin_scope_and_output_limits",
+      "file": "crates/tool-registry/tests/builtins.rs",
+      "linux": {
+        "status": "not_run",
+        "evidence": null
+      },
+      "macos": {
+        "status": "not_run",
+        "evidence": null
+      }
+    },
+    {
+      "id": "P2-09",
+      "test": "tool_cancel_releases_owned_resources",
+      "file": "crates/harness-core/tests/tool_cancellation.rs",
+      "linux": {
+        "status": "not_run",
+        "evidence": null
+      },
+      "macos": {
+        "status": "not_run",
+        "evidence": null
+      }
+    }
+  ],
+  "out_of_scope": [
+    "Reimplementing W1/W3",
+    "Plugin hosting (W5)",
+    "Live approval RPC/CLI and canonical model/tool loop (W6)",
+    "MCP, skills and overall Phase 2 acceptance"
+  ],
+  "steps": [
+    {
+      "id": "W4-01",
+      "title": "Shared execution contract",
+      "status": "implemented",
+      "commit": "576309d6514c7edf6a575c02f8468b8939b9abb4",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/576309d6514c7edf6a575c02f8468b8939b9abb4"
+      ],
+      "tasks": [
+        {
+          "id": "W4-01.01",
+          "description": "Reuse W1 registry and W3 authorization; execute only the unchanged authorized invocation.",
+          "done": true
+        },
+        {
+          "id": "W4-01.02",
+          "description": "Extend execution context with cancellation, deadline and byte limits; preserve the existing result/error contracts.",
+          "done": true
+        },
+        {
+          "id": "W4-01.03",
+          "description": "Register the five builtins with the exact defaults listed below.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-02",
+      "title": "fs.read",
+      "status": "implemented",
+      "commit": "c34d97e032e911e13275f90a1a99848f245e2e72",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/c34d97e032e911e13275f90a1a99848f245e2e72"
+      ],
+      "tasks": [
+        {
+          "id": "W4-02.01",
+          "description": "Implement policy-scoped file/range reads with path and symlink checks.",
+          "done": true
+        },
+        {
+          "id": "W4-02.02",
+          "description": "Enforce deadline and output-byte limits; return the existing inline/artifact result form.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-03",
+      "title": "fs.list",
+      "status": "implemented",
+      "commit": "411f08928b51288b1d88ae602b70bc25189512cb",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/411f08928b51288b1d88ae602b70bc25189512cb"
+      ],
+      "tasks": [
+        {
+          "id": "W4-03.01",
+          "description": "Implement policy-scoped directory listing with path/symlink checks.",
+          "done": true
+        },
+        {
+          "id": "W4-03.02",
+          "description": "Return deterministic results with bounded entry count, output and execution time.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-04",
+      "title": "fs.write",
+      "status": "implemented",
+      "commit": "20cd26c82929fdcc1de6c4d68a8d451814797287",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/20cd26c82929fdcc1de6c4d68a8d451814797287"
+      ],
+      "tasks": [
+        {
+          "id": "W4-04.01",
+          "description": "Validate the approved destination and contents; prevent path/symlink scope escape.",
+          "done": true
+        },
+        {
+          "id": "W4-04.02",
+          "description": "Enforce limits and cancellation; clean owned incomplete writes and report any effect honestly.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-05",
+      "title": "shell.run",
+      "status": "implemented",
+      "commit": "a7a4361843c7efeeddd22b8208df0006ff6a5e01",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/a7a4361843c7efeeddd22b8208df0006ff6a5e01"
+      ],
+      "tasks": [
+        {
+          "id": "W4-05.01",
+          "description": "Spawn the exact executable, argument array and working directory after authorization; no implicit shell interpolation.",
+          "done": true
+        },
+        {
+          "id": "W4-05.02",
+          "description": "Bound stdout/stderr collection and enforce the approved deadline.",
+          "done": true
+        },
+        {
+          "id": "W4-05.03",
+          "description": "On cancellation or timeout, terminate and reap owned processes without affecting unrelated work.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-06",
+      "title": "http.fetch",
+      "status": "implemented",
+      "commit": "0e455efbe800599d85477cee352985cb9d057bd8",
+      "evidence": [
+        "https://github.com/LayerDynamics/alloy/commit/0e455efbe800599d85477cee352985cb9d057bd8"
+      ],
+      "tasks": [
+        {
+          "id": "W4-06.01",
+          "description": "Implement bounded GET/HEAD requests to policy-approved destinations.",
+          "done": true
+        },
+        {
+          "id": "W4-06.02",
+          "description": "Check every redirect before following; reject destination-scope escapes.",
+          "done": true
+        },
+        {
+          "id": "W4-06.03",
+          "description": "Enforce response-byte limits, deadlines and cancellation; close owned network resources.",
+          "done": true
+        }
+      ]
+    },
+    {
+      "id": "W4-07",
+      "title": "Cancellation and resource cleanup",
+      "status": "in_progress",
+      "commit": null,
+      "evidence": [
+        "docs/acceptance/w4-exit-review.md"
+      ],
+      "tasks": [
+        {
+          "id": "W4-07.01",
+          "description": "Apply operation-specific cancellation across filesystem, process and HTTP work.",
+          "done": false
+        },
+        {
+          "id": "W4-07.02",
+          "description": "Release owned handles, processes and output resources on completion, failure, timeout and cancellation.",
+          "done": false
+        },
+        {
+          "id": "W4-07.03",
+          "description": "Test session isolation and avoid holding store/session/native inference locks across tool execution.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "id": "W4-08",
+      "title": "Acceptance and closeout",
+      "status": "in_progress",
+      "commit": null,
+      "evidence": [
+        "docs/acceptance/w4-exit-review.md"
+      ],
+      "tasks": [
+        {
+          "id": "W4-08.01",
+          "description": "Implement and run P2-07 builtin_scope_and_output_limits, proving allowed operations and scope/limit rejection.",
+          "done": false
+        },
+        {
+          "id": "W4-08.02",
+          "description": "Implement and run P2-09 tool_cancel_releases_owned_resources, proving owned cleanup and isolation; record any remaining cross-package integration coverage explicitly.",
+          "done": false
+        },
+        {
+          "id": "W4-08.03",
+          "description": "Run both named gates on Linux and macOS; record the candidate SHA and result links.",
+          "done": false
+        },
+        {
+          "id": "W4-08.04",
+          "description": "Run affected existing tests, formatting, Clippy and documentation checks; fix failures.",
+          "done": false
+        },
+        {
+          "id": "W4-08.05",
+          "description": "Review the change, link the PR to #31, and update this tracker from recorded results.",
+          "done": false
+        }
+      ]
+    }
+  ],
+  "implementation_baseline_sha": "f3988af56ab51d4df6622b20c1826f5a10188a99",
+  "acceptance_review": "docs/acceptance/w4-exit-review.md",
+  "evidence_scope": "W4 builtin-only P2-09; W5/W6 generation/approval/hook pause integration remains pending"
+}

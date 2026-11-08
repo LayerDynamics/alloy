@@ -62,3 +62,77 @@ qwen3/tool-policy suites, existing final policy/registration-change tests and
 workspace/doc regressions. Preserve finite SQL/process-exit fault and trusted
 local storage assumptions. No new dependency, wire enum or authorization handle.
 Passing a host run does not establish Linux/macOS acceptance or W3 sign-off.
+
+
+## W4-01.01 adapter placement refinement
+
+The receipt-consuming dispatcher lives in harness-core/src/tool_execution.rs,
+not in tool-registry. ReceiptExecutor registers the same implementation Arc in
+W1 and a private harness dispatch index. The registry is exposed read-only; no
+raw executable handle or client approval flag is introduced. This preserves the
+existing dependency direction and does not reimplement W3 admission/approval.
+
+StartedInvocation retains a process-local monotonic observation immediately
+before the successful start transaction's state update/commit. This private
+observation is not serialized or added to the frozen binding; it conservatively
+charges transaction/handoff delay against the approved execution timeout.
+ExecutionContext::from_start prevents renewing that deadline at dispatch.
+
+Preparation checks the current Started row/session/epoch/binding and current
+registered definition, consumes the receipt, and retains the existing exclusive
+store ownership lease. Detached run owns no SessionStore borrow or SQLite
+transaction. Completion consumes the original receipt through complete_tool;
+failed completion does not regrant execution. A dropped/inconsistent job remains
+unresolved and recovers conservatively. No other caller lock is proven released
+by these signatures; W6 must still validate its enclosing lock/configuration
+publication discipline.
+
+This generic registry/receipt bridge does not complete builtin registrations,
+resource-scope adapters, streaming artifact finalization, W5 hooks, W6 dispatch,
+or P2-07/P2-09 acceptance. Their existing W4 tasks remain open. Inline/artifact
+wire shapes and W3 provenance checks are unchanged.
+
+
+## W4-01.03 complete-catalogue registration entrypoint
+
+ReceiptExecutor::with_builtins uses the existing tool-registry builtin definition
+factory and registers each definition with its corresponding daemon-supplied
+implementation through the same W1/private-index registration path. The required
+BuiltinImplementations bundle has five nonoptional fields and no Default or
+placeholder implementation. Initialization returns the entire fresh executor or
+an error; it does not partially mutate a live catalogue or execute a tool.
+Effect/approval defaults and schema identities are not duplicated or lowered by
+this constructor. Limits remain explicit trusted inputs, tightened later by W3.
+
+The registration tests supply explicitly identified counter backends and run W3
+admission/approval/start/receipt dispatch for all five entries. They establish
+registration/default/selection and authorization-boundary behavior, not actual
+filesystem/process/network resource enforcement or P2-07/P2-09 acceptance.
+Operational setup must supply all five configured concrete adapters. Missing
+HTTP implementation cannot be hidden by a successful four-entry catalogue or
+an automatically substituted not-implemented handler. Per-builtin resource and
+canonical output adapters remain the subsequent W4 tasks; W6 admission is not
+activated by this constructor.
+
+
+## W4-02.01 concrete scoped file-read adapter
+
+FileReadTool in tool-registry/src/builtins/fs.rs owns the pinned ReadScope and a
+positive daemon-configured inline ceiling. Requests cannot choose the root or
+raise that ceiling. Context-aware execution parses the unchanged validated
+path/offset/length and delegates to the existing no-follow scoped range reader.
+Its legacy entrypoint fails closed; production callers use receipt-owned dispatch.
+
+This candidate supports complete bounded UTF-8 inline ToolResult content and
+mirrors that exact serialized content to the supplied bounded sink. Explicit
+scope-operation and incomplete-output diagnostics distinguish rejection from
+attempted I/O. Missing/oversized/binary output never becomes truncated or lossy
+success. Large or non-UTF-8 ranges return artifact_output_required until the
+separate W4-02.02 streaming artifact adapter is implemented. No artifact reference
+is fabricated, and W4-02.02/full W4 acceptance remain open.
+
+The new tests register the real file adapter (with a test-only invocation counter)
+and exercise W3 admission/start/dispatch/completion against real local files.
+They retain existing scope and trusted-filesystem assumptions. Configured adapter
+identity remains part of trusted daemon setup; W6 must coordinate authoritative
+configuration publication and cancellation without retaining execution locks.
