@@ -20,6 +20,10 @@ pub mod file_list;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod file_write;
 
+/// Receipt-owned destructive shell execution and bounded result persistence.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod shell_run;
+
 use serde::Serialize;
 use std::{
     collections::BTreeMap,

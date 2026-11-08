@@ -732,3 +732,72 @@ mod group_teardown_tests {
         assert!(!child.active);
     }
 }
+
+/// Concrete shell.run backend bound to trusted executable/cwd configuration.
+/// Configuration is not approval or a sandbox. Only the receipt-owned harness
+/// path supports execution; legacy/generic entrypoints fail closed.
+pub struct ShellRunTool {
+    scope: ShellScope,
+}
+impl ShellRunTool {
+    /// Bind a separately configured executable/cwd/input-size scope.
+    pub fn new(scope: ShellScope) -> Self {
+        Self { scope }
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellArguments {
+    executable: String,
+    args: Vec<String>,
+    cwd: String,
+}
+impl crate::registry::ToolImplementation for ShellRunTool {
+    fn execute(&self, invocation: &crate::call::ToolInvocation) -> crate::result::ToolResult {
+        crate::result::ToolResult::Inline(crate::result::InlineToolResult {
+            call_id: invocation.call.call_id.clone(),
+            is_error: true,
+            content: serde_json::json!({"kind":"policy","message":"Receipt-owned shell execution required",
+                "details":{"reason":"shell_receipt_required","started":false,"pid":null}}),
+        })
+    }
+    fn execute_with_context(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        _context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> crate::result::ToolResult {
+        output.abort();
+        self.execute(invocation)
+    }
+    fn execute_shell_run(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<ShellReport, ShellFailure> {
+        let request = (|| {
+            context.check()?;
+            if invocation.call.tool_id != "shell.run" {
+                return Err(ShellError::Policy("shell.run identity required"));
+            }
+            let args: ShellArguments = serde_json::from_value(serde_json::Value::Object(
+                invocation.call.arguments.clone(),
+            ))
+            .map_err(|_| ShellError::Policy("invalid shell arguments"))?;
+            ShellRequest::new(&args.executable, args.args, &args.cwd)
+        })();
+        match request {
+            Ok(request) => self.scope.run(&request, context, output),
+            Err(cause) => {
+                output.abort();
+                Err(ShellFailure {
+                    started: false,
+                    pid: None,
+                    cause,
+                    cleanup_errors: Vec::new(),
+                })
+            }
+        }
+    }
+}

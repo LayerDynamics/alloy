@@ -35,6 +35,24 @@ pub trait ToolImplementation: Send + Sync {
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
 
+    /// Run the approved shell invocation after a durable start, preserving spawn
+    /// and cleanup status. Unsupported backends never fall back to other methods.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_shell_run(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::shell::ShellReport, crate::builtins::shell::ShellFailure> {
+        output.abort();
+        Err(crate::builtins::shell::ShellFailure {
+            started: false,
+            pid: None,
+            cause: crate::builtins::shell::ShellError::Policy("scoped shell backend required"),
+            cleanup_errors: Vec::new(),
+        })
+    }
+
     /// Execute scoped fs.write after durable-start authorization, retaining typed
     /// publication status. Unsupported backends fail closed without fallback.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
