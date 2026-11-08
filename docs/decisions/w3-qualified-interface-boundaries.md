@@ -113,3 +113,26 @@ HTTP implementation cannot be hidden by a successful four-entry catalogue or
 an automatically substituted not-implemented handler. Per-builtin resource and
 canonical output adapters remain the subsequent W4 tasks; W6 admission is not
 activated by this constructor.
+
+
+## W4-02.01 concrete scoped file-read adapter
+
+FileReadTool in tool-registry/src/builtins/fs.rs owns the pinned ReadScope and a
+positive daemon-configured inline ceiling. Requests cannot choose the root or
+raise that ceiling. Context-aware execution parses the unchanged validated
+path/offset/length and delegates to the existing no-follow scoped range reader.
+Its legacy entrypoint fails closed; production callers use receipt-owned dispatch.
+
+This candidate supports complete bounded UTF-8 inline ToolResult content and
+mirrors that exact serialized content to the supplied bounded sink. Explicit
+scope-operation and incomplete-output diagnostics distinguish rejection from
+attempted I/O. Missing/oversized/binary output never becomes truncated or lossy
+success. Large or non-UTF-8 ranges return artifact_output_required until the
+separate W4-02.02 streaming artifact adapter is implemented. No artifact reference
+is fabricated, and W4-02.02/full W4 acceptance remain open.
+
+The new tests register the real file adapter (with a test-only invocation counter)
+and exercise W3 admission/start/dispatch/completion against real local files.
+They retain existing scope and trusted-filesystem assumptions. Configured adapter
+identity remains part of trusted daemon setup; W6 must coordinate authoritative
+configuration publication and cancellation without retaining execution locks.

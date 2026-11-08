@@ -839,3 +839,212 @@ mod scoped_write {
 /// Linux/macOS scoped create-only write primitives; no live dispatch enabled.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use scoped_write::{WriteFailure, WritePublication, WriteReport, WriteRequest, WriteScope};
+
+/// Concrete fs.read implementation bound to a daemon-configured pinned scope.
+/// This object is not authorization: register it through the receipt executor.
+/// Its legacy entrypoint fails closed. This W4-02.01 candidate supports complete
+/// bounded UTF-8 inline results only; large/binary output requires the pending
+/// W4-02.02 artifact adapter and is explicitly rejected rather than truncated.
+pub struct FileReadTool {
+    scope: ReadScope,
+    max_inline_bytes: usize,
+}
+impl FileReadTool {
+    /// Configure a scope and positive serialized-inline ceiling at trusted setup.
+    /// The request cannot supply or replace either value. No default is invented.
+    pub fn new(scope: ReadScope, max_inline_bytes: usize) -> Result<Self, ReadError> {
+        if max_inline_bytes == 0 {
+            return Err(ExecutionError::InvalidLimits.into());
+        }
+        Ok(Self {
+            scope,
+            max_inline_bytes,
+        })
+    }
+    fn read_content(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<serde_json::Value, ReadAdapterFailure> {
+        context
+            .check()
+            .map_err(|e| read_adapter_execution(e, false))?;
+        if invocation.call.tool_id != "fs.read" {
+            return Err(ReadAdapterFailure {
+                kind: crate::result::ToolErrorKind::Protocol,
+                reason: "tool_id_mismatch",
+                attempted: false,
+            });
+        }
+        let args: FileReadArguments =
+            serde_json::from_value(serde_json::Value::Object(invocation.call.arguments.clone()))
+                .map_err(|_| ReadAdapterFailure {
+                    kind: crate::result::ToolErrorKind::Protocol,
+                    reason: "invalid_read_arguments",
+                    attempted: false,
+                })?;
+        let request = ReadRequest::new(&args.path, args.offset, args.length)
+            .map_err(|e| read_adapter_failure(e, false))?;
+        let maximum = context.max_output_bytes().min(self.max_inline_bytes as u64);
+        if request.length > maximum {
+            return Err(ReadAdapterFailure {
+                kind: crate::result::ToolErrorKind::Execution,
+                reason: "artifact_output_required",
+                attempted: false,
+            });
+        }
+        let mut buffer = crate::execution::BoundedOutput::new(context, maximum as usize)
+            .map_err(|e| read_adapter_execution(e, false))?;
+        let report = self
+            .scope
+            .read_into(&request, context, &mut buffer)
+            .map_err(|e| read_adapter_failure(e, true))?;
+        let bytes = buffer
+            .finish()
+            .map_err(|e| read_adapter_execution(e, true))?;
+        let text = String::from_utf8(bytes).map_err(|_| ReadAdapterFailure {
+            kind: crate::result::ToolErrorKind::Execution,
+            reason: "artifact_output_required",
+            attempted: true,
+        })?;
+        context
+            .check()
+            .map_err(|e| read_adapter_execution(e, true))?;
+        let content = serde_json::json!({"text": text, "bytes_read": report.bytes_read,
+            "offset": request.offset});
+        let mut writer = InlineReadOutput {
+            output,
+            context,
+            maximum,
+            accepted: 0,
+            failure: None,
+        };
+        if serde_json::to_writer(&mut writer, &content).is_err() {
+            return Err(read_adapter_execution(
+                writer.failure.unwrap_or(ExecutionError::IncompleteOutput),
+                true,
+            ));
+        }
+        context
+            .check()
+            .map_err(|e| read_adapter_execution(e, true))?;
+        Ok(content)
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileReadArguments {
+    path: String,
+    offset: u64,
+    length: u64,
+}
+struct ReadAdapterFailure {
+    kind: crate::result::ToolErrorKind,
+    reason: &'static str,
+    attempted: bool,
+}
+fn read_adapter_execution(error: ExecutionError, attempted: bool) -> ReadAdapterFailure {
+    use crate::result::ToolErrorKind;
+    let (kind, reason) = match error {
+        ExecutionError::Cancelled => (ToolErrorKind::Execution, "cancelled"),
+        ExecutionError::DeadlineExceeded => (ToolErrorKind::Timeout, "deadline_exceeded"),
+        ExecutionError::OutputLimit => (ToolErrorKind::Execution, "output_limit"),
+        ExecutionError::InvalidLimits => (ToolErrorKind::Execution, "invalid_execution_limits"),
+        ExecutionError::AllocationFailed => (ToolErrorKind::Execution, "allocation_failed"),
+        ExecutionError::IncompleteOutput => (ToolErrorKind::Execution, "incomplete_output"),
+    };
+    ReadAdapterFailure {
+        kind,
+        reason,
+        attempted,
+    }
+}
+fn read_adapter_failure(error: ReadError, attempted: bool) -> ReadAdapterFailure {
+    match error {
+        ReadError::Execution(error) => read_adapter_execution(error, attempted),
+        ReadError::Policy(_) => ReadAdapterFailure {
+            kind: crate::result::ToolErrorKind::Policy,
+            reason: "read_scope_or_range_rejected",
+            attempted,
+        },
+        ReadError::Io(_) => ReadAdapterFailure {
+            kind: crate::result::ToolErrorKind::Execution,
+            reason: "file_read_failed",
+            attempted,
+        },
+    }
+}
+fn read_adapter_error(call: &str, failure: ReadAdapterFailure) -> crate::result::ToolResult {
+    crate::result::ToolResult::Inline(crate::result::InlineToolResult {
+        call_id: call.into(),
+        is_error: true,
+        content: serde_json::json!({"kind":failure.kind,"message":"Scoped file read did not produce a complete inline result",
+            "details":{"reason":failure.reason,"scope_operation_attempted":failure.attempted,"output_complete":false}}),
+    })
+}
+impl crate::registry::ToolImplementation for FileReadTool {
+    fn execute(&self, invocation: &crate::call::ToolInvocation) -> crate::result::ToolResult {
+        read_adapter_error(
+            &invocation.call.call_id,
+            ReadAdapterFailure {
+                kind: crate::result::ToolErrorKind::Policy,
+                reason: "durable_context_required",
+                attempted: false,
+            },
+        )
+    }
+    fn execute_with_context(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> crate::result::ToolResult {
+        match self.read_content(invocation, context, output) {
+            Ok(content) => crate::result::ToolResult::Inline(crate::result::InlineToolResult {
+                call_id: invocation.call.call_id.clone(),
+                content,
+                is_error: false,
+            }),
+            Err(failure) => {
+                output.abort();
+                read_adapter_error(&invocation.call.call_id, failure)
+            }
+        }
+    }
+}
+struct InlineReadOutput<'a> {
+    output: &'a mut dyn OutputSink,
+    context: &'a ExecutionContext,
+    maximum: u64,
+    accepted: u64,
+    failure: Option<ExecutionError>,
+}
+impl InlineReadOutput<'_> {
+    fn fail(&mut self, error: ExecutionError) -> io::Error {
+        self.failure = Some(error);
+        self.output.abort();
+        io::Error::other("inline read output failed")
+    }
+}
+impl io::Write for InlineReadOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(error) = self.failure {
+            return Err(self.fail(error));
+        }
+        if let Err(error) = self.context.check() {
+            return Err(self.fail(error));
+        }
+        if bytes.len() as u64 > self.maximum.saturating_sub(self.accepted) {
+            return Err(self.fail(ExecutionError::OutputLimit));
+        }
+        if let Err(error) = self.output.write_chunk(bytes) {
+            return Err(self.fail(error));
+        }
+        self.accepted += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
