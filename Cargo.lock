@@ -1667,6 +1667,8 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "ureq",
+ "url",
 ]
 
 [[package]]

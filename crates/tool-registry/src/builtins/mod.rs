@@ -9,6 +9,9 @@ pub mod fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod shell;
 
+/// Scoped GET/HEAD primitives and receipt-only backend.
+pub mod http;
+
 use crate::{
     definition::{ApprovalRequirement, ToolDefinition, ToolEffect, ToolOrigin, ToolPolicy},
     error::ValidationError,

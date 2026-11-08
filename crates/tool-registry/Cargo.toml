@@ -13,6 +13,8 @@ jsonschema = { version = "=0.33.0", default-features = false }
 semver = "=1.0.27"
 serde = { workspace = true }
 serde_json = { workspace = true }
+ureq = { workspace = true }
+url = "=2.5.8"
 
 [lints]
 workspace = true

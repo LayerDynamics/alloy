@@ -24,6 +24,9 @@ pub mod file_write;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod shell_run;
 
+/// Receipt-owned policy-governed HTTP requests and bounded results.
+pub mod http_fetch;
+
 use serde::Serialize;
 use std::{
     collections::BTreeMap,

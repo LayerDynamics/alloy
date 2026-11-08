@@ -35,6 +35,21 @@ pub trait ToolImplementation: Send + Sync {
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
 
+    /// Execute HTTP through an explicit scoped backend after durable start.
+    /// Unsupported registrations fail closed without fallback or network work.
+    fn execute_http_fetch(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::http::HttpReport, crate::builtins::http::HttpFailure> {
+        output.abort();
+        Err(crate::builtins::http::HttpFailure {
+            cause: crate::builtins::http::HttpError::Policy("scoped HTTP backend required"),
+            requests_attempted: 0,
+        })
+    }
+
     /// Run the approved shell invocation after a durable start, preserving spawn
     /// and cleanup status. Unsupported backends never fall back to other methods.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
