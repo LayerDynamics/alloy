@@ -219,9 +219,9 @@ impl ApprovalState {
     }
     /// Check only graph legality; no preconditions or external effects are evaluated.
     ///
-    /// A later durable coordinator must validate exact identity, expiry, epoch,
+    /// The durable coordinator validates exact identity, expiry, epoch,
     /// policy/registration revisions, cancellation, ownership and hook outcome,
-    /// then atomically persist state and event. This return value is not a grant.
+    /// and atomically persists state and event. This return value is not a grant.
     pub fn transition(self, event: Transition) -> Result<Self, InvalidTransition> {
         use ApprovalState::*;
         use Transition::*;
@@ -365,7 +365,7 @@ impl From<serde_json::Error> for BindingError {
 ///
 /// Construction is crate-private and requires a registry-resolved invocation.
 /// No executable implementation is retained. No Clone, Deserialize, or unchecked
-/// public constructor is provided. The later durable coordinator must enforce
+/// public constructor is provided. The durable coordinator enforces
 /// uniqueness, monotonic deadlines, revision/epoch checks and single-use claims.
 #[derive(Debug)]
 pub struct InvocationBinding {

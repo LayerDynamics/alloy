@@ -1,10 +1,13 @@
-Here is the **W3** implementation checklist, based on the freeze now present on `feat/30-policy-approvals-artifacts`. Only the contract document is marked complete; implementation and test results remain unchecked until verified. [github_mcp_direct:get_file_contents]
+# W3 implementation and acceptance checklist
 
-Suggested repository location:
+Status: implementation review and evidence tracking; not a W3 acceptance decision.
 
-```text
-docs/acceptance/w3-implementation-checklist.md
-```
+A checked source-review item identifies inspected implementation/documentation,
+not an automatically passing test or downstream integration. Test execution and
+platform acceptance require their own candidate-specific evidence. Unchecked
+items may need review or evidence; they do not automatically mean missing code.
+
+mean missing implementation. See [API review](w3-api-internal-error-review.md).
 
 ## 0. Baseline and contract
 
@@ -14,7 +17,7 @@ docs/acceptance/w3-implementation-checklist.md
 - [ ] Record the implementation starting commit and establish passing baseline regressions.
 - [ ] Treat changes to the frozen behavior or upper bounds as explicit contract revisions—not silent implementation deviations.
 
-The frozen document explicitly distinguishes design approval from runtime implementation and acceptance. [github_mcp_direct:get_file_contents]
+The frozen document explicitly distinguishes design approval from runtime implementation and acceptance.
 
 ## 1. Files and public API boundaries
 
@@ -22,12 +25,12 @@ The frozen document explicitly distinguishes design approval from runtime implem
 
 - [ ] Update `crates/harness-core/Cargo.toml` with only the dependencies actually required.
 - [ ] Update `Cargo.lock` for actual dependency changes; retain pinned versions.
-- [ ] Update `crates/harness-core/src/lib.rs` with reviewed exports.
-- [ ] Extend `crates/harness-core/src/error.rs` for internal failures without expanding the tool-result wire error enum.
+- [x] Update `crates/harness-core/src/lib.rs` with reviewed exports.
+- [x] Review internal failures without expanding the tool-result wire enum; retain existing variants with conservative operation-stage handling (see API review).
 - [ ] Extend `crates/harness-core/src/store.rs` for schema v2, durable transitions, migration, and recovery.
 - [ ] Add `crates/harness-core/src/policy.rs`.
-- [ ] Add `crates/harness-core/src/approval.rs`.
-- [ ] Add `crates/harness-core/src/artifact.rs`.
+- [x] Add `crates/harness-core/src/approval.rs`.
+- [x] Add `crates/harness-core/src/artifact.rs`.
 
 ### Acceptance-test files
 
@@ -37,19 +40,19 @@ The frozen document explicitly distinguishes design approval from runtime implem
 ### API invariants
 
 - [ ] Reuse the existing registry definition, call, context, result, and error contracts.
-- [ ] Prevent public unchecked construction of authorization handles.
-- [ ] Keep authorization handles non-`Clone`, non-`Copy`, and non-deserializable.
+- [x] Prevent public unchecked construction of authorization handles.
+- [x] Keep authorization handles non-`Clone`, non-`Copy`, and non-deserializable.
 - [ ] Preserve W2 decoder/slab ownership; do not modify the parser’s allocation contract to implement approvals.
-- [ ] Document the handoff interfaces needed by W4/W5/W6 without implementing those packages.
+- [x] Document the handoff interfaces needed by W4/W5/W6 without implementing those packages.
 
-These are the production boundaries and ownership constraints recorded in the freeze. [github_mcp_direct:get_file_contents]
+These are the production boundaries and ownership constraints recorded in the freeze.
 
 ## 2. Canonicalization and immutable binding
 
 ### Canonical arguments
 
 - [ ] Require structural/schema validation before canonicalization.
-- [ ] Preserve duplicate-key rejection before object construction.
+- [x] Source-reviewed W2 recursive duplicate-key rejection before returning argument objects; W3 canonicalization does not replace parsing. New atomic/streaming split test requires execution.
 - [ ] Recursively sort object keys by UTF-8 byte order.
 - [ ] Preserve array order and string contents.
 - [ ] Use the pinned Rust `serde_json` representation for strings and numbers.
@@ -73,24 +76,26 @@ These are the production boundaries and ownership constraints recorded in the fr
 - [ ] Verify that relevant changes to arguments, context, definition, policy, and epoch alter the binding.
 - [ ] Verify that object-key insertion order alone does not alter canonical bytes.
 
-All canonicalization and binding rules above are frozen in `alloy.w3/1`. [github_mcp_direct:get_file_contents]
+All canonicalization and binding rules above are frozen in `alloy.w3/1`.
 
 ## 3. Daemon-owned policy
 
 - [ ] Implement `Deny`, `AllowWithoutPrompt`, and `RequireApproval`.
 - [ ] Default to denial when no allow rule matches.
-- [ ] Fail closed for malformed or unavailable configuration.
+- [x] Source-reviewed typed policy configuration validation; tests cover malformed typed input.
+- [ ] W6: bound and strictly parse raw policy input; fail closed on unavailable/malformed authoritative configuration, with loader tests.
 - [ ] Allow policy to strengthen—but never weaken—registration requirements.
 - [ ] Ensure approval cannot override policy denial.
 - [ ] Ensure `approval: never` bypasses neither validation nor resource-scope checks.
-- [ ] Preserve the frozen builtin effect/approval defaults.
+- [ ] Run the five-default policy fixture; W4 must verify actual builtin registrations and operation-boundary enforcement. Selected W3 safety floors are not exhaustive default verification.
 - [ ] Bind effective timeout/output limits and prevent widening.
-- [ ] Invalidate outstanding authority after policy or registration changes.
+- [x] Source-reviewed final-start binding re-evaluation against supplied policy/registry.
+- [ ] W6: enforce authoritative current configuration and serialize reload publication against final start; race-test stale snapshots.
 - [ ] Keep resource authorization separate from argument canonicalization.
 - [ ] Test that model/plugin-provided authority-shaped data grants no permission.
 - [ ] Document that actual operation-boundary enforcement belongs to W4.
 
-The policy must use trusted registration and daemon state, not model claims. [github_mcp_direct:get_file_contents]
+The policy must use trusted registration and daemon state, not model claims.
 
 ## 4. Approval state machine and single-use execution
 
@@ -114,7 +119,7 @@ The policy must use trusted registration and daemon state, not model claims. [gi
 - [ ] Never execute before that commit succeeds.
 - [ ] Ensure dropping a handle neither executes nor restores authority.
 - [ ] Test racing decisions, racing claims, and duplicate start attempts.
-- [ ] Avoid claiming transactional exactly-once external effects.
+- [x] Avoid claiming transactional exactly-once external effects.
 
 ### Expiry and cancellation
 
@@ -127,7 +132,7 @@ The policy must use trusted registration and daemon state, not model claims. [gi
 - [ ] Withdraw pre-start authority on pause/cancel.
 - [ ] Keep post-start cancellation distinct from “nothing executed.”
 
-These behaviors are part of the frozen state machine, including the final authorization check after hooks. [github_mcp_direct:get_file_contents]
+These behaviors are part of the frozen state machine, including the final authorization check after hooks.
 
 ## 5. Durable storage, migration, and recovery
 
@@ -144,7 +149,8 @@ These behaviors are part of the frozen state machine, including the final author
 - [ ] Atomically record completion plus `tool.completed`.
 - [ ] Prevent duplicate terminal results.
 - [ ] Record pre-execution rejection without `tool.started`.
-- [ ] Keep transactions short; hold no database/session/native-slot lock across waits, hooks, streaming, or execution.
+- [x] Document short runtime store access and release-before-I/O handoff; startup reconciliation is exclusive and may hash while borrowing the store.
+- [ ] W4/W5/W6: verify caller-owned locks/native slots are not retained across waits, hooks, streaming, verification or execution.
 
 ### Ownership and recovery
 
@@ -164,7 +170,7 @@ These behaviors are part of the frozen state machine, including the final author
 - [ ] Release admission capacity correctly on terminal transitions.
 - [ ] Do not present these limits as complete bounds on downstream running operations.
 
-Migration, exclusive ownership, and restart invalidation are explicitly frozen storage requirements. [github_mcp_direct:get_file_contents]
+Migration, exclusive ownership, and restart invalidation are explicitly frozen storage requirements.
 
 ## 6. Artifact storage and publication
 
@@ -207,7 +213,7 @@ Migration, exclusive ownership, and restart invalidation are explicitly frozen s
 - [ ] Validate complete length/digest before claiming integrity verification.
 - [ ] Preserve the existing inline-or-artifact result envelope and error categories.
 
-The artifact contract separates filesystem publication from database commit; it does not claim cross-resource atomicity. [github_mcp_direct:get_file_contents]
+The artifact contract separates filesystem publication from database commit; it does not claim cross-resource atomicity.
 
 ## 7. Required acceptance and failure tests
 
@@ -235,7 +241,7 @@ The artifact contract separates filesystem publication from database commit; it 
 - [ ] Discover and run the exact named test on Linux.
 - [ ] Discover and run the exact named test on Mac.
 
-Both named gates and the supporting failure cases are required by the freeze; documentation or zero-test success does not satisfy them. [github_mcp_direct:get_file_contents]
+Both named gates and the supporting failure cases are required by the freeze; documentation or zero-test success does not satisfy them.
 
 ## 8. Regression evidence and merge gate
 
@@ -268,4 +274,9 @@ Both named gates and the supporting failure cases are required by the freeze; do
 9. Review and merge scoped W3.
 ```
 
-The next implementation task is item 2: Rust canonicalization fixtures and state-transition tests, before building authorization behavior around them.
+Current closeout task: review remaining unchecked requirements and collect committed-candidate Linux/macOS evidence; implementation delivery is not acceptance.
+
+## Qualified boundary review
+
+See [W3 qualified interface boundaries](../decisions/w3-qualified-interface-boundaries.md).
+Checked source/documentation items do not assert executed tests or downstream acceptance.

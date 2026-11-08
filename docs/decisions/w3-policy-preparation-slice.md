@@ -1,5 +1,27 @@
 # W3 policy and binding preparation slice
 
+## Current implementation status (historical-slice clarification)
+
+The text below records the preparation-only slice at its original delivery.
+Its references to a future coordinator and pending P2-06/P2-08 describe that
+historical stage, not the current implementation. The durable coordinator,
+artifact store, artifact-backed completion, and finite recovery matrix have
+since been delivered:
+
+- [Durable storage and approvals](w3-durable-storage-slice.md).
+- [Artifact publication](w3-artifact-publication-slice.md).
+- [Artifact-backed completion](w3-artifact-completion-slice.md).
+- [Failure/recovery matrix](../acceptance/w3-failure-recovery-matrix.md), with
+  its [machine-readable inventory](../acceptance/w3-failure-recovery-matrix.json).
+
+P2-06 and P2-08 are implemented fixtures; passing Linux/macOS results must still
+be linked to a reviewed candidate. Source delivery is not runtime acceptance.
+Raw configuration loading, builtin execution, plugins and live tool-loop
+integration remain downstream responsibilities. No historical acceptance
+status, contract version, bound, or fault-model claim is changed by this note.
+
+## Original preparation-slice record
+
 Status: implementation slice; durable authorization and acceptance pending.
 Related issue: #30. Contract: alloy.w3/1.
 

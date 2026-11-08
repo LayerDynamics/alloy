@@ -1,5 +1,6 @@
-//! Policy preparation and binding tests, NOT P2-06 durable authorization acceptance.
-//! All implementations are counter-only fixtures; no builtin or external effect runs.
+//! Policy/binding tests and the counter-based P2-06 durable admission fixture.
+//! No production builtin or external effect runs. Fixture implementation is not
+//! candidate-bound Linux/macOS acceptance; retain the platform validation evidence.
 
 use harness_core::{
     approval::{
@@ -668,4 +669,38 @@ fn destructive_effect_requires_bound_approval() {
     let mut reopened = SessionStore::open(dir.path().join("approvals.db")).unwrap();
     assert!(reopened.claim_tool("session-1", "call-2").is_err());
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn w3_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution() {
+    for strengthen in [false, true] {
+        for (id, effect, approval) in [
+            ("fs.read", ToolEffect::Read, ApprovalRequirement::Never),
+            ("fs.list", ToolEffect::Read, ApprovalRequirement::Never),
+            ("fs.write", ToolEffect::Write, ApprovalRequirement::Policy),
+            (
+                "shell.run",
+                ToolEffect::Destructive,
+                ApprovalRequirement::Always,
+            ),
+            ("http.fetch", ToolEffect::Read, ApprovalRequirement::Policy),
+        ] {
+            let (registry, count) = registered(definition(id, effect, approval));
+            let decision = policy(rule(id, strengthen))
+                .evaluate(
+                    &registry,
+                    invocation(id, json!({"path":"fixture.txt"})),
+                    "epoch-boundary",
+                    1000,
+                )
+                .unwrap();
+            let expected = strengthen || id == "shell.run";
+            assert_eq!(
+                matches!(decision, PolicyDecision::RequireApproval(_)),
+                expected,
+                "{id}"
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+    }
 }

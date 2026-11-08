@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Phase-1 agent supervisor skeleton, session store, and telemetry client"
+description = "Agent supervision, durable sessions, policy, approvals, bounded artifacts, and telemetry"
 
 [dependencies]
 engine = { path = "../engine" }
