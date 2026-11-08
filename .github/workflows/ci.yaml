@@ -97,10 +97,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p target/w4-acceptance/linux
+          mkdir -p target/w4-acceptance/linux target/w5-acceptance/linux
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
             -v "$PWD/target/w4-acceptance/linux":/evidence \
+            -v "$PWD/target/w5-acceptance/linux":/w5-evidence \
+            -e ALLOY_W5_OUTPUT=/w5-evidence \
+            -e ALLOY_W5_CANDIDATE="${{ github.sha }}" \
             -e ALLOY_W4_OUTPUT=/evidence \
             -e ALLOY_W4_CANDIDATE="${{ github.sha }}" \
             -e CARGO_TERM_COLOR=never \
@@ -179,8 +182,18 @@ jobs:
               echo "::group::W4 named gates and evidence"
               RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
               bash scripts/w4_acceptance.sh
+              bash scripts/w5_acceptance.sh
               echo "::endgroup::"
             '
+
+      - name: Retain W5 Linux evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w5-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w5-acceptance/linux/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Retain W4 Linux evidence
         if: ${{ always() }}
@@ -312,6 +325,22 @@ jobs:
         with:
           name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w4-acceptance/macos/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: W5 named hooks, owned-process and sandbox gates
+        shell: bash
+        env:
+          ALLOY_W5_CANDIDATE: ${{ github.sha }}
+          ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
+        run: bash scripts/w5_acceptance.sh
+
+      - name: Retain W5 macOS evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w5-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w5-acceptance/macos/
           if-no-files-found: warn
           retention-days: 30
 

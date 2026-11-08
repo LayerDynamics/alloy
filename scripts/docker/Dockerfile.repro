@@ -28,6 +28,7 @@ RUN apt-get update \
       ca-certificates \
       curl \
       git \
+      python3 \
       pkg-config \
       cmake \
       make \
@@ -62,7 +63,8 @@ ENV CARGO_TERM_COLOR=never
 
 # Verify both conventional compiler commands exist.
 RUN cc --version \
- && c++ --version
+ && c++ --version \
+ && python3 --version
 
 # Verify the selected C++ standard library supports std::format.
 RUN printf '%s\n' \
