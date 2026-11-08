@@ -85,6 +85,28 @@ impl ExecutionContext {
             max_output_bytes,
         })
     }
+    /// Build the effective deadline from a trusted durable-start observation,
+    /// never from the later dispatch time. A future anchor is invalid; elapsed
+    /// deadlines and cancellation fail before an implementation can be invoked.
+    pub fn from_start(
+        registration: &ToolPolicy,
+        timeout_ms: u64,
+        max_output_bytes: u64,
+        cancellation: CancellationToken,
+        started_at: Instant,
+    ) -> Result<Self, ExecutionError> {
+        if started_at > Instant::now() {
+            return Err(ExecutionError::InvalidLimits);
+        }
+        let deadline = started_at
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or(ExecutionError::InvalidLimits)?;
+        let mut context = Self::new(registration, timeout_ms, max_output_bytes, cancellation)?;
+        context.deadline = deadline;
+        context.check()?;
+        Ok(context)
+    }
+
     /// Check the operation-local cancellation flag and deadline.
     pub fn check(&self) -> Result<(), ExecutionError> {
         self.check_at(Instant::now())

@@ -13,6 +13,7 @@ pub mod policy;
 pub mod store;
 pub mod supervisor;
 pub mod telemetry;
+pub mod tool_execution;
 
 pub use context::ContextBuilder;
 pub use error::{HarnessError, HarnessResult};

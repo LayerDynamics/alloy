@@ -515,6 +515,7 @@ fn duplicate_completion_attempt_cannot_append_a_second_terminal_result() {
     let started = f.started();
     let duplicate = StartedInvocation {
         binding: rebuild(&started.binding, &f.registry, &f.policy),
+        execution_started_at: started.execution_started_at,
     };
     let result = f.effect(&started);
     f.store.complete_tool(started, result.clone()).unwrap();

@@ -62,3 +62,32 @@ qwen3/tool-policy suites, existing final policy/registration-change tests and
 workspace/doc regressions. Preserve finite SQL/process-exit fault and trusted
 local storage assumptions. No new dependency, wire enum or authorization handle.
 Passing a host run does not establish Linux/macOS acceptance or W3 sign-off.
+
+
+## W4-01.01 adapter placement refinement
+
+The receipt-consuming dispatcher lives in harness-core/src/tool_execution.rs,
+not in tool-registry. ReceiptExecutor registers the same implementation Arc in
+W1 and a private harness dispatch index. The registry is exposed read-only; no
+raw executable handle or client approval flag is introduced. This preserves the
+existing dependency direction and does not reimplement W3 admission/approval.
+
+StartedInvocation retains a process-local monotonic observation immediately
+before the successful start transaction's state update/commit. This private
+observation is not serialized or added to the frozen binding; it conservatively
+charges transaction/handoff delay against the approved execution timeout.
+ExecutionContext::from_start prevents renewing that deadline at dispatch.
+
+Preparation checks the current Started row/session/epoch/binding and current
+registered definition, consumes the receipt, and retains the existing exclusive
+store ownership lease. Detached run owns no SessionStore borrow or SQLite
+transaction. Completion consumes the original receipt through complete_tool;
+failed completion does not regrant execution. A dropped/inconsistent job remains
+unresolved and recovers conservatively. No other caller lock is proven released
+by these signatures; W6 must still validate its enclosing lock/configuration
+publication discipline.
+
+This generic registry/receipt bridge does not complete builtin registrations,
+resource-scope adapters, streaming artifact finalization, W5 hooks, W6 dispatch,
+or P2-07/P2-09 acceptance. Their existing W4 tasks remain open. Inline/artifact
+wire shapes and W3 provenance checks are unchanged.
