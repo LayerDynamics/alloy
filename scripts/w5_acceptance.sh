@@ -56,7 +56,8 @@ for name in plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_
     w5_capability_subsets_fragmentation_and_real_zero_effect_marker \
     w5_inherited_descriptor_is_closed_on_exec \
     w5_invalid_limits_and_duplicate_registration_spawn_nothing \
-    w5_blocked_stdin_deadline_reaps_owned_process; do
+    w5_blocked_stdin_deadline_reaps_owned_process \
+    w5_high_fd_above_lowered_limit_is_not_inherited; do
   grep -Fx "$name: test" "$OUT/protocol-discovery.txt"
   gate "$name" cargo test --locked -p harness-core --test plugin_hooks "$name" -- --exact --nocapture
 done

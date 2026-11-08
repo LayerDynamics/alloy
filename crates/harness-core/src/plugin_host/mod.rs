@@ -5,6 +5,7 @@ mod process;
 mod protocol;
 mod requests;
 pub mod sandbox;
+mod spawn;
 mod strict_json;
 use process::Process;
 use protocol::{AFTER, AfterReply, BEFORE, BeforeReply, Handshake, VERSION};

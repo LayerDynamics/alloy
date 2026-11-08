@@ -1,11 +1,11 @@
 //! Owned nonblocking child transport; no detached reader/writer threads.
-use super::{HostError, Limits, PluginConfig, sandbox};
+use super::spawn::Child;
+use super::{HostError, Limits, PluginConfig, spawn};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    os::unix::process::CommandExt,
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Stdio},
+    process::{ChildStderr, ChildStdin, ChildStdout},
     thread,
     time::{Duration, Instant},
 };
@@ -14,7 +14,6 @@ use tool_registry::execution::CancellationToken;
 unsafe extern "C" {
     fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
     fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
-    fn getdtablesize() -> std::ffi::c_int;
 }
 fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
@@ -70,46 +69,17 @@ pub(crate) struct Process {
 }
 impl Process {
     pub fn spawn(config: &PluginConfig, limits: Limits) -> Result<Self, HostError> {
-        let mut cmd = sandbox::command(config)?;
-        // SAFETY: getdtablesize has no pointer inputs and observes the descriptor limit.
-        let fd_limit = unsafe { getdtablesize() };
-        if fd_limit < 3 {
-            return Err(HostError::new("invalid descriptor limit"));
-        }
-        // SAFETY: this callback calls only async-signal-safe fcntl. It allocates
-        // nothing and marks inherited descriptors CLOEXEC rather than closing
-        // Rust's exec-error pipe before exec can report an error.
-        unsafe {
-            cmd.pre_exec(move || {
-                for fd in 3..fd_limit {
-                    let flags = fcntl(fd, 1);
-                    if flags >= 0 && fcntl(fd, 2, flags | 1) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
-        let child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(HostError::io)?;
-        let mut owned = Self {
+        let (child, input, output, stderr) = spawn::spawn(config)?;
+        let owned = Self {
             child,
-            input: None,
-            output: None,
-            stderr: None,
+            input: Some(input),
+            output: Some(output),
+            stderr: Some(stderr),
             diagnostics: Vec::new(),
             limits,
             next_id: 0,
             dead: false,
         };
-        owned.input = owned.child.stdin.take();
-        owned.output = owned.child.stdout.take();
-        owned.stderr = owned.child.stderr.take();
         for fd in [
             owned.input.as_ref().unwrap().as_raw_fd(),
             owned.output.as_ref().unwrap().as_raw_fd(),

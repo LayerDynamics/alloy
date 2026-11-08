@@ -1,8 +1,10 @@
 # Tool hooks V1 — W5 candidate
 
-Status: implementation plus follow-up hardening awaiting candidate-bound
-Linux/macOS results and explicit sandbox reviewer sign-off. The prior Mac run
-passed the earlier canonical-file fixture; it does not validate this follow-up.
+Status: the pre-fix candidate d496cbbaf933814c0db66405e4e34e1282aa3766 passed
+Linux and Mac CI. Review found incomplete descriptor sanitization above a lowered
+soft limit. This follow-up replaces the sweep and adds the isolated regression;
+its new candidate requires fresh Linux/Mac results and reviewer reconciliation.
+Prior green checks do not validate changed spawn code.
 
 Transport: one JSON-RPC 2.0 request/response per newline, UTF-8 JSON, strictly
 matching u64 IDs, no notifications, no batching, no retries. initialize declares

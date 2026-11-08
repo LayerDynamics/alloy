@@ -179,3 +179,65 @@ fn w5_blocked_stdin_deadline_reaps_owned_process() {
     assert!(start.elapsed() < Duration::from_secs(3));
     assert_reaped(pid);
 }
+
+// Re-exec the Rust test harness so resource-limit changes cannot affect parallel tests.
+#[test]
+fn w5_high_fd_above_lowered_limit_is_not_inherited() {
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "w5_high_fd_isolated_helper", "--nocapture"])
+        .env("ALLOY_W5_FD_HELPER", "1").output().unwrap();
+    assert!(result.status.success(), "helper status={:?}\nstdout={}\nstderr={}",
+        result.status, String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("W5_HIGH_FD_REGRESSION_PASSED"));
+}
+#[test]
+fn w5_high_fd_isolated_helper() {
+    if std::env::var("ALLOY_W5_FD_HELPER").as_deref() != Ok("1") { return; }
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Limit { current: u64, maximum: u64 }
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, limit: *mut Limit) -> i32;
+        fn setrlimit(resource: i32, limit: *const Limit) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    #[cfg(target_os = "linux")]
+    const NOFILE: i32 = 7;
+    #[cfg(target_os = "macos")]
+    const NOFILE: i32 = 8;
+    let _ = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let mut original = Limit { current: 0, maximum: 0 };
+    // SAFETY: original is correctly sized writable storage on supported 64-bit targets.
+    assert_eq!(unsafe { getrlimit(NOFILE, &mut original) }, 0);
+    assert!(original.maximum >= 256, "regression requires hard NOFILE >=256");
+    let raised = Limit { current: original.current.max(256), maximum: original.maximum };
+    // SAFETY: this isolated process changes only its own soft descriptor limit.
+    assert_eq!(unsafe { setrlimit(NOFILE, &raised) }, 0);
+    // SAFETY: F_DUPFD creates a new owned descriptor >=128 with CLOEXEC unset.
+    let high = unsafe { fcntl(file.as_raw_fd(), 0, 128) };
+    assert!(high >= 128);
+    // SAFETY: high is newly returned by F_DUPFD and has no other Rust owner.
+    let high_fd = unsafe { OwnedFd::from_raw_fd(high) };
+    // SAFETY: observes flags of this live owned descriptor.
+    assert_eq!(unsafe { fcntl(high, 1) } & 1, 0);
+    let lowered = Limit { current: 64, maximum: original.maximum };
+    // SAFETY: this affects only the helper, not the main harness or runner.
+    assert_eq!(unsafe { setrlimit(NOFILE, &lowered) }, 0);
+    let mut config = config(dir.path(), "highfd", "fd_probe");
+    config.args.push(high.to_string());
+    let cancel = CancellationToken::default();
+    let mut host = PluginHost::start(vec![config], limits(), deadline(), &cancel).unwrap();
+    let outcome = host.before(&invocation(), deadline(), &cancel);
+    assert_eq!(outcome.decision, Decision::Allow, "{:?}", outcome.receipts);
+    assert_eq!(outcome.receipts[0].annotations.get("highfd.fd_closed"), Some(&json!(true)));
+    let pid = observed_pid(dir.path(), "highfd");
+    drop(host);
+    assert_reaped(pid);
+    drop(high_fd);
+    // SAFETY: restore this helper's original limit before final harness reporting.
+    assert_eq!(unsafe { setrlimit(NOFILE, &original) }, 0);
+    println!("W5_HIGH_FD_REGRESSION_PASSED fd={high} soft_limit=64");
+}

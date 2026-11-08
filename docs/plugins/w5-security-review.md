@@ -23,9 +23,15 @@ not writable by the plugin or other untrusted users. Canonicalization does not p
 an executable inode across replacement. Supply-chain verification or adversarial
 host-filesystem replacement is not provided by this module; do not claim otherwise.
 
-All descriptors above stderr are marked close-on-exec in the child before exec.
-The caller provides stdin/stdout/stderr pipes; no environment is inherited.
-Rust std::process's own exec-error descriptor remains usable before exec.
+Descriptor sanitization is independent of allocation limits. Linux uses
+close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC) in the child; failure rejects spawn,
+with no incomplete limit-based fallback. This requires the supported Linux image
+and a kernel/libc providing close_range with CLOEXEC support. Rust's exec-error
+pipe remains usable until exec. macOS uses POSIX_SPAWN_CLOEXEC_DEFAULT with explicit
+stdio duplication, source-end closes, working directory, and a private group.
+Only stdin/stdout/stderr are deliberately inherited; no environment is inherited.
+An isolated real-host regression retains FD >=128, lowers NOFILE to 64, and verifies
+that the executed plugin cannot observe the descriptor on either platform.
 
 The owner keeps a direct child handle unreaped until stop, sends SIGKILL to its
 private process group and direct child, retries interrupted wait, and reports
