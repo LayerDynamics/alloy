@@ -35,6 +35,23 @@ pub trait ToolImplementation: Send + Sync {
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
 
+    /// Execute scoped fs.write after durable-start authorization, retaining typed
+    /// publication status. Unsupported backends fail closed without fallback.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn execute_file_write(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::WriteReport, crate::builtins::fs::WriteFailure> {
+        output.abort();
+        Err(crate::builtins::fs::WriteFailure {
+            publication: crate::builtins::fs::WritePublication::NotPublished,
+            cause: crate::builtins::fs::ReadError::Policy("scoped file-write backend required"),
+            cleanup_error: None,
+        })
+    }
+
     /// Stream canonical fs.list JSON after independent durable-start authorization.
     /// Unsupported backends fail closed without invoking any other entrypoint.
     #[cfg(unix)]

@@ -59,7 +59,7 @@ pub struct FileListCompletion {
 }
 enum ListPayload {
     Result(ToolResult),
-    Artifact(PendingArtifact),
+    Artifact(Box<PendingArtifact>),
 }
 struct ListOutput<'a> {
     writer: Option<ArtifactWriter>,
@@ -215,7 +215,7 @@ impl FileListExecution {
                                 }))
                             } else {
                                 match output.writer.take().map(ArtifactWriter::finish) {
-                                    Some(Ok(pending)) => ListPayload::Artifact(pending),
+                                    Some(Ok(pending)) => ListPayload::Artifact(Box::new(pending)),
                                     _ => ListPayload::Result(control_error(
                                         &call,
                                         ToolErrorKind::Execution,
@@ -259,7 +259,7 @@ impl FileListCompletion {
                     drop(pending);
                     context_error(&call, error, true)
                 } else {
-                    let metadata = pending.commit(store)?;
+                    let metadata = (*pending).commit(store)?;
                     ToolResult::Artifact(ArtifactToolResult {
                         call_id: call.clone(),
                         artifact_ref: metadata.artifact_ref,

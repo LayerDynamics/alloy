@@ -1136,3 +1136,74 @@ impl crate::registry::ToolImplementation for FileListTool {
         result
     }
 }
+
+/// Concrete create-only fs.write backend bound to a separately configured root.
+/// This is not approval. Execute through the harness receipt-owned write path;
+/// legacy/generic entrypoints fail closed rather than losing publication status.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct FileWriteTool {
+    scope: WriteScope,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl FileWriteTool {
+    /// Bind a trusted writable scope with its independent input-byte ceiling.
+    pub fn new(scope: WriteScope) -> Self {
+        Self { scope }
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWriteArguments {
+    path: String,
+    content: String,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl crate::registry::ToolImplementation for FileWriteTool {
+    fn execute(&self, invocation: &crate::call::ToolInvocation) -> crate::result::ToolResult {
+        crate::result::ToolResult::Inline(crate::result::InlineToolResult {
+            call_id: invocation.call.call_id.clone(),
+            is_error: true,
+            content: serde_json::json!({"kind":"policy","message":"Receipt-owned write execution is required",
+                "details":{"reason":"write_receipt_required","publication":"not_published","effects_may_have_occurred":false}}),
+        })
+    }
+    fn execute_with_context(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        _context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> crate::result::ToolResult {
+        output.abort();
+        self.execute(invocation)
+    }
+    fn execute_file_write(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<WriteReport, WriteFailure> {
+        let request = (|| {
+            context.check().map_err(ReadError::Execution)?;
+            if invocation.call.tool_id != "fs.write" {
+                return Err(ReadError::Policy("fs.write identity required"));
+            }
+            let args: FileWriteArguments = serde_json::from_value(serde_json::Value::Object(
+                invocation.call.arguments.clone(),
+            ))
+            .map_err(|_| ReadError::Policy("invalid fs.write arguments"))?;
+            WriteRequest::new(&args.path, args.content)
+        })();
+        match request {
+            Ok(request) => self.scope.write_into(&request, context, output),
+            Err(cause) => {
+                output.abort();
+                Err(WriteFailure {
+                    publication: WritePublication::NotPublished,
+                    cause,
+                    cleanup_error: None,
+                })
+            }
+        }
+    }
+}

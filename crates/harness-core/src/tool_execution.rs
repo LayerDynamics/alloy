@@ -16,6 +16,10 @@ pub mod file_read;
 #[cfg(unix)]
 pub mod file_list;
 
+/// Receipt-owned create-only writes preserving publication and persistence outcomes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod file_write;
+
 use serde::Serialize;
 use std::{
     collections::BTreeMap,

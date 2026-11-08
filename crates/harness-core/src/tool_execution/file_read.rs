@@ -59,7 +59,7 @@ pub struct FileReadCompletion {
 }
 enum ReadPayload {
     Result(ToolResult),
-    Artifact(PendingArtifact),
+    Artifact(Box<PendingArtifact>),
 }
 struct ReadOutput<'a> {
     writer: Option<ArtifactWriter>,
@@ -218,7 +218,7 @@ impl FileReadExecution {
                                 }))
                             } else {
                                 match output.writer.take().map(ArtifactWriter::finish) {
-                                    Some(Ok(pending)) => ReadPayload::Artifact(pending),
+                                    Some(Ok(pending)) => ReadPayload::Artifact(Box::new(pending)),
                                     _ => ReadPayload::Result(control_error(
                                         &call,
                                         ToolErrorKind::Execution,
@@ -262,7 +262,7 @@ impl FileReadCompletion {
                     drop(pending);
                     context_error(&call, error, true)
                 } else {
-                    let metadata = pending.commit(store)?;
+                    let metadata = (*pending).commit(store)?;
                     ToolResult::Artifact(ArtifactToolResult {
                         call_id: call.clone(),
                         artifact_ref: metadata.artifact_ref,
