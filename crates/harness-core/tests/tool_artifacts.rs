@@ -95,7 +95,7 @@ fn publish(
 }
 #[test]
 fn oversized_tool_result_artifact_roundtrip() {
-    let (dir, mut store, artifacts) = fixture(ArtifactLimits::default());
+    let (dir, mut store, artifacts, receipt) = completion_tests::fixture_started();
     let bytes: Vec<u8> = (0..1_048_699).map(|n| (n % 251) as u8).collect();
     let metadata = publish(&mut store, &artifacts, &bytes);
     assert_eq!(metadata.byte_length, bytes.len() as u64);
@@ -103,6 +103,17 @@ fn oversized_tool_result_artifact_roundtrip() {
     assert_eq!(metadata.artifact_ref.len(), 37);
     assert_eq!(metadata.preview_encoding, "base64");
     assert!(metadata.preview_bytes.len() <= 5464);
+    let result = ToolResult::Artifact(tool_registry::result::ArtifactToolResult {
+        call_id: "c".into(),
+        artifact_ref: metadata.artifact_ref.clone(),
+        is_error: false,
+    });
+    let expected_result = serde_json::to_value(&result).unwrap();
+    store.complete_tool(receipt, result).unwrap();
+    assert_eq!(
+        store.tool_state("s", "c").unwrap().as_deref(),
+        Some("Completed")
+    );
     let events = store.list_events("s").unwrap();
     let created: Vec<_> = events
         .iter()
@@ -110,6 +121,13 @@ fn oversized_tool_result_artifact_roundtrip() {
         .collect();
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].artifact_refs, json!([metadata.artifact_ref]));
+    let completed: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::ToolCompleted)
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].payload["result"], expected_result);
+    assert_eq!(completed[0].artifact_refs, json!([metadata.artifact_ref]));
     drop(artifacts);
     drop(store);
     let mut store = SessionStore::open(dir.path().join("events.db")).unwrap();
@@ -129,7 +147,24 @@ fn oversized_tool_result_artifact_roundtrip() {
     verified.read_to_end(&mut restored).unwrap();
     assert_eq!(restored, bytes);
     let after = store.list_events("s").unwrap();
-    assert_eq!(&after[..events.len()], events.as_slice());
+    assert_eq!(after, events);
+    assert_eq!(
+        store.tool_state("s", "c").unwrap().as_deref(),
+        Some("Completed")
+    );
+    assert!(store.claim_tool("s", "c").is_err());
+    let connection = rusqlite::Connection::open(store.path()).unwrap();
+    let persisted: String = connection
+        .query_row(
+            "SELECT result_json FROM tool_intents WHERE session_id='s' AND call_id='c'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted).unwrap(),
+        expected_result
+    );
     assert_eq!(
         after
             .iter()
@@ -482,4 +517,457 @@ fn metadata_event_disagreement_refuses_cleanup() {
             .join(m.artifact_ref)
             .exists()
     );
+}
+
+// Step B: artifact registration -> canonical ToolResult -> durable completion.
+mod completion_tests {
+    use super::*;
+    use harness_core::store::StartedInvocation;
+    use tool_registry::result::{ArtifactToolResult, InlineToolResult};
+
+    pub(super) fn fixture_started() -> (
+        tempfile::TempDir,
+        SessionStore,
+        ArtifactStore,
+        StartedInvocation,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SessionStore::open(dir.path().join("events.db")).unwrap();
+        store.create_session("s", "fixture").unwrap();
+        let receipt = start(&mut store, "c");
+        let artifacts = ArtifactStore::open(
+            &mut store,
+            dir.path().join("artifacts"),
+            ArtifactLimits::default(),
+        )
+        .unwrap();
+        (dir, store, artifacts, receipt)
+    }
+    fn artifact_result(call: &str, reference: &str, is_error: bool) -> ToolResult {
+        ToolResult::Artifact(ArtifactToolResult {
+            call_id: call.into(),
+            artifact_ref: reference.into(),
+            is_error,
+        })
+    }
+    fn completed(store: &SessionStore) -> Vec<harness_core::store::EventRecord> {
+        store
+            .list_events("s")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == EventKind::ToolCompleted && e.payload["state"] == "Completed")
+            .collect()
+    }
+    fn assert_uncompleted(store: &SessionStore, call: &str) {
+        assert_eq!(
+            store.tool_state("s", call).unwrap().as_deref(),
+            Some("Started")
+        );
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        let result: Option<String> = connection
+            .query_row(
+                "SELECT result_json FROM tool_intents WHERE session_id='s' AND call_id=?1",
+                [call],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert!(completed(store).is_empty());
+        assert!(
+            store
+                .list_events("s")
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != EventKind::ToolCompleted)
+        );
+    }
+    #[test]
+    fn artifact_completion_preserves_both_error_flags_and_exact_wire_fields() {
+        for is_error in [false, true] {
+            let (_dir, mut store, a, receipt) = fixture_started();
+            let m = publish(&mut store, &a, b"result");
+            let result = artifact_result("c", &m.artifact_ref, is_error);
+            let expected = serde_json::to_value(&result).unwrap();
+            store.complete_tool(receipt, result).unwrap();
+            let events = completed(&store);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].payload["result"], expected);
+            assert_eq!(events[0].artifact_refs, json!([m.artifact_ref]));
+            assert_eq!(expected.as_object().unwrap().len(), 3);
+            assert_eq!(
+                expected,
+                json!({"call_id":"c","artifact_ref":m.artifact_ref,"is_error":is_error})
+            );
+            let connection = rusqlite::Connection::open(store.path()).unwrap();
+            let saved: String = connection
+                .query_row(
+                    "SELECT result_json FROM tool_intents WHERE session_id='s' AND call_id='c'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&saved).unwrap(),
+                expected
+            );
+            assert!(store.claim_tool("s", "c").is_err());
+            assert!(a.begin(&store, "s", "c", 1).is_err());
+        }
+    }
+    #[test]
+    fn inline_completion_remains_wire_compatible_and_has_no_artifact_refs() {
+        let (_dir, mut store, _a, receipt) = fixture_started();
+        let result = ToolResult::Inline(InlineToolResult {
+            call_id: "c".into(),
+            content: json!({"text":"inline"}),
+            is_error: false,
+        });
+        let expected = serde_json::to_value(&result).unwrap();
+        store.complete_tool(receipt, result).unwrap();
+        let events = completed(&store);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["result"], expected);
+        assert_eq!(events[0].artifact_refs, json!([]));
+    }
+    #[test]
+    fn artifact_from_another_call_cannot_complete_this_call() {
+        let (_dir, mut store, a, old_receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"owned by c");
+        drop(old_receipt);
+        let receipt = start(&mut store, "other");
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("other", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "other");
+    }
+    fn start_other_session(store: &mut SessionStore) -> StartedInvocation {
+        use harness_core::policy::{DaemonPolicy, PolicyConfig, PolicyRule};
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolDefinition {
+                    id: "fixture.output".into(),
+                    version: "1.0.0".into(),
+                    description: "other session".into(),
+                    input_schema: json!({"type":"object","additionalProperties":false}),
+                    origin: ToolOrigin::Builtin,
+                    policy: ToolPolicy {
+                        effect: ToolEffect::Read,
+                        approval: ApprovalRequirement::Never,
+                        timeout_ms: 1000,
+                        max_output_bytes: MAX_ARTIFACT_BYTES,
+                    },
+                },
+                Arc::new(Never),
+            )
+            .unwrap();
+        let policy = DaemonPolicy::new(PolicyConfig {
+            rules: vec![PolicyRule {
+                tool_id: "fixture.output".into(),
+                allowed_arguments: vec![serde_json::Map::new()],
+                require_approval: false,
+                timeout_ms: 1000,
+                max_output_bytes: MAX_ARTIFACT_BYTES,
+            }],
+        })
+        .unwrap();
+        store
+            .admit_tool(
+                &registry,
+                &policy,
+                ToolInvocation {
+                    context: ToolCallContext {
+                        session_id: "other-session".into(),
+                        turn_id: "t".into(),
+                        generation_id: "g".into(),
+                    },
+                    call: ToolCall {
+                        call_id: "c".into(),
+                        tool_id: "fixture.output".into(),
+                        arguments: serde_json::Map::new(),
+                    },
+                },
+            )
+            .unwrap();
+        let claim = store.claim_tool("other-session", "c").unwrap();
+        store.start_tool(claim, &registry, &policy).unwrap()
+    }
+    #[test]
+    fn artifact_from_another_session_cannot_complete_same_call_id() {
+        let (_dir, mut store, a, old_receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"session s only");
+        drop(old_receipt);
+        store.create_session("other-session", "fixture").unwrap();
+        let receipt = start_other_session(&mut store);
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_eq!(
+            store.tool_state("other-session", "c").unwrap().as_deref(),
+            Some("Started")
+        );
+        assert!(
+            store
+                .list_events("other-session")
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != EventKind::ToolCompleted)
+        );
+    }
+    #[test]
+    fn unknown_artifact_reference_is_rejected() {
+        let (_dir, mut store, _a, receipt) = fixture_started();
+        assert!(
+            store
+                .complete_tool(
+                    receipt,
+                    artifact_result("c", "art1_00000000000000000000000000000000", false)
+                )
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn malformed_artifact_reference_is_rejected_without_completion() {
+        for reference in [
+            "../object",
+            "/tmp/object",
+            "art1_ABC",
+            "art1_0000000000000000000000000000000g",
+            "",
+        ] {
+            let (_dir, mut store, _a, receipt) = fixture_started();
+            assert!(
+                store
+                    .complete_tool(receipt, artifact_result("c", reference, false))
+                    .is_err()
+            );
+            assert_uncompleted(&store, "c");
+        }
+    }
+    #[test]
+    fn published_but_unregistered_object_cannot_complete_a_tool() {
+        let (dir, mut store, a, receipt) = fixture_started();
+        let mut writer = a.begin(&store, "s", "c", 4).unwrap();
+        writer.write_all(b"data").unwrap();
+        let pending = writer.finish().unwrap();
+        let reference = std::fs::read_dir(dir.path().join("artifacts/objects"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &reference, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+        drop(pending);
+    }
+    #[test]
+    fn result_call_must_match_consumed_start_receipt() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        assert!(
+            store
+                .complete_tool(
+                    receipt,
+                    artifact_result("wrong-call", &m.artifact_ref, false)
+                )
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn completion_rejects_altered_metadata_ownership() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        let mut altered = m.clone();
+        altered.session_id = "forged-session".into();
+        connection
+            .execute(
+                "UPDATE tool_artifacts SET metadata_json=?1 WHERE artifact_ref=?2",
+                rusqlite::params![serde_json::to_string(&altered).unwrap(), m.artifact_ref],
+            )
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn artifact_without_creation_event_cannot_complete() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection
+            .execute("DELETE FROM events WHERE kind='artifact.created'", [])
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn duplicate_creation_event_is_rejected() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        store
+            .append_event(
+                "s",
+                EventKind::ArtifactCreated,
+                serde_json::to_value(&m).unwrap(),
+                json!([m.artifact_ref]),
+            )
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn mismatched_creation_event_reference_is_rejected() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "UPDATE events SET artifact_refs='[]' WHERE kind='artifact.created'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+    }
+    #[test]
+    fn wrong_epoch_or_binding_digest_cannot_complete() {
+        for column in ["daemon_epoch", "binding_digest"] {
+            let (_dir, mut store, a, receipt) = fixture_started();
+            let m = publish(&mut store, &a, b"data");
+            let connection = rusqlite::Connection::open(store.path()).unwrap();
+            connection.execute(&format!("UPDATE tool_intents SET {column}='changed' WHERE session_id='s' AND call_id='c'"),[]).unwrap();
+            assert!(
+                store
+                    .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                    .is_err()
+            );
+            assert_uncompleted(&store, "c");
+        }
+    }
+    #[test]
+    fn terminal_projection_rejects_late_receipt_without_second_completion() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "UPDATE tool_intents SET state='Completed' WHERE session_id='s' AND call_id='c'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert!(completed(&store).is_empty());
+        assert_eq!(
+            store.tool_state("s", "c").unwrap().as_deref(),
+            Some("Completed")
+        );
+    }
+    #[test]
+    fn completion_update_failure_leaves_result_and_event_uncommitted() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_completion_update BEFORE UPDATE ON tool_intents WHEN NEW.state='Completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+        assert!(store.claim_tool("s", "c").is_err());
+    }
+    #[test]
+    fn completion_event_failure_rolls_back_and_recovers_without_reexecution() {
+        let (dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"preserved");
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_completion_event BEFORE INSERT ON events WHEN NEW.kind='tool.completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(
+            store
+                .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+                .is_err()
+        );
+        assert_uncompleted(&store, "c");
+        assert!(store.claim_tool("s", "c").is_err());
+        // Remove only the injected fixture trigger so recovery can append evidence.
+        connection
+            .execute_batch("DROP TRIGGER fail_completion_event;")
+            .unwrap();
+        drop(connection);
+        drop(a);
+        drop(store);
+        let mut store = SessionStore::open(dir.path().join("events.db")).unwrap();
+        let a = ArtifactStore::open(
+            &mut store,
+            dir.path().join("artifacts"),
+            ArtifactLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.tool_state("s", "c").unwrap().as_deref(),
+            Some("OutcomeUnknown")
+        );
+        assert!(store.claim_tool("s", "c").is_err());
+        assert!(completed(&store).is_empty());
+        let mut verified = a
+            .lookup(&store, "s", "c", &m.artifact_ref)
+            .unwrap()
+            .verify()
+            .unwrap();
+        let mut bytes = Vec::new();
+        verified.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"preserved");
+    }
+    #[test]
+    fn completion_keeps_metadata_out_of_the_result_envelope() {
+        let (_dir, mut store, a, receipt) = fixture_started();
+        let m = publish(&mut store, &a, b"data");
+        store
+            .complete_tool(receipt, artifact_result("c", &m.artifact_ref, false))
+            .unwrap();
+        let events = completed(&store);
+        let result = events[0].payload["result"].as_object().unwrap();
+        for field in [
+            "preview_bytes",
+            "preview_encoding",
+            "byte_length",
+            "sha256",
+            "contract_version",
+        ] {
+            assert!(!result.contains_key(field));
+        }
+        assert_eq!(result.len(), 3);
+    }
 }

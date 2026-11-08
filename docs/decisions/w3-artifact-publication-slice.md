@@ -99,6 +99,6 @@ power-loss or arbitrary hardware guarantees. Run on both Linux and macOS.
 
 No changes to tool-result wire variants/error categories, W2 slab/parser ownership,
 plugins, builtin execution, live RPC/CLI, or the canonical tool loop. This slice
-registers artifacts, not tool completion: complete_tool still rejects artifact-
-backed ToolResult until the separate completion-association integration patch.
+registers artifacts. Step B now connects committed artifact-backed ToolResult to
+complete_tool; see w3-artifact-completion-slice.md for provenance checks and tests.
 Existing contract JSON status is not rewritten to claim acceptance.

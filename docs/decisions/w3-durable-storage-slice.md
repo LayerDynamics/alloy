@@ -10,8 +10,9 @@ No external tool is executed by these APIs.
 
 Implementation placement: store.rs owns the connection and OS file lock;
 store/durable.rs holds the coordinator and its focused tests. This is a file
-organization decision, not new W3 scope. No artifact publication API is enabled.
-The tool_artifacts table reserves metadata storage for the later artifact slice.
+organization decision, not new W3 scope. Artifact publication and completion now
+use tool_artifacts; see w3-artifact-publication-slice.md and
+w3-artifact-completion-slice.md for those follow-up implementation records.
 
 All mutating SessionStore opens acquire a nonblocking OS lock on a persistent
 `<database-path>.alloy-owner.lock` sidecar before SQLite migration/recovery. The
@@ -64,11 +65,12 @@ remain Started until conservative restart recovery, never automatic replay.
 The caller passes the CURRENT authoritative policy/registry to start_tool; stale
 snapshots must not be presented as current by W6. W4 must enforce operation-boundary
 resource scope and execute only the receipt's unchanged invocation. Completion
-accepts existing inline ToolResult only. Artifact-backed results fail closed until
-the artifact publication slice. An inline storage ceiling of 1 MiB is imposed;
-larger results require the not-yet-implemented artifact handoff. Completion consumes
-the receipt; failed/uncertain completion is conservatively recovered as unknown
-instead of returning any new permission to execute.
+accepts the existing inline and artifact-backed ToolResult variants. Artifact
+results require committed session/call-owned metadata and matching creation
+evidence; see w3-artifact-completion-slice.md. The result envelope remains bounded
+to 1 MiB; larger bytes belong in the bounded artifact store. Completion consumes
+the receipt; failed/uncertain completion never returns permission to execute.
+Unresolved Started is conservatively recovered as OutcomeUnknown.
 
 Pausing or completing a session withdraws pre-start intents atomically with the
 status update. Started operations remain W4/W6-owned cancellation responsibilities.

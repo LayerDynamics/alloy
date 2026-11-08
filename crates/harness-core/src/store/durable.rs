@@ -22,6 +22,28 @@ impl AuthorizedInvocation {
     }
 }
 /// Single-use durable start receipt. W4 may attempt only this exact invocation.
+///
+/// A start receipt cannot be cloned:
+/// ```compile_fail
+/// use harness_core::store::StartedInvocation;
+/// fn clone_receipt(receipt: &StartedInvocation) -> StartedInvocation {
+///     Clone::clone(receipt)
+/// }
+/// ```
+/// Completion consumes it; a second completion cannot reuse the same receipt:
+/// ```compile_fail
+/// use harness_core::store::{SessionStore, StartedInvocation};
+/// use tool_registry::result::ToolResult;
+/// fn reuse(store: &mut SessionStore, receipt: StartedInvocation, result: ToolResult) {
+///     store.complete_tool(receipt, result.clone()).unwrap();
+///     store.complete_tool(receipt, result).unwrap();
+/// }
+/// ```
+/// Start receipts cannot be constructed by deserializing client input:
+/// ```compile_fail
+/// use harness_core::store::StartedInvocation;
+/// let _: StartedInvocation = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Debug)]
 pub struct StartedInvocation {
     binding: InvocationBinding,
@@ -125,6 +147,100 @@ fn terminal(
         EventKind::ToolCompleted,
         serde_json::json!({"state":next,"reason":reason,"is_error":true,"outcome_known": next != "OutcomeUnknown"}),
     )
+}
+
+// Validate only committed database provenance inside the completion transaction.
+// File verification remains a separate lock-free ArtifactStore read operation.
+fn committed_artifact_for_completion(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &InvocationBinding,
+    reference: &str,
+) -> HarnessResult<()> {
+    use crate::artifact::{ArtifactMetadata, MAX_ARTIFACT_BYTES, MAX_PREVIEW_BYTES};
+    let valid_hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    };
+    if reference.len() != 37
+        || !reference.starts_with("art1_")
+        || !valid_hex(&reference.as_bytes()[5..])
+    {
+        return Err(invalid("invalid artifact reference"));
+    }
+    let invocation = binding.invocation();
+    let session = &invocation.context.session_id;
+    let call = &invocation.call.call_id;
+    let json: Option<String> = tx.query_row(
+        "SELECT metadata_json FROM tool_artifacts WHERE artifact_ref=?1 AND session_id=?2 AND call_id=?3",
+        params![reference,session,call], |r| r.get(0),
+    ).optional()?;
+    let json = json.ok_or_else(|| invalid("artifact is not committed for this session/call"))?;
+    if json.len() > crate::approval::MAX_CANONICAL_BINDING_BYTES {
+        return Err(invalid(
+            "artifact metadata exceeds storage envelope ceiling",
+        ));
+    }
+    let metadata: ArtifactMetadata = serde_json::from_str(&json)?;
+    let bound_max = binding.snapshot()["effective_max_output_bytes"]
+        .as_u64()
+        .ok_or_else(|| invalid("binding lacks output limit"))?;
+    let preview_valid = match metadata.preview_encoding.as_str() {
+        "utf8" => metadata.preview_bytes.len() <= MAX_PREVIEW_BYTES,
+        "base64" => metadata.preview_bytes.len() <= 5464 && metadata.preview_bytes.is_ascii(),
+        _ => false,
+    };
+    if metadata.artifact_ref != reference
+        || &metadata.session_id != session
+        || &metadata.call_id != call
+        || metadata.contract_version != CONTRACT_VERSION
+        || metadata.byte_length > MAX_ARTIFACT_BYTES
+        || metadata.byte_length > bound_max
+        || metadata.created_at_unix_ms < 0
+        || metadata.sha256.len() != 64
+        || !valid_hex(metadata.sha256.as_bytes())
+        || !preview_valid
+    {
+        return Err(invalid(
+            "artifact metadata does not match invocation contract",
+        ));
+    }
+    let expected = serde_json::to_value(metadata)?;
+    let mut statement = tx.prepare(
+        "SELECT payload_json,artifact_refs FROM events WHERE session_id=?1 AND kind='artifact.created' ORDER BY seq",
+    )?;
+    let mut rows = statement.query([session])?;
+    let mut matches = 0usize;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > 4096 {
+            return Err(invalid(
+                "artifact creation history exceeds frozen file ceiling",
+            ));
+        }
+        let payload: String = row.get(0)?;
+        if payload.len() > crate::approval::MAX_CANONICAL_BINDING_BYTES {
+            return Err(invalid("artifact creation payload exceeds ceiling"));
+        }
+        let payload: Value = serde_json::from_str(&payload)?;
+        if payload["artifact_ref"].as_str() != Some(reference) {
+            continue;
+        }
+        let refs: String = row.get(1)?;
+        if refs.len() > crate::approval::MAX_CANONICAL_BINDING_BYTES {
+            return Err(invalid("artifact creation references exceed ceiling"));
+        }
+        let refs: Value = serde_json::from_str(&refs)?;
+        if payload != expected || refs != serde_json::json!([reference]) {
+            return Err(invalid("artifact metadata/creation event mismatch"));
+        }
+        matches += 1;
+    }
+    if matches != 1 {
+        return Err(invalid("artifact has no unique committed creation event"));
+    }
+    Ok(())
 }
 
 impl SessionStore {
@@ -369,22 +485,29 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Persist an actual inline result once. Artifact publication is a later slice.
-    /// Commit failure leaves Started unresolved; it never grants a retry execution.
+    /// Persist one canonical inline or committed artifact-backed result.
+    /// Artifact validation here is bounded metadata/creation-event validation,
+    /// not filesystem streaming. Use ArtifactStore lookup/verify outside store
+    /// locks when consuming bytes. Failure consumes the receipt but never grants
+    /// another execution; unresolved Started is conservatively recovered unknown.
     pub fn complete_tool(
         &mut self,
         handle: StartedInvocation,
         result: tool_registry::result::ToolResult,
     ) -> HarnessResult<()> {
+        use tool_registry::result::ToolResult;
         let (session, call) = key(&handle.binding);
-        let value = serde_json::to_value(result)?;
-        if value["call_id"].as_str() != Some(call.as_str()) || value.get("artifact_ref").is_some() {
-            return Err(invalid(
-                "result identity mismatch or unimplemented artifact publication",
-            ));
+        if result.call_id() != call {
+            return Err(invalid("result call identity mismatch"));
         }
-        if serde_json::to_vec(&value)?.len() > crate::approval::MAX_CANONICAL_BINDING_BYTES {
-            return Err(invalid("inline result exceeds storage ceiling"));
+        let artifact_ref = match &result {
+            ToolResult::Inline(_) => None,
+            ToolResult::Artifact(artifact) => Some(artifact.artifact_ref.clone()),
+        };
+        let value = serde_json::to_value(&result)?;
+        let result_json = serde_json::to_string(&value)?;
+        if result_json.len() > crate::approval::MAX_CANONICAL_BINDING_BYTES {
+            return Err(invalid("tool result exceeds storage envelope ceiling"));
         }
         let tx = self
             .conn
@@ -392,21 +515,37 @@ impl SessionStore {
         if state(&tx, &session, &call)? != "Started" {
             return Err(invalid("intent is not Started"));
         }
-        let owner: String = tx.query_row(
-            "SELECT daemon_epoch FROM tool_intents WHERE session_id=?1 AND call_id=?2",
-            params![session, call],
-            |r| r.get(0),
+        let owner: (String, String) = tx.query_row(
+            "SELECT daemon_epoch,binding_digest FROM tool_intents WHERE session_id=?1 AND call_id=?2",
+            params![session,call], |r| Ok((r.get(0)?,r.get(1)?)),
         )?;
-        if owner != self.epoch {
-            return Err(invalid("wrong daemon epoch"));
+        if owner.0 != self.epoch
+            || field(&handle.binding, "daemon_epoch")? != self.epoch
+            || owner.1 != handle.binding.digest()
+        {
+            return Err(invalid("completion receipt epoch or binding mismatch"));
         }
-        tx.execute("UPDATE tool_intents SET state='Completed',result_json=?3 WHERE session_id=?1 AND call_id=?2",params![session,call,serde_json::to_string(&value)?])?;
-        event(
+        let refs = match artifact_ref.as_deref() {
+            Some(reference) => {
+                committed_artifact_for_completion(&tx, &handle.binding, reference)?;
+                serde_json::json!([reference])
+            }
+            None => serde_json::json!([]),
+        };
+        let updated = tx.execute(
+            "UPDATE tool_intents SET state='Completed',result_json=?3 WHERE session_id=?1 AND call_id=?2 AND state='Started' AND daemon_epoch=?4 AND binding_digest=?5",
+            params![session,call,result_json,self.epoch,handle.binding.digest()],
+        )?;
+        if updated != 1 {
+            return Err(invalid("completion ownership was lost"));
+        }
+        append_event_in_tx(
             &tx,
             &session,
-            &call,
+            now_ms()?,
             EventKind::ToolCompleted,
-            serde_json::json!({"state":"Completed","result":value}),
+            serde_json::json!({"contract_version":CONTRACT_VERSION,"call_id":call,"state":"Completed","result":value}),
+            refs,
         )?;
         tx.commit()?;
         Ok(())
