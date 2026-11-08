@@ -1,9 +1,13 @@
-//! W4 builtin definition/schema factories. No OS/network implementation here.
+//! W4 builtin definitions and scoped execution primitives.
 //! Limits are explicit daemon inputs; no new default time/byte limits are frozen.
 //! Schema validity is not filesystem/network resource authorization.
 /// Scoped file-read primitives; no live dispatch is enabled.
 #[cfg(unix)]
 pub mod fs;
+
+/// Owned shell process primitives; no live dispatch enabled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod shell;
 
 use crate::{
     definition::{ApprovalRequirement, ToolDefinition, ToolEffect, ToolOrigin, ToolPolicy},
