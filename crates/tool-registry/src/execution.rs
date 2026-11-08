@@ -120,6 +120,8 @@ impl ExecutionContext {
 pub trait OutputSink {
     /// Accept all bytes or fail; partial output is never complete success.
     fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), ExecutionError>;
+    /// Invalidate partial output after any producer or sink failure.
+    fn abort(&mut self);
 }
 
 /// Small bounded collector for fixtures/inline staging, not the artifact store.
@@ -152,6 +154,9 @@ impl BoundedOutput {
     }
 }
 impl OutputSink for BoundedOutput {
+    fn abort(&mut self) {
+        self.failed = true;
+    }
     fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), ExecutionError> {
         if self.failed {
             return Err(ExecutionError::IncompleteOutput);

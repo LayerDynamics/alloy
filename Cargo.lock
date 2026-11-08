@@ -1663,6 +1663,7 @@ name = "tool-registry"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

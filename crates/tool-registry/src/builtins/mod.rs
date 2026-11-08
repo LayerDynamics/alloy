@@ -1,6 +1,10 @@
 //! W4 builtin definition/schema factories. No OS/network implementation here.
 //! Limits are explicit daemon inputs; no new default time/byte limits are frozen.
 //! Schema validity is not filesystem/network resource authorization.
+/// Scoped file-read primitives; no live dispatch is enabled.
+#[cfg(unix)]
+pub mod fs;
+
 use crate::{
     definition::{ApprovalRequirement, ToolDefinition, ToolEffect, ToolOrigin, ToolPolicy},
     error::ValidationError,
