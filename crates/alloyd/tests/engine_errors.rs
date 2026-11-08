@@ -281,6 +281,17 @@ fn assert_failure_survives(at: FailureAt) {
                 "pre-stream failures use the final response"
             );
         }
+        assert!(
+            invoke(&service, "daemon.status", json!({}))[0]
+                .get("result")
+                .is_some(),
+            "refusal leaves the daemon reachable"
+        );
+        assert!(
+            SessionStore::open(&db).is_err(),
+            "live daemon must retain exclusive mutating store ownership"
+        );
+        drop(service);
         let store = SessionStore::open(&db).unwrap();
         let events = store.list_events(session_id).unwrap();
         assert!(
@@ -289,12 +300,6 @@ fn assert_failure_survives(at: FailureAt) {
                 EventKind::AssistantMessage | EventKind::RunCompleted
             )),
             "failed partial text cannot be committed as a successful turn"
-        );
-        assert!(
-            invoke(&service, "daemon.status", json!({}))[0]
-                .get("result")
-                .is_some(),
-            "refusal leaves the daemon reachable"
         );
     }
 }

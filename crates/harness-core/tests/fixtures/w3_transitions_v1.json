@@ -1,0 +1,139 @@
+{
+  "contract_version": "alloy.w3/1",
+  "note": "Only pure graph legality. All unlisted pairs reject. Restart preserves terminal labels without appending duplicate events. No atomicity, expiry checks, side-effect prevention, or durable authorization is proved by this table.",
+  "states": [
+    "AwaitingApproval",
+    "Ready",
+    "Claimed",
+    "Started",
+    "Denied",
+    "Expired",
+    "Withdrawn",
+    "Rejected",
+    "Completed",
+    "OutcomeUnknown"
+  ],
+  "events": [
+    "Approve",
+    "Deny",
+    "Claim",
+    "Start",
+    "Complete",
+    "Expire",
+    "Withdraw",
+    "Reject",
+    "Restart"
+  ],
+  "allowed": [
+    {
+      "from": "AwaitingApproval",
+      "event": "Approve",
+      "to": "Ready"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "Deny",
+      "to": "Denied"
+    },
+    {
+      "from": "Ready",
+      "event": "Claim",
+      "to": "Claimed"
+    },
+    {
+      "from": "Claimed",
+      "event": "Start",
+      "to": "Started"
+    },
+    {
+      "from": "Started",
+      "event": "Complete",
+      "to": "Completed"
+    },
+    {
+      "from": "Claimed",
+      "event": "Reject",
+      "to": "Rejected"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "Expire",
+      "to": "Expired"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "Withdraw",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "AwaitingApproval",
+      "event": "Restart",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Ready",
+      "event": "Expire",
+      "to": "Expired"
+    },
+    {
+      "from": "Ready",
+      "event": "Withdraw",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Ready",
+      "event": "Restart",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Claimed",
+      "event": "Expire",
+      "to": "Expired"
+    },
+    {
+      "from": "Claimed",
+      "event": "Withdraw",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Claimed",
+      "event": "Restart",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Started",
+      "event": "Restart",
+      "to": "OutcomeUnknown"
+    },
+    {
+      "from": "Denied",
+      "event": "Restart",
+      "to": "Denied"
+    },
+    {
+      "from": "Expired",
+      "event": "Restart",
+      "to": "Expired"
+    },
+    {
+      "from": "Withdrawn",
+      "event": "Restart",
+      "to": "Withdrawn"
+    },
+    {
+      "from": "Rejected",
+      "event": "Restart",
+      "to": "Rejected"
+    },
+    {
+      "from": "Completed",
+      "event": "Restart",
+      "to": "Completed"
+    },
+    {
+      "from": "OutcomeUnknown",
+      "event": "Restart",
+      "to": "OutcomeUnknown"
+    }
+  ]
+}

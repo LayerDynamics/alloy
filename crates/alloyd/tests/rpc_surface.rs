@@ -180,13 +180,46 @@ impl GenerationEventStream for GatedStream {
     }
 }
 
+/// Own all fixture threads so a restart releases the first daemon's store.
+struct TestServer {
+    socket: PathBuf,
+    stopping: Arc<AtomicBool>,
+    accept: Option<thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    fn stop(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        if let Some(accept) = self.accept.take() {
+            self.stopping
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Wake blocking accept. The loop checks stopping before spawning.
+            let _ = UnixStream::connect(&self.socket);
+            let result = accept.join();
+            assert!(
+                result.is_ok() || thread::panicking(),
+                "test server thread panicked during shutdown"
+            );
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 fn start_server_with_engine<E: Engine + 'static>(
     dir: &Path,
     socket_name: &str,
     engine: E,
     models_resident: u64,
     memory_reserved: u64,
-) -> (PathBuf, PathBuf) {
+) -> (PathBuf, PathBuf, TestServer) {
     let socket = dir.join(socket_name);
     let db = dir.join("sessions.sqlite");
     let telemetry = Arc::new(TelemetryClient::new(
@@ -205,20 +238,48 @@ fn start_server_with_engine<E: Engine + 'static>(
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600, "socket must be mode 0600");
-    thread::spawn(move || {
+    let stopping = Arc::new(AtomicBool::new(false));
+    let thread_stopping = Arc::clone(&stopping);
+    let accept = thread::spawn(move || {
+        let mut workers = Vec::new();
+        let mut connections = Vec::new();
         for connection in listener.incoming() {
             let stream = connection.expect("accept");
+            if thread_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("server read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("server write timeout");
+            connections.push(stream.try_clone().expect("shutdown handle"));
             let service = Arc::clone(&service);
-            thread::spawn(move || {
+            workers.push(thread::spawn(move || {
                 let _ = handle_connection(stream, service.as_ref());
-            });
+            }));
         }
+        // Teardown must also unblock readers on persistent connections.
+        for connection in connections {
+            let _ = connection.shutdown(std::net::Shutdown::Both);
+        }
+        let mut panicked = false;
+        for worker in workers {
+            panicked |= worker.join().is_err();
+        }
+        assert!(!panicked, "test connection worker panicked");
+        // The last service owner drops as this thread exits, before join returns.
     });
-    thread::sleep(Duration::from_millis(20));
-    (socket, db)
+    let server = TestServer {
+        socket: socket.clone(),
+        stopping,
+        accept: Some(accept),
+    };
+    (socket, db, server)
 }
 
-fn start_server(dir: &Path) -> (PathBuf, PathBuf) {
+fn start_server(dir: &Path) -> (PathBuf, PathBuf, TestServer) {
     start_server_with_engine(
         dir,
         "alloyd.sock",
@@ -262,7 +323,7 @@ fn call(socket: &std::path::Path, request: Value) -> Vec<Value> {
 #[test]
 fn rpc_surface_v1() {
     let dir = tempdir().expect("tempdir");
-    let (socket, _db) = start_server(dir.path());
+    let (socket, db, server) = start_server(dir.path());
 
     // api_version negotiation — missing version.
     let missing = call(
@@ -482,8 +543,13 @@ fn rpc_surface_v1() {
         .expect("sess prefix")
         .parse()
         .expect("numeric id");
+    assert!(
+        harness_core::SessionStore::open(&db).is_err(),
+        "first live daemon must retain exclusive ownership"
+    );
+    server.stop();
     drop(socket);
-    let (socket2, _) = start_server_with_engine(
+    let (socket2, _, _server2) = start_server_with_engine(
         dir.path(),
         "alloyd-reopen.sock",
         FixtureEngine::new("ignored"),
@@ -551,7 +617,7 @@ fn stream_events_order() {
     let cancel = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(StreamGate::default());
     let release_gate = gate.release_on_drop();
-    let (socket, _) = start_server_with_engine(
+    let (socket, _, _server) = start_server_with_engine(
         dir.path(),
         "stream.sock",
         GatedFixtureEngine::new(
@@ -657,7 +723,7 @@ fn pause_cancels_only_target_session() {
     let cancel_a = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(StreamGate::default());
     let release_gate = gate.release_on_drop();
-    let (socket, _) = start_server_with_engine(
+    let (socket, _, _server) = start_server_with_engine(
         dir.path(),
         "multi.sock",
         GatedFixtureEngine::new(

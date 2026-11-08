@@ -1,14 +1,15 @@
-//! Phase-1 harness core: supervisor skeleton, context builder, session store,
-//! and FR-35 telemetry client.
+//! Harness core: supervision, durable sessions, W3 policy/approvals and artifacts.
 //!
-//! This crate sits between the daemon JSON-RPC surface and the in-process
-//! engine. Phase 1 covers a single-session turn loop with no tools, policy,
-//! MCP, skills, or compaction.
+//! The active supervisor remains text-only. These reusable daemon APIs do not
+//! enable builtin execution, plugin hosting, live approval RPC or the tool loop.
 
 #![deny(missing_docs)]
 
+pub mod approval;
+pub mod artifact;
 pub mod context;
 pub mod error;
+pub mod policy;
 pub mod store;
 pub mod supervisor;
 pub mod telemetry;

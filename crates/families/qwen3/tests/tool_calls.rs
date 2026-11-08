@@ -245,3 +245,35 @@ fn unresolved_tool_name_remains_data_not_a_registration() {
         _ => panic!("expected exactly one untrusted parsed call"),
     }
 }
+
+#[test]
+fn w3_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes() {
+    for body in [
+        r#"{"name":"a","name":"b","arguments":{}}"#,
+        r#"{"name":"a","arguments":{"x":1,"x":2}}"#,
+        r#"{"name":"a","arguments":{"nested":[{"x":1,"x":2}]}}"#,
+        r#"{"name":"a","arguments":{"x":1,"\u0078":2}}"#,
+    ] {
+        let text = format!("<tool_call>{body}</tool_call>");
+        for split in 0..=text.len() {
+            let chunks = [&text.as_bytes()[..split], &text.as_bytes()[split..]];
+            assert_eq!(
+                parse_chunks(&chunks, ParserLimits::default()),
+                Err(ToolParseError::InvalidJson)
+            );
+            let mut parser = ToolCallParser::new(ParserLimits::default()).unwrap();
+            let mut failure = None;
+            for chunk in chunks {
+                match parser.push_stream(chunk) {
+                    Ok(blocks) => assert!(blocks.is_empty(), "duplicate call escaped as proposal"),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failure, Some(ToolParseError::InvalidJson));
+            assert_eq!(parser.finish(), Err(ToolParseError::FailedParser));
+        }
+    }
+}

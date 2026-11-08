@@ -1,0 +1,85 @@
+{
+  "contract_version": "alloy.w3/1",
+  "canonicalization_version": "alloy-json-c14n/1",
+  "note": "Expected canonical strings are explicit contract vectors, not Python JSON serialization. Rust verifies bytes and hashes; upstream parser duplicate-key/schema checks are separate.",
+  "cases": [
+    {
+      "id": "object_order",
+      "input_json": "{\"z\":0,\"a\":1}",
+      "canonical_json": "{\"a\":1,\"z\":0}",
+      "sha256": "b55af27c4bd5f02ebeca8f901b84d2940b22e7bea7230e4d06f275d903bfdd72"
+    },
+    {
+      "id": "nested_order",
+      "input_json": "{\"z\":{\"b\":2,\"a\":1},\"a\":[{\"y\":2,\"x\":1},null,true,false]}",
+      "canonical_json": "{\"a\":[{\"x\":1,\"y\":2},null,true,false],\"z\":{\"a\":1,\"b\":2}}",
+      "sha256": "0a08ff9b5ab4c95d92d569582a41c6424b768f085b682f8265f90c404e7f48dc"
+    },
+    {
+      "id": "arrays_preserved",
+      "input_json": "{\"items\":[3,1,2]}",
+      "canonical_json": "{\"items\":[3,1,2]}",
+      "sha256": "de21aef9c6d6b65cfe6dc3c9159d9969659d1f5b854c6249d871036c57a26966"
+    },
+    {
+      "id": "unicode_order",
+      "input_json": "{\"雪\":1,\"é\":2,\"é\":3,\"a\":4}",
+      "canonical_json": "{\"a\":4,\"é\":3,\"é\":2,\"雪\":1}",
+      "sha256": "dfc7f15709e17acb33ec27d3a5e66a73e3fee48afa4a662f1a7d8102c2f4ac7e"
+    },
+    {
+      "id": "escapes",
+      "input_json": "{\"s\":\"a\\n\\t\\r\\u0000\\\"\\\\/\"}",
+      "canonical_json": "{\"s\":\"a\\n\\t\\r\\u0000\\\"\\\\/\"}",
+      "sha256": "5aa3639e504ac8efa2359ae6b846bc6b720c3ce3abae7b736a19e4978b91e2a6"
+    },
+    {
+      "id": "integer_extremes",
+      "input_json": "{\"u\":18446744073709551615,\"i\":-9223372036854775808}",
+      "canonical_json": "{\"i\":-9223372036854775808,\"u\":18446744073709551615}",
+      "sha256": "87d2608b3207e7e8d6219389ac761c598a364eea5dcf8517f5f28441e25d1bd6"
+    },
+    {
+      "id": "integer_one",
+      "input_json": "{\"n\":1}",
+      "canonical_json": "{\"n\":1}",
+      "sha256": "2bfd14f43d17fc7cea24e0917a8879b4b2f880b8baeec1b9d90fbaad655e71bd"
+    },
+    {
+      "id": "float_one",
+      "input_json": "{\"n\":1.0}",
+      "canonical_json": "{\"n\":1.0}",
+      "sha256": "3b6b06ecd1c968c8e738e0f11c4bb361fca80a9a694de22fe66a05286afbd081"
+    },
+    {
+      "id": "negative_zero",
+      "input_json": "{\"n\":-0.0}",
+      "canonical_json": "{\"n\":-0.0}",
+      "sha256": "a8a313cade05001e69f7ddb5db01e1e2d06fb8f6913ab492cc4506d4e65d465a"
+    },
+    {
+      "id": "empty_object",
+      "input_json": "{}",
+      "canonical_json": "{}",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "id": "empty_array",
+      "input_json": "[]",
+      "canonical_json": "[]",
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "id": "scalar_string",
+      "input_json": "\"résumé 雪\"",
+      "canonical_json": "\"résumé 雪\"",
+      "sha256": "c6b2cb5da0809e471b823a3936fd916d0a0d2139b24d463ea7c52521ed3a4b00"
+    }
+  ],
+  "binding": {
+    "note": "Representative encoding vector; placeholder definition/argument digest strings are NOT a valid registered or authorized invocation. This tests encoding/domain separation, not binding validation.",
+    "input_json": "{\"arguments_digest\":\"args-sha256-fixture\",\"call_id\":\"call-1\",\"canonical_arguments\":\"{\\\"a\\\":1}\",\"contract_version\":\"alloy.w3/1\",\"created_at_unix_ms\":1000,\"daemon_epoch\":\"epoch-1\",\"effective_approval_requirement\":\"always\",\"effective_effect\":\"destructive\",\"effective_max_output_bytes\":65536,\"effective_timeout_ms\":10000,\"expires_at_unix_ms\":301000,\"generation_id\":\"generation-1\",\"policy_revision\":\"policy-1\",\"registered_definition_digest\":\"definition-sha256-fixture\",\"registered_tool_version\":\"1.0.0\",\"session_id\":\"session-1\",\"tool_id\":\"shell.run\",\"turn_id\":\"turn-1\"}",
+    "canonical_json": "{\"arguments_digest\":\"args-sha256-fixture\",\"call_id\":\"call-1\",\"canonical_arguments\":\"{\\\"a\\\":1}\",\"contract_version\":\"alloy.w3/1\",\"created_at_unix_ms\":1000,\"daemon_epoch\":\"epoch-1\",\"effective_approval_requirement\":\"always\",\"effective_effect\":\"destructive\",\"effective_max_output_bytes\":65536,\"effective_timeout_ms\":10000,\"expires_at_unix_ms\":301000,\"generation_id\":\"generation-1\",\"policy_revision\":\"policy-1\",\"registered_definition_digest\":\"definition-sha256-fixture\",\"registered_tool_version\":\"1.0.0\",\"session_id\":\"session-1\",\"tool_id\":\"shell.run\",\"turn_id\":\"turn-1\"}",
+    "domain_separated_sha256": "a159de0d2482d7a54ed349bc5f255305e8cb5c2714115c582a049bec7d0556ba"
+  }
+}

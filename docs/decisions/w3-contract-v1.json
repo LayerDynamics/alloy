@@ -1,0 +1,105 @@
+{
+  "contract_version": "alloy.w3/1",
+  "status": "design_frozen_runtime_unimplemented",
+  "canonicalization_version": "alloy-json-c14n/1",
+  "database_schema_version": 2,
+  "issue": 30,
+  "branch": "feat/30-policy-approvals-artifacts",
+  "starting_commit": "58d7db53d8fb6f549cddba990dd9e83521989d92",
+  "normative_document": "w3-approval-and-storage-contract.md",
+  "normative_document_sha256": "7f4959558b85da12a61b3ae61650f8536140e6f1a08ffb33c07feafde90b764e",
+  "binding_digest": {
+    "algorithm": "sha256",
+    "domain_utf8": "alloy.w3.invocation.v1",
+    "domain_separator_byte": 0
+  },
+  "binding_fields": [
+    "contract_version",
+    "daemon_epoch",
+    "session_id",
+    "turn_id",
+    "generation_id",
+    "call_id",
+    "tool_id",
+    "registered_tool_version",
+    "registered_definition_digest",
+    "canonical_arguments",
+    "arguments_digest",
+    "policy_revision",
+    "effective_effect",
+    "effective_approval_requirement",
+    "effective_timeout_ms",
+    "effective_max_output_bytes",
+    "created_at_unix_ms",
+    "expires_at_unix_ms"
+  ],
+  "limits": {
+    "max_canonical_binding_bytes": 1048576,
+    "max_pending_ready_claimed_per_session": 32,
+    "max_pending_ready_claimed_per_daemon": 256,
+    "authorization_ttl_ms": 300000,
+    "max_artifact_bytes": 16777216,
+    "max_preview_source_bytes": 4096,
+    "max_base64_preview_characters": 5464,
+    "copy_buffer_bytes_per_writer": 65536,
+    "max_concurrent_artifact_writers": 8,
+    "max_managed_artifact_bytes": 1073741824,
+    "max_managed_artifact_files": 4096
+  },
+  "states": {
+    "active": [
+      "AwaitingApproval",
+      "Ready",
+      "Claimed",
+      "Started"
+    ],
+    "terminal": [
+      "Denied",
+      "Expired",
+      "Withdrawn",
+      "Rejected",
+      "Completed",
+      "OutcomeUnknown"
+    ]
+  },
+  "restart": {
+    "AwaitingApproval": "Withdrawn",
+    "Ready": "Withdrawn",
+    "Claimed": "Withdrawn",
+    "Started": "OutcomeUnknown",
+    "automatic_replay": false
+  },
+  "artifact_reference_regex": "^art1_[0-9a-f]{32}$",
+  "tool_error_kinds": [
+    "protocol",
+    "execution",
+    "timeout",
+    "policy"
+  ],
+  "human_approval_request_fields": [
+    "session_id",
+    "call_id",
+    "allow"
+  ],
+  "required_gates": [
+    {
+      "id": "P2-06",
+      "test": "destructive_effect_requires_bound_approval",
+      "file": "crates/harness-core/tests/tool_policy.rs",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "id": "P2-08",
+      "test": "oversized_tool_result_artifact_roundtrip",
+      "file": "crates/harness-core/tests/tool_artifacts.rs",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    }
+  ],
+  "tests_executed_by_this_freeze_script": false
+}

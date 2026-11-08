@@ -5,12 +5,15 @@ use std::fmt;
 /// Result alias for harness-core operations.
 pub type HarnessResult<T> = Result<T, HarnessError>;
 
-/// Errors from the session store, context builder, supervisor, or telemetry.
+/// Internal failures from sessions, durable tool lifecycle, artifacts, and supervision.
+/// These categories do not extend the tool-result wire error vocabulary.
 #[derive(Debug)]
 pub enum HarnessError {
-    /// SQLite or schema failure.
+    /// Storage, schema, ownership, artifact I/O, or integrity failure.
+    /// This category alone does not establish retry safety or commit outcome.
     Store(String),
-    /// Invalid session or event input.
+    /// Invalid input, lifecycle state, binding, or serialized metadata.
+    /// Never infer execution authority or retry safety from an error message.
     Invalid(String),
     /// Engine render/generate failure.
     Engine(String),
