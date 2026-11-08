@@ -607,6 +607,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokenizers",
+ "tool-registry",
  "ureq",
 ]
 

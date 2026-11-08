@@ -12,12 +12,13 @@ engine = { path = "../engine" }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "=0.10.9"
+tool-registry = { path = "../tool-registry" }
 ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = "=3.27.0"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
-sha2 = "=0.10.9"
 
 [lints]
 workspace = true

@@ -1,10 +1,8 @@
-//! Pure W3 contract primitives, not durable authorization.
+//! W3 canonical encoding, lifecycle labels, and immutable invocation bindings.
 //!
-//! This module implements canonical byte encoding and the permitted state graph.
-//! A state value is NOT an execution capability. These functions perform no
-//! registry validation, policy evaluation, clock checks, database transaction,
-//! hook invocation, or tool execution. The later durable coordinator must prove
-//! those preconditions before making a transition usable for execution.
+//! Bindings and graph labels are not execution capabilities. Policy preparation
+//! validates registry requests but does not persist/consume approvals, check a
+//! live deadline, run hooks, or execute tools. Those require the durable coordinator.
 
 use serde_json::Value;
 use std::{
@@ -315,3 +313,165 @@ impl fmt::Display for InvalidTransition {
     }
 }
 impl Error for InvalidTransition {}
+
+// W3 policy/binding slice: snapshots only, never execution grants.
+
+/// Fixed authorization lifetime, checked with overflow-safe arithmetic.
+pub const AUTHORIZATION_TTL_MS: i64 = 300_000;
+
+/// Failure to prepare an immutable invocation identity, not a wire error enum.
+#[derive(Debug)]
+pub enum BindingError {
+    /// A canonical token stream exceeds its ceiling or cannot be encoded.
+    Canonicalization(CanonicalizationError),
+    /// Trusted contract metadata could not be represented as JSON.
+    Serialization(serde_json::Error),
+    /// Daemon-supplied epoch or timestamp is invalid.
+    InvalidContext(&'static str),
+    /// The expiration timestamp cannot be represented by the store's i64 clock.
+    TimestampOverflow,
+}
+impl fmt::Display for BindingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Canonicalization(error) => write!(f, "binding canonicalization: {error}"),
+            Self::Serialization(error) => write!(f, "binding serialization: {error}"),
+            Self::InvalidContext(field) => write!(f, "invalid binding context: {field}"),
+            Self::TimestampOverflow => f.write_str("binding expiration timestamp overflow"),
+        }
+    }
+}
+impl Error for BindingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Canonicalization(error) => Some(error),
+            Self::Serialization(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<CanonicalizationError> for BindingError {
+    fn from(error: CanonicalizationError) -> Self {
+        Self::Canonicalization(error)
+    }
+}
+impl From<serde_json::Error> for BindingError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(error)
+    }
+}
+
+/// Immutable, bounded request identity. NOT approval or permission to execute.
+///
+/// Construction is crate-private and requires a registry-resolved invocation.
+/// No executable implementation is retained. No Clone, Deserialize, or unchecked
+/// public constructor is provided. The later durable coordinator must enforce
+/// uniqueness, monotonic deadlines, revision/epoch checks and single-use claims.
+#[derive(Debug)]
+pub struct InvocationBinding {
+    invocation: tool_registry::call::ToolInvocation,
+    definition: tool_registry::definition::ToolDefinition,
+    snapshot: Value,
+    bytes: Vec<u8>,
+    digest: String,
+}
+
+/// Already evaluated daemon inputs; not accepted from model/client data.
+pub(crate) struct BindingInputs<'a> {
+    /// Current daemon instance identity.
+    pub(crate) daemon_epoch: &'a str,
+    /// Complete effective policy digest.
+    pub(crate) policy_revision: &'a str,
+    /// Resolved prompt requirement after daemon policy.
+    pub(crate) effective_approval: tool_registry::definition::ApprovalRequirement,
+    /// Tightened duration ceiling.
+    pub(crate) timeout_ms: u64,
+    /// Tightened collection ceiling.
+    pub(crate) max_output_bytes: u64,
+    /// Daemon clock observation, not a client-provided deadline.
+    pub(crate) created_at_unix_ms: i64,
+}
+
+/// SHA-256 identity checksum; not a signature or authorization credential.
+pub(crate) fn identity_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+impl InvocationBinding {
+    pub(crate) fn from_resolved(
+        resolved: &tool_registry::registry::ResolvedInvocation<'_>,
+        inputs: BindingInputs<'_>,
+    ) -> Result<Self, BindingError> {
+        use sha2::{Digest, Sha256};
+        if inputs.daemon_epoch.is_empty() || inputs.daemon_epoch.trim() != inputs.daemon_epoch {
+            return Err(BindingError::InvalidContext("daemon_epoch"));
+        }
+        if inputs.created_at_unix_ms < 0 {
+            return Err(BindingError::InvalidContext("created_at_unix_ms"));
+        }
+        let expires = inputs
+            .created_at_unix_ms
+            .checked_add(AUTHORIZATION_TTL_MS)
+            .ok_or(BindingError::TimestampOverflow)?;
+        let invocation = resolved.invocation();
+        let definition = resolved.definition();
+        let argument_bytes = canonical_json(&Value::Object(invocation.call.arguments.clone()))?;
+        // canonical_json emits valid UTF-8 JSON; errors still remain fail-closed.
+        let arguments = String::from_utf8(argument_bytes.clone())
+            .map_err(|_| BindingError::InvalidContext("canonical_arguments_utf8"))?;
+        let definition_bytes = canonical_json(&serde_json::to_value(definition)?)?;
+        let snapshot = serde_json::json!({
+            "contract_version": CONTRACT_VERSION,
+            "daemon_epoch": inputs.daemon_epoch,
+            "session_id": invocation.context.session_id,
+            "turn_id": invocation.context.turn_id,
+            "generation_id": invocation.context.generation_id,
+            "call_id": invocation.call.call_id,
+            "tool_id": definition.id,
+            "registered_tool_version": definition.version,
+            "registered_definition_digest": identity_digest(&definition_bytes),
+            "canonical_arguments": arguments,
+            "arguments_digest": identity_digest(&argument_bytes),
+            "policy_revision": inputs.policy_revision,
+            "effective_effect": definition.policy.effect,
+            "effective_approval_requirement": inputs.effective_approval,
+            "effective_timeout_ms": inputs.timeout_ms,
+            "effective_max_output_bytes": inputs.max_output_bytes,
+            "created_at_unix_ms": inputs.created_at_unix_ms,
+            "expires_at_unix_ms": expires,
+        });
+        // The complete envelope must fit, even when arguments alone already fit.
+        let bytes = canonical_json(&snapshot)?;
+        let mut hash = Sha256::new();
+        hash.update(b"alloy.w3.invocation.v1\0");
+        hash.update(&bytes);
+        Ok(Self {
+            invocation: invocation.clone(),
+            definition: definition.clone(),
+            snapshot,
+            bytes,
+            digest: format!("{:x}", hash.finalize()),
+        })
+    }
+    /// Read the original validated request; no mutation or implementation handle.
+    pub fn invocation(&self) -> &tool_registry::call::ToolInvocation {
+        &self.invocation
+    }
+    /// Read the registered definition captured during validation.
+    pub fn definition(&self) -> &tool_registry::definition::ToolDefinition {
+        &self.definition
+    }
+    /// Read all frozen binding fields; callers cannot mutate the retained snapshot.
+    pub fn snapshot(&self) -> &Value {
+        &self.snapshot
+    }
+    /// Exact project-local canonical bytes of the complete binding.
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    /// Domain-separated SHA-256 identity, not a bearer token or approval.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
