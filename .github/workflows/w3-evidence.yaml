@@ -69,7 +69,7 @@ jobs:
             bash -euo pipefail -c '
               apt-get update
               apt-get install -y --no-install-recommends python3
-              tar -C /src --exclude=target -cf - . | tar -C /work -xf -
+              tar -C /src --exclude=target -cf - . | tar --no-same-owner -C /work -xf -
               test "$(git rev-parse HEAD)" = "$W3_CANDIDATE"
               rustup component add rustfmt clippy
               python3 scripts/w3_collect.py \
