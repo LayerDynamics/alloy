@@ -1,282 +1,214 @@
 # W3 implementation and acceptance checklist
 
-Status: implementation review and evidence tracking; not a W3 acceptance decision.
+Status: implementation delivered; verification review and final acceptance pending.
+Reviewed implementation baseline: `9ee31cdc8c5f3352cf492a1de41684b596331752`.
 
-A checked source-review item identifies inspected implementation/documentation,
-not an automatically passing test or downstream integration. Test execution and
-platform acceptance require their own candidate-specific evidence. Unchecked
-items may need review or evidence; they do not automatically mean missing code.
+A checked implementation item means the implementation or named test is delivered,
+not that every branch has completed source review or that its test passed on every
+required platform. Execution and acceptance are tracked separately below.
+No result is inferred merely from a pushed commit.
 
-mean missing implementation. See [API review](w3-api-internal-error-review.md).
+## Evidence index
+
+- [Frozen contract](../decisions/w3-approval-and-storage-contract.md) and
+  [manifest](../decisions/w3-contract-v1.json).
+- [API and internal-error review](w3-api-internal-error-review.md).
+- [Qualified interface boundaries](../decisions/w3-qualified-interface-boundaries.md).
+- [Dependency, freeze and fixture provenance](w3-dependency-freeze-provenance.md).
+- [Durable storage slice](../decisions/w3-durable-storage-slice.md).
+- [Artifact publication slice](../decisions/w3-artifact-publication-slice.md).
+- [Artifact completion slice](../decisions/w3-artifact-completion-slice.md).
+- [Finite failure/recovery matrix](w3-failure-recovery-matrix.md) and
+  [machine-readable inventory](w3-failure-recovery-matrix.json).
+
+Source/test paths below are relative to `crates/harness-core/` unless qualified.
+These records identify implementation and test evidence; historical slice status
+remains historical, not current acceptance.
 
 ## 0. Baseline and contract
 
-- [x] Freeze document exists at `docs/decisions/w3-approval-and-storage-contract.md`.
-- [ ] Verify `w3-contract-v1.json` matches the normative Markdown and its recorded SHA-256.
-- [ ] Confirm contract version `alloy.w3/1` and canonicalization version `alloy-json-c14n/1`.
-- [ ] Record the implementation starting commit and establish passing baseline regressions.
-- [ ] Treat changes to the frozen behavior or upper bounds as explicit contract revisions—not silent implementation deviations.
+- [x] Freeze document and manifest delivered; constants identify `alloy.w3/1` and `alloy-json-c14n/1`.
+- [x] Implementation starting commit recorded: `58d7db53d8fb6f549cddba990dd9e83521989d92`.
+- [x] Rust freeze verification implemented in `tests/w3_contract.rs::freeze_manifest_matches_normative_record`.
+- [x] Rust canonical-vector reproduction implemented in `tests/w3_provenance.rs::frozen_vectors_are_reproduced_by_rust`; goldens are not overwritten.
+- [x] Historical policy commit `a578f175c504e54719abb164bb1d638f328cfc5d` inspected: runtime promotion of `sha2 = "=0.10.9"`; its lock patch adds only the harness-core `tool-registry` edge.
+- [ ] Review the full baseline-to-candidate dependency audit and exact passing freeze/provenance logs.
+- [ ] Link passing baseline regressions; recording the starting SHA alone does not establish them.
+- [ ] Confirm any frozen behavior or upper-bound changes through explicit contract review; do not silently revise the freeze to satisfy tests.
 
-The frozen document explicitly distinguishes design approval from runtime implementation and acceptance.
+Reproduction proves current Rust reproducibility, not an undocumented historical
+creation command. The design-time manifest status is not a runtime acceptance flag.
 
 ## 1. Files and public API boundaries
 
-### Production files
-
-- [ ] Update `crates/harness-core/Cargo.toml` with only the dependencies actually required.
-- [ ] Update `Cargo.lock` for actual dependency changes; retain pinned versions.
-- [x] Update `crates/harness-core/src/lib.rs` with reviewed exports.
-- [x] Review internal failures without expanding the tool-result wire enum; retain existing variants with conservative operation-stage handling (see API review).
-- [ ] Extend `crates/harness-core/src/store.rs` for schema v2, durable transitions, migration, and recovery.
-- [ ] Add `crates/harness-core/src/policy.rs`.
-- [x] Add `crates/harness-core/src/approval.rs`.
-- [x] Add `crates/harness-core/src/artifact.rs`.
-
-### Acceptance-test files
-
-- [ ] Add `crates/harness-core/tests/tool_policy.rs`.
-- [ ] Add `crates/harness-core/tests/tool_artifacts.rs`.
-
-### API invariants
-
-- [ ] Reuse the existing registry definition, call, context, result, and error contracts.
-- [x] Prevent public unchecked construction of authorization handles.
-- [x] Keep authorization handles non-`Clone`, non-`Copy`, and non-deserializable.
-- [ ] Preserve W2 decoder/slab ownership; do not modify the parser’s allocation contract to implement approvals.
-- [x] Document the handoff interfaces needed by W4/W5/W6 without implementing those packages.
-
-These are the production boundaries and ownership constraints recorded in the freeze.
+- [x] Required direct dependencies declared in `Cargo.toml`; `sha2` remains exactly pinned and `tool-registry` is a path dependency.
+- [x] Required W3 lockfile dependency edge delivered; complete historical pin audit awaits reviewed execution evidence in section 0.
+- [x] Reviewed module exports in `src/lib.rs`; active supervisor still described as text-only.
+- [x] Internal-error review recorded without expanding the tool-result wire enum or adding unnecessary variants.
+- [x] Schema-v2 integration delivered in `src/store.rs`, with coordinator/migration/recovery in `src/store/durable.rs`.
+- [x] `src/policy.rs`, `src/approval.rs`, and `src/artifact.rs` delivered.
+- [x] `tests/tool_policy.rs`, `tests/tool_artifacts.rs`, and `tests/w3_provenance.rs` delivered.
+- [x] Registry-owned definition, invocation/context and result contracts reused.
+- [x] Authorization/start handles have private fields and immutable accessors, with no unchecked public constructor, Clone, Copy or Deserialize.
+- [x] Receipt compile-fail documentation delivered for cloning, reuse and deserialization.
+- [x] W4/W5/W6 handoffs documented without claiming those integrations exist.
+- [ ] Complete candidate-diff and W1/W2 regression verification of decoder/slab allocation and ownership preservation.
 
 ## 2. Canonicalization and immutable binding
 
-### Canonical arguments
+Implementation: `src/approval.rs`, `src/policy.rs`, `src/store/durable.rs`.
+Tests: `tests/w3_contract.rs`, `tests/tool_policy.rs`, `tests/w3_provenance.rs`.
 
-- [ ] Require structural/schema validation before canonicalization.
-- [x] Source-reviewed W2 recursive duplicate-key rejection before returning argument objects; W3 canonicalization does not replace parsing. New atomic/streaming split test requires execution.
-- [ ] Recursively sort object keys by UTF-8 byte order.
-- [ ] Preserve array order and string contents.
-- [ ] Use the pinned Rust `serde_json` representation for strings and numbers.
-- [ ] Preserve represented numeric distinctions such as `1` versus `1.0`.
-- [ ] Perform no coercion, default insertion, Unicode normalization, path rewriting, or shell expansion.
-- [ ] Generate and verify golden bytes/digests using Rust—not Python’s JSON encoder.
-
-### Invocation binding
-
-- [ ] Persist every frozen binding field, including daemon epoch and session/turn/generation/call association.
-- [ ] Bind the complete registered definition and effective daemon-policy revision.
-- [ ] Retain the complete bounded invocation snapshot, not only hashes.
-- [ ] Compute the binding digest with the exact domain prefix and NUL separator.
-- [ ] Enforce lifetime uniqueness of `(session_id, call_id)`, including terminal calls.
-- [ ] Reject bindings exceeding 1 MiB.
-- [ ] Require a new call identity for any changed invocation.
-
-### Fixtures
-
-- [ ] Cover nested objects, array order, escapes, Unicode, and numeric distinctions.
-- [ ] Verify that relevant changes to arguments, context, definition, policy, and epoch alter the binding.
-- [ ] Verify that object-key insertion order alone does not alter canonical bytes.
-
-All canonicalization and binding rules above are frozen in `alloy.w3/1`.
+- [x] Registry/schema validation precedes invocation binding.
+- [x] Upstream Qwen3 StrictJson recursively rejects duplicate decoded keys before returning argument objects; canonicalization cannot recover discarded duplicates.
+- [x] Atomic/streaming duplicate-key split coverage delivered in `crates/families/qwen3/tests/tool_calls.rs::w3_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes`.
+- [x] Object keys sorted recursively by UTF-8 bytes; array order and strings preserved.
+- [x] Pinned serde_json representation used, including represented `1` versus `1.0` distinction.
+- [x] No coercion, default insertion, Unicode normalization, path rewriting or shell expansion in canonicalization.
+- [x] Rust byte/digest fixtures and reproduction test delivered, including nested objects, arrays, escapes, Unicode and numeric distinctions.
+- [x] Complete bounded binding snapshot retained and persisted, including epoch and session/turn/generation/call association.
+- [x] Complete registered-definition digest and effective policy revision bound.
+- [x] Exact `alloy.w3.invocation.v1` domain plus NUL separator implemented.
+- [x] Lifetime `(session_id, call_id)` reservation delivered, including terminal calls.
+- [x] Complete binding ceiling of 1 MiB enforced; changed invocation requires a new call identity.
+- [x] Tests cover relevant argument/context/definition/policy/epoch changes and object insertion-order independence.
+- [ ] Review exact passing canonicalization, binding and Rust reproduction logs for the final candidate.
 
 ## 3. Daemon-owned policy
 
-- [ ] Implement `Deny`, `AllowWithoutPrompt`, and `RequireApproval`.
-- [ ] Default to denial when no allow rule matches.
-- [x] Source-reviewed typed policy configuration validation; tests cover malformed typed input.
-- [ ] W6: bound and strictly parse raw policy input; fail closed on unavailable/malformed authoritative configuration, with loader tests.
-- [ ] Allow policy to strengthen—but never weaken—registration requirements.
-- [ ] Ensure approval cannot override policy denial.
-- [ ] Ensure `approval: never` bypasses neither validation nor resource-scope checks.
-- [ ] Run the five-default policy fixture; W4 must verify actual builtin registrations and operation-boundary enforcement. Selected W3 safety floors are not exhaustive default verification.
-- [ ] Bind effective timeout/output limits and prevent widening.
-- [x] Source-reviewed final-start binding re-evaluation against supplied policy/registry.
-- [ ] W6: enforce authoritative current configuration and serialize reload publication against final start; race-test stale snapshots.
-- [ ] Keep resource authorization separate from argument canonicalization.
-- [ ] Test that model/plugin-provided authority-shaped data grants no permission.
-- [ ] Document that actual operation-boundary enforcement belongs to W4.
+Implementation: `src/policy.rs`; coverage: `tests/tool_policy.rs`.
 
-The policy must use trusted registration and daemon state, not model claims.
+- [x] Deny, AllowWithoutPrompt and RequireApproval implemented; no matching allow rule defaults to denial.
+- [x] Typed configuration rejects malformed types/unknown fields and invalid or duplicate rules.
+- [x] Policy strengthens registration approval requirements; destructive/always cases require prompting.
+- [x] Human approval cannot make a policy-denied invocation runnable.
+- [x] Approval-never still requires registry validation and exact-argument policy matching.
+- [x] Effective timeout/output limits use minima and cannot widen registration.
+- [x] Final start re-evaluates supplied policy/registry and compares binding identity.
+- [x] Argument canonicalization kept distinct from operation-boundary resource authorization.
+- [x] Authority-shaped input rejection tests and zero-execution counters delivered.
+- [x] Five frozen-default policy fixture delivered: `w3_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution`.
+- [ ] Review passing boundary/policy logs; fixture delivery is not production builtin verification.
 
-## 4. Approval state machine and single-use execution
+Actual resource enforcement and builtin registrations belong to W4. Raw policy
+loading and authoritative live policy/registry publication belong to W6 (section 9).
+Selected W3 safety floors are not an exhaustive deployed-default audit.
 
-### States and transitions
+## 4. Approval state machine and single-use admission
 
-- [ ] Implement all frozen active and terminal states.
-- [ ] Reject every transition not explicitly allowed.
-- [ ] Prevent terminal states from becoming runnable.
-- [ ] Implement first-valid-decision-wins behavior.
-- [ ] Reject duplicate/conflicting decisions without another approval event.
-- [ ] Reject unknown, wrong-session, expired, and withdrawn requests.
-- [ ] Record explicit denial as `tool.approved` with `allow: false`.
-- [ ] Do not fabricate a human approval event for automatic authorization.
+Implementation: `src/approval.rs`, `src/store/durable.rs`.
+Coverage: contract graph, durable unit suite, P2-06 and Step C matrix.
 
-### Claim and start boundary
+- [x] Frozen active/terminal labels and permitted transitions implemented; terminal states cannot regain runnable authority.
+- [x] First valid decision wins; duplicate/conflicting decisions add no approval event.
+- [x] Unknown, wrong-session, expired and withdrawn decisions rejected.
+- [x] Explicit denial recorded as tool.approved with allow:false; automatic authorization fabricates no human event.
+- [x] Ready-to-Claimed consumption is atomic; final start consumes the opaque handle and commits tool.started before returning an execution receipt.
+- [x] Final checks cover active session, deadline, supplied policy/registration, epoch and binding ownership.
+- [x] Claim returns without retaining a SQLite transaction across the future hook gap.
+- [x] Dropped/failed consumed handles do not restore Ready or authorize execution.
+- [x] Decision/claim races and duplicate start/completion rejection coverage delivered.
+- [x] 300-second monotonic lifetime, no renewal on allow, equality-as-expired and Claimed expiry/withdrawal implemented.
+- [x] Pause/cancel withdraws pre-start authority transactionally; failed revocation is not acknowledged as success.
+- [x] Started cancellation and failed completion never imply nonexecution or grant an execution retry.
+- [x] No transactional exactly-once external-effect claim.
+- [ ] Review final-candidate lifecycle and failure/recovery results, including real subprocess observations.
 
-- [ ] Implement atomic `Ready → Claimed` consumption.
-- [ ] Run future before-hook work outside database/session locks.
-- [ ] Recheck cancellation, expiry, policy revision, registration digest, epoch, and ownership before `Started`.
-- [ ] Consume the opaque handle when committing `tool.started`.
-- [ ] Never execute before that commit succeeds.
-- [ ] Ensure dropping a handle neither executes nor restores authority.
-- [ ] Test racing decisions, racing claims, and duplicate start attempts.
-- [x] Avoid claiming transactional exactly-once external effects.
+## 5. Durable storage, migration and recovery
 
-### Expiry and cancellation
+Implementation: `src/store.rs`, `src/store/durable.rs`; test index: Step C matrix.
 
-- [ ] Enforce the 300-second lifetime from intent creation.
-- [ ] Do not renew expiry on allow.
-- [ ] Check expiry on decision, claim, and final start.
-- [ ] Treat equality with the deadline as expired.
-- [ ] Use monotonic deadlines during the live daemon epoch.
-- [ ] Permit expiry/withdrawal while `Claimed`.
-- [ ] Withdraw pre-start authority on pause/cancel.
-- [ ] Keep post-start cancellation distinct from “nothing executed.”
+- [x] Transactional schema-v1-to-v2 migration and newer-schema rejection delivered.
+- [x] Historical row preservation and migration rollback tests delivered.
+- [x] Intent, artifact and runtime metadata tables delivered; new W3 payloads carry their contract marker.
+- [x] Intent/request, decision/approval, claim consumption, start/event and completion/event transactions delivered.
+- [x] Pre-execution rejection records no start; duplicate terminal results rejected.
+- [x] Persistent sidecar ownership acquired before epoch recovery; competing daemon opens rejected.
+- [x] Recovery withdraws unresolved pre-start authority, marks Started unknown, preserves terminal results and never replays effects.
+- [x] Expiry, withdrawal and recovery reasons recorded durably.
+- [x] Combined 32-per-session and 256-per-daemon pre-start admission limits implemented with terminal capacity release.
+- [x] Limits are not claimed to bound all downstream running operations.
+- [x] Statement/commit failures and lifecycle process-exit checkpoints delivered under test-only controls.
+- [ ] Review final-candidate preservation, ownership, capacity and failure results.
 
-These behaviors are part of the frozen state machine, including the final authorization check after hooks.
+## 6. Artifact implementation delivered; detailed branch review pending
 
-## 5. Durable storage, migration, and recovery
+Implementation: `src/artifact.rs`, metadata transaction in `src/store.rs`,
+completion association in `src/store/durable.rs`. Tests: `tests/tool_artifacts.rs`
+and artifact unit tests. Checked delivery does not close the detailed audit below.
 
-### Schema and transactions
+- [x] Opaque art1_ references, private temporary creation and no-overwrite publication delivered.
+- [x] Ownership metadata, length, digest, preview, timestamp and contract version stored.
+- [x] Store-owned resolution, exact session/call lookup and complete integrity verification delivered.
+- [x] Invalid/traversal/symlink references and missing/corrupt objects covered by rejection tests.
+- [x] 16 MiB object, 4096 preview-source bytes, 5464 base64-character, 64 KiB copy buffer and eight-writer ceilings implemented.
+- [x] 1 GiB/4096 managed quotas, shared reservations and tighter invocation limits implemented.
+- [x] UTF-8/binary previews and over-limit/partial-input rejection tests delivered; truncation is not reported as complete output.
+- [x] Streaming digest/length/preview, file synchronization, no-overwrite publication and directory synchronization pipeline delivered.
+- [x] Metadata plus artifact.created commit transaction delivered; public reference returned only after successful registration.
+- [x] Runtime streaming/synchronization split from metadata transaction; startup reconciliation exception documented.
+- [x] Uncertain publication/commit handling and proof-before-cleanup reconciliation delivered; no automatic referenced-object eviction.
+- [x] Artifact-backed completion validates committed session/call provenance and preserves existing ToolResult envelope/error categories.
+- [x] Collision/quota/corruption/orphan/publication interruption and completion rejection/rollback coverage delivered.
+- [ ] Finish untruncated review of allocation failure, reservation release, writer/PendingArtifact drop, synchronization and uncertain-commit branches.
+- [ ] Finish review of ownership leases, full verification and proof-before-deletion ordering.
+- [ ] Review final-candidate artifact publication, completion and interruption test results.
 
-- [ ] Implement transactional schema v1 → v2 migration.
-- [ ] Preserve historical event IDs, sequences, payloads, and artifact references.
-- [ ] Reject unsupported newer schemas before application mutation.
-- [ ] Add intent, artifact, and runtime metadata storage.
-- [ ] Mark only new W3 payloads with `alloy.w3/1`.
-- [ ] Atomically persist intent plus `tool.requested`.
-- [ ] Atomically persist decision plus `tool.approved`.
-- [ ] Atomically consume the claim plus append `tool.started`.
-- [ ] Atomically record completion plus `tool.completed`.
-- [ ] Prevent duplicate terminal results.
-- [ ] Record pre-execution rejection without `tool.started`.
-- [x] Document short runtime store access and release-before-I/O handoff; startup reconciliation is exclusive and may hash while borrowing the store.
-- [ ] W4/W5/W6: verify caller-owned locks/native slots are not retained across waits, hooks, streaming, verification or execution.
+Hard-link publication conservatively reserves two entries and twice the bounded
+maximum bytes until settlement. Reconciliation assumes trusted daemon-owned local
+storage; it does not defend against malicious same-user directory replacement.
+Filesystem publication and SQLite registration are not one atomic transaction.
 
-### Ownership and recovery
+## 7. Named gates and supporting coverage
 
-- [ ] Acquire store-scoped exclusive mutating daemon ownership before epoch recovery.
-- [ ] Prevent a second daemon from invalidating the first daemon’s authority.
-- [ ] Withdraw old `AwaitingApproval`, `Ready`, and `Claimed` states on restart.
-- [ ] Recover unresolved `Started` operations as `OutcomeUnknown`.
-- [ ] Preserve terminal states.
-- [ ] Never automatically replay an interrupted operation.
-- [ ] Record durable explanations for expiry, withdrawal, and recovery.
-- [ ] Inject transaction failures and verify that no usable authority escapes.
+### P2-06: destructive_effect_requires_bound_approval
 
-### Admission limits
+- [x] Named counter-based fixture delivered in `tests/tool_policy.rs`.
+- [x] Assertions cover no execution before approval, matching authorization, denied/wrong-session/changed requests and duplicate authority.
+- [x] Supporting durable/Step C suites cover expiry, races, cancellation, restart, transaction failure and no replay.
+- [ ] Review exact named test discovery and pass on Linux at the final candidate.
+- [ ] Review exact named test discovery and pass on macOS at the final candidate.
 
-- [ ] Enforce the combined pending/ready/claimed limit of 32 per session.
-- [ ] Enforce the combined limit of 256 per daemon.
-- [ ] Release admission capacity correctly on terminal transitions.
-- [ ] Do not present these limits as complete bounds on downstream running operations.
+### P2-08: oversized_tool_result_artifact_roundtrip
 
-Migration, exclusive ownership, and restart invalidation are explicitly frozen storage requirements.
+- [x] Named fixture delivered in `tests/tool_artifacts.rs`.
+- [x] Assertions cover full accepted bytes, digest, length, reference, bounded preview, completion and unchanged history after reopen.
+- [x] Supporting tests cover empty/exact/over limits, UTF-8/binary output, interruption, quotas, collisions, integrity, paths and cleanup.
+- [x] Migration preservation and rollback coverage delivered in durable/Step C suites.
+- [ ] Review exact named test discovery and pass on Linux at the final candidate.
+- [ ] Review exact named test discovery and pass on macOS at the final candidate.
 
-## 6. Artifact storage and publication
+Reported earlier host run: 21 Step C, 25 durable, 9 artifact-unit, 34 artifact
+integration, 15 contract and 24 policy tests passed. This is historical conversation
+evidence, not a reviewed final-candidate report. The later builtin-default test
+adds one policy test; the new provenance target adds one test and Qwen3 gains the
+duplicate-key boundary test. Reconcile exact validator inventories; never accept
+zero-test success or suppress discovery mismatches.
 
-### Identity, metadata, and lookup
+## 8. Final evidence and acceptance (open)
 
-- [ ] Generate `art1_` references with exactly 32 lowercase hexadecimal suffix characters.
-- [ ] Enforce collision-safe, no-overwrite creation/publication.
-- [ ] Store all frozen ownership, length, digest, preview, timestamp, and version metadata.
-- [ ] Resolve references exclusively through store-owned paths.
-- [ ] Enforce permitted session association on lookup.
-- [ ] Reject invalid references, traversal, and symlink redirection.
-- [ ] Fail on missing/corrupted committed objects; never substitute another object.
+- [ ] Record exact final candidate SHA, clean checkout and toolchain/platform identity.
+- [ ] Review full dependency/freeze/Rust-reproduction evidence and retain raw logs.
+- [ ] Review formatting, locked workspace compilation and Clippy with warnings denied.
+- [ ] Review harness-core all-targets/doc, registry, Qwen3 and required workspace tests.
+- [ ] Review strict rustdoc results, including the repaired Qwen3 shape comments.
+- [ ] Review required W1/W2/native regression evidence; no gate waived.
+- [ ] Retain Linux/macOS logs, exact named test discovery, source hashes and CI/artifact links.
+- [ ] Finish detailed artifact/failure branch review and resolve any findings.
+- [ ] Record a scoped W3 acceptance decision; this checklist is not sign-off.
+- [ ] Verify PR links issue #30 and identifies downstream boundaries.
+- [x] Keep source delivery, executed validation and accepted results distinct.
+- [x] Preserve finite SQL/process-exit fault model, trusted-storage assumptions and no-replay limitation.
+- [x] Do not claim builtin execution, plugins, live approvals, the integrated tool loop or overall Phase 2 completion.
 
-### Bounded collection
+## 9. Downstream obligations (not missing W3 implementations)
 
-- [ ] Enforce 16 MiB maximum payload per artifact.
-- [ ] Enforce 4,096 preview source bytes and 5,464 base64 characters.
-- [ ] Handle UTF-8 boundaries and binary previews correctly.
-- [ ] Use at most the frozen 64 KiB copy buffer per writer.
-- [ ] Enforce eight concurrent writers.
-- [ ] Enforce the 1 GiB managed-byte and 4,096 managed-file quotas.
-- [ ] Include temporary/orphan files and reservations without double-counting.
-- [ ] Reserve capacity before writing.
-- [ ] Respect tighter tool limits.
-- [ ] Reject over-limit output without labeling truncation as a complete artifact.
-- [ ] Do not automatically evict referenced artifacts.
+- [ ] W4: verify actual builtin defaults and enforce resource scopes/limits at operation boundaries.
+- [ ] W5: enforce permitted hook responses without mutating the approved invocation or original result.
+- [ ] W6: bound/strictly parse raw policy input and fail closed for unavailable/malformed authoritative configuration.
+- [ ] W6: serialize current policy/registry publication against final start and race-test stale snapshots.
+- [ ] W4/W5/W6: verify caller-owned store/session/native locks are released across waits, hooks, streaming, verification and execution.
+- [ ] W6: handle failed revocation/completion conservatively without false cancellation acknowledgment or external-effect replay.
 
-### Publication and failure handling
-
-- [ ] Create private temporary files exclusively.
-- [ ] Stream length, digest, and preview incrementally.
-- [ ] Finalize/synchronize before publication.
-- [ ] Publish without overwrite and synchronize directories as required.
-- [ ] Commit artifact metadata plus `artifact.created` atomically.
-- [ ] Return the reference only after successful commit.
-- [ ] Keep database transactions closed during streaming/synchronization.
-- [ ] Handle uncertain commit outcomes without blind deletion.
-- [ ] Reconcile temporary/orphan files under exclusive ownership.
-- [ ] Delete only objects proven unreferenced.
-- [ ] Validate complete length/digest before claiming integrity verification.
-- [ ] Preserve the existing inline-or-artifact result envelope and error categories.
-
-The artifact contract separates filesystem publication from database commit; it does not claim cross-resource atomicity.
-
-## 7. Required acceptance and failure tests
-
-### P2-06 — `destructive_effect_requires_bound_approval`
-
-- [ ] Test exists in `tests/tool_policy.rs`.
-- [ ] No execution before approval.
-- [ ] Valid approval admits only the matching invocation.
-- [ ] Denied, changed, wrong-session, stale, and duplicate decisions cause zero extra effects.
-- [ ] Use an execution counter/marker—not error assertions alone.
-- [ ] Cover expiry, races, cancellation, restart, and commit failure.
-- [ ] Discover and run the exact named test on Linux.
-- [ ] Discover and run the exact named test on Mac.
-
-### P2-08 — `oversized_tool_result_artifact_roundtrip`
-
-- [ ] Test exists in `tests/tool_artifacts.rs`.
-- [ ] Full accepted bytes, length, digest, reference, and preview survive reopen.
-- [ ] Artifact creation is represented in append-only history.
-- [ ] Interrupted writes never become valid references.
-- [ ] Cover empty/exact/one-over boundaries and binary/UTF-8 output.
-- [ ] Inject failures at write/publication/commit boundaries.
-- [ ] Cover concurrent quotas, cleanup, collisions, corruption, and path attacks.
-- [ ] Verify migration preserves old rows.
-- [ ] Discover and run the exact named test on Linux.
-- [ ] Discover and run the exact named test on Mac.
-
-Both named gates and the supporting failure cases are required by the freeze; documentation or zero-test success does not satisfy them.
-
-## 8. Regression evidence and merge gate
-
-- [ ] Formatting passes.
-- [ ] Locked workspace compilation passes.
-- [ ] Clippy passes with warnings denied.
-- [ ] Harness-core target and documentation tests pass.
-- [ ] Registry contract tests remain green.
-- [ ] Existing W1/W2 and required workspace/native regressions remain green.
-- [ ] Strict rustdoc gates pass.
-- [ ] Record the exact candidate SHA and clean-tree state.
-- [ ] Retain commands, toolchain versions, Linux/Mac results, and raw logs.
-- [ ] Keep implementation status separate from test and acceptance status.
-- [ ] Review new dependencies and public authorization APIs.
-- [ ] Record a scoped W3 acceptance decision.
-- [ ] PR links issue #30 and states remaining downstream boundaries.
-- [ ] Do not claim builtin execution, plugin hosting, live approval RPC/CLI, the full tool loop, or overall Phase 2 completion.
-
-## Recommended execution order
-
-```text
-1. Verify the freeze pair.
-2. Add Rust canonicalization fixtures and state-transition tests.
-3. Implement policy and immutable binding.
-4. Implement migration, exclusive ownership, and durable approvals.
-5. Pass P2-06.
-6. Implement artifact storage and failure recovery.
-7. Pass P2-08.
-8. Run regressions and collect Linux/Mac evidence.
-9. Review and merge scoped W3.
-```
-
-Current closeout task: review remaining unchecked requirements and collect committed-candidate Linux/macOS evidence; implementation delivery is not acceptance.
-
-## Qualified boundary review
-
-See [W3 qualified interface boundaries](../decisions/w3-qualified-interface-boundaries.md).
-Checked source/documentation items do not assert executed tests or downstream acceptance.
+These are explicit integration handoffs. Their implementation belongs to the
+downstream packages, not a retroactive expansion of W3.
