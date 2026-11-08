@@ -35,6 +35,21 @@ pub trait ToolImplementation: Send + Sync {
     /// result. Execution errors are represented in the returned tool result.
     fn execute(&self, invocation: &ToolInvocation) -> ToolResult;
 
+    /// Stream canonical fs.list JSON after independent durable-start authorization.
+    /// Unsupported backends fail closed without invoking any other entrypoint.
+    #[cfg(unix)]
+    fn execute_file_list(
+        &self,
+        _invocation: &ToolInvocation,
+        _context: &crate::execution::ExecutionContext,
+        output: &mut dyn crate::execution::OutputSink,
+    ) -> Result<crate::builtins::fs::ListReport, crate::builtins::fs::ReadError> {
+        output.abort();
+        Err(crate::builtins::fs::ReadError::Policy(
+            "raw file-list backend required",
+        ))
+    }
+
     /// Stream raw fs.read bytes after durable-start authorization. Other backends
     /// fail closed; this does not fall back to legacy or inline execution.
     #[cfg(unix)]

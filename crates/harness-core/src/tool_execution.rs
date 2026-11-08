@@ -12,6 +12,10 @@ use crate::{HarnessError, HarnessResult, SessionStore, store::StartedInvocation}
 #[cfg(unix)]
 pub mod file_read;
 
+/// Receipt-owned deterministic directory listing and canonical output.
+#[cfg(unix)]
+pub mod file_list;
+
 use serde::Serialize;
 use std::{
     collections::BTreeMap,

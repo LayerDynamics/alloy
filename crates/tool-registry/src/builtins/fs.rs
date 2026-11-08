@@ -1072,3 +1072,67 @@ impl io::Write for InlineReadOutput<'_> {
         Ok(())
     }
 }
+
+/// Concrete fs.list backend bound to a daemon-configured pinned read scope.
+/// Configuration grants no execution authority. Use the harness receipt-owned
+/// listing path for bounded inline/artifact completion; other entrypoints fail
+/// closed rather than buffering unbounded output or returning a partial listing.
+pub struct FileListTool {
+    scope: ReadScope,
+}
+impl FileListTool {
+    /// Bind an already configured read scope; model arguments cannot replace it.
+    pub fn new(scope: ReadScope) -> Self {
+        Self { scope }
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileListArguments {
+    path: String,
+    max_entries: u64,
+}
+impl crate::registry::ToolImplementation for FileListTool {
+    fn execute(&self, invocation: &crate::call::ToolInvocation) -> crate::result::ToolResult {
+        crate::result::ToolResult::Inline(crate::result::InlineToolResult {
+            call_id: invocation.call.call_id.clone(),
+            is_error: true,
+            content: serde_json::json!({
+                "kind":"policy", "message":"Receipt-owned listing output is required",
+                "details":{"reason":"list_receipt_output_required","scope_operation_attempted":false}
+            }),
+        })
+    }
+    fn execute_with_context(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        _context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> crate::result::ToolResult {
+        output.abort();
+        self.execute(invocation)
+    }
+    fn execute_file_list(
+        &self,
+        invocation: &crate::call::ToolInvocation,
+        context: &ExecutionContext,
+        output: &mut dyn OutputSink,
+    ) -> Result<ListReport, ReadError> {
+        let result = (|| {
+            context.check()?;
+            if invocation.call.tool_id != "fs.list" {
+                return Err(ReadError::Policy("fs.list identity required"));
+            }
+            let args: FileListArguments = serde_json::from_value(serde_json::Value::Object(
+                invocation.call.arguments.clone(),
+            ))
+            .map_err(|_| ReadError::Policy("invalid fs.list arguments"))?;
+            let request = ListRequest::new(&args.path, args.max_entries)?;
+            self.scope.list_into(&request, context, output)
+        })();
+        if result.is_err() {
+            output.abort();
+        }
+        result
+    }
+}
