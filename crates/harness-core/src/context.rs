@@ -12,6 +12,8 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod tool_history;
+
 const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Builds engine context snapshots from durable session events.
@@ -21,14 +23,22 @@ pub struct ContextBuilder;
 impl ContextBuilder {
     /// Reconstruct chat messages from append-only session events.
     ///
-    /// Phase 1 only materializes `user.message` and `assistant.message` bodies.
-    /// Other event kinds are skipped for the model-visible transcript.
+    /// Text-only reconstruction rejects tool lifecycle history; use
+    /// `build_tool_snapshot` to preserve linked tool context instead.
     pub fn messages_from_events(events: &[EventRecord]) -> HarnessResult<Vec<Message>> {
         let mut messages = Vec::new();
         for event in events {
             let role = match event.kind {
                 EventKind::UserMessage => MessageRole::User,
                 EventKind::AssistantMessage => MessageRole::Assistant,
+                EventKind::ToolRequested
+                | EventKind::ToolApproved
+                | EventKind::ToolStarted
+                | EventKind::ToolCompleted => {
+                    return Err(HarnessError::Invalid(
+                        "tool events require build_tool_snapshot".into(),
+                    ));
+                }
                 _ => continue,
             };
             let content = event
