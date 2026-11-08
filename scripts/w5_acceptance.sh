@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# W5 collector prerequisite: Python must exist in the execution environment.
+command -v python3 >/dev/null 2>&1 || {
+  echo "W5 acceptance requires python3 in the execution environment; provision the runner/container." >&2
+  exit 127
+}
 ROOT="$(pwd)"
 OUT="${ALLOY_W5_OUTPUT:?Set ALLOY_W5_OUTPUT outside the source tree or under target}"
 mkdir -p "$OUT"
