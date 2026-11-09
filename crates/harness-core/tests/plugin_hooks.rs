@@ -194,6 +194,38 @@ fn plugin_protocol_timeout_and_sandbox() {
     }
 }
 #[test]
+fn unsolicited_output_between_calls_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::default();
+    let mut host = PluginHost::start(
+        vec![config(dir.path(), "a", "unsolicited")],
+        limits(),
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    let marker = dir.path().join("events.a.unsolicited");
+    let until = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(marker.exists(), "fixture did not send unsolicited output");
+    let outcome = host.before(&invocation(), deadline(), &cancel);
+    assert_eq!(outcome.decision, Decision::Veto);
+    assert!(
+        outcome.receipts[0]
+            .diagnostic
+            .as_ref()
+            .unwrap()
+            .contains("unsolicited")
+    );
+    assert!(
+        !std::fs::read_to_string(dir.path().join("events"))
+            .unwrap()
+            .contains("a:before")
+    );
+}
+#[test]
 fn cancellation_reaps_and_after_failure_cannot_mutate_original_result() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();

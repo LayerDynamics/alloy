@@ -19,6 +19,7 @@ case "$OUT/" in "$ROOT/"*)
 esac
 PLUGIN_TESTS=(
   plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_sandbox
+  unsolicited_output_between_calls_fails_closed
   hardening::plugin_failures_reap_real_children_and_stop_later_hooks
   hardening::plugin_registration_is_atomic_and_drop_reaps
   hardening::plugin_cancellation_isolated_and_after_failure_is_warning_only

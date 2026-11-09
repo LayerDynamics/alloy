@@ -123,6 +123,18 @@ impl Process {
     pub fn diagnostics(&self) -> &[u8] {
         &self.diagnostics
     }
+    fn reject_pending_output(&mut self) -> Result<(), HostError> {
+        let mut byte = [0u8; 1];
+        loop {
+            match self.output.as_mut().unwrap().read(&mut byte) {
+                Ok(0) => return Err(HostError::new("plugin stdout closed")),
+                Ok(_) => return Err(HostError::new("unsolicited plugin output")),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(HostError::io(e)),
+            }
+        }
+    }
     pub fn rpc<T: DeserializeOwned>(
         &mut self,
         method: &str,
@@ -177,6 +189,9 @@ impl Process {
         if cancel.is_cancelled() || Instant::now() >= outer_deadline {
             return Err(HostError::new("hook cancelled/expired before encoding"));
         }
+        // A child must not send a frame between requests, including a partial
+        // frame. Check the nonblocking pipe before issuing the next request.
+        self.reject_pending_output()?;
         let deadline = Instant::now()
             .checked_add(self.limits.timeout)
             .ok_or_else(|| HostError::new("timeout overflow"))?
@@ -200,6 +215,7 @@ impl Process {
         )
         .map_err(|_| HostError::new("request encoding/byte limit"))?;
         writer.bytes.push(b'\n');
+        self.reject_pending_output()?;
         let mut written = 0;
         let mut received = Vec::new();
         let mut stderr_total = 0usize;

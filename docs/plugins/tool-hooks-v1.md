@@ -12,6 +12,11 @@ protocol_version=1, exact plugin_id/version and the supported subset of
  tool.before_execute and tool.after_execute. No unknown hooks or duplicate
 capabilities. Unknown envelope/response fields fail the exchange. No environment
 is inherited and no shell is used. Executable and cwd are absolute daemon inputs.
+Pending stdout is rejected before request encoding and again before writing. Since
+stdin and stdout are separate pipes, these checks cannot establish when bytes
+arriving concurrently with a request were produced; predictable response IDs do
+not prove that a plugin waited for the request. Do not claim complete detection
+of all raced unsolicited responses from these checks.
 
 Before params: protocol_version and invocation (invocation/session/call IDs,
 exact registered definition, schema_hash, validated arguments, approval snapshot,

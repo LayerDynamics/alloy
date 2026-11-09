@@ -77,6 +77,12 @@ fn main() {
         } else {
             println!("{frame}"); io::stdout().flush().unwrap();
         }
+        if mode == "unsolicited" && method == "initialize" {
+            thread::sleep(Duration::from_millis(20));
+            println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"decision":"allow"}}}}"#);
+            io::stdout().flush().unwrap();
+            std::fs::write(format!("{log}.{id}.unsolicited"), b"sent").unwrap();
+        }
         if mode == "not_reading_after_initialize" && method == "initialize" {
             thread::sleep(Duration::from_secs(60));
             return;
