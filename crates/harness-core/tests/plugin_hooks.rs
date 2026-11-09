@@ -226,6 +226,85 @@ fn unsolicited_output_between_calls_fails_closed() {
     );
 }
 #[test]
+fn raced_preconstructed_response_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::default();
+    let mut large_limits = limits();
+    large_limits.message_bytes = 512 * 1024;
+    let mut host = PluginHost::start(
+        vec![config(dir.path(), "a", "raced_stale")],
+        large_limits,
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    let mut call = invocation();
+    call.arguments
+        .insert("payload".into(), json!("x".repeat(256 * 1024)));
+    let outcome = host.before(&call, deadline(), &cancel);
+    assert_eq!(outcome.decision, Decision::Veto);
+    let diagnostic = outcome.receipts[0].diagnostic.as_deref().unwrap();
+    assert!(
+        diagnostic.contains("unsolicited or multiple response frames")
+            || diagnostic.contains("response identity mismatch"),
+        "{diagnostic}"
+    );
+    assert!(dir.path().join("events.a.race_started").exists());
+}
+#[test]
+fn plugin_receives_canonical_payload_and_cannot_replace_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = CancellationToken::default();
+    let mut call = invocation();
+    call.arguments.insert("path".into(), json!("fixture.txt"));
+    call.approval = json!({"binding":"approved", "version":1});
+    let result = ToolResult::Inline(InlineToolResult {
+        call_id: call.call_id.clone(),
+        is_error: false,
+        content: json!({"bytes":"original"}),
+    });
+    let mut cfg = config(dir.path(), "a", "payload");
+    cfg.args.push(serde_json::to_string(&call).unwrap());
+    cfg.args.push(serde_json::to_string(&result).unwrap());
+    let mut host = PluginHost::start(vec![cfg], limits(), deadline(), &cancel).unwrap();
+    assert_eq!(
+        host.before(&call, deadline(), &cancel).decision,
+        Decision::Allow
+    );
+    assert!(
+        host.after(&call, &result, 37, deadline(), &cancel)[0]
+            .diagnostic
+            .is_none()
+    );
+    let ids = std::fs::read_to_string(dir.path().join("events.a.request_ids")).unwrap();
+    let ids: Vec<_> = ids.lines().collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert!(
+        ids.iter()
+            .all(|id| id.parse::<u64>().is_ok_and(|n| n < (1u64 << 53)))
+    );
+    drop(host);
+    let mut host = PluginHost::start(
+        vec![config(dir.path(), "a", "after_mutation")],
+        limits(),
+        deadline(),
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(
+        host.before(&call, deadline(), &cancel).decision,
+        Decision::Allow
+    );
+    let original = serde_json::to_value(&result).unwrap();
+    assert!(
+        host.after(&call, &result, 37, deadline(), &cancel)[0]
+            .diagnostic
+            .is_some()
+    );
+    assert_eq!(serde_json::to_value(&result).unwrap(), original);
+}
+#[test]
 fn cancellation_reaps_and_after_failure_cannot_mutate_original_result() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();

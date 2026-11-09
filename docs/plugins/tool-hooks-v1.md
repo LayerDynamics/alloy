@@ -7,16 +7,20 @@ its new candidate requires fresh Linux/Mac results and reviewer reconciliation.
 Prior green checks do not validate changed spawn code.
 
 Transport: one JSON-RPC 2.0 request/response per newline, UTF-8 JSON, strictly
-matching u64 IDs, no notifications, no batching, no retries. initialize declares
+matching random u64 IDs in the exactly representable JSON integer range 0 through
+2^53-1, no notifications, no batching, no retries. The ID is serialized after the payload;
+plugins must echo it unchanged. A response prepared before the challenge is
+revealed has a 2^-53 chance of guessing it in one attempt, assuming secure OS
+randomness. Repeated independent attempts increase the aggregate probability.
+Entropy failure stops the child; there is no predictable fallback. initialize declares
 protocol_version=1, exact plugin_id/version and the supported subset of
  tool.before_execute and tool.after_execute. No unknown hooks or duplicate
 capabilities. Unknown envelope/response fields fail the exchange. No environment
 is inherited and no shell is used. Executable and cwd are absolute daemon inputs.
-Pending stdout is rejected before request encoding and again before writing. Since
-stdin and stdout are separate pipes, these checks cannot establish when bytes
-arriving concurrently with a request were produced; predictable response IDs do
-not prove that a plugin waited for the request. Do not claim complete detection
-of all raced unsolicited responses from these checks.
+Pending stdout is rejected before request encoding and again before writing.
+Separate pipes cannot independently prove the time of a write; the challenge
+binds an accepted response probabilistically to the current request rather than
+claiming a deterministic observation of the child's write time.
 
 Before params: protocol_version and invocation (invocation/session/call IDs,
 exact registered definition, schema_hash, validated arguments, approval snapshot,

@@ -34,9 +34,10 @@ fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
 #[derive(Serialize)]
 struct Request<'a, T> {
     jsonrpc: &'static str,
-    id: u64,
     method: &'a str,
     params: T,
+    // The unpredictable challenge comes last, after the complete payload.
+    id: u64,
 }
 struct LimitedWriter {
     bytes: Vec<u8>,
@@ -64,7 +65,6 @@ pub(crate) struct Process {
     stderr: Option<ChildStderr>,
     diagnostics: Vec<u8>,
     limits: Limits,
-    next_id: u64,
     dead: bool,
 }
 impl Process {
@@ -77,7 +77,6 @@ impl Process {
             stderr: Some(stderr),
             diagnostics: Vec::new(),
             limits,
-            next_id: 0,
             dead: false,
         };
         for fd in [
@@ -196,10 +195,10 @@ impl Process {
             .checked_add(self.limits.timeout)
             .ok_or_else(|| HostError::new("timeout overflow"))?
             .min(outer_deadline);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| HostError::new("request id overflow"))?;
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).map_err(|_| HostError::new("request entropy unavailable"))?;
+        // Keep IDs exact in IEEE-754 JSON clients while retaining fresh entropy.
+        let request_id = u64::from_ne_bytes(nonce) & ((1u64 << 53) - 1);
         let mut writer = LimitedWriter {
             bytes: Vec::new(),
             max: self.limits.message_bytes - 1,
@@ -208,9 +207,9 @@ impl Process {
             &mut writer,
             &Request {
                 jsonrpc: "2.0",
-                id: self.next_id,
                 method,
                 params,
+                id: request_id,
             },
         )
         .map_err(|_| HostError::new("request encoding/byte limit"))?;
@@ -272,7 +271,7 @@ impl Process {
                         }
                         let reply: super::protocol::Envelope<T> =
                             super::strict_json::decode(&received[..end])?;
-                        if reply.jsonrpc != "2.0" || reply.id != self.next_id {
+                        if reply.jsonrpc != "2.0" || reply.id != request_id {
                             return Err(HostError::new("response identity mismatch"));
                         }
                         if cancel.is_cancelled() || Instant::now() >= deadline {

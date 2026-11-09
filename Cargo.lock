@@ -602,6 +602,7 @@ name = "harness-core"
 version = "0.1.0"
 dependencies = [
  "engine",
+ "getrandom 0.3.4",
  "rusqlite",
  "serde",
  "serde_json",

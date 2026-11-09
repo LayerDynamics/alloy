@@ -55,6 +55,22 @@ The W6 integration must not hold store/session/native locks across hook IPC.
 
 ## Evidence and approval
 
+Independent review of candidate 253c24c found that macOS pipe creation uses
+`pipe` followed by `fcntl(F_SETFD)`. An unrelated concurrent fork/exec can
+inherit an endpoint before CLOEXEC is set. Close-by-default protects the plugin
+child, not unrelated children. Acceptance is blocked until atomic CLOEXEC
+transport creation or equivalent process-wide containment is implemented and
+tested under concurrent spawn; a local mutex is insufficient unless every spawn
+path, including libraries, participates.
+
+Executable pathname checks do not protect an inode through hard links or pin it
+against replacement. Deployment must protect executable and runtime inodes and
+their parent paths from plugin credentials and untrusted users, including ACLs,
+hard-link aliases, and replacement. The plugin shares the daemon UID: clearing
+owner write permission alone is not sufficient if that UID can restore it.
+The owner must explicitly confirm this deployment assumption. The existing
+native fork probe does not by itself prove every process-creation path is denied.
+
 - [ ] P2-10 and protocol P2-11 pass on Linux for the submitted candidate.
 - [ ] P2-10, protocol P2-11, and native sandbox tests pass on macOS.
 - [ ] Actual sandboxed host proves allowed read, denied undeclared read/write,

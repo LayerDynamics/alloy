@@ -1,16 +1,32 @@
-use std::{env, fs::OpenOptions, io::{self, BufRead, Write}, thread, time::Duration};
+use std::{env, fs::OpenOptions, io::{self, BufRead, Read, Write}, thread, time::Duration};
 fn main() {
     let args: Vec<_> = env::args().collect();
     let id = &args[1];
     let mode = &args[2];
     let log = &args[3];
     std::fs::write(format!("{log}.{id}.pid"), std::process::id().to_string()).unwrap();
-    for line in io::stdin().lock().lines() {
-        let line = line.unwrap();
-        let start = line.find("\"id\":").unwrap() + 5;
-        let number: String = line[start..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap() == 0 { break; }
+        let line = line.trim_end_matches('\n');
+        let start = line.rfind("\"id\":").unwrap() + 5;
+        let id_start = line[start..].trim_start();
+        let end = id_start.chars().take_while(|c| c.is_ascii_digit()).count();
+        let number = &id_start[..end];
         let method = if line.contains("\"initialize\"") { "initialize" }
             else if line.contains("\"tool.before_execute\"") { "before" } else { "after" };
+        if mode == "payload" && method != "initialize" {
+            writeln!(OpenOptions::new().create(true).append(true).open(format!("{log}.{id}.request_ids")).unwrap(), "{number}").unwrap();
+            assert!(line.contains(&format!("\"invocation\":{}", args[4])));
+            assert!(line.contains("\"protocol_version\":1"));
+            assert!(line.ends_with(&format!(",\"id\":{number}}}")));
+            if method == "after" {
+                assert!(line.contains(&format!("\"result\":{}", args[5])));
+                assert!(line.contains("\"duration_ms\":37"));
+            }
+        }
         writeln!(OpenOptions::new().create(true).append(true).open(log).unwrap(), "{id}:{method}").unwrap();
         let result = if method == "initialize" {
             if mode == "handshake_hang" { thread::sleep(Duration::from_secs(60)); return; }
@@ -40,6 +56,7 @@ fn main() {
                 "long_annotation" => format!(r#"{{"decision":"allow","annotations":{{"{id}.x":"{}"}}}}"#, "x".repeat(2048)),
                 "mutation" => r#"{"decision":"allow","arguments":{"changed":true}}"#.into(),
                 "after_failure" if method == "after" => r#"{"decision":"allow"}"#.into(),
+                "after_mutation" if method == "after" => r#"{"annotations":{},"result":{"changed":true}}"#.into(),
                 "fd_probe" if method == "before" => {
                     unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
                     let fd: i32 = args[4].parse().unwrap();
@@ -70,7 +87,7 @@ fn main() {
                 _ => format!(r#"{{"annotations":{{"{id}.seen":true}}}}"#),
             }
         };
-        let response_id = if mode == "wrong_id" && method != "initialize" { "999" } else { &number };
+        let response_id = if mode == "wrong_id" && method != "initialize" { "0" } else { number };
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{response_id},"result":{result}}}"#);
         if mode == "fragmented" {
             for byte in frame.bytes().chain(std::iter::once(b'\n')) { io::stdout().write_all(&[byte]).unwrap(); io::stdout().flush().unwrap(); }
@@ -82,6 +99,17 @@ fn main() {
             println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"decision":"allow"}}}}"#);
             io::stdout().flush().unwrap();
             std::fs::write(format!("{log}.{id}.unsolicited"), b"sent").unwrap();
+        }
+        if mode == "raced_stale" && method == "initialize" {
+            let mut byte = [0u8; 1];
+            input.read_exact(&mut byte).unwrap();
+            std::fs::write(format!("{log}.{id}.race_started"), b"started").unwrap();
+            println!(r#"{{"jsonrpc":"2.0","id":0,"result":{{"decision":"allow"}}}}"#);
+            io::stdout().flush().unwrap();
+            let mut rest = String::new();
+            let _ = input.read_line(&mut rest);
+            thread::sleep(Duration::from_secs(2));
+            return;
         }
         if mode == "not_reading_after_initialize" && method == "initialize" {
             thread::sleep(Duration::from_secs(60));
