@@ -82,6 +82,24 @@ fn main() {
                         let pid = unsafe { fork() };
                         if pid == 0 { std::process::exit(87); }
                         assert_eq!(pid, -1, "sandbox must deny child creation");
+                        unsafe extern "C" {
+                            fn posix_spawn(pid: *mut i32, path: *const i8, actions: *const std::ffi::c_void, attr: *const std::ffi::c_void, argv: *const *mut i8, envp: *const *mut i8) -> i32;
+                            fn kill(pid: i32, signal: i32) -> i32;
+                            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+                        }
+                        let program = std::ffi::CString::new(args[7].as_bytes()).unwrap();
+                        let argv = [program.as_ptr().cast_mut(), std::ptr::null_mut()];
+                        let env = [std::ptr::null_mut()];
+                        let mut spawned = -1;
+                        // SAFETY: C strings and null-terminated arrays outlive the call.
+                        let status = unsafe { posix_spawn(&mut spawned, program.as_ptr(), std::ptr::null(), std::ptr::null(), argv.as_ptr(), env.as_ptr()) };
+                        if status == 0 {
+                            let mut child_status = 0;
+                            // SAFETY: only this unexpectedly spawned child is killed and reaped.
+                            unsafe { kill(spawned, 9); waitpid(spawned, &mut child_status, 0); }
+                            panic!("sandbox permitted posix_spawn");
+                        }
+                        assert_eq!(status, 1, "posix_spawn was not denied by sandbox");
                         // Exercise the normal process-spawn path as well as fork.
                         // Always reap a surprising successful child before failing.
                         match std::process::Command::new(&args[7]).spawn() {

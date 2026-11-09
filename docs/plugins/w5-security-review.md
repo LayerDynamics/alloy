@@ -68,8 +68,13 @@ against replacement. Deployment must protect executable and runtime inodes and
 their parent paths from plugin credentials and untrusted users, including ACLs,
 hard-link aliases, and replacement. The plugin shares the daemon UID: clearing
 owner write permission alone is not sufficient if that UID can restore it.
-The owner must explicitly confirm this deployment assumption. The existing
-native fork probe does not by itself prove every process-creation path is denied.
+The owner must explicitly confirm this deployment assumption. Native tests now
+exercise fork, direct posix_spawn and the standard library's process-spawn path;
+they do not prove that every possible process-creation interface is denied.
+Another native test gives a sandboxed plugin the real path of a published
+artifact outside its grants, observes a denied write and rejected result
+replacement, and verifies the original bytes through the artifact store. This
+does not protect an artifact tree the operator has explicitly granted writable.
 
 - [ ] P2-10 and protocol P2-11 pass on Linux for the submitted candidate.
 - [ ] P2-10, protocol P2-11, and native sandbox tests pass on macOS.
