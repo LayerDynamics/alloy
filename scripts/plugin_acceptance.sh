@@ -50,14 +50,14 @@ gate compile cargo check --locked -p harness-core --all-targets
 gate clippy cargo clippy --locked -p harness-core --all-targets -- -D warnings
 cargo test --locked -p harness-core --test plugin_hooks -- --list > "$OUT/protocol-discovery.txt"
 for name in plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_sandbox \
-    plugin_failures_reap_real_children_and_stop_later_hooks \
-    plugin_registration_is_atomic_and_drop_reaps \
-    plugin_cancellation_isolated_and_after_failure_is_warning_only \
-    plugin_capability_subsets_fragmentation_and_real_zero_effect_marker \
-    plugin_inherited_descriptor_is_closed_on_exec \
-    plugin_invalid_limits_and_duplicate_registration_spawn_nothing \
-    plugin_blocked_stdin_deadline_reaps_owned_process \
-    plugin_high_fd_above_lowered_limit_is_not_inherited; do
+    hardening::plugin_failures_reap_real_children_and_stop_later_hooks \
+    hardening::plugin_registration_is_atomic_and_drop_reaps \
+    hardening::plugin_cancellation_isolated_and_after_failure_is_warning_only \
+    hardening::plugin_capability_subsets_fragmentation_and_real_zero_effect_marker \
+    hardening::plugin_inherited_descriptor_is_closed_on_exec \
+    hardening::plugin_invalid_limits_and_duplicate_registration_spawn_nothing \
+    hardening::plugin_blocked_stdin_deadline_reaps_owned_process \
+    hardening::plugin_high_fd_above_lowered_limit_is_not_inherited; do
   grep -Fx "$name: test" "$OUT/protocol-discovery.txt"
   gate "$name" cargo test --locked -p harness-core --test plugin_hooks "$name" -- --exact --nocapture
 done
@@ -68,11 +68,11 @@ grep -Fx 'plugin_host::host::strict_json::duplicate_escaped_nested_and_trailing_
 if [[ "$(uname -s)" == Darwin ]]; then
   cargo test --locked -p harness-core --test plugin_sandbox -- --list > "$OUT/sandbox-discovery.txt"
   grep -Fx 'plugin_protocol_timeout_and_sandbox: test' "$OUT/sandbox-discovery.txt"
-  grep -Fx 'plugin_alias_read_works_but_symlink_cannot_escape: test' "$OUT/sandbox-discovery.txt"
-  gate sandbox-alias cargo test --locked -p harness-core --test plugin_sandbox plugin_alias_read_works_but_symlink_cannot_escape -- --exact --nocapture
+  grep -Fx 'hardening::plugin_alias_read_works_but_symlink_cannot_escape: test' "$OUT/sandbox-discovery.txt"
+  gate sandbox-alias cargo test --locked -p harness-core --test plugin_sandbox hardening::plugin_alias_read_works_but_symlink_cannot_escape -- --exact --nocapture
   gate sandbox cargo test --locked -p harness-core --test plugin_sandbox plugin_protocol_timeout_and_sandbox -- --exact --nocapture
-  grep -Fx 'plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork: test' "$OUT/protocol-discovery.txt"
-  gate sandboxed-host cargo test --locked -p harness-core --test plugin_hooks plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork -- --exact --nocapture
+  grep -Fx 'hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork: test' "$OUT/protocol-discovery.txt"
+  gate sandboxed-host cargo test --locked -p harness-core --test plugin_hooks hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork -- --exact --nocapture
 else
   printf '%s\n' 'NOT APPLICABLE: macOS Seatbelt lane required separately.' > "$OUT/sandbox-platform.txt"
 fi

@@ -1,3 +1,4 @@
+use super::*;
 
 #[test]
 fn plugin_alias_read_works_but_symlink_cannot_escape() {
@@ -12,14 +13,30 @@ fn plugin_alias_read_works_but_symlink_cannot_escape() {
     symlink(bad.canonicalize().unwrap(), &escape).unwrap();
     let policy = Sandbox::MacOs {
         read_files: vec!["/dev/null".into()],
-        read_trees: vec!["/bin".into(), "/usr/lib".into(), "/System".into(), allowed.path().into()],
+        read_trees: vec![
+            "/bin".into(),
+            "/usr/lib".into(),
+            "/System".into(),
+            allowed.path().into(),
+        ],
         write_trees: vec![],
     };
     let profile = profile(&policy).unwrap();
-    let run = |path: &std::path::Path| Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", &profile, "/bin/cat"]).arg(path).env_clear().output().unwrap();
+    let run = |path: &std::path::Path| {
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/cat"])
+            .arg(path)
+            .env_clear()
+            .output()
+            .unwrap()
+    };
     let positive = run(&good);
-    assert!(positive.status.success(), "{:?}: {}", positive.status, String::from_utf8_lossy(&positive.stderr));
+    assert!(
+        positive.status.success(),
+        "{:?}: {}",
+        positive.status,
+        String::from_utf8_lossy(&positive.stderr)
+    );
     assert_eq!(positive.stdout, b"allowed");
     let negative = run(&escape);
     assert_eq!(negative.status.code(), Some(1));
