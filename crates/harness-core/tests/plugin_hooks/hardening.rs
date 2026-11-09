@@ -129,6 +129,95 @@ fn fileport_rejects_malformed_helper_message() {
 #[cfg(target_os = "macos")]
 #[test]
 fn fileport_rejects_wrong_sender_and_complex_messages() {
+    if std::env::var_os("ALLOY_FILEPORT_RIGHTS_TEST").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hardening::fileport_rejects_wrong_sender_and_complex_messages",
+                "--nocapture",
+            ])
+            .env("ALLOY_FILEPORT_RIGHTS_TEST", "1")
+            .env("ALLOY_W5_FD_FIXTURE", fixture())
+            .env("ALLOY_W5_FD_HELPER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FILEPORT_RIGHTS_PASSED"));
+        return;
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_port_names(
+            task: u32,
+            names: *mut *mut u32,
+            nc: *mut u32,
+            types: *mut *mut u32,
+            tc: *mut u32,
+        ) -> i32;
+        fn mach_port_get_refs(task: u32, name: u32, right: u32, refs: *mut u32) -> i32;
+        fn mach_port_allocate(task: u32, right: u32, name: *mut u32) -> i32;
+        fn mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32;
+        fn vm_deallocate(task: u32, address: usize, size: usize) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    type Inventory = (Vec<(u32, u32, [u32; 5])>, Vec<i32>);
+    fn inventory() -> Inventory {
+        let mut names = std::ptr::null_mut();
+        let mut types = std::ptr::null_mut();
+        let (mut nc, mut tc) = (0, 0);
+        // SAFETY: mach_task_self_ is the current task's read-only port name.
+        let task = unsafe { mach_task_self_ };
+        // SAFETY: Mach returns allocated arrays and initializes both lengths.
+        let status = unsafe { mach_port_names(task, &mut names, &mut nc, &mut types, &mut tc) };
+        assert_eq!(status, 0);
+        assert_eq!(nc, tc);
+        // SAFETY: the kernel returned nc entries in each array on success.
+        let name_slice = unsafe { std::slice::from_raw_parts(names, nc as usize) };
+        // SAFETY: the types array also contains tc initialized entries.
+        let type_slice = unsafe { std::slice::from_raw_parts(types, tc as usize) };
+        let mut rights = Vec::new();
+        for (&name, &kind) in name_slice.iter().zip(type_slice) {
+            let mut refs = [0; 5];
+            for (right, count) in refs.iter_mut().enumerate() {
+                if kind & (1 << (right + 16)) != 0 {
+                    // SAFETY: name and right were returned by mach_port_names.
+                    let status = unsafe { mach_port_get_refs(task, name, right as u32, count) };
+                    assert_eq!(status, 0);
+                }
+            }
+            rights.push((name, kind, refs));
+        }
+        // SAFETY: release the two out-of-line arrays allocated by mach_port_names.
+        let status = unsafe { vm_deallocate(task, names as usize, nc as usize * 4) };
+        assert_eq!(status, 0);
+        // SAFETY: same ownership applies to the separate types array.
+        let status = unsafe { vm_deallocate(task, types as usize, tc as usize * 4) };
+        assert_eq!(status, 0);
+        rights.sort_unstable();
+        let mut fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        // The directory stream itself appears in the listing; after dropping it,
+        // retain only still-open descriptors. F_GETFD only observes state.
+        // SAFETY: F_GETFD accepts any integer descriptor.
+        fds.retain(|fd| unsafe { fcntl(*fd, 1) } >= 0);
+        fds.sort_unstable();
+        (rights, fds)
+    }
     let dir = tempfile::tempdir().unwrap();
     let source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fileport_adversarial_helper.c");
@@ -146,7 +235,26 @@ fn fileport_rejects_wrong_sender_and_complex_messages() {
         );
         let plugin = config(dir.path(), "adversarial", "allow");
         let cancel = CancellationToken::default();
+        // Include the first attempt in the inventory check, not only steady state.
+        let baseline = inventory();
+        let mut probe = 0;
+        // SAFETY: mach_task_self_ is the current task's read-only port name.
+        let task = unsafe { mach_task_self_ };
+        // SAFETY: allocate an actual receive right to validate the inventory.
+        assert_eq!(unsafe { mach_port_allocate(task, 1, &mut probe) }, 0);
+        assert_ne!(inventory().0, baseline.0, "inventory missed an added right");
+        // SAFETY: probe is the receive right allocated immediately above.
+        assert_eq!(unsafe { mach_port_mod_refs(task, probe, 1, -1) }, 0);
+        assert_eq!(inventory(), baseline);
         for _ in 0..8 {
+            for role in ["helper", "sender"] {
+                let path = format!("{}.{}.pid", helper.display(), role);
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("failed to remove prior fixture marker: {e}"),
+                }
+            }
             let error = PluginHost::start_with_helper(
                 vec![plugin.clone()],
                 limits(),
@@ -157,9 +265,41 @@ fn fileport_rejects_wrong_sender_and_complex_messages() {
             .err()
             .expect("adversarial helper reply was accepted");
             assert!(error.to_string().contains("Input/output error"), "{error}");
+            let marker = |role: &str| {
+                let path = format!("{}.{}.pid", helper.display(), role);
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap()
+            };
+            assert_reaped(marker("helper"));
+            if mode == 1 {
+                let sender = marker("sender");
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    // SAFETY: signal zero observes this fixture PID without signaling it.
+                    if unsafe { kill(sender, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(3)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < until,
+                        "forged sender {sender} remains alive"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            assert_eq!(
+                inventory(),
+                baseline,
+                "rights or descriptors leaked in mode {mode}"
+            );
         }
         assert!(!dir.path().join("events").exists());
     }
+    println!("FILEPORT_RIGHTS_PASSED");
 }
 
 #[cfg(target_os = "macos")]
