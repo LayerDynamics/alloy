@@ -21,5 +21,8 @@ ureq = { workspace = true }
 tempfile = "=3.27.0"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 
+[build-dependencies]
+cc = "=1.11.0"
+
 [lints]
 workspace = true

@@ -66,6 +66,20 @@ fn limits() -> Limits {
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
+fn start_host(
+    configs: Vec<PluginConfig>,
+    limits: Limits,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<PluginHost, harness_core::plugin_host::HostError> {
+    PluginHost::start_with_helper(
+        configs,
+        limits,
+        deadline,
+        cancel,
+        Path::new(env!("CARGO_BIN_EXE_alloy-plugin-pipe-helper")),
+    )
+}
 fn config(dir: &Path, id: &str, mode: &str) -> PluginConfig {
     PluginConfig {
         id: id.into(),
@@ -100,7 +114,7 @@ fn plugin_tool_hooks_order_veto_annotation() {
     let cancel = CancellationToken::default();
     let call = invocation();
     let original = serde_json::to_value(&call).unwrap();
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![
             config(dir.path(), "a", "allow"),
             config(dir.path(), "b", "allow"),
@@ -141,7 +155,7 @@ fn plugin_tool_hooks_order_veto_annotation() {
     );
     drop(host);
     let other = tempfile::tempdir().unwrap();
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![
             config(other.path(), "a", "veto"),
             config(other.path(), "b", "allow"),
@@ -170,7 +184,7 @@ fn plugin_protocol_timeout_and_sandbox() {
     let cancel = CancellationToken::default();
     let dir = tempfile::tempdir().unwrap();
     assert!(
-        PluginHost::start(
+        start_host(
             vec![config(dir.path(), "a", "version")],
             limits(),
             deadline(),
@@ -179,7 +193,7 @@ fn plugin_protocol_timeout_and_sandbox() {
         .is_err()
     );
     for mode in ["hang", "crash", "malformed", "flood", "mutation"] {
-        let mut host = PluginHost::start(
+        let mut host = start_host(
             vec![config(dir.path(), "a", mode)],
             limits(),
             deadline(),
@@ -197,7 +211,7 @@ fn plugin_protocol_timeout_and_sandbox() {
 fn unsolicited_output_between_calls_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![config(dir.path(), "a", "unsolicited")],
         limits(),
         deadline(),
@@ -231,7 +245,7 @@ fn raced_preconstructed_response_fails_closed() {
     let cancel = CancellationToken::default();
     let mut large_limits = limits();
     large_limits.message_bytes = 512 * 1024;
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![config(dir.path(), "a", "raced_stale")],
         large_limits,
         deadline(),
@@ -266,7 +280,7 @@ fn plugin_receives_canonical_payload_and_cannot_replace_result() {
     let mut cfg = config(dir.path(), "a", "payload");
     cfg.args.push(serde_json::to_string(&call).unwrap());
     cfg.args.push(serde_json::to_string(&result).unwrap());
-    let mut host = PluginHost::start(vec![cfg], limits(), deadline(), &cancel).unwrap();
+    let mut host = start_host(vec![cfg], limits(), deadline(), &cancel).unwrap();
     assert_eq!(
         host.before(&call, deadline(), &cancel).decision,
         Decision::Allow
@@ -285,7 +299,7 @@ fn plugin_receives_canonical_payload_and_cannot_replace_result() {
             .all(|id| id.parse::<u64>().is_ok_and(|n| n < (1u64 << 53)))
     );
     drop(host);
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![config(dir.path(), "a", "after_mutation")],
         limits(),
         deadline(),
@@ -308,7 +322,7 @@ fn plugin_receives_canonical_payload_and_cannot_replace_result() {
 fn cancellation_reaps_and_after_failure_cannot_mutate_original_result() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![config(dir.path(), "a", "hang")],
         limits(),
         deadline(),
@@ -326,7 +340,7 @@ fn cancellation_reaps_and_after_failure_cannot_mutate_original_result() {
     );
     worker.join().unwrap();
     let cancel = CancellationToken::default();
-    let mut host = PluginHost::start(
+    let mut host = start_host(
         vec![config(dir.path(), "a", "after_failure")],
         limits(),
         deadline(),

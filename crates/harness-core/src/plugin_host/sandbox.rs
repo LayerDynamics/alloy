@@ -42,7 +42,7 @@ pub fn profile(policy: &Sandbox) -> Result<String, HostError> {
         return Err(HostError::new("trusted policy has no sandbox profile"));
     };
     let mut text = String::from(
-        "(version 1)\n(deny default)\n(allow process-exec)\n(deny process-fork)\n(allow file-read-data (literal \"/\"))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"hw.pagesize_compat\"))\n",
+        "(version 1)\n(deny default)\n(allow process-exec)\n(deny process-fork)\n(deny file-link)\n(allow file-read-data (literal \"/\"))\n(allow sysctl-read (sysctl-name \"security.mac.lockdown_mode_state\") (sysctl-name \"kern.bootargs\") (sysctl-name \"hw.pagesize_compat\"))\n",
     );
     // Content grants remain scoped. Metadata grants cover exact ancestor nodes
     // for both the configured spelling and the resolved path, not whole trees.

@@ -60,7 +60,14 @@ fn sandboxed_after_hook_cannot_replace_artifact_or_its_bytes() {
     };
     let cancel = CancellationToken::default();
     let deadline = || Instant::now() + Duration::from_secs(10);
-    let mut host = PluginHost::start(vec![config], limits, deadline(), &cancel).unwrap();
+    let mut host = PluginHost::start_with_helper(
+        vec![config],
+        limits,
+        deadline(),
+        &cancel,
+        Path::new(env!("CARGO_BIN_EXE_alloy-plugin-pipe-helper")),
+    )
+    .unwrap();
     let call = HookInvocation {
         invocation_id: "inv-c".into(),
         session_id: "s".into(),

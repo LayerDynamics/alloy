@@ -114,6 +114,28 @@ impl PluginHost {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Self, HostError> {
+        Self::start_inner(configs, limits, deadline, cancel, None)
+    }
+
+    /// Start with an explicitly selected absolute macOS pipe-helper path.
+    /// The operator is responsible for protecting the helper and its parents.
+    pub fn start_with_helper(
+        configs: Vec<PluginConfig>,
+        limits: Limits,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        helper: &std::path::Path,
+    ) -> Result<Self, HostError> {
+        Self::start_inner(configs, limits, deadline, cancel, Some(helper))
+    }
+
+    fn start_inner(
+        configs: Vec<PluginConfig>,
+        limits: Limits,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        helper: Option<&std::path::Path>,
+    ) -> Result<Self, HostError> {
         if configs.len() > 64
             || limits.message_bytes > 8 * 1024 * 1024
             || limits.diagnostic_bytes > 1024 * 1024
@@ -139,6 +161,8 @@ impl PluginHost {
                 return Err(HostError::new("invalid/duplicate plugin identity"));
             }
         }
+        // Validate all sandbox write grants before starting any plugin.
+        let helper = spawn::prepare_helper(&configs, helper, deadline, cancel)?;
         let mut host = Self {
             plugins: Vec::new(),
             limits,
@@ -147,7 +171,7 @@ impl PluginHost {
             if cancel.is_cancelled() || Instant::now() >= deadline {
                 return Err(HostError::new("registration cancelled/expired"));
             }
-            let mut process = Process::spawn(&config, limits)?;
+            let mut process = Process::spawn(&config, limits, helper.as_deref(), deadline, cancel)?;
             let handshake: Handshake = process.rpc("initialize", serde_json::json!({
                 "protocol_version":VERSION, "plugin_id":config.id, "plugin_version":config.version,
                 "hooks":[BEFORE,AFTER]

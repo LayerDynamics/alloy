@@ -77,6 +77,8 @@ fn main() {
                     assert!(std::net::TcpStream::connect_timeout(&args[6].parse().unwrap(), Duration::from_millis(100)).is_err());
                     #[cfg(target_os = "macos")]
                     {
+                        let link_error = std::fs::hard_link(&args[7], &args[8]).expect_err("sandbox permitted a new hard link");
+                        assert_eq!(link_error.kind(), io::ErrorKind::PermissionDenied);
                         unsafe extern "C" { fn fork() -> i32; }
                         // SAFETY: test-only probe expects fork to be denied by Seatbelt.
                         let pid = unsafe { fork() };

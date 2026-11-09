@@ -5,13 +5,48 @@ pub(super) use macos::Child;
 #[cfg(target_os = "linux")]
 pub(super) use std::process::Child;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
+use std::{path::Path, time::Instant};
+use tool_registry::execution::CancellationToken;
 type Spawned = (Child, ChildStdin, ChildStdout, ChildStderr);
-pub(super) fn spawn(config: &PluginConfig) -> Result<Spawned, HostError> {
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_helper(
+    _configs: &[PluginConfig],
+    helper: Option<&Path>,
+    _deadline: Instant,
+    _cancel: &CancellationToken,
+) -> Result<Option<std::path::PathBuf>, HostError> {
+    Ok(helper.map(Path::to_owned))
+}
+#[cfg(target_os = "macos")]
+pub(super) fn prepare_helper(
+    configs: &[PluginConfig],
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Option<std::path::PathBuf>, HostError> {
+    if configs.is_empty() {
+        return Ok(None);
+    }
+    macos::prepare_helper(configs, helper, deadline, cancel)
+        .map(Some)
+        .map_err(HostError::io)
+}
+pub(super) fn spawn(
+    config: &PluginConfig,
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Spawned, HostError> {
     let command = sandbox::command(config)?;
-    platform(command).map_err(HostError::io)
+    platform(command, helper, deadline, cancel).map_err(HostError::io)
 }
 #[cfg(target_os = "linux")]
-fn platform(mut cmd: std::process::Command) -> std::io::Result<Spawned> {
+fn platform(
+    mut cmd: std::process::Command,
+    _helper: Option<&Path>,
+    _deadline: Instant,
+    _cancel: &CancellationToken,
+) -> std::io::Result<Spawned> {
     use std::{io, os::unix::process::CommandExt, process::Stdio};
     unsafe extern "C" {
         fn close_range(first: u32, last: u32, flags: i32) -> i32;
@@ -40,8 +75,13 @@ fn platform(mut cmd: std::process::Command) -> std::io::Result<Spawned> {
     Ok((child, input, output, error))
 }
 #[cfg(target_os = "macos")]
-fn platform(cmd: std::process::Command) -> std::io::Result<Spawned> {
-    macos::spawn(cmd)
+fn platform(
+    cmd: std::process::Command,
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> std::io::Result<Spawned> {
+    macos::spawn(cmd, helper, deadline, cancel)
 }
 
 #[cfg(target_os = "macos")]
@@ -52,7 +92,7 @@ mod macos {
         io,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
-            unix::{ffi::OsStrExt, process::ExitStatusExt},
+            unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
         },
         process::{Command, ExitStatus},
     };
@@ -61,8 +101,12 @@ mod macos {
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
     #[link(name = "System")]
     unsafe extern "C" {
-        fn pipe(fds: *mut i32) -> i32;
-        fn fcntl(fd: i32, command: i32, ...) -> i32;
+        fn alloy_fileport_pipes(
+            helper: *const c_char,
+            stop: extern "C" fn(*mut c_void) -> i32,
+            context: *mut c_void,
+            out: *mut i32,
+        ) -> i32;
         fn kill(pid: i32, signal: i32) -> i32;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         fn posix_spawnattr_init(attr: *mut Opaque) -> i32;
@@ -93,6 +137,89 @@ mod macos {
     fn cstring(value: &std::ffi::OsStr) -> io::Result<CString> {
         CString::new(value.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in spawn configuration"))
+    }
+    pub(super) fn prepare_helper(
+        configs: &[super::PluginConfig],
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &tool_registry::execution::CancellationToken,
+    ) -> io::Result<std::path::PathBuf> {
+        let helper = match helper {
+            Some(path) if path.is_absolute() => path.to_owned(),
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "helper path must be absolute",
+                ));
+            }
+            None => std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| io::Error::other("executable has no parent"))?
+                .join("alloy-plugin-pipe-helper"),
+        }
+        .canonicalize()?;
+        if !helper.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid pipe helper",
+            ));
+        }
+        let mut protected = vec![helper.clone()];
+        for config in configs {
+            protected.push(config.program.canonicalize()?);
+        }
+        let mut visited = 0usize;
+        for config in configs {
+            let super::sandbox::Sandbox::MacOs { write_trees, .. } = &config.sandbox else {
+                continue;
+            };
+            for path in write_trees {
+                let root = path.canonicalize()?;
+                if protected.iter().any(|p| p.starts_with(&root)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "plugin writable tree includes a protected executable",
+                    ));
+                }
+                let mut pending = vec![root];
+                while let Some(directory) = pending.pop() {
+                    if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "plugin writable-tree audit cancelled or expired",
+                        ));
+                    }
+                    for entry in std::fs::read_dir(directory)? {
+                        if cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "plugin writable-tree audit cancelled or expired",
+                            ));
+                        }
+                        visited += 1;
+                        if visited > 16384 {
+                            return Err(io::Error::other(
+                                "plugin writable-tree audit exceeds entry limit",
+                            ));
+                        }
+                        let path = entry?.path();
+                        let metadata = std::fs::symlink_metadata(&path)?;
+                        if metadata.file_type().is_symlink() {
+                            continue;
+                        }
+                        if metadata.is_dir() {
+                            pending.push(path);
+                        } else if metadata.is_file() && metadata.nlink() != 1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "plugin writable tree contains a hard-linked file",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(helper)
     }
     struct Attr(Opaque);
     impl Attr {
@@ -128,33 +255,57 @@ mod macos {
             }
         }
     }
-    fn pipe_pair() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut raw = [-1; 2];
-        // SAFETY: raw contains two writable ints; success creates owned descriptors.
-        if unsafe { pipe(raw.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful pipe produced two distinct, newly owned descriptors.
-        let pair = unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) };
-        fn prepare(fd: OwnedFd) -> io::Result<OwnedFd> {
-            let owned = if fd.as_raw_fd() < 3 {
-                // SAFETY: F_DUPFD duplicates this live descriptor to an available slot >=3.
-                let copied = unsafe { fcntl(fd.as_raw_fd(), 0, 3) };
-                if copied < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: copied is a new owned descriptor not owned elsewhere.
-                unsafe { OwnedFd::from_raw_fd(copied) }
-            } else {
-                fd
-            };
-            // SAFETY: F_SETFD changes flags on this owned descriptor only.
-            if unsafe { fcntl(owned.as_raw_fd(), 2, 1) } < 0 {
-                return Err(io::Error::last_os_error());
+    fn pipes(
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &tool_registry::execution::CancellationToken,
+    ) -> io::Result<[OwnedFd; 6]> {
+        let selected = match helper {
+            Some(path) if path.is_absolute() => path.to_owned(),
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "helper path must be absolute",
+                ));
             }
-            Ok(owned)
+            None => std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| io::Error::other("executable has no parent"))?
+                .join("alloy-plugin-pipe-helper"),
+        };
+        let selected = selected.canonicalize()?;
+        if !selected.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid pipe helper",
+            ));
         }
-        Ok((prepare(pair.0)?, prepare(pair.1)?))
+        let selected = cstring(selected.as_os_str())?;
+        struct Stop<'a> {
+            deadline: std::time::Instant,
+            cancel: &'a tool_registry::execution::CancellationToken,
+        }
+        extern "C" fn stopped(context: *mut c_void) -> i32 {
+            // SAFETY: the synchronous C call retains this live stack value only for its duration.
+            let state = unsafe { &*(context.cast::<Stop<'_>>()) };
+            i32::from(state.cancel.is_cancelled() || std::time::Instant::now() >= state.deadline)
+        }
+        let mut state = Stop { deadline, cancel };
+        let mut raw = [-1; 6];
+        // SAFETY: selected is NUL-terminated; callback/context and six output slots remain valid.
+        let code = unsafe {
+            alloy_fileport_pipes(
+                selected.as_ptr(),
+                stopped,
+                (&mut state as *mut Stop<'_>).cast(),
+                raw.as_mut_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        // SAFETY: the C function returns six distinct, owned CLOEXEC descriptors on success.
+        Ok(raw.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
     }
     pub(crate) struct Child {
         pid: i32,
@@ -192,7 +343,12 @@ mod macos {
             }
         }
     }
-    pub(super) fn spawn(cmd: Command) -> io::Result<Spawned> {
+    pub(super) fn spawn(
+        cmd: Command,
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &tool_registry::execution::CancellationToken,
+    ) -> io::Result<Spawned> {
         let program = cstring(cmd.get_program())?;
         let mut args = vec![program.clone()];
         for arg in cmd.get_args() {
@@ -206,9 +362,14 @@ mod macos {
         argv.push(std::ptr::null_mut());
         // sandbox::command requires an empty environment; never inherit environ.
         let environment = [std::ptr::null_mut::<c_char>()];
-        let (input_read, input_write) = pipe_pair()?;
-        let (output_read, output_write) = pipe_pair()?;
-        let (error_read, error_write) = pipe_pair()?;
+        let [
+            input_read,
+            input_write,
+            output_read,
+            output_write,
+            error_read,
+            error_write,
+        ] = pipes(helper, deadline, cancel)?;
         let mut attr = Attr::new()?;
         let mut actions = Actions::new()?;
         // SAFETY: opaque handles are initialized, C strings/FDs remain live through

@@ -68,8 +68,14 @@ pub(crate) struct Process {
     dead: bool,
 }
 impl Process {
-    pub fn spawn(config: &PluginConfig, limits: Limits) -> Result<Self, HostError> {
-        let (child, input, output, stderr) = spawn::spawn(config)?;
+    pub fn spawn(
+        config: &PluginConfig,
+        limits: Limits,
+        helper: Option<&std::path::Path>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<Self, HostError> {
+        let (child, input, output, stderr) = spawn::spawn(config, helper, deadline, cancel)?;
         let owned = Self {
             child,
             input: Some(input),

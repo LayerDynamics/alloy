@@ -601,6 +601,7 @@ dependencies = [
 name = "harness-core"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "engine",
  "getrandom 0.3.4",
  "rusqlite",

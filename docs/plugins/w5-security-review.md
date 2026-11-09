@@ -18,10 +18,13 @@ the three named sysctls observed on the tested Mac: `security.mac.lockdown_mode_
 silence log noise. Read/write trees must actually be directories.
 
 The executable/cwd are canonicalized before launch, and the executable must be a
-regular file. The daemon operator must deploy it and its runtime under directories
-not writable by the plugin or other untrusted users. Canonicalization does not pin
-an executable inode across replacement. Supply-chain verification or adversarial
-host-filesystem replacement is not provided by this module; do not claim otherwise.
+regular file. The operator selected a user-owned writable installation. The owner
+and unsandboxed same-privilege processes are trusted not to modify the helper,
+plugin, runtime files, their aliases or parent paths while the host uses them.
+Canonicalization does not pin an inode across replacement, and this module does
+not provide supply-chain verification or protection against adversarial changes
+by those trusted host processes. Do not grant plugins write access to their code
+or runtime resources.
 
 Descriptor sanitization is independent of allocation limits. Linux uses
 close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC) in the child; failure rejects spawn,
@@ -39,6 +42,14 @@ cleanup errors in bounded retained diagnostics. Tests independently observe ESRC
 and ECHILD for exact child PIDs after timeout, cancellation, invalid responses,
 failed registration, and drop. This is not an OS OOM prevention mechanism.
 
+Independent review found that an unrelated process-wide child reaper can consume
+an owned child before cleanup; its PID can then be reused before a SIGKILL. This
+applies to helper and plugin cleanup. The tests assume exclusive reaping and do
+not establish safety with a competing reaper or SIGCHLD auto-reaping. Acceptance
+is blocked until ownership is enforced or an identity-safe cleanup mechanism is
+implemented and tested. Do not embed this host in a process with competing child
+reapers and treat the warning as a complete fix.
+
 ## Protocol boundary
 
 Bounded raw lines are decoded through duplicate-key-rejecting recursive JSON
@@ -55,20 +66,22 @@ The W6 integration must not hold store/session/native locks across hook IPC.
 
 ## Evidence and approval
 
-Independent review of candidate 253c24c found that macOS pipe creation uses
-`pipe` followed by `fcntl(F_SETFD)`. An unrelated concurrent fork/exec can
-inherit an endpoint before CLOEXEC is set. Close-by-default protects the plugin
-child, not unrelated children. Acceptance is blocked until atomic CLOEXEC
-transport creation or equivalent process-wide containment is implemented and
-tested under concurrent spawn; a local mutex is insufficient unless every spawn
-path, including libraries, participates.
+Independent review of candidate 253c24c found that macOS pipe creation used
+`pipe` followed by `fcntl(F_SETFD)`, exposing endpoints to unrelated concurrent
+exec. The current implementation creates them in a separate single-threaded
+helper, transfers them over a private Mach port with a kernel audit-token sender
+check, and imports close-on-exec file descriptors. The isolated concurrency test
+includes an intentionally inheritable positive control. The changed transport
+still requires candidate-bound CI and an independent review decision.
 
-Executable pathname checks do not protect an inode through hard links or pin it
-against replacement. Deployment must protect executable and runtime inodes and
-their parent paths from plugin credentials and untrusted users, including ACLs,
-hard-link aliases, and replacement. The plugin shares the daemon UID: clearing
-owner write permission alone is not sufficient if that UID can restore it.
-The owner must explicitly confirm this deployment assumption. Native tests now
+Executable pathname checks do not pin an inode against replacement. Registration
+rejects a write tree containing any configured executable or the helper, scans
+write trees for existing hard-linked regular files, and rejects trees exceeding
+16,384 entries. Seatbelt denies creation of new hard links. This conservative
+scan is point-in-time and cannot stop a trusted same-UID host process from racing
+it; the operator remains responsible for runtime resources, mount aliases and
+the selected trust boundary. Clearing owner write permission is insufficient
+against the owner, who can restore it. Native tests now
 exercise fork, direct posix_spawn and the standard library's process-spawn path;
 they do not prove that every possible process-creation interface is denied.
 Another native test gives a sandboxed plugin the real path of a published

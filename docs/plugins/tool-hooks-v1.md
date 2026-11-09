@@ -1,10 +1,8 @@
 # Tool hooks V1 — W5 candidate
 
-Status: the pre-fix candidate d496cbbaf933814c0db66405e4e34e1282aa3766 passed
-Linux and Mac CI. Review found incomplete descriptor sanitization above a lowered
-soft limit. This follow-up replaces the sweep and adds the isolated regression;
-its new candidate requires fresh Linux/Mac results and reviewer reconciliation.
-Prior green checks do not validate changed spawn code.
+Status: candidate under review. Acceptance requires Linux and macOS results and
+an independent security decision bound to the submitted commit; prior green
+checks do not validate later changes.
 
 Transport: one JSON-RPC 2.0 request/response per newline, UTF-8 JSON, strictly
 matching random u64 IDs in the exactly representable JSON integer range 0 through
@@ -52,6 +50,24 @@ canonical file resources, no network grant. Never silently fall back to trusted.
 Trusted is explicit and offers no sandbox claim. Linux does not implement the
 Mac policy and rejects it. Runtime reads must be explicitly declared; the Mac
 positive/negative test is mandatory, not ignored/skipped on a Mac runner.
+
+On macOS the host needs the `alloy-plugin-pipe-helper` executable. Production
+packages install it next to the daemon. For a source build, use
+`cargo build --locked -p alloyd -p harness-core`; library embedders may instead
+provide its absolute path to `PluginHost::start_with_helper`. A missing or invalid
+helper fails registration. The helper creates pipe endpoints in a single-threaded
+process and transfers them through a private Mach port; the host checks the
+kernel-supplied sender identity and imports close-on-exec descriptors.
+
+The operator may keep a user-owned, writable installation. That model trusts the
+owner and unsandboxed processes running with the same privileges not to change
+the plugin, helper, runtime resources, or paths while the host uses them; the
+sandbox does not defend against such host-side changes. Less-trusted plugins
+must not receive write access to executable or runtime resources. Registration
+rejects writable trees containing a configured executable or helper, and rejects
+existing hard-linked regular files in those trees (up to 16,384 entries); the
+profile denies creating new hard links. This is a point-in-time check, not inode
+pinning or a defense against concurrent changes by trusted host processes.
 
 See `w5-security-review.md` for the tightened V1 restrictions and review record.
 Remaining deployment/security assumptions must be confirmed by the reviewer: Seatbelt platform/runtime compatibility; profile
