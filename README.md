@@ -75,6 +75,8 @@ both merge before the following install command is available. This is a
 development preview; no prebuilt bottle or tagged binary release is claimed.
 
 ```bash
+brew tap LayerDynamics/alloy
+brew trust --formula layerdynamics/alloy/alloy
 brew install LayerDynamics/alloy/alloy
 alloy --version
 alloyd --check-native

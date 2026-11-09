@@ -26,11 +26,19 @@ vendored MLX and can take several minutes. A missing compiler is an installation
 build diagnostics, not a reason to defer compilation until the first chat.
 
 ```bash
+brew tap LayerDynamics/alloy
+brew trust --formula layerdynamics/alloy/alloy
 brew install LayerDynamics/alloy/alloy
 alloy --version
 alloyd --check-native
 alloy start
 ```
+
+The explicit trust step grants Homebrew permission to load this formula only.
+Homebrew 6 also grants that permission implicitly when installing its fully
+qualified name, but the explicit command makes the setup and CI sequence
+visible and does not trust other items in the tap. See
+[Homebrew tap trust](https://docs.brew.sh/Tap-Trust).
 
 The Ruby formula lives at `alloy.rb` in the tap repository root. Its location
 does not change Homebrew's `owner/tap/formula` naming: `LayerDynamics/alloy`

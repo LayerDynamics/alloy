@@ -260,6 +260,19 @@ export function ciFormula(commit, name, sourceUrl) {
   }
   return formula;
 }
+
+export async function installOwnedFormula(context, owner, { run = execute, env = process.env } = {}) {
+  validateOwnership(owner, context);
+  assert(owner.preflight_verified && owner.tap_attempted && owner.cleanup_phase === "pending", "installation requires an owned tapped candidate");
+  verifyTemporaryMarker(owner);
+  const options = { env: brewEnvironment(owner, env), log: path.join(owner.output, "brew.log") };
+  // Grant only this run's formula. Do not depend on install's implicit trust or
+  // trust every current and future item in the tap.
+  await run(owner.brew, ["trust", "--formula", owner.formula], { ...options, timeoutMs: 30000 });
+  updateOwnership(context, owner, { install_attempted: true });
+  await run(owner.brew, ["install", "--build-from-source", owner.formula], options);
+}
+
 export async function main() {
   assert(process.platform === "darwin" && process.arch === "arm64", "real Homebrew acceptance requires physical Apple Silicon with Metal");
   process.on("SIGINT", stopOwned); process.on("SIGTERM", stopOwned);
@@ -313,8 +326,7 @@ export async function main() {
     updateOwnership(context, owner, { tap_attempted: true });
     await execute(brew, ["tap", "--custom-remote", tap, localTap], { env, log });
     if (stopping) throw new Error("Homebrew acceptance cancelled");
-    updateOwnership(context, owner, { install_attempted: true });
-    await execute(brew, ["install", "--build-from-source", formula], { env, log });
+    await installOwnedFormula(context, owner);
     if (stopping) throw new Error("Homebrew acceptance cancelled");
     result.prefix = (await execute(brew, ["--prefix", formula], { env, log })).stdout.trim();
     assert(path.isAbsolute(result.prefix));

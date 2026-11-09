@@ -4,10 +4,39 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { cleanupOwned, createOwnership, createTemporaryMarker, ownershipContext, ownershipFile, updateOwnership } from "./ci.mjs";
+import { cleanupOwned, createOwnership, createTemporaryMarker, installOwnedFormula, ownershipContext, ownershipFile, updateOwnership } from "./ci.mjs";
 
 const COMMIT = "c".repeat(40);
 const MARKER = "alloy-ci-owner.json";
+
+test("installation explicitly trusts only its owned formula before attempting a build", async (t) => {
+  const f = fixture(t);
+  f.prepare();
+  updateOwnership(f.context, f.owner, { install_attempted: false });
+  const calls = [];
+  await installOwnedFormula(f.context, f.owner, { env: f.env, run: async (command, args) => {
+    assert.equal(command, f.owner.brew);
+    calls.push(args);
+    assert.equal(JSON.parse(fs.readFileSync(ownershipFile(f.context), "utf8")).install_attempted, args[0] === "install");
+  } });
+  assert.deepEqual(calls, [["trust", "--formula", f.owner.formula], ["install", "--build-from-source", f.owner.formula]]);
+});
+
+test("a trust failure prevents installation and preserves recoverable tap ownership", async (t) => {
+  const f = fixture(t);
+  f.prepare();
+  updateOwnership(f.context, f.owner, { install_attempted: false });
+  const calls = [];
+  await assert.rejects(installOwnedFormula(f.context, f.owner, { env: f.env, run: async (command, args) => {
+    calls.push(args);
+    throw new Error("trust denied");
+  } }), /trust denied/);
+  assert.deepEqual(calls, [["trust", "--formula", f.owner.formula]]);
+  const owner = JSON.parse(fs.readFileSync(ownershipFile(f.context), "utf8"));
+  assert.equal(owner.install_attempted, false);
+  assert.equal(owner.tap_attempted, true);
+  assert.equal(owner.cleanup_phase, "pending");
+});
 
 function fixture(t, { marker = true, token } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "alloy-brew-cleanup-test-")));
