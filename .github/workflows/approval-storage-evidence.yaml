@@ -125,13 +125,16 @@ jobs:
       - name: Collect approval and storage gates and complete source sections
         shell: bash
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
-          rustup component add rustfmt clippy
-          python3 scripts/approval_storage_evidence.py \
-            --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
-            --output "$APPROVAL_STORAGE_EVIDENCE/results" \
-            2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+          # Expansion intentionally happens in the locked child shell.
+          # shellcheck disable=SC2016
+          python3 scripts/ci/mac_locked_step.py -- bash -euo pipefail -c '
+            test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
+            rustup component add rustfmt clippy
+            python3 scripts/approval_storage_evidence.py \
+              --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
+              --output "$APPROVAL_STORAGE_EVIDENCE/results" \
+              2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+          '
       - name: Retain approval and storage macOS evidence even after failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

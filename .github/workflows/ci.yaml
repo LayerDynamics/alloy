@@ -25,6 +25,10 @@ jobs:
           persist-credentials: false
       - name: Plugin collector output lifecycle
         run: python3 -B -m unittest discover -s scripts/tests -p test_plugin_acceptance_output.py
+      - name: CI shard and required-check invariants
+        run: ruby scripts/tests/ci_partition_test.rb
+      - name: Host lock regression
+        run: python3 -B -m unittest discover -s scripts/tests -p test_mac_ci_lock.py
       - name: Node runtime
         uses: actions/setup-node@v5
         with:
@@ -35,8 +39,74 @@ jobs:
         working-directory: ts/cli
         run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
 
-  linux:
-    name: linux-arm64
+  linux_foundation:
+    name: linux-foundation
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: pins and corpus
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
+          bash scripts/pins_check.sh --test
+          bash bench/corpus/validate.sh
+      - name: bindgen image and test 10
+        run: |
+          set -euo pipefail
+          docker build --platform linux/arm64 -t alloy-builder:phase0 -f scripts/docker/Dockerfile scripts/docker
+          bash scripts/bindgen_check.sh --test
+      - name: inventory gate
+        run: bash scripts/coverage_inventory.sh --test
+
+  linux_repro:
+    name: linux-reproducibility
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: build native test image
+        run: docker build --platform linux/arm64 -t alloy-native-builder:phase0 -f scripts/docker/Dockerfile.repro scripts/docker
+      - name: native build reproducibility
+        run: ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 bash scripts/repro_check.sh --test
+
+  linux_engine:
+    name: linux-engine-and-native
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: build native test image
+        run: docker build --platform linux/arm64 -t alloy-native-builder:phase0 -f scripts/docker/Dockerfile.repro scripts/docker
+      - name: tool registry, FFI, infrastructure, Qwen3, and engine verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 -v "$PWD":/src:ro \
+            -e CARGO_TERM_COLOR=never -w /work alloy-native-builder:phase0 \
+            bash -euo pipefail -c '
+              tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf -
+              cargo test --locked -p tool-registry --all-targets
+              cargo test --locked -p tool-registry --doc
+              cargo test --locked -p mlx-ffi --all-targets -- --test-threads=1
+              cargo test --locked -p inference-infra --all-targets
+              cargo test --locked -p qwen3 --all-targets
+              cargo test --locked -p qwen3 --doc
+              cargo check --locked -p engine --all-targets
+              cargo test --locked -p engine --all-targets
+              cargo test --locked -p engine --doc
+              RUSTDOCFLAGS="-D warnings" cargo doc --locked -p engine --no-deps
+            '
+
+  linux_core:
+    name: linux-core-and-acceptance
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
 
@@ -45,36 +115,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           persist-credentials: false
-
-      - name: pins and corpus
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-jsonschema
-
-          bash scripts/pins_check.sh --test
-          bash bench/corpus/validate.sh
-
-      - name: bindgen image and test 10
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker build --platform linux/arm64 \
-            -t alloy-builder:phase0 \
-            -f scripts/docker/Dockerfile \
-            scripts/docker
-
-          bash scripts/bindgen_check.sh --test
-
-      - name: inventory gate
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          bash scripts/coverage_inventory.sh --test
 
       - name: build native test image
         shell: bash
@@ -86,20 +126,17 @@ jobs:
             -f scripts/docker/Dockerfile.repro \
             scripts/docker
 
-      - name: native build reproducibility
+      - name: harness-core, alloyd, and acceptance verification
         shell: bash
+        env:
+          CI_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-
-          ALLOY_BUILDER_IMAGE=alloy-native-builder:phase0 \
-            bash scripts/repro_check.sh --test
-
-      - name: FFI, infrastructure, Qwen3, engine, harness-core, and alloyd verification
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           mkdir -p target/w4-acceptance/linux target/w5-acceptance/linux
+          for evidence in target/w4-acceptance/linux target/w5-acceptance/linux; do
+            printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$GITHUB_SHA" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$evidence/ci-identity.txt"
+          done
           docker run --rm --platform linux/arm64 \
             -v "$PWD":/src:ro \
             -v "$PWD/target/w4-acceptance/linux":/evidence \
@@ -129,42 +166,6 @@ jobs:
               cargo clippy --locked --workspace --all-targets -- -D warnings
               echo "::endgroup::"
 
-              echo "::group::Tool registry tests"
-              cargo test --locked -p tool-registry --all-targets
-              cargo test --locked -p tool-registry --doc
-              echo "::endgroup::"
-
-              echo "::group::MLX FFI tests"
-              cargo test --locked -p mlx-ffi --all-targets \
-                -- --test-threads=1
-              echo "::endgroup::"
-
-              echo "::group::Inference infrastructure tests"
-              cargo test --locked -p inference-infra --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Qwen3 tests"
-              cargo test --locked -p qwen3 --all-targets
-              cargo test --locked -p qwen3 --doc
-              echo "::endgroup::"
-
-              echo "::group::Engine all-target check"
-              cargo check --locked -p engine --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Engine all-target tests"
-              cargo test --locked -p engine --all-targets
-              echo "::endgroup::"
-
-              echo "::group::Engine documentation tests"
-              cargo test --locked -p engine --doc
-              echo "::endgroup::"
-
-              echo "::group::Engine documentation build"
-              RUSTDOCFLAGS="-D warnings" \
-                cargo doc --locked -p engine --no-deps
-              echo "::endgroup::"
-
               echo "::group::Harness-core all-target tests"
               cargo test --locked -p harness-core --all-targets
               echo "::endgroup::"
@@ -185,6 +186,9 @@ jobs:
               RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
               bash scripts/builtin_acceptance.sh
               bash scripts/plugin_acceptance.sh
+              grep -Fx "exit_code=0" /evidence/status.txt
+              test -s /evidence/p2-07-run.log && test -s /evidence/p2-09-run.log
+              test -s /w5-evidence/report.json
               echo "::endgroup::"
             '
 
@@ -194,7 +198,7 @@ jobs:
         with:
           name: w5-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w5-acceptance/linux/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
       - name: Retain W4 Linux evidence
@@ -203,11 +207,25 @@ jobs:
         with:
           name: w4-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w4-acceptance/linux/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
-  mac:
-    name: mac-metal
+  linux:
+    name: linux-arm64
+    needs: [linux_foundation, linux_repro, linux_engine, linux_core]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every Linux shard
+        env:
+          FOUNDATION: ${{ needs.linux_foundation.result }}
+          REPRO: ${{ needs.linux_repro.result }}
+          ENGINE: ${{ needs.linux_engine.result }}
+          CORE: ${{ needs.linux_core.result }}
+        run: test "$FOUNDATION" = success && test "$REPRO" = success && test "$ENGINE" = success && test "$CORE" = success
+
+  mac_core:
+    name: mac-core
 
     # Every repository push and same-repository PR validates the unified
     # CPU/GPU path. Fork PRs do not execute on the persistent Mac runner.
@@ -216,6 +234,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
 
     runs-on: [self-hosted, macOS, arm64]
+    defaults:
+      run:
+        shell: python3 scripts/ci/mac_locked_step.py {0}
     timeout-minutes: 180
     env:
       # A pre-provisioned flat artifact directory; empty uses the documented local default.
@@ -235,6 +256,150 @@ jobs:
           cache: npm
           cache-dependency-path: ts/cli/package-lock.json
 
+      - name: CLI and monitor tests
+        run: cd ts/cli && npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
+
+      - name: Host lock regression
+        run: python3 -B -m unittest discover -s scripts/tests -p test_mac_ci_lock.py
+
+      - name: Tool registry tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tool-registry --all-targets
+          cargo test --locked -p tool-registry --doc
+
+      - name: Metal and unified tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p mlx-ffi \
+            --no-fail-fast \
+            -- --test-threads=1
+
+      - name: Native infrastructure and KV block transfers
+        run: cargo test --locked -p inference-infra --all-targets
+
+      - name: Qwen3 tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p qwen3 --all-targets
+          cargo test --locked -p qwen3 --doc
+
+      - name: engine all-target check
+        run: |
+          set -euo pipefail
+
+          cargo check --locked -p engine --all-targets
+
+      - name: engine all-target tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p engine --all-targets
+
+      - name: engine documentation tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p engine --doc
+
+      - name: engine documentation build
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+
+          cargo doc --locked -p engine --no-deps
+
+      - name: W4 scoped named gates and candidate evidence
+        env:
+          ALLOY_W4_CANDIDATE: ${{ github.sha }}
+          ALLOY_W4_OUTPUT: ${{ github.workspace }}/target/w4-acceptance/macos
+          CI_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p "$ALLOY_W4_OUTPUT"
+          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$GITHUB_SHA" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W4_OUTPUT/ci-identity.txt"
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
+          bash scripts/builtin_acceptance.sh
+          grep -Fx 'exit_code=0' "$ALLOY_W4_OUTPUT/status.txt"
+          test -s "$ALLOY_W4_OUTPUT/p2-07-run.log" && test -s "$ALLOY_W4_OUTPUT/p2-09-run.log"
+
+      - name: Retain builtin macOS evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w4-acceptance/macos/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: W5 named hooks, owned-process and sandbox gates
+        env:
+          ALLOY_W5_CANDIDATE: ${{ github.sha }}
+          ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
+          CI_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p "$ALLOY_W5_OUTPUT"
+          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$GITHUB_SHA" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W5_OUTPUT/ci-identity.txt"
+          bash scripts/plugin_acceptance.sh
+          test -s "$ALLOY_W5_OUTPUT/report.json"
+
+      - name: Retain plugin macOS evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: w5-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/w5-acceptance/macos/
+          if-no-files-found: error
+          retention-days: 30
+
+      # The W5 collector above executes harness-core all-target and doc tests.
+
+      - name: alloyd all-target tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p alloyd --all-targets
+
+      - name: alloyd documentation tests
+        run: |
+          set -euo pipefail
+
+          cargo test --locked -p alloyd --doc
+
+  # Independent physical Macs enable these two jobs to run simultaneously.
+  # A single registered Mac serializes them; never run two model jobs on the
+  # same host merely by registering extra runner processes.
+  mac_integration:
+    name: mac-installed-and-real-model
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, arm64]
+    defaults:
+      run:
+        shell: python3 scripts/ci/mac_locked_step.py {0}
+    timeout-minutes: 180
+    env:
+      ALLOY_QWEN3_ARTIFACT: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
+      ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
+    steps:
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Node runtime
+        uses: actions/setup-node@v5
+        with:
+          node-version: '26.13.0'
+          cache: npm
+          cache-dependency-path: ts/cli/package-lock.json
       - name: Inspect Homebrew host locks
         run: node scripts/homebrew/host-check.mjs
 
@@ -247,149 +412,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: CLI and monitor tests
-        working-directory: ts/cli
-        run: npm ci && npm test && node --test scripts/real-model-acceptance.test.mjs && node --test ../../scripts/homebrew/*.test.mjs
-
-      - name: Tool registry tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p tool-registry --all-targets
-          cargo test --locked -p tool-registry --doc
-
-      - name: Metal and unified tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p mlx-ffi \
-            --no-fail-fast \
-            -- --test-threads=1
-
-      - name: Native infrastructure and KV block transfers
-        shell: bash
-        run: cargo test --locked -p inference-infra --all-targets
-
-      - name: Qwen3 tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p qwen3 --all-targets
-          cargo test --locked -p qwen3 --doc
-
-      - name: engine all-target check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo check --locked -p engine --all-targets
-
-      - name: engine all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --all-targets
-
-      - name: engine documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --doc
-
-      - name: engine documentation build
-        shell: bash
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          set -euo pipefail
-
-          cargo doc --locked -p engine --no-deps
-
-      - name: W4 scoped named gates and candidate evidence
-        shell: bash
-        env:
-          ALLOY_W4_CANDIDATE: ${{ github.sha }}
-          ALLOY_W4_OUTPUT: ${{ github.workspace }}/target/w4-acceptance/macos
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
-          bash scripts/builtin_acceptance.sh
-
-      - name: Retain builtin macOS evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/w4-acceptance/macos/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: W5 named hooks, owned-process and sandbox gates
-        shell: bash
-        env:
-          ALLOY_W5_CANDIDATE: ${{ github.sha }}
-          ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
-        run: bash scripts/plugin_acceptance.sh
-
-      - name: Retain plugin macOS evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: w5-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/w5-acceptance/macos/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: harness-core all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p harness-core --all-targets
-
-      - name: harness-core documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p harness-core --doc
-
-      - name: alloyd all-target tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --all-targets
-
-      - name: alloyd documentation tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --doc
+      - name: Install CLI build dependencies
+        run: cd ts/cli && npm ci
 
       - name: "Test 13: real Qwen3 incremental CLI stream"
         if: ${{ !cancelled() }}
         timeout-minutes: 35
-        shell: bash
         run: bash ts/cli/scripts/qwen3_end_to_end_stream.sh
 
       - name: "Test 14: real daemon restart, history, and SSD KV restore"
         if: ${{ !cancelled() }}
         timeout-minutes: 40
-        shell: bash
         run: bash ts/cli/scripts/session_restart_real_model.sh
 
       - name: "M9: real 4B and 14B memory acceptance"
         if: ${{ !cancelled() }}
         timeout-minutes: 45
-        shell: bash
         env:
           ALLOY_M9_MODEL_A_DIR: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
           ALLOY_M9_MODEL_B_DIR: ${{ vars.ALLOY_M9_MODEL_B_DIR }}
@@ -406,13 +444,12 @@ jobs:
       - name: Homebrew installed CPU/Metal and real-model acceptance
         if: ${{ !cancelled() }}
         timeout-minutes: 90
-        shell: bash
         run: exec node scripts/homebrew/ci.mjs
 
       - name: Clean this run's owned Homebrew resources
         if: ${{ always() }}
         timeout-minutes: 5
-        shell: bash
+        shell: python3 scripts/ci/mac_locked_step.py --cleanup {0}
         run: exec node scripts/homebrew/ci.mjs --cleanup-owned
 
       - name: Retain Phase 1 and Homebrew acceptance evidence
@@ -423,3 +460,17 @@ jobs:
           path: target/phase-1-acceptance/
           if-no-files-found: error
           retention-days: 30
+
+  mac:
+    name: mac-metal
+    needs: [mac_core, mac_integration]
+    if: >-
+      always() && (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both macOS shards
+        env:
+          CORE: ${{ needs.mac_core.result }}
+          INTEGRATION: ${{ needs.mac_integration.result }}
+        run: test "$CORE" = success && test "$INTEGRATION" = success
