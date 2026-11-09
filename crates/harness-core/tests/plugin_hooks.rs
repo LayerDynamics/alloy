@@ -17,6 +17,17 @@ fn fixture() -> &'static Path {
     static FIXTURE: OnceLock<std::path::PathBuf> = OnceLock::new();
     FIXTURE
         .get_or_init(|| {
+            // The descriptor-limit helper is a re-exec of this test binary. Reuse
+            // the parent's fixture rather than compiling and cold-launching a
+            // second executable while the parallel protocol tests are running.
+            if std::env::var("ALLOY_W5_FD_HELPER").as_deref() == Ok("1") {
+                let bin = std::path::PathBuf::from(
+                    std::env::var_os("ALLOY_W5_FD_FIXTURE")
+                        .expect("descriptor helper requires the parent's compiled fixture"),
+                );
+                assert!(bin.is_absolute() && bin.is_file());
+                return bin;
+            }
             let dir = tempfile::tempdir().unwrap().keep();
             let bin = dir.join("tool-hook-fixture");
             let status = Command::new("rustc")
@@ -29,6 +40,16 @@ fn fixture() -> &'static Path {
                 .status()
                 .unwrap();
             assert!(status.success());
+            // Finish the platform's first-exec work before exercising bounded
+            // hook IPC. In particular, macOS can delay a freshly linked image
+            // before main; that delay is unrelated to descriptor inheritance.
+            let status = Command::new(&bin)
+                .args(["fixture-readiness", "allow"])
+                .arg(dir.join("readiness"))
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "compiled plugin fixture failed to start");
             bin
         })
         .as_path()

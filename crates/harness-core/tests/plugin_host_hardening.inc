@@ -185,6 +185,7 @@ fn w5_blocked_stdin_deadline_reaps_owned_process() {
 fn w5_high_fd_above_lowered_limit_is_not_inherited() {
     let result = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "w5_high_fd_isolated_helper", "--nocapture"])
+        .env("ALLOY_W5_FD_FIXTURE", fixture())
         .env("ALLOY_W5_FD_HELPER", "1").output().unwrap();
     assert!(result.status.success(), "helper status={:?}\nstdout={}\nstderr={}",
         result.status, String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
