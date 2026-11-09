@@ -63,4 +63,5 @@ fn plugin_protocol_timeout_and_sandbox() {
     assert!(negative.stdout.is_empty());
 }
 
-include!("plugin_sandbox_hardening.inc");
+#[path = "plugin_sandbox/hardening.rs"]
+mod hardening;
