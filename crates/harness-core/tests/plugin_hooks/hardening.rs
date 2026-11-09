@@ -253,6 +253,7 @@ fn plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
         good.canonicalize().unwrap().to_str().unwrap().into(),
         bad.canonicalize().unwrap().to_str().unwrap().into(),
         listener.local_addr().unwrap().to_string(),
+        c.program.to_str().unwrap().into(),
     ]);
     c.sandbox = Sandbox::MacOs {
         read_files: vec![

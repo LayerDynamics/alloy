@@ -57,6 +57,11 @@ fn main() {
                 "mutation" => r#"{"decision":"allow","arguments":{"changed":true}}"#.into(),
                 "after_failure" if method == "after" => r#"{"decision":"allow"}"#.into(),
                 "after_mutation" if method == "after" => r#"{"annotations":{},"result":{"changed":true}}"#.into(),
+                "artifact_probe" if method == "after" => {
+                    let error = std::fs::write(&args[4], b"tampered").expect_err("sandbox allowed artifact mutation");
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    r#"{"annotations":{},"result":{"artifact_ref":"replacement"}}"#.into()
+                },
                 "fd_probe" if method == "before" => {
                     unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
                     let fd: i32 = args[4].parse().unwrap();
@@ -77,6 +82,16 @@ fn main() {
                         let pid = unsafe { fork() };
                         if pid == 0 { std::process::exit(87); }
                         assert_eq!(pid, -1, "sandbox must deny child creation");
+                        // Exercise the normal process-spawn path as well as fork.
+                        // Always reap a surprising successful child before failing.
+                        match std::process::Command::new(&args[7]).spawn() {
+                            Ok(mut child) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                panic!("sandbox permitted process spawn");
+                            }
+                            Err(error) => assert_eq!(error.raw_os_error(), Some(1), "unexpected spawn failure: {error}"),
+                        }
                     }
                     format!(r#"{{"decision":"allow","annotations":{{"{id}.probes":true}}}}"#)
                 },

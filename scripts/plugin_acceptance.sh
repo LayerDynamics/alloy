@@ -68,7 +68,7 @@ if [[ -f "$OUT/collector-files.txt" && ! -L "$OUT/collector-files.txt" ]]; then
 fi
 # Older collectors have no manifest. Include their pre-module and interim
 # colon-separated names as well as the current normalized names.
-for name in format compile clippy strict-json sandbox-alias sandbox sandboxed-host \
+for name in format compile clippy strict-json sandbox-alias sandbox sandboxed-host artifact-sandbox \
     all-targets doctests rustdoc "${PLUGIN_TESTS[@]}"; do
   for stem in "$name" "${name//::/_}" "${name#hardening::}"; do
     rm -f -- "$OUT/$stem.log" "$OUT/$stem.command.txt"
@@ -77,7 +77,7 @@ done
 rm -f -- "$OUT/collector-files.txt" "$OUT/candidate.txt" "$OUT/platform.txt" \
   "$OUT/source-before.sha256" "$OUT/source-after.sha256" \
   "$OUT/protocol-discovery.txt" "$OUT/unit-discovery.txt" \
-  "$OUT/sandbox-discovery.txt" "$OUT/sandbox-platform.txt"
+  "$OUT/sandbox-discovery.txt" "$OUT/sandbox-platform.txt" "$OUT/artifact-discovery.txt"
 : > "$OUT/collector-files.txt"
 # Clear old proof before prerequisite/candidate validation can fail.
 command -v python3 >/dev/null 2>&1 || {
@@ -145,6 +145,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
   gate sandbox cargo test --locked -p harness-core --test plugin_sandbox plugin_protocol_timeout_and_sandbox -- --exact --nocapture
   grep -Fx 'hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork: test' "$OUT/protocol-discovery.txt"
   gate sandboxed-host cargo test --locked -p harness-core --test plugin_hooks hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork -- --exact --nocapture
+  cargo test --locked -p harness-core --test tool_artifacts -- --list > "$OUT/artifact-discovery.txt"
+  grep -Fx 'plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes: test' "$OUT/artifact-discovery.txt"
+  gate artifact-sandbox cargo test --locked -p harness-core --test tool_artifacts plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes -- --exact --nocapture
 else
   printf '%s\n' 'NOT APPLICABLE: macOS Seatbelt lane required separately.' > "$OUT/sandbox-platform.txt"
 fi
