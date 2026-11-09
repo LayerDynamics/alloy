@@ -42,8 +42,10 @@ PY
 snapshot > "$OUT/source-before.sha256"
 gate() {
   local name="$1"; shift
-  printf '%s\n' "$*" > "$OUT/$name.command.txt"
-  "$@" 2>&1 | tee "$OUT/$name.log"
+  # Rust module separators are valid selectors but invalid artifact filenames.
+  local artifact_name="${name//::/_}"
+  printf '%s\n' "$*" > "$OUT/$artifact_name.command.txt"
+  "$@" 2>&1 | tee "$OUT/$artifact_name.log"
 }
 gate format cargo fmt --all -- --check
 gate compile cargo check --locked -p harness-core --all-targets
