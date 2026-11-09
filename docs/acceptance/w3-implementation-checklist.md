@@ -45,7 +45,7 @@ creation command. The design-time manifest status is not a runtime acceptance fl
 - [x] Required W3 lockfile dependency edge delivered; complete historical pin audit awaits reviewed execution evidence in section 0.
 - [x] Reviewed module exports in `src/lib.rs`; active supervisor still described as text-only.
 - [x] Internal-error review recorded without expanding the tool-result wire enum or adding unnecessary variants.
-- [x] Schema-v2 integration delivered in `src/store.rs`, with coordinator/migration/recovery in `src/store/durable.rs`.
+- [x] Schema-v2 integration delivered in `src/store/mod.rs`, with coordinator/migration/recovery in `src/store/durable/mod.rs`.
 - [x] `src/policy.rs`, `src/approval.rs`, and `src/artifact.rs` delivered.
 - [x] `tests/tool_policy.rs`, `tests/tool_artifacts.rs`, and `tests/w3_provenance.rs` delivered.
 - [x] Registry-owned definition, invocation/context and result contracts reused.
@@ -56,7 +56,7 @@ creation command. The design-time manifest status is not a runtime acceptance fl
 
 ## 2. Canonicalization and immutable binding
 
-Implementation: `src/approval.rs`, `src/policy.rs`, `src/store/durable.rs`.
+Implementation: `src/approval.rs`, `src/policy.rs`, `src/store/durable/mod.rs`.
 Tests: `tests/w3_contract.rs`, `tests/tool_policy.rs`, `tests/w3_provenance.rs`.
 
 - [x] Registry/schema validation precedes invocation binding.
@@ -96,7 +96,7 @@ Selected W3 safety floors are not an exhaustive deployed-default audit.
 
 ## 4. Approval state machine and single-use admission
 
-Implementation: `src/approval.rs`, `src/store/durable.rs`.
+Implementation: `src/approval.rs`, `src/store/durable/mod.rs`.
 Coverage: contract graph, durable unit suite, P2-06 and Step C matrix.
 
 - [x] Frozen active/terminal labels and permitted transitions implemented; terminal states cannot regain runnable authority.
@@ -116,7 +116,7 @@ Coverage: contract graph, durable unit suite, P2-06 and Step C matrix.
 
 ## 5. Durable storage, migration and recovery
 
-Implementation: `src/store.rs`, `src/store/durable.rs`; test index: Step C matrix.
+Implementation: `src/store/mod.rs`, `src/store/durable/mod.rs`; test index: Step C matrix.
 
 - [x] Transactional schema-v1-to-v2 migration and newer-schema rejection delivered.
 - [x] Historical row preservation and migration rollback tests delivered.
@@ -133,8 +133,8 @@ Implementation: `src/store.rs`, `src/store/durable.rs`; test index: Step C matri
 
 ## 6. Artifact implementation delivered; detailed branch review pending
 
-Implementation: `src/artifact.rs`, metadata transaction in `src/store.rs`,
-completion association in `src/store/durable.rs`. Tests: `tests/tool_artifacts.rs`
+Implementation: `src/artifact.rs`, metadata transaction in `src/store/mod.rs`,
+completion association in `src/store/durable/mod.rs`. Tests: `tests/tool_artifacts.rs`
 and artifact unit tests. Checked delivery does not close the detailed audit below.
 
 - [x] Opaque art1_ references, private temporary creation and no-overwrite publication delivered.

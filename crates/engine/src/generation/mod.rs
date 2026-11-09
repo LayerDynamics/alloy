@@ -1713,7 +1713,7 @@ mod w2_proposal_queue_tests {
 
 // W2_COMPLETION_GATE_TEST_MODULE_V1
 #[cfg(test)]
-#[path = "generation/w2_completion_gate_tests.rs"]
+#[path = "w2_completion_gate_tests.rs"]
 mod w2_completion_gate_tests;
 
 #[cfg(test)]

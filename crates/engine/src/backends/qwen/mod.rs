@@ -106,7 +106,7 @@ impl Qwen3Execution {
     }
 }
 
-include!("qwen/artifact.rs");
+include!("artifact.rs");
 
 /// Explicit bounds; no model, output, or memory policy is silently selected.
 #[derive(Clone, Debug)]
@@ -621,7 +621,7 @@ impl Qwen3Backend {
     }
 }
 
-include!("qwen/loading.rs");
+include!("loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn cache_manifest_digest(
@@ -948,7 +948,7 @@ impl RuntimeBackend for Qwen3Backend {
     }
 }
 
-include!("qwen/cache.rs");
+include!("cache.rs");
 
 fn registration(
     context_limit: usize,
@@ -1021,7 +1021,7 @@ fn byte_decoder_map() -> BTreeMap<char, u8> {
 /// has not been opened yet (MLX Qwen3-4bit community artifacts use 64).
 const AFFINE4_GROUP_SIZE: u64 = 64;
 
-include!("qwen/memory.rs");
+include!("memory.rs");
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()

@@ -183,6 +183,10 @@ Silicon, while still checking every expected digest.
 
 ### Local pre-push checks
 
+Rust directory modules use `module/mod.rs` throughout the crate source trees.
+Keep child declarations in that file; leaf modules remain `child.rs`. When
+moving a module, update relative includes and evidence-collector source paths.
+
 Enable the repository's tracked hook once per checkout:
 
 ```bash

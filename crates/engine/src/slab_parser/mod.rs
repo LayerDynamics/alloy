@@ -755,5 +755,5 @@ mod tests {
 
 // W2_PARSER_PLACEMENT_PARITY_V1
 #[cfg(test)]
-#[path = "slab_parser/parity.rs"]
+#[path = "parity.rs"]
 mod parity;

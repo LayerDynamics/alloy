@@ -12,8 +12,8 @@ from pathlib import Path
 
 AUDIT_FILES = [
     "crates/harness-core/src/artifact.rs",
-    "crates/harness-core/src/store.rs",
-    "crates/harness-core/src/store/durable.rs",
+    "crates/harness-core/src/store/mod.rs",
+    "crates/harness-core/src/store/durable/mod.rs",
     "crates/harness-core/src/store/durable/failure_recovery.rs",
     "crates/harness-core/tests/tool_artifacts.rs",
 ]

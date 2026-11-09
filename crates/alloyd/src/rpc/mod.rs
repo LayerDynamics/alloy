@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 codec, `api_version` gate, and Phase-1 error registry.
 
-#[path = "rpc/slab_transport.rs"]
+#[path = "slab_transport.rs"]
 mod slab_transport;
 pub use slab_transport::{
     RpcTransportLimits, measure_slab_session_event, write_slab_session_event,

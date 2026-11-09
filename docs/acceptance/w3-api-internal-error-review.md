@@ -17,7 +17,7 @@ is not a substitute for raw logs on a clean committed Linux/macOS candidate.
 
 | Responsibility | Source assessment | Evidence / handoff |
 |---|---|---|
-| Opaque receipts | AuthorizedInvocation and StartedInvocation have private binding fields, immutable accessors and no public constructor/Clone/Copy/Deserialize | src/store/durable.rs; StartedInvocation compile-fail rustdoc; run harness-core --doc |
+| Opaque receipts | AuthorizedInvocation and StartedInvocation have private binding fields, immutable accessors and no public constructor/Clone/Copy/Deserialize | src/store/durable/mod.rs; StartedInvocation compile-fail rustdoc; run harness-core --doc |
 | Single use | start_tool and complete_tool take receipts by value; database state/epoch/digest checks reject reconstructed duplicate authority | durable.rs; Step C duplicate_start_attempts_do_not_admit_a_second_effect and duplicate_completion_attempt_cannot_append_a_second_terminal_result |
 | W4 immutable execution | binding() exposes shared references only; no executable is selected by model input | W4 must execute only the registered unchanged invocation after successful start commit, with bound resource scopes/limits |
 | W5 immutable hooks | W3 provides immutable views, not a plugin enforcement implementation | W5 must send bounded copies and accept only veto/reason/annotations; never apply changes to arguments or original results |
@@ -49,7 +49,7 @@ Existing W6 callers do not yet establish these tool-operation obligations.
 - docs/decisions/w3-approval-and-storage-contract.md and w3-contract-v1.json:
   normative contract; this review does not change ceilings or wire formats.
 - src/approval.rs: canonical encoding, immutable binding, state graph.
-- src/store/durable.rs: admission/decision/claim/start/completion/recovery.
+- src/store/durable/mod.rs: admission/decision/claim/start/completion/recovery.
 - src/artifact.rs: bounded publication, lookup/verification, startup reconciliation.
 - tests/tool_policy.rs: P2-06 destructive_effect_requires_bound_approval.
 - tests/tool_artifacts.rs: P2-08 oversized_tool_result_artifact_roundtrip.

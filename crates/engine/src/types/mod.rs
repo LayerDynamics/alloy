@@ -5,7 +5,7 @@
 //! Those checks belong to the registry and concrete engine implementation.
 
 use crate::error::EngineError;
-#[path = "types/tool_context.rs"]
+#[path = "tool_context.rs"]
 mod tool_context;
 use std::{
     fmt,
