@@ -268,6 +268,7 @@ function launchOwned(command: string, args: string[], options: {
 }
 
 export type StartDaemonOptions = DaemonLaunchOptions & {
+  toolsConfig?: string;
   signal?: AbortSignal;
   readinessTimeoutMs?: number;
   buildTimeoutMs?: number;
@@ -306,6 +307,7 @@ export async function startDaemon(settings: AlloySettings, options: StartDaemonO
     const result = await probe(settings.socket, { timeoutMs: probeTimeoutMs, signal });
     if (signal.aborted) throw abortReason(signal);
     if (result.status === "ready") {
+      if (options.toolsConfig !== undefined) throw new Error("An existing daemon cannot apply --tools-config. Stop its owning foreground process, then start it with this configuration.");
       log(`Already running: API 1 is ready at ${settings.socket}. Existing daemon configuration was not changed.`);
       return "ready";
     }
@@ -364,6 +366,7 @@ export async function startDaemon(settings: AlloySettings, options: StartDaemonO
     if (signal.aborted) throw abortReason(signal);
     const args = ["--artifact", settings.artifact, "--profile", settings.profile, "--socket", settings.socket, "--db", settings.db,
       "--corpus-models", settings.corpus_models ?? STARTER_CORPUS_PATH];
+    if (options.toolsConfig !== undefined) args.push("--tools-config", path.resolve(options.toolsConfig));
     log(`Starting ${command}\nModel: ${settings.artifact}\nSocket: ${settings.socket}`);
     owned = launchOwned(command, args, { env, output, errorOutput, processGroup: false, shutdownGraceMs });
     const daemon = owned;

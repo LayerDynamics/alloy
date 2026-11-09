@@ -1,0 +1,557 @@
+//! Bounded canonical W6 coordinator. Only durable W3 receipts reach W4 dispatch.
+use super::*;
+use crate::{
+    artifact::ArtifactStore,
+    plugin_host::{Decision, HookInvocation, HookReceipt, PluginHost},
+    policy::DaemonPolicy,
+    store::IntentAdmission,
+    tool_execution::ReceiptExecutor,
+};
+use serde_json::{Value, json};
+use tool_registry::{
+    call::{ToolCall, ToolCallContext, ToolInvocation},
+    execution::CancellationToken,
+    result::{InlineToolResult, ToolResult},
+};
+
+/// Immutable execution catalogue and policy, with separately owned plugin processes.
+pub struct ToolRuntime {
+    /// Exact registry and its existing scoped W4 implementations.
+    pub executor: ReceiptExecutor,
+    /// Daemon-owned exact-argument policy.
+    pub policy: DaemonPolicy,
+    /// Durable bounded output storage.
+    pub artifacts: ArtifactStore,
+    /// Ordered W5 plugin host. Its mutex never encloses store or execution work.
+    pub plugins: Mutex<PluginHost>,
+}
+/// Limits for a whole user turn; the round deadline is shared, never renewed.
+#[derive(Clone, Copy)]
+pub struct ToolLoopConfig {
+    /// Existing generation and context ceilings.
+    pub round: ToolRoundConfig,
+    /// Total calls across all rounds.
+    pub max_calls: usize,
+    /// Inline output threshold, independent of approved output ceiling.
+    pub inline_bytes: usize,
+}
+/// Streaming supervisor event. Engine round terminals never escape as turn terminals.
+pub struct ToolLoopEvent {
+    /// Existing wire event name.
+    pub event: &'static str,
+    /// Structured data, never authority.
+    pub body: Value,
+}
+impl<E: Engine> Supervisor<E> {
+    /// Run a complete user turn. The caller owns the session's exclusive turn slot.
+    /// Store/session/native locks must not enclose this call; waits and effects borrow none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tool_turn<S, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        runtime: &ToolRuntime,
+        session: &str,
+        user: &str,
+        config: ToolLoopConfig,
+        cancel: &CancellationToken,
+        mut started: S,
+        mut emit: F,
+    ) -> HarnessResult<TurnOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(ToolLoopEvent) -> HarnessResult<()>,
+    {
+        if user.is_empty() || config.max_calls == 0 || config.inline_bytes == 0 {
+            return Err(HarnessError::Invalid(
+                "nonempty user and positive turn limits required".into(),
+            ));
+        }
+        let turn = {
+            let mut guard = lock_store(store)?;
+            ensure_active_locked(&guard, session)?;
+            guard.append_event(
+                session,
+                EventKind::UserMessage,
+                json!({"content":user,"role":"user"}),
+                json!([]),
+            )?;
+            guard
+                .append_event(
+                    session,
+                    EventKind::RunStarted,
+                    json!({"mode":"tools"}),
+                    json!([]),
+                )?
+                .seq
+        };
+        let mut calls = 0usize;
+        let mut text = String::new();
+        let mut streamed_bytes = 0usize;
+        let mut total_usage = engine::types::Usage::default();
+        let mut finish_reason = engine::types::FinishReason::EndOfSequence;
+        let result = (|| {
+            for round in 0..config.round.max_rounds {
+                live(store, session, cancel, config.round.deadline)?;
+                let outcome = self.generate_tool_round_cancellable(
+                    store,
+                    runtime.executor.registry(),
+                    ToolRoundRequest {
+                        session_id: session,
+                        turn_seq: turn,
+                        round,
+                    },
+                    config.round,
+                    Some(cancel),
+                    |id| {
+                        live(store, session, cancel, config.round.deadline)?;
+                        started(id)
+                    },
+                    |event| {
+                        live(store, session, cancel, config.round.deadline)?;
+                        let (name, body) = match event {
+                            GenerationEvent::TextDelta { text } => {
+                                let next = streamed_bytes
+                                    .checked_add(text.len())
+                                    .filter(|bytes| *bytes <= config.round.max_text_bytes)
+                                    .ok_or_else(|| {
+                                        HarnessError::Engine("turn text limit exceeded".into())
+                                    })?;
+                                streamed_bytes = next;
+                                ("text_delta", json!({"text":text}))
+                            }
+                            GenerationEvent::RuntimeWarning { code, message } => {
+                                ("runtime_warning", json!({"code":code,"message":message}))
+                            }
+                            _ => {
+                                return Err(HarnessError::Engine(
+                                    "unexpected round callback".into(),
+                                ));
+                            }
+                        };
+                        emit(ToolLoopEvent { event: name, body })
+                    },
+                )?;
+                total_usage.input_tokens = total_usage
+                    .input_tokens
+                    .checked_add(outcome.usage.input_tokens)
+                    .ok_or_else(|| HarnessError::Engine("usage overflow".into()))?;
+                total_usage.output_tokens = total_usage
+                    .output_tokens
+                    .checked_add(outcome.usage.output_tokens)
+                    .ok_or_else(|| HarnessError::Engine("usage overflow".into()))?;
+                finish_reason = outcome.finish_reason;
+                if outcome.assistant_text.len()
+                    > config.round.max_text_bytes.saturating_sub(text.len())
+                {
+                    return Err(HarnessError::Engine("turn text limit exceeded".into()));
+                }
+                text.push_str(&outcome.assistant_text);
+                if outcome.proposals.is_empty() {
+                    live(store, session, cancel, config.round.deadline)?;
+                    let mut guard = lock_store(store)?;
+                    ensure_active_locked(&guard, session)?;
+                    guard.append_event(
+                        session,
+                        EventKind::AssistantMessage,
+                        json!({"content":outcome.assistant_text,"role":"assistant"}),
+                        json!([]),
+                    )?;
+                    guard.append_event(
+                        session,
+                        EventKind::RunCompleted,
+                        json!({"input_tokens":outcome.input_tokens,"status":"completed"}),
+                        json!([]),
+                    )?;
+                    return Ok(TurnOutcome {
+                        session_id: session.into(),
+                        assistant_text: text.clone(),
+                        input_tokens: outcome.input_tokens,
+                        request_id: outcome.request_id,
+                    });
+                }
+                if outcome.proposals.len() > config.max_calls.saturating_sub(calls) {
+                    return Err(HarnessError::Engine("turn call limit exceeded".into()));
+                }
+                // Persist text before its calls, preserving exactly the streamed ordering.
+                if !outcome.assistant_text.is_empty() {
+                    lock_store(store)?.append_event(
+                        session,
+                        EventKind::AssistantMessage,
+                        json!({"content":outcome.assistant_text,"role":"assistant"}),
+                        json!([]),
+                    )?;
+                }
+                let proposed: Vec<(String, serde_json::Map<String, Value>)> =
+                    match outcome.proposals {
+                        RoundProposals::None => Vec::new(),
+                        RoundProposals::Legacy(values) => values
+                            .into_iter()
+                            .map(|v| (v.name().into(), v.arguments().clone()))
+                            .collect(),
+                        RoundProposals::Slab(owner) => {
+                            let mut values = Vec::new();
+                            for i in 0..owner.proposal_count() {
+                                let view = owner.proposal(i).ok_or_else(|| {
+                                    HarnessError::Invalid("missing slab descriptor".into())
+                                })?;
+                                values.push((
+                                    view.name.into(),
+                                    serde_json::from_str(view.arguments_json)?,
+                                ));
+                            }
+                            values
+                        }
+                    };
+                for (name, arguments) in proposed {
+                    live(store, session, cancel, config.round.deadline)?;
+                    let call_id = format!("{}-call-{calls}", outcome.request_id.as_str());
+                    calls += 1;
+                    let invocation = ToolInvocation {
+                        context: ToolCallContext {
+                            session_id: session.into(),
+                            turn_id: format!("turn-{turn}"),
+                            generation_id: outcome.request_id.as_str().into(),
+                        },
+                        call: ToolCall {
+                            call_id: call_id.clone(),
+                            tool_id: name,
+                            arguments,
+                        },
+                    };
+                    // Invalid calls become linked canonical protocol results, never executable intents.
+                    if runtime
+                        .executor
+                        .registry()
+                        .resolve(invocation.clone())
+                        .is_err()
+                    {
+                        let result = ToolResult::Inline(InlineToolResult {
+                            call_id: call_id.clone(),
+                            is_error: true,
+                            content: json!({"kind":"protocol","message":"Unknown tool or invalid arguments"}),
+                        });
+                        let mut guard = lock_store(store)?;
+                        guard.append_event(session,EventKind::ToolRequested,json!({"contract_version":crate::approval::CONTRACT_VERSION,"call_id":call_id,"request":invocation,"state":"ProtocolRejected"}),json!([]))?;
+                        guard.append_event(session,EventKind::ToolCompleted,json!({"contract_version":crate::approval::CONTRACT_VERSION,"call_id":call_id,"state":"Completed","result":result}),json!([]))?;
+                        drop(guard);
+                        emit(ToolLoopEvent {
+                            event: "tool_result",
+                            body: tool_result_body(&call_id, &result),
+                        })?;
+                        continue;
+                    }
+                    let admission = lock_store(store)?.admit_tool(
+                        runtime.executor.registry(),
+                        &runtime.policy,
+                        invocation.clone(),
+                    )?;
+                    emit(ToolLoopEvent {
+                        event: "tool_requested",
+                        body: json!({"call_id":call_id,"tool_id":invocation.call.tool_id,"arguments":invocation.call.arguments}),
+                    })?;
+                    if admission == IntentAdmission::AwaitingApproval {
+                        let definition = runtime
+                            .executor
+                            .registry()
+                            .resolve(invocation.clone())
+                            .map_err(|e| HarnessError::Invalid(e.to_string()))?
+                            .definition()
+                            .clone();
+                        emit(ToolLoopEvent {
+                            event: "approval_requested",
+                            body: json!({"call_id":call_id,"tool_id":invocation.call.tool_id,"arguments":invocation.call.arguments,"effect":definition.policy.effect,"summary":summary(&json!({"tool_id":invocation.call.tool_id,"arguments":invocation.call.arguments,"effect":definition.policy.effect}))}),
+                        })?;
+                        loop {
+                            live(store, session, cancel, config.round.deadline)?;
+                            let mut guard = lock_store(store)?;
+                            guard.expire_tool_intents()?;
+                            let state = guard.tool_state(session, &call_id)?;
+                            drop(guard);
+                            if state.as_deref() != Some("AwaitingApproval") {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    let state = lock_store(store)?.tool_state(session, &call_id)?;
+                    if state.as_deref() != Some("Ready") {
+                        emit_terminal_tool(store, session, &call_id, &mut emit)?;
+                        continue;
+                    }
+                    let handle = lock_store(store)?.claim_tool(session, &call_id)?;
+                    let b = handle.binding();
+                    let timeout = b.snapshot()["effective_timeout_ms"]
+                        .as_u64()
+                        .ok_or_else(|| HarnessError::Invalid("missing timeout".into()))?;
+                    let deadline = config
+                        .round
+                        .deadline
+                        .min(Instant::now() + Duration::from_millis(timeout));
+                    let hook = HookInvocation {
+                        invocation_id: b.digest().into(),
+                        session_id: session.into(),
+                        call_id: call_id.clone(),
+                        definition: b.definition().clone(),
+                        schema_hash: {
+                            use sha2::{Digest, Sha256};
+                            format!(
+                                "{:x}",
+                                Sha256::digest(
+                                    crate::approval::canonical_json(&b.definition().input_schema)
+                                        .map_err(|e| HarnessError::Invalid(e.to_string()))?
+                                )
+                            )
+                        },
+                        arguments: invocation.call.arguments.clone(),
+                        approval: b.snapshot().clone(),
+                        deadline_unix_ms: b.snapshot()["expires_at_unix_ms"].as_u64().unwrap_or(0),
+                    };
+                    let (before, mut after_unavailable) = {
+                        let mut host = lock_plugin_host(&runtime.plugins, deadline, cancel)?;
+                        let after_unavailable = host.after_dispatch_failure_receipts(
+                            &hook,
+                            "after-hook dispatch unavailable",
+                        );
+                        (host.before(&hook, deadline, cancel), after_unavailable)
+                    };
+                    record_hooks(store, session, &call_id, &before.receipts)?;
+                    if before.decision == Decision::Veto {
+                        lock_store(store)?.reject_tool(handle, "before_hook_veto_or_failure")?;
+                        emit_terminal_tool(store, session, &call_id, &mut emit)?;
+                        continue;
+                    }
+                    live(store, session, cancel, config.round.deadline)?;
+                    let receipt = lock_store(store)?.start_tool(
+                        handle,
+                        runtime.executor.registry(),
+                        &runtime.policy,
+                    )?;
+                    emit(ToolLoopEvent {
+                        event: "tool_call_started",
+                        body: json!({"call_id":call_id,"tool_id":invocation.call.tool_id}),
+                    })?;
+                    let clock = Instant::now();
+                    let result = dispatch(
+                        runtime,
+                        store,
+                        receipt,
+                        cancel.clone(),
+                        config.inline_bytes,
+                        config.round.deadline,
+                    )?;
+                    // After hooks annotate the persisted original result and can never retry it.
+                    let after = if after_unavailable.is_empty() {
+                        Vec::new()
+                    } else {
+                        match lock_plugin_host(&runtime.plugins, config.round.deadline, cancel) {
+                            Ok(mut host) => host.after(
+                                &hook,
+                                &result,
+                                clock.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                                config.round.deadline,
+                                cancel,
+                            ),
+                            Err(error) => {
+                                for receipt in &mut after_unavailable {
+                                    receipt.diagnostic = Some(error.to_string());
+                                }
+                                after_unavailable
+                            }
+                        }
+                    };
+                    record_hooks(store, session, &call_id, &after)?;
+                    emit(ToolLoopEvent {
+                        event: "tool_result",
+                        body: {
+                            let mut body = tool_result_body(&call_id, &result);
+                            body["hooks"] = hook_values(&after);
+                            body
+                        },
+                    })?;
+                }
+            }
+            Err(HarnessError::Engine("tool round limit exceeded".into()))
+        })();
+        match &result {
+            Ok(_) => {
+                self.telemetry.record_turn();
+                self.telemetry.request_flush();
+                emit(ToolLoopEvent {
+                    event: "generation_completed",
+                    body: json!({"finish_reason":match finish_reason{engine::types::FinishReason::EndOfSequence=>"end_of_sequence",engine::types::FinishReason::OutputLimit=>"output_limit"},"usage":{"input_tokens":total_usage.input_tokens,"output_tokens":total_usage.output_tokens}}),
+                })?;
+            }
+            Err(error) => {
+                cancel.cancel();
+                let mut guard = lock_store(store)?;
+                guard.withdraw_tools(session, "turn_failed_or_cancelled")?;
+                let history = guard.list_events(session)?;
+                if !history.iter().any(|e| {
+                    e.seq > turn && matches!(e.kind, EventKind::RunCompleted | EventKind::RunPaused)
+                }) {
+                    guard.append_event(
+                        session,
+                        EventKind::RunCompleted,
+                        json!({"status":"failed","error":error.to_string()}),
+                        json!([]),
+                    )?;
+                }
+                drop(guard);
+                let _ = emit(ToolLoopEvent {
+                    event: "request_failed",
+                    body: json!({"message":error.to_string()}),
+                });
+            }
+        }
+        result
+    }
+}
+// Plugin processes are shared, but waiting for their host must not retain another
+// session's turn past cancellation/deadline. Once acquired, W5 checks those same
+// controls before IPC, including when an already-cancelled after hook is attempted.
+fn lock_plugin_host<'a>(
+    plugins: &'a Mutex<PluginHost>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> HarnessResult<std::sync::MutexGuard<'a, PluginHost>> {
+    loop {
+        match plugins.try_lock() {
+            Ok(host) => return Ok(host),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(HarnessError::Engine("plugin lock poisoned".into()));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if cancel.is_cancelled() || Instant::now() >= deadline {
+            return Err(HarnessError::Engine(
+                "plugin host wait cancelled or deadline expired".into(),
+            ));
+        }
+        thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn ensure_active_locked(store: &SessionStore, session: &str) -> HarnessResult<()> {
+    if store
+        .get_session(session)?
+        .is_none_or(|s| s.status != SessionStatus::Active)
+    {
+        return Err(HarnessError::Invalid("session is not active".into()));
+    }
+    Ok(())
+}
+fn live(
+    store: &Mutex<SessionStore>,
+    session: &str,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> HarnessResult<()> {
+    if cancel.is_cancelled() || Instant::now() >= deadline {
+        return Err(HarnessError::Engine(
+            "tool turn cancelled or deadline expired".into(),
+        ));
+    }
+    ensure_active_locked(&*lock_store(store)?, session)
+}
+fn hook_values(receipts: &[HookReceipt]) -> Value {
+    json!(receipts.iter().map(|r|json!({"plugin_id":r.plugin_id,"plugin_version":r.plugin_version,"invocation_id":r.invocation_id,"hook":r.hook,"annotations":r.annotations,"diagnostic":r.diagnostic})).collect::<Vec<_>>())
+}
+fn record_hooks(
+    store: &Mutex<SessionStore>,
+    session: &str,
+    call: &str,
+    receipts: &[HookReceipt],
+) -> HarnessResult<()> {
+    if !receipts.is_empty() {
+        lock_store(store)?.append_event(session,EventKind::ToolRequested,json!({"contract_version":crate::approval::CONTRACT_VERSION,"call_id":call,"transition":"HookReceipts","receipts":hook_values(receipts)}),json!([]))?;
+    }
+    Ok(())
+}
+fn emit_terminal_tool<F: FnMut(ToolLoopEvent) -> HarnessResult<()>>(
+    store: &Mutex<SessionStore>,
+    session: &str,
+    call: &str,
+    emit: &mut F,
+) -> HarnessResult<()> {
+    let terminal = lock_store(store)?
+        .list_events(session)?
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == EventKind::ToolCompleted && e.payload["call_id"] == call)
+        .ok_or_else(|| HarnessError::Invalid("missing terminal tool result".into()))?;
+    emit(ToolLoopEvent {
+        event: "tool_result",
+        body: {
+            let mut body = terminal.payload;
+            body["is_error"] = json!(true);
+            body["summary"] = json!(summary(&body));
+            body
+        },
+    })
+}
+fn dispatch(
+    runtime: &ToolRuntime,
+    store: &Mutex<SessionStore>,
+    receipt: crate::store::StartedInvocation,
+    cancel: CancellationToken,
+    inline: usize,
+    deadline: Instant,
+) -> HarnessResult<ToolResult> {
+    let (finished, watch) = std::sync::mpsc::channel();
+    let cancellation = cancel.clone();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            if matches!(
+                watch.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                cancellation.cancel();
+            }
+        });
+        let result = (|| {
+            let executor = &runtime.executor;
+            let name = receipt.binding().invocation().call.tool_id.clone();
+            // Preparation and final persistence are short store operations. run borrows no store.
+            macro_rules! io_tool {
+                ($prepare:ident) => {{
+                    let job = executor.$prepare(
+                        &*lock_store(store)?,
+                        receipt,
+                        &runtime.artifacts,
+                        cancel,
+                        inline,
+                    )?;
+                    let completion = job.run();
+                    completion.complete(&mut *lock_store(store)?)
+                }};
+            }
+            match name.as_str() {
+                "fs.read" => io_tool!(prepare_file_read),
+                "fs.list" => io_tool!(prepare_file_list),
+                "shell.run" => io_tool!(prepare_shell_run).map_err(|e| e.error),
+                "http.fetch" => io_tool!(prepare_http_fetch).map_err(|e| e.error),
+                "fs.write" => {
+                    let job = executor.prepare_file_write(&*lock_store(store)?, receipt, cancel)?;
+                    let completion = job.run();
+                    completion
+                        .complete(&mut *lock_store(store)?)
+                        .map_err(|e| e.error)
+                }
+                _ => Err(HarnessError::Invalid(
+                    "W6 dispatch requires a registered builtin adapter".into(),
+                )),
+            }
+        })();
+        let _ = finished.send(());
+        result
+    })
+}
+
+fn summary(value: &Value) -> String {
+    value.to_string().chars().take(1024).collect()
+}
+fn tool_result_body(call: &str, result: &ToolResult) -> Value {
+    json!({"call_id":call,"is_error":result.is_error(),"summary":summary(&serde_json::to_value(result).expect("ToolResult serialization")),"result":result})
+}

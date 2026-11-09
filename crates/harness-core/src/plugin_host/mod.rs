@@ -261,6 +261,27 @@ impl PluginHost {
         }
         receipts
     }
+    /// Snapshot failure receipts for the declared after hooks, in configured order.
+    ///
+    /// These carry no plugin response or annotation. The coordinator may retain
+    /// them before execution and persist them only if it later cannot dispatch
+    /// after hooks, preserving the actual result without waiting on another turn.
+    pub fn after_dispatch_failure_receipts(
+        &self,
+        call: &HookInvocation,
+        diagnostic: &str,
+    ) -> Vec<HookReceipt> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.hooks.contains(AFTER))
+            .map(|plugin| {
+                let mut failure = receipt(plugin, call, AFTER);
+                failure.diagnostic = Some(diagnostic.to_owned());
+                failure
+            })
+            .collect()
+    }
+
     /// Bounded retained diagnostics, including stopped children, in plugin order.
     pub fn diagnostics(&self) -> Vec<(&str, &[u8])> {
         self.plugins
@@ -292,4 +313,10 @@ fn validate(values: &BTreeMap<String, Value>, id: &str, limits: Limits) -> Resul
         return Err(HostError::new("annotation namespace/byte limit"));
     }
     Ok(())
+}
+
+/// Decode bounded daemon configuration with duplicate-key and nesting rejection.
+/// The caller must cap input bytes before reading; this grants no authority.
+pub fn decode_configuration<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, HostError> {
+    strict_json::decode(bytes)
 }

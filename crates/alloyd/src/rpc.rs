@@ -199,7 +199,7 @@ pub fn parse_request_line(line: &str) -> Result<RpcRequest, RpcError> {
     if trimmed.is_empty() {
         return Err(RpcError::invalid_request("empty line"));
     }
-    serde_json::from_str(trimmed)
+    harness_core::plugin_host::decode_configuration(trimmed.as_bytes())
         .map_err(|error| RpcError::invalid_request(format!("malformed JSON-RPC request: {error}")))
 }
 

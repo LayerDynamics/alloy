@@ -117,6 +117,26 @@ impl<E: Engine> Supervisor<E> {
         registry: &ToolRegistry,
         request: ToolRoundRequest<'_>,
         config: ToolRoundConfig,
+        on_started: S,
+        on_event: F,
+    ) -> HarnessResult<ToolRoundOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(&GenerationEvent) -> HarnessResult<()>,
+    {
+        self.generate_tool_round_cancellable(
+            store, registry, request, config, None, on_started, on_event,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn generate_tool_round_cancellable<S, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        registry: &ToolRegistry,
+        request: ToolRoundRequest<'_>,
+        config: ToolRoundConfig,
+        cancellation: Option<&tool_registry::execution::CancellationToken>,
         mut on_started: S,
         mut on_event: F,
     ) -> HarnessResult<ToolRoundOutcome>
@@ -135,7 +155,12 @@ impl<E: Engine> Supervisor<E> {
             registry,
             config.context_limits,
         )?;
-        let check = || check_live(store, request.session_id, config.deadline);
+        let check = || {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                return Err(invalid("tool turn cancelled"));
+            }
+            check_live(store, request.session_id, config.deadline)
+        };
         let rendered = wait_checked(
             self.engine.render_and_count(snapshot.clone()),
             config.deadline,

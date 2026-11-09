@@ -16,7 +16,9 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod tool_loop;
 mod tool_round;
+pub use tool_loop::{ToolLoopConfig, ToolLoopEvent, ToolRuntime};
 pub use tool_round::{RoundProposals, ToolRoundConfig, ToolRoundOutcome, ToolRoundRequest};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);

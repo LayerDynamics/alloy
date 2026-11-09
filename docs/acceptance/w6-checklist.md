@@ -1,5 +1,7 @@
 ## W6 implementation and acceptance checklist
 
+Current continuation: [integrated implementation and acceptance boundary](w6-integrated-loop.md). Checked named gates are supported by the retained local integration/Linux/Mac CLI evidence; final platform/candidate acceptance remains open. The local implementation is present; unchecked items remain acceptance obligations until final evidence/review resolves them.
+
 Scope: issue #33, Phase 2 W6 only. W2/W3/W4/W5 are reusable dependencies;
 W6 wires them together. An individual patch is not W6 completion. Keep #33 open
 until P2-12/P2-13/P2-14 and the required supporting checks pass.
@@ -42,14 +44,18 @@ until P2-12/P2-13/P2-14 and the required supporting checks pass.
 - [ ] Verify the CLI can send approval/pause while session.send is waiting, without blocking its own control path.
 
 ### 6. Acceptance and evidence
-- [ ] P2-12 canonical_tool_loop_persists_results: actual supervisor orchestration with scripted inference requests a real registered builtin, consumes its result, returns final text, preserves ordering/call IDs, enforces limits and does not replay after reopen.
-- [ ] P2-13 approval_rpc_remains_responsive: real daemon service/socket path accepts approval/denial/pause from another connection while send waits, keeps unrelated RPC responsive, and emits one terminal outcome.
-- [ ] P2-14 cli_renders_approval_and_tool_result: approval/tool rendering and real decision/control flow, including deny/cancel/noninteractive cases. Node 26.13.0 Linux + Mac.
-- [ ] Discover and execute exact named gates; verify effects/markers/process observations, not zero-test or mock-only success claims.
-- [ ] Run Linux and Mac native regressions, package all-target/doc checks, strict rustdoc, formatting, Clippy, and CLI tests without weakening previous phase gates.
+- [x] P2-12 canonical_tool_loop_persists_results: actual supervisor orchestration with scripted inference requests a real registered builtin, consumes its result, returns final text, preserves ordering/call IDs, enforces limits and does not replay after reopen.
+- [x] P2-13 approval_rpc_remains_responsive: real daemon service/socket path accepts approval/denial/pause from another connection while send waits, keeps unrelated RPC responsive, and emits one terminal outcome.
+- [x] P2-14 cli_renders_approval_and_tool_result: approval/tool rendering and real decision/control flow, including deny/cancel/noninteractive cases. Node 26.13.0 Linux + Mac.
+- [x] Discover and execute exact named gates; verify effects/markers/process observations, not zero-test or mock-only success claims.
+- [x] Run Linux and Mac native regressions, package all-target/doc checks, strict rustdoc, formatting, Clippy, and CLI tests without weakening previous phase gates.
 - [ ] Record the final head/tested-merge SHA relationship, clean source provenance, commands, exact test results and retained logs/artifact URLs. Reconcile the checklist before closing #33.
-- [ ] Keep trained-model full Phase 2 acceptance/exit review in W7; do not claim it from scripted inference tests.
+- [x] Keep trained-model full Phase 2 acceptance/exit review in W7; do not claim it from scripted inference tests.
 
 ### Patch ledger
 - Patch 1: durable generation identity and fail-closed text-supervisor stream boundary. It does not enable tools, add approvals/RPC/CLI, or satisfy P2-12/13/14 by itself.
 - Subsequent patches must implement the context/loop/lifecycle, responsive RPC/configuration, CLI, and integrated acceptance items above; their completion must be demonstrated, not inferred from patch 1.
+
+- Integrated continuation: canonical loop, actual scoped daemon configuration, responsive strict approval RPC, CLI decisions, and P2-12/13/14 tests are implemented. See the linked record for current evidence and remaining gates; this does not close #33.
+
+- Native Terminal all-target evidence: `work/w6-resume-20261108/native-terminal.sBAkKn/` records 366 passed, exit 0, unchanged source. Log and manifest hashes were verified against the retained files. Earlier Codex-context HTTP failures remain diagnostic; final candidate/CI closeout remains open.

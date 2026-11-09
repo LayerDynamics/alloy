@@ -30,6 +30,7 @@ use std::task::{Context, Poll};
 
 /// Per-session turn slot: present while a send is in progress.
 struct InflightSlot {
+    cancellation: tool_registry::execution::CancellationToken,
     request_id: Option<RequestId>,
     /// Set by pause before a request id exists; on_started must cancel immediately.
     cancel_requested: bool,
@@ -47,6 +48,7 @@ pub struct DaemonService<E: Engine> {
     memory_reserved: u64,
     metrics: Option<Arc<dyn MetricsSource>>,
     notification_limits: Option<RpcTransportLimits>,
+    tools: Option<harness_core::supervisor::ToolRuntime>,
 }
 
 impl<E: Engine> DaemonService<E> {
@@ -72,7 +74,36 @@ impl<E: Engine> DaemonService<E> {
             memory_reserved,
             metrics: None,
             notification_limits: None,
+            tools: None,
         })
+    }
+
+    /// Bind an immutable scoped catalogue and policy before publishing the service.
+    pub fn with_tools(mut self, runtime: harness_core::supervisor::ToolRuntime) -> Self {
+        // Tool turns must not wait forever for a client that stops reading.
+        // Explicit caller transport configuration still takes precedence.
+        self.notification_limits.get_or_insert_with(|| {
+            RpcTransportLimits::new(2 * 1024 * 1024, std::time::Duration::from_secs(5))
+                .expect("positive bounded tool transport defaults")
+        });
+        self.tools = Some(runtime);
+        self
+    }
+
+    /// Initialize the bounded artifact store in this service's own store epoch.
+    pub fn open_artifacts(
+        &self,
+        root: &Path,
+    ) -> Result<harness_core::artifact::ArtifactStore, RpcError> {
+        harness_core::artifact::ArtifactStore::open(
+            &mut *self
+                .store
+                .lock()
+                .map_err(|_| RpcError::internal("store lock poisoned"))?,
+            root,
+            Default::default(),
+        )
+        .map_err(map_harness)
     }
 
     /// Attach read-only runtime metrics without changing legacy status fields.
@@ -122,8 +153,8 @@ impl<E: Engine> DaemonService<E> {
             "sessions.resume" => self.sessions_resume(&request.params),
             "daemon.status" => self.daemon_status(),
             "daemon.metrics" => self.daemon_metrics(),
-            "session.approve"
-            | "models.list"
+            "session.approve" => self.session_approve(&request.params),
+            "models.list"
             | "models.pull"
             | "models.verify"
             | "models.capabilities"
@@ -193,6 +224,7 @@ impl<E: Engine> DaemonService<E> {
             }
         }
 
+        let cancellation = tool_registry::execution::CancellationToken::default();
         {
             let mut guard = self
                 .inflight
@@ -207,39 +239,80 @@ impl<E: Engine> DaemonService<E> {
             guard.insert(
                 session_id.clone(),
                 InflightSlot {
+                    cancellation: cancellation.clone(),
                     request_id: None,
                     cancel_requested: false,
                 },
             );
         }
 
-        let outcome = self.supervisor.run_turn_streaming(
-            &self.store,
-            &session_id,
-            &content,
-            self.max_output_tokens,
-            |request_id| {
-                let mut guard = self
-                    .inflight
-                    .lock()
-                    .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
-                let Some(slot) = guard.get_mut(&session_id) else {
-                    return Err(HarnessError::Engine(format!(
-                        "inflight slot missing for session {session_id}"
-                    )));
-                };
-                slot.request_id = Some(request_id.clone());
-                let cancel_now = slot.cancel_requested.then(|| request_id.clone());
-                drop(guard);
-                if let Some(id) = cancel_now {
-                    self.supervisor.cancel(id)?;
-                }
-                Ok(())
-            },
-            |event| {
-                write_generation_notification(writer, &session_id, event, self.notification_limits)
-            },
-        );
+        let on_started = |request_id: &RequestId| {
+            let mut guard = self
+                .inflight
+                .lock()
+                .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
+            let slot = guard
+                .get_mut(&session_id)
+                .ok_or_else(|| HarnessError::Engine("missing inflight slot".into()))?;
+            slot.request_id = Some(request_id.clone());
+            if slot.cancel_requested {
+                return Err(HarnessError::Engine("turn cancelled".into()));
+            }
+            Ok(())
+        };
+        let outcome = if let Some(runtime) = &self.tools {
+            self.supervisor.run_tool_turn(
+                &self.store,
+                runtime,
+                &session_id,
+                &content,
+                crate::tool_config::loop_config(self.max_output_tokens),
+                &cancellation,
+                on_started,
+                |event| {
+                    write_tool_notification(
+                        writer,
+                        &session_id,
+                        event.event,
+                        event.body,
+                        self.notification_limits.expect("configured tool transport"),
+                    )
+                },
+            )
+        } else {
+            self.supervisor.run_turn_streaming(
+                &self.store,
+                &session_id,
+                &content,
+                self.max_output_tokens,
+                |request_id| {
+                    let mut guard = self
+                        .inflight
+                        .lock()
+                        .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
+                    let Some(slot) = guard.get_mut(&session_id) else {
+                        return Err(HarnessError::Engine(format!(
+                            "inflight slot missing for session {session_id}"
+                        )));
+                    };
+                    slot.request_id = Some(request_id.clone());
+                    let cancel_now = slot.cancel_requested.then(|| request_id.clone());
+                    drop(guard);
+                    if let Some(id) = cancel_now {
+                        self.supervisor.cancel(id)?;
+                    }
+                    Ok(())
+                },
+                |event| {
+                    write_generation_notification(
+                        writer,
+                        &session_id,
+                        event,
+                        self.notification_limits,
+                    )
+                },
+            )
+        };
         {
             let mut guard = self
                 .inflight
@@ -256,6 +329,35 @@ impl<E: Engine> DaemonService<E> {
         }))
     }
 
+    fn session_approve(&self, params: &Value) -> Result<Value, RpcError> {
+        let object = params
+            .as_object()
+            .ok_or_else(|| RpcError::invalid_params("approval object required"))?;
+        if object.len() != 3
+            || !object.contains_key("session_id")
+            || !object.contains_key("call_id")
+            || !object.contains_key("allow")
+        {
+            return Err(RpcError::invalid_params(
+                "exact session_id, call_id and allow required",
+            ));
+        }
+        let session = require_session_id(params)?;
+        let call = params["call_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| RpcError::invalid_params("call_id string required"))?;
+        let allow = params["allow"]
+            .as_bool()
+            .ok_or_else(|| RpcError::invalid_params("explicit allow boolean required"))?;
+        self.store
+            .lock()
+            .map_err(|_| RpcError::internal("store lock poisoned"))?
+            .decide_tool(session, call, allow)
+            .map_err(map_harness)?;
+        Ok(json!({"ok":true,"session_id":session,"call_id":call,"allow":allow}))
+    }
+
     fn session_pause(&self, params: &Value) -> Result<Value, RpcError> {
         let session_id = require_session_id(params)?;
         let inflight_request = {
@@ -265,6 +367,7 @@ impl<E: Engine> DaemonService<E> {
                 .map_err(|_| RpcError::internal("inflight lock poisoned"))?;
             if let Some(slot) = guard.get_mut(session_id) {
                 slot.cancel_requested = true;
+                slot.cancellation.cancel();
                 slot.request_id.clone()
             } else {
                 None
@@ -643,6 +746,26 @@ impl GenerationEventStream for CancellableStream {
     }
 }
 
+fn write_tool_notification<W: Write>(
+    writer: &mut W,
+    session_id: &str,
+    event: &'static str,
+    body: Value,
+    limits: RpcTransportLimits,
+) -> Result<(), HarnessError> {
+    let line = encode_line(&RpcNotification::session_event(event, session_id, body))
+        .map_err(|error| HarnessError::Engine(error.message))?;
+    if line.len() > limits.max_notification_bytes() {
+        return Err(HarnessError::Engine(
+            "tool notification byte limit exceeded".into(),
+        ));
+    }
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.flush())
+        .map_err(|error| HarnessError::Engine(error.to_string()))
+}
+
 fn write_generation_notification<W: Write>(
     writer: &mut W,
     session_id: &str,
@@ -740,5 +863,31 @@ mod w2_notification_dispatch_tests {
         let wire: Value = serde_json::from_slice(&bytes).expect("JSON");
         assert_eq!(wire["params"]["event"], "text_delta");
         assert_eq!(wire["params"]["body"], json!({"text":"hello"}));
+    }
+}
+
+#[cfg(test)]
+mod w6_tool_notification_tests {
+    use super::*;
+    #[test]
+    fn tool_notification_limit_counts_escaped_envelope_before_any_write() {
+        let body = json!({"text":"é\n\""});
+        let encoded = encode_line(&RpcNotification::session_event(
+            "text_delta",
+            "s",
+            body.clone(),
+        ))
+        .unwrap();
+        let mut bytes = Vec::new();
+        let short =
+            RpcTransportLimits::new(encoded.len() - 1, std::time::Duration::from_secs(1)).unwrap();
+        assert!(
+            write_tool_notification(&mut bytes, "s", "text_delta", body.clone(), short).is_err()
+        );
+        assert!(bytes.is_empty(), "rejection must not emit a partial frame");
+        let exact =
+            RpcTransportLimits::new(encoded.len(), std::time::Duration::from_secs(1)).unwrap();
+        write_tool_notification(&mut bytes, "s", "text_delta", body, exact).unwrap();
+        assert_eq!(bytes, encoded.as_bytes());
     }
 }

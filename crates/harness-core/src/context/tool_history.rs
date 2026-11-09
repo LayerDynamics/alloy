@@ -132,6 +132,13 @@ impl ContextBuilder {
                             limits,
                         )?;
                     } else {
+                        if string(&event.payload, "transition")? == "HookReceipts" {
+                            if !calls.contains_key(call_id) || !event.payload["receipts"].is_array()
+                            {
+                                return Err(invalid("orphan or malformed hook receipts"));
+                            }
+                            continue;
+                        }
                         if string(&event.payload, "transition")? != "Claimed" {
                             return Err(invalid("unknown request transition"));
                         }

@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { askApproval, formatToolEvent } from "./approval.js";
 import type { Readable, Writable } from "node:stream";
 import type { CliArgs } from "./args.js";
 import type { AlloySettings } from "./settings.js";
@@ -15,6 +16,8 @@ export interface ChatRpcClient {
 }
 
 export type ChatTurnOptions = {
+  control?: Pick<ChatRpcClient, "call">;
+  approval?: (body: Record<string, unknown>, signal: AbortSignal) => Promise<boolean | null>;
   output?: Writable;
   errorOutput?: Writable;
   waitingInitialMs?: number;
@@ -52,6 +55,10 @@ export async function sendChatTurn(
   let settled = false;
   let failed = false;
   let streamed = "";
+  let controlFailure: Error | undefined;
+  let decisions = Promise.resolve();
+  const prompts = new AbortController();
+  const seenApprovals = new Set<string>();
   const report = (text: string): void => { errorOutput.write(`${text}\n`); };
   const stopWaiting = (): void => { waiting = false; clearTimeout(timer); timer = undefined; };
   const notice = (): void => {
@@ -68,9 +75,36 @@ export async function sendChatTurn(
       // A connection may carry unrelated session notifications. They must not
       // print text, stop this turn's notice, or change its terminal outcome.
       if (settled || failed || event.session_id !== sessionId) return;
+      if (["approval_requested", "tool_requested", "tool_call_started", "tool_result"].includes(event.event)) {
+        stopWaiting();
+        report(formatToolEvent(event.event, event.body));
+        if (event.event === "approval_requested") {
+          const callId = event.body.call_id;
+          if (typeof callId !== "string" || !callId || seenApprovals.has(callId)) return;
+          seenApprovals.add(callId);
+          decisions = decisions.then(async () => {
+            if (settled || prompts.signal.aborted) return;
+            if (!options.control) throw new Error("Approval requires a separate control connection");
+            const allow = options.approval ? await options.approval(event.body, prompts.signal) : null;
+            if (prompts.signal.aborted) return;
+            if (allow === null) {
+              report("No explicit approval decision; cancelling the turn.");
+              await options.control.call("session.pause", { session_id: sessionId });
+            } else {
+              await options.control.call("session.approve", { session_id: sessionId, call_id: callId, allow });
+            }
+          }).catch(async (error: unknown) => {
+            controlFailure = error instanceof Error ? error : new Error(String(error));
+            report(controlFailure.message);
+            await options.control?.call("session.pause", { session_id: sessionId }).catch(() => {});
+          });
+        }
+        return;
+      }
       if (event.event === "request_failed") {
         failed = true;
         stopWaiting();
+        prompts.abort();
         report(formatRequestFailed(event.body));
         return;
       }
@@ -90,7 +124,9 @@ export async function sendChatTurn(
       }
     });
     stopWaiting();
-    if (failed) return 3;
+    prompts.abort();
+    await decisions;
+    if (failed || controlFailure) return 3;
     const finalText = finalAssistantText(result, sessionId);
     if (streamed.length === 0) {
       report("Received the final response without streamed text.");
@@ -108,6 +144,7 @@ export async function sendChatTurn(
     return 2;
   } finally {
     settled = true;
+    prompts.abort();
     stopWaiting();
   }
 }
@@ -128,6 +165,10 @@ export async function runChat(
     return 1;
   }
 
+  let control: ChatRpcClient | undefined;
+  let rl: readline.Interface | undefined;
+  let askingApproval = false;
+  let sending = false;
   try {
     let sessionId: string;
     if (args.resume) {
@@ -146,36 +187,70 @@ export async function runChat(
       report(`session ${sessionId} profile=${settings.profile}`);
     }
 
-    const sendOnce = (content: string): Promise<number> => sendChatTurn(client, sessionId, content, options);
+    const input = options.input ?? process.stdin;
+    const interactive = (input as Readable & { isTTY?: boolean }).isTTY === true || typeof (input as Readable & { setRawMode?: unknown }).setRawMode === "function";
+    if (interactive) {
+      rl = readline.createInterface({ input, output: errorOutput, terminal: true });
+      rl.on("SIGINT", () => {
+        if (askingApproval) return;
+        if (sending) void control?.call("session.pause", { session_id: sessionId }).catch((error: unknown) => report(String(error)));
+        rl?.close();
+      });
+      rl.on("close", () => {
+        if (sending && !askingApproval) void control?.call("session.pause", { session_id: sessionId }).catch((error: unknown) => report(String(error)));
+      });
+    }
+    const sendOnce = async (content: string): Promise<number> => {
+      try {
+      control ??= await (options.connect ?? RpcClient.connect)(settings.socket);
+      sending = true;
+      return await sendChatTurn(client, sessionId, content, { ...options, control,
+        approval: options.approval ?? (interactive && rl ? async (_body, signal) => {
+          askingApproval = true;
+          try { return await askApproval(rl!, signal, report); }
+          finally { askingApproval = false; }
+        } : async () => null),
+      });
+      } catch (error) {
+        report(error instanceof Error ? error.message : String(error)); return 2;
+      } finally { sending = false; }
+    };
 
     if (args.message !== undefined) {
       return await sendOnce(args.message);
     }
 
-    const rl = readline.createInterface({
+    rl ??= readline.createInterface({
       input: options.input ?? process.stdin,
       output: errorOutput,
-      terminal: true,
+      terminal: interactive,
     });
-    rl.setPrompt("> ");
-    rl.prompt();
-
-    try {
-      for await (const line of rl) {
-        const content = line.trim();
-        if (!content) {
-          rl.prompt();
-          continue;
-        }
-        const code = await sendOnce(content);
-        if (code !== 0) return code;
-        rl.prompt();
-      }
-      return 0;
-    } finally {
-      rl.close();
+    const terminal = rl;
+    const queued: string[] = [];
+    let ended = false;
+    let waiter: ((value: string | null) => void) | undefined;
+    terminal.on("line", (line: string) => {
+      if (askingApproval) return;
+      if (waiter) { const done = waiter; waiter = undefined; done(line); }
+      else queued.push(line);
+    });
+    terminal.once("close", () => { ended = true; waiter?.(null); waiter = undefined; });
+    const nextLine = (): Promise<string | null> => {
+      if (queued.length) return Promise.resolve(queued.shift()!);
+      if (ended) return Promise.resolve(null);
+      return new Promise((resolve) => { waiter = resolve; terminal.setPrompt("> "); terminal.prompt(); });
+    };
+    while (true) {
+      const line = await nextLine();
+      if (line === null) return 0;
+      const content = line.trim();
+      if (!content) continue;
+      const code = await sendOnce(content);
+      if (code !== 0) return code;
     }
   } finally {
+    rl?.close();
+    if (control !== client) control?.close();
     client.close();
   }
 }

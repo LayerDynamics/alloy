@@ -71,11 +71,16 @@ fn run() -> Result<(), String> {
     let mut paged_ssd_cache_dir = None;
     let mut hot_cache_limit = HotCacheLimit::Percent(25);
     let mut hot_cache_only = false;
+    let mut tools_config: Option<std::path::PathBuf> = None;
     let mut rpc_transport = rpc_transport_config::TransportArgs::default();
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--tools-config" => {
+                index += 1;
+                tools_config = Some(require_value(&args, index, "--tools-config")?.into());
+            }
             "--socket" => {
                 index += 1;
                 socket = Some(require_value(&args, index, "--socket")?);
@@ -237,19 +242,23 @@ fn run() -> Result<(), String> {
         booted.engine.clone(),
         booted.memory_enforcer.clone(),
     ));
-    let service = Arc::new(rpc_transport_config::apply(
-        DaemonService::open(
-            &config.db_path,
-            booted.engine,
-            telemetry,
-            max_output_tokens,
-            booted.models_resident,
-            booted.memory_reserved,
-        )
-        .map_err(|error| error.message)?
-        .with_metrics_source(metrics),
-        rpc_transport_limits,
-    ));
+    let mut service = DaemonService::open(
+        &config.db_path,
+        booted.engine,
+        telemetry,
+        max_output_tokens,
+        booted.models_resident,
+        booted.memory_reserved,
+    )
+    .map_err(|error| error.message)?
+    .with_metrics_source(metrics);
+    if let Some(path) = tools_config {
+        let artifacts = service
+            .open_artifacts(&config.db_path.with_extension("artifacts"))
+            .map_err(|e| e.message)?;
+        service = service.with_tools(alloyd::tool_config::load(&path, artifacts)?);
+    }
+    let service = Arc::new(rpc_transport_config::apply(service, rpc_transport_limits));
     if let Some(limits) = rpc_transport_limits {
         eprintln!(
             "alloyd: RPC slab transport max_bytes={} write_timeout_ms={} (tool policy unchanged)",
@@ -399,6 +408,7 @@ OPTIONS:
   --corpus-models PATH         Optional bench/corpus/models.json for sha256 verification
   --socket PATH                UDS path (default: ~/.alloy/alloyd.sock)
   --db PATH                    SQLite session store (default: ~/.alloy/sessions.sqlite)
+  --tools-config PATH          Explicit scoped tools, exact-argument policy and ordered plugins
   --max-output-tokens N        Greedy decode cap (default: 512)
   --memory-guard TIER          safe|balanced|aggressive|custom (default: balanced)
   --memory-guard-gb N          Custom ceiling in GiB (implies --memory-guard custom)
@@ -411,7 +421,8 @@ OPTIONS:
   --cpu                       MLX CPU transformer operations (default on other platforms)
   --rpc-max-notification-bytes N  Full escaped slab notification limit, including newline
   --rpc-write-timeout-ms N     Socket per-write timeout in milliseconds
-                              Supply both RPC flags or neither; no implicit policy
+                              Supply both RPC flags or neither; tool mode defaults to
+                              2 MiB notifications and a 5-second write timeout
                               These flags do not enable tools or approvals
   --telemetry-endpoint URL     FR-35 flush URL
   -V, --version               Show the daemon version without starting it
