@@ -40,6 +40,7 @@ pub mod tiered_kv;
 pub mod types;
 
 #[cfg(test)]
-mod w3_acceptance;
+#[path = "../tests/unit/engine_acceptance.rs"]
+mod engine_acceptance;
 
 pub mod slab_parser;

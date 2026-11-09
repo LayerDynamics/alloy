@@ -15,7 +15,7 @@ use tool_registry::{
     execution::{BoundedOutput, CancellationToken, ExecutionContext, ExecutionError},
 };
 mod fixture {
-    include!("fixtures/w4_http_server.rs");
+    include!("fixtures/http_server.rs");
 }
 use fixture::{Server, response};
 struct Directory(PathBuf);

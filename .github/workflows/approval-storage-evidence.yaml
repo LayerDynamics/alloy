@@ -1,0 +1,142 @@
+name: approval-storage-evidence
+
+on:
+  push:
+    branches: [feat/30-policy-approvals-artifacts]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: approval-storage-evidence-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: approval-storage-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    env:
+      APPROVAL_STORAGE_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Initialize evidence path on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/approval-storage-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-linux"
+          mkdir -p "$evidence"
+          printf 'APPROVAL_STORAGE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
+      - name: Checkout exact candidate with history
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.APPROVAL_STORAGE_CANDIDATE }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Record workflow provenance
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$APPROVAL_STORAGE_EVIDENCE"
+          printf 'candidate=%s\nrun=%s/%s/actions/runs/%s\nattempt=%s\n' \
+            "$APPROVAL_STORAGE_CANDIDATE" "$SERVER_URL" "$REPOSITORY" "$RUN_ID" "$RUN_ATTEMPT" \
+            > "$APPROVAL_STORAGE_EVIDENCE/workflow.txt"
+      - name: Build existing Linux native environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/arm64 \
+            -t alloy-approval-storage-native:local \
+            -f scripts/docker/Dockerfile.repro scripts/docker \
+            2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/image-build.log"
+      - name: Collect approval and storage gates and complete source sections
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src:ro \
+            -v "$APPROVAL_STORAGE_EVIDENCE":/evidence \
+            -e APPROVAL_STORAGE_CANDIDATE -e CARGO_TERM_COLOR=never \
+            -w /work alloy-approval-storage-native:local \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends python3
+              tar -C /src --exclude=target -cf - . | tar --no-same-owner -C /work -xf -
+              test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
+              rustup component add rustfmt clippy
+              python3 scripts/approval_storage_evidence.py \
+                --repo /work --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
+                --output /evidence/results
+            ' 2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+      - name: Retain approval and storage Linux evidence even after failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: approval-storage-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APPROVAL_STORAGE_EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  mac:
+    name: approval-storage-macos-arm64
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 180
+    env:
+      APPROVAL_STORAGE_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Initialize evidence path on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/approval-storage-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-macos"
+          mkdir -p "$evidence"
+          printf 'APPROVAL_STORAGE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
+      - name: Checkout exact candidate with history
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.APPROVAL_STORAGE_CANDIDATE }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Record workflow provenance
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$APPROVAL_STORAGE_EVIDENCE"
+          printf 'candidate=%s\nrun=%s/%s/actions/runs/%s\nattempt=%s\n' \
+            "$APPROVAL_STORAGE_CANDIDATE" "$SERVER_URL" "$REPOSITORY" "$RUN_ID" "$RUN_ATTEMPT" \
+            > "$APPROVAL_STORAGE_EVIDENCE/workflow.txt"
+      - name: Collect approval and storage gates and complete source sections
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
+          rustup component add rustfmt clippy
+          python3 scripts/approval_storage_evidence.py \
+            --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
+            --output "$APPROVAL_STORAGE_EVIDENCE/results" \
+            2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+      - name: Retain approval and storage macOS evidence even after failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: approval-storage-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APPROVAL_STORAGE_EVIDENCE }}/
+          if-no-files-found: error
+          retention-days: 30

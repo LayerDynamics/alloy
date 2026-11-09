@@ -797,7 +797,7 @@ fn write_generation_notification<W: Write>(
 }
 
 #[cfg(test)]
-mod w2_notification_dispatch_tests {
+mod tool_output_notification_dispatch_tests {
     use super::*;
     use engine::{
         admission::AdmissionController,
@@ -867,7 +867,7 @@ mod w2_notification_dispatch_tests {
 }
 
 #[cfg(test)]
-mod w6_tool_notification_tests {
+mod tool_loop_tool_notification_tests {
     use super::*;
     #[test]
     fn tool_notification_limit_counts_escaped_envelope_before_any_write() {

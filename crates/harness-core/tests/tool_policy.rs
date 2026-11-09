@@ -672,7 +672,7 @@ fn destructive_effect_requires_bound_approval() {
 }
 
 #[test]
-fn w3_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution() {
+fn approval_storage_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution() {
     for strengthen in [false, true] {
         for (id, effect, approval) in [
             ("fs.read", ToolEffect::Read, ApprovalRequirement::Never),

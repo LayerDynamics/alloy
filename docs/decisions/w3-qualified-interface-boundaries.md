@@ -56,8 +56,8 @@ configuration manager or reload guarantee is implemented by this documentation.
 
 ## Evidence and limits
 
-Run w3_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes and
-w3_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution, the complete
+Run approval_storage_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes and
+approval_storage_boundary_five_frozen_builtin_defaults_preserve_prompt_resolution, the complete
 qwen3/tool-policy suites, existing final policy/registration-change tests and
 workspace/doc regressions. Preserve finite SQL/process-exit fault and trusted
 local storage assumptions. No new dependency, wire enum or authorization handle.

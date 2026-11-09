@@ -12,7 +12,7 @@ Implement the context projection as private child module
 `crates/harness-core/src/context/tool_history.rs`, declared by `context.rs`.
 It extends the existing public `ContextBuilder` with `build_tool_snapshot`;
 there is no duplicate registry, dispatcher, root crate or new dependency.
-`tests/w6_tool_context.rs` is an auto-discovered harness-core integration target.
+`tests/canonical_tool_context.rs` is an auto-discovered harness-core integration target.
 The manifest has no `autotests = false`; exact discovery is checked by the runner.
 
 ## Implemented boundary
