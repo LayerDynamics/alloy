@@ -9,6 +9,9 @@ impl Server {
             while !running.load(Ordering::Acquire){
                 match listener.accept(){
                     Ok((mut stream,_))=>{
+                        // macOS inherits the nonblocking listener flag on accepted sockets.
+                        // Use blocking reads so the configured per-read timeout applies.
+                        stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();stream.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
                         let mut bytes=Vec::new();let mut block = [0u8; 512];
                         let header_started = std::time::Instant::now();
