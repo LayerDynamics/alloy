@@ -17,6 +17,17 @@ case "$OUT/" in "$ROOT/"*)
     echo 'Set ALLOY_W5_OUTPUT outside the source tree or under target' >&2; exit 1;;
   esac;;
 esac
+PLUGIN_TESTS=(
+  plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_sandbox
+  hardening::plugin_failures_reap_real_children_and_stop_later_hooks
+  hardening::plugin_registration_is_atomic_and_drop_reaps
+  hardening::plugin_cancellation_isolated_and_after_failure_is_warning_only
+  hardening::plugin_capability_subsets_fragmentation_and_real_zero_effect_marker
+  hardening::plugin_inherited_descriptor_is_closed_on_exec
+  hardening::plugin_invalid_limits_and_duplicate_registration_spawn_nothing
+  hardening::plugin_blocked_stdin_deadline_reaps_owned_process
+  hardening::plugin_high_fd_above_lowered_limit_is_not_inherited
+)
 if ! mkdir "$OUT/.plugin-acceptance.lock"; then
   echo 'Acceptance output is already in use; choose a separate output directory.' >&2
   exit 1
@@ -39,14 +50,32 @@ finish_collection() {
 trap finish_collection EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# These direct-child names are reserved collector outputs. Keep unrelated files
-# and directories; unlinking a matching symlink never touches its target.
+# Invalidate proof first, but never glob caller logs (a wrapper may already have
+# OUT/driver.log open). Only remove recorded or exact legacy collector outputs.
 rm -f -- "$OUT/report.json" "$OUT/report.json.tmp"
-rm -f -- "$OUT/"*.log "$OUT/"*.command.txt \
-  "$OUT/candidate.txt" "$OUT/platform.txt" \
+if [[ -f "$OUT/collector-files.txt" && ! -L "$OUT/collector-files.txt" ]]; then
+  while IFS= read -r artifact || [[ -n "$artifact" ]]; do
+    case "$artifact" in */*|''|.|..)
+      echo 'Invalid collector output manifest entry' >&2; exit 1;;
+    esac
+    case "$artifact" in *.log|*.command.txt) rm -f -- "$OUT/$artifact";; *)
+      echo 'Invalid collector output manifest entry' >&2; exit 1;;
+    esac
+  done < "$OUT/collector-files.txt"
+fi
+# Older collectors have no manifest. Include their pre-module and interim
+# colon-separated names as well as the current normalized names.
+for name in format compile clippy strict-json sandbox-alias sandbox sandboxed-host \
+    all-targets doctests rustdoc "${PLUGIN_TESTS[@]}"; do
+  for stem in "$name" "${name//::/_}" "${name#hardening::}"; do
+    rm -f -- "$OUT/$stem.log" "$OUT/$stem.command.txt"
+  done
+done
+rm -f -- "$OUT/collector-files.txt" "$OUT/candidate.txt" "$OUT/platform.txt" \
   "$OUT/source-before.sha256" "$OUT/source-after.sha256" \
   "$OUT/protocol-discovery.txt" "$OUT/unit-discovery.txt" \
   "$OUT/sandbox-discovery.txt" "$OUT/sandbox-platform.txt"
+: > "$OUT/collector-files.txt"
 # Clear old proof before prerequisite/candidate validation can fail.
 command -v python3 >/dev/null 2>&1 || {
   echo "W5 acceptance requires python3 in the execution environment; provision the runner/container." >&2
@@ -89,6 +118,7 @@ gate() {
   # Rust module separators are valid selectors but invalid artifact filenames.
   local artifact_name="${name//::/_}"
   GATE_LOGS+=("$artifact_name.log")
+  printf '%s\n' "$artifact_name.command.txt" "$artifact_name.log" >> "$OUT/collector-files.txt"
   printf '%s\n' "$*" > "$OUT/$artifact_name.command.txt"
   "$@" 2>&1 | tee "$OUT/$artifact_name.log"
 }
@@ -96,15 +126,7 @@ gate format cargo fmt --all -- --check
 gate compile cargo check --locked -p harness-core --all-targets
 gate clippy cargo clippy --locked -p harness-core --all-targets -- -D warnings
 cargo test --locked -p harness-core --test plugin_hooks -- --list > "$OUT/protocol-discovery.txt"
-for name in plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_sandbox \
-    hardening::plugin_failures_reap_real_children_and_stop_later_hooks \
-    hardening::plugin_registration_is_atomic_and_drop_reaps \
-    hardening::plugin_cancellation_isolated_and_after_failure_is_warning_only \
-    hardening::plugin_capability_subsets_fragmentation_and_real_zero_effect_marker \
-    hardening::plugin_inherited_descriptor_is_closed_on_exec \
-    hardening::plugin_invalid_limits_and_duplicate_registration_spawn_nothing \
-    hardening::plugin_blocked_stdin_deadline_reaps_owned_process \
-    hardening::plugin_high_fd_above_lowered_limit_is_not_inherited; do
+for name in "${PLUGIN_TESTS[@]}"; do
   grep -Fx "$name: test" "$OUT/protocol-discovery.txt"
   gate "$name" cargo test --locked -p harness-core --test plugin_hooks "$name" -- --exact --nocapture
 done
