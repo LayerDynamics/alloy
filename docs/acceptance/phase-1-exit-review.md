@@ -38,7 +38,7 @@ A prior branch's binary, fixture-only success, skipped model test, or an artifac
 | Vendored native build is reproducible | Phase 0 test 11: two successful post-freeze runs with recorded pins/corpus identity. This is distinct from Phase 1 test 11, `admission_estimate`. | **Passed** in the two linked post-freeze runs; unchanged vendor pins. |
 | Telemetry ships with its privacy/schema contract | Phase 1 tests 9 and 10; schema/anonymity, bounded flush, offline drop, and failure-isolation tests; published event schema and privacy policy before any tagged emitting pre-release. | **Phase 1 passed:** named tests and worker/deadline regressions passed. Hosted endpoint and published privacy policy remain release prerequisites. |
 | Live memory guard and residency/cache pull-forward | M1–M10 named acceptance from the [memory design](../designs/omlx-memory-method-parity.md), including live native counters and protected-resource behavior. | **Passed:** native CPU/Metal, exact protected ownership, emergency cancellation, and hot/SSD KV gates. |
-| Large pinned model and clean admission rejection | `scripts/m9_large_model_acceptance.sh`: candidate-bound pinned large-model load/generation, measured memory evidence, and separately demonstrated bounded rejection under an insufficient budget. | **Passed:** real 4B/14B Metal execution, typed protected refusal, separate `ReservationBudget` refusal, and empty shutdown ledger. |
+| Large pinned model and clean admission rejection | `scripts/large_model_acceptance.sh`: candidate-bound pinned large-model load/generation, measured memory evidence, and separately demonstrated bounded rejection under an insufficient budget. | **Passed:** real 4B/14B Metal execution, typed protected refusal, separate `ReservationBudget` refusal, and empty shutdown ledger. |
 | Existing native and CLI regression gates | All required jobs in [ci.yaml](../../.github/workflows/ci.yaml); no gate silently skipped due to absent model files. | **Passed** in final push and PR runs. |
 
 ## First candidate results and required repairs
@@ -183,14 +183,14 @@ The automatic Mac job runs both named tests and the M9 large-model driver after 
 
 ## Reproduce the M9 large-model gate
 
-Run [m9_large_model_acceptance.sh](../../scripts/m9_large_model_acceptance.sh) from a clean committed candidate checkout on native Apple Silicon. It validates both distinct frozen profiles (`qwen3-4b-4bit` and `qwen3-14b-4bit`) against [models.json](../../bench/corpus/models.json), records the exact compiled checkout/commit, and requires real Metal prefill/decode. A low-memory preflight or missing model fails; the driver does not substitute a tiny or CPU-only model.
+Run [large_model_acceptance.sh](../../scripts/large_model_acceptance.sh) from a clean committed candidate checkout on native Apple Silicon. It validates both distinct frozen profiles (`qwen3-4b-4bit` and `qwen3-14b-4bit`) against [models.json](../../bench/corpus/models.json), records the exact compiled checkout/commit, and requires real Metal prefill/decode. A low-memory preflight or missing model fails; the driver does not substitute a tiny or CPU-only model.
 
 ```bash
 mkdir -p /absolute/path/to/phase-1-evidence
 ALLOY_M9_MODEL_A_DIR=/absolute/path/to/alloy-qwen3-4b-4bit \
 ALLOY_M9_MODEL_B_DIR=/absolute/path/to/alloy-qwen3-14b-4bit \
 ALLOY_M9_OUTPUT=/absolute/path/to/phase-1-evidence/m9-acceptance.jsonl \
-  bash scripts/m9_large_model_acceptance.sh
+  bash scripts/large_model_acceptance.sh
 ```
 
 `ALLOY_M9_OUTPUT` must name a new file; existing evidence is not overwritten. `ALLOY_M9_EXPECTED_COMMIT`, when supplied, must exactly equal the checkout's full HEAD SHA. `ALLOY_M9_TIMEOUT_SECONDS` defaults to 1800 with a 120-second cleanup grace; its supported range is 60–7200. CI stores the machine-readable `acceptance.jsonl` and the complete `driver.log` together in a unique `m9-large-model-*` artifact subdirectory, including early preflight/build failures. Require the final `acceptance_passed` record and inspect the measured peaks, admission budgets, and rejection records; exit status alone is not the full review evidence.

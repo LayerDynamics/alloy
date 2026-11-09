@@ -24,6 +24,7 @@ function printHelp(): void {
   alloy --setup                 alias for alloy setup
 
 Setup/start options:
+  --tools-config PATH           explicit tool/policy/plugin configuration for alloy start
   --artifact PATH               existing model, or destination with --download
   --download                    explicitly download the pinned starter model
   --socket PATH --db PATH       override saved daemon paths
@@ -136,12 +137,12 @@ export async function runCli(argv: string[], overrides: Partial<CliDependencies>
     if (configurationError !== undefined) throw new Error(configurationError);
     if (settings.profile !== STARTER_MODEL.profile) throw new Error(`Unsupported profile ${settings.profile}. Run alloy setup --profile ${STARTER_MODEL.profile}.`);
     const current = await dependencies.probeDaemon(settings.socket);
-    if (current.status === "ready") return dependencies.startDaemon(settings);
+    if (current.status === "ready") return dependencies.startDaemon(settings, args.toolsConfig === undefined ? {} : { toolsConfig: args.toolsConfig });
     if (!current.can_start) throw new Error(`${current.error ?? "The selected socket is unavailable"}. Run alloy doctor before starting another daemon.`);
     const launch = await dependencies.resolveDaemonLaunch(settings);
     if (launch.kind === "unavailable") throw new Error(`${launch.error}. Run alloy doctor to check startup prerequisites.`);
     settings = await dependencies.runSetup(setupOverrides(args), undefined, { download: args.download });
-    return dependencies.startDaemon(settings);
+    return dependencies.startDaemon(settings, args.toolsConfig === undefined ? {} : { toolsConfig: args.toolsConfig });
   }
   if (configurationError !== undefined) throw new Error(configurationError);
   if (!settings.artifact && Boolean(process.stdin.isTTY && process.stderr.isTTY)) {

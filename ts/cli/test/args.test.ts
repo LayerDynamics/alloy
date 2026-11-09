@@ -99,3 +99,8 @@ test("monitor rejects chat/setup mutations and chat rejects monitor flags", () =
   }
   assert.throws(() => parseArgv(["node", "alloy", "--json"]), /only valid with alloy monitor/);
 });
+
+test("tool configuration is an explicit startup option and cannot silently affect chat", () => {
+  assert.equal(parseArgv(["node", "alloy", "start", "--tools-config", "/fixture/tools.json"]).toolsConfig, "/fixture/tools.json");
+  assert.throws(() => parseArgv(["node", "alloy", "--tools-config", "/fixture/tools.json"]), /only valid with alloy start/);
+});

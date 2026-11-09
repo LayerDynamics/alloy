@@ -1,6 +1,6 @@
 
 #[test]
-fn w5_alias_read_works_but_symlink_cannot_escape() {
+fn plugin_alias_read_works_but_symlink_cannot_escape() {
     use std::os::unix::fs::symlink;
     let allowed = tempfile::tempdir().unwrap();
     let denied = tempfile::tempdir().unwrap();

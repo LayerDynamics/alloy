@@ -104,7 +104,7 @@ New test/source delivery is separate from unrun candidate/platform evidence and 
 
 P2-09 here covers W4 builtins only. W5/W6 generation, approval-wait and hook pause orchestration and external caller-lock integration remain pending. No full Phase 2 claim.
 
-Use `scripts/w4_acceptance.sh` and the exit review for candidate/source provenance. Both platform records and required native/workspace regressions remain required.
+Use `scripts/builtin_acceptance.sh` and the exit review for candidate/source provenance. Both platform records and required native/workspace regressions remain required.
 
 ## Out of scope
 

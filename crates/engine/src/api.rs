@@ -546,6 +546,6 @@ impl Drop for CancelOnDropStream {
 
 // W2_COMPLETION_GATE_TEST_CONTEXT_V1
 #[cfg(test)]
-pub(crate) fn w2_test_execution_context(permit: ExecutionPermit) -> ExecutionContext {
+pub(crate) fn tool_output_test_execution_context(permit: ExecutionPermit) -> ExecutionContext {
     ExecutionContext::new(permit)
 }

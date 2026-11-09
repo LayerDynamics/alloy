@@ -169,7 +169,7 @@ test("owned foreground startup waits for its PID, passes configuration literally
     return ready();
   };
   const result = await startDaemon(settings, {
-    env: { ...process.env, START_RECORD: record }, signal: abort.signal, probe, pollIntervalMs: 10,
+    env: { ...process.env, START_RECORD: record }, signal: abort.signal, probe, pollIntervalMs: 10, toolsConfig: path.join(root, "tools with spaces $(literal).json"),
     output: output.output, errorOutput: output.output,
     log: (text) => { logs.push(text); if (text.startsWith("READY")) abort.abort(); },
   });
@@ -179,6 +179,7 @@ test("owned foreground startup waits for its PID, passes configuration literally
   assert.equal(alive(actual.pid), false);
   assert.equal(actual.args[actual.args.indexOf("--artifact") + 1], settings.artifact);
   assert.equal(actual.args[actual.args.indexOf("--corpus-models") + 1], STARTER_CORPUS_PATH);
+  assert.equal(actual.args[actual.args.indexOf("--tools-config") + 1], path.join(root, "tools with spaces $(literal).json"));
   assert.equal(actual.args.includes("--cpu"), false);
   assert.equal(actual.args.includes("--metal"), false);
   assert.deepEqual([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")], listeners);

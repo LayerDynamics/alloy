@@ -217,7 +217,7 @@ impl<W: Write> Write for ConnectionWriter<W> {
 }
 
 #[cfg(test)]
-mod w2_connection_writer_tests {
+mod tool_output_connection_writer_tests {
     use super::*;
     use std::io::{self, ErrorKind};
     struct PartialFailure {

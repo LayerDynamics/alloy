@@ -1,8 +1,8 @@
 //! Harness core: supervision, durable sessions, W3 policy/approvals and artifacts.
 //!
-//! The active supervisor remains text-only. These reusable daemon APIs do not
-//! enable builtin execution, live approval RPC or the tool loop. The W5 plugin
-//! host is opt-in; the active supervisor does not construct or call it.
+//! The supervisor supports both text turns and explicitly configured canonical
+//! tool turns. Tool turns use durable policy receipts, scoped builtin adapters,
+//! ordered plugins and a separately responsive approval/control connection.
 
 #![deny(missing_docs)]
 

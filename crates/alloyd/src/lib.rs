@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod rpc;
 pub mod server;
 pub mod service;
+pub mod tool_config;
 
 pub use boot::{BootRequest, BootedEngine, boot_qwen3};
 pub use metrics::{LiveEngineMetrics, MetricsSource};

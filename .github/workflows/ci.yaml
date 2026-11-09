@@ -179,10 +179,10 @@ jobs:
               cargo test --locked -p alloyd --doc
               echo "::endgroup::"
 
-              echo "::group::W4 named gates and evidence"
+              echo "::group::Builtin named gates and evidence"
               RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
-              bash scripts/w4_acceptance.sh
-              bash scripts/w5_acceptance.sh
+              bash scripts/builtin_acceptance.sh
+              bash scripts/plugin_acceptance.sh
               echo "::endgroup::"
             '
 
@@ -317,9 +317,9 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --workspace --all-targets -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
-          bash scripts/w4_acceptance.sh
+          bash scripts/builtin_acceptance.sh
 
-      - name: Retain W4 macOS evidence
+      - name: Retain builtin macOS evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
@@ -333,9 +333,9 @@ jobs:
         env:
           ALLOY_W5_CANDIDATE: ${{ github.sha }}
           ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
-        run: bash scripts/w5_acceptance.sh
+        run: bash scripts/plugin_acceptance.sh
 
-      - name: Retain W5 macOS evidence
+      - name: Retain plugin macOS evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
@@ -397,7 +397,7 @@ jobs:
           evidence_dir="$(mktemp -d "$ALLOY_ACCEPTANCE_OUTPUT_DIR/m9-large-model-XXXXXX")"
           export ALLOY_M9_OUTPUT="$evidence_dir/acceptance.jsonl"
           driver_status=0
-          bash scripts/m9_large_model_acceptance.sh 2>&1 | tee "$evidence_dir/driver.log" || driver_status=$?
+          bash scripts/large_model_acceptance.sh 2>&1 | tee "$evidence_dir/driver.log" || driver_status=$?
           node ts/cli/scripts/real-model-acceptance.mjs --summarize-m9 "$ALLOY_M9_OUTPUT"
           exit "$driver_status"
 

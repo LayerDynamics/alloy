@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 engine = { path = "../engine" }
 harness-core = { path = "../harness-core" }
+tool-registry = { path = "../tool-registry" }
 mlx-ffi = { path = "../mlx-ffi" }
 qwen3 = { path = "../families/qwen3" }
 serde = { workspace = true }

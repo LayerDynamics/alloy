@@ -32,7 +32,7 @@ this W4-scoped P2-09 entrypoint is not full Phase 2 P2-09 acceptance.
 - [ ] Source/lock/failure-path review and limitations recorded by a reviewer.
 - [ ] PR references #31 and records a scoped W4 decision.
 
-Run `bash scripts/w4_acceptance.sh` from a clean committed checkout. It retains
+Run `bash scripts/builtin_acceptance.sh` from a clean committed checkout. It retains
 candidate/platform/toolchain, W4 source hashes, exact discovery and run logs under
 `target/w4-acceptance/<platform>/`. CI reuses the existing Linux native container
 and Mac lane, preserves their regressions and always uploads W4 evidence.

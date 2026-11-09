@@ -325,3 +325,6 @@ fn supervisor_completes_two_turns_while_telemetry_transport_is_blocked() {
     turns.join().unwrap();
     drop(release);
 }
+
+include!("turn_boundary.inc");
+include!("tool_round.inc");

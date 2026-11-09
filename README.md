@@ -75,6 +75,8 @@ both merge before the following install command is available. This is a
 development preview; no prebuilt bottle or tagged binary release is claimed.
 
 ```bash
+brew tap LayerDynamics/alloy
+brew trust --formula layerdynamics/alloy/alloy
 brew install LayerDynamics/alloy/alloy
 alloy --version
 alloyd --check-native
@@ -180,6 +182,10 @@ builds optimize SHA-256 verification, including the ARM SHA backend on Apple
 Silicon, while still checking every expected digest.
 
 ### Local pre-push checks
+
+Rust directory modules use `module/mod.rs` throughout the crate source trees.
+Keep child declarations in that file; leaf modules remain `child.rs`. When
+moving a module, update relative includes and evidence-collector source paths.
 
 Enable the repository's tracked hook once per checkout:
 

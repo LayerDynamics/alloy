@@ -17,7 +17,7 @@ fn assert_reaped(pid: i32) {
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10), "expected ECHILD: already reaped");
 }
 #[test]
-fn w5_failures_reap_real_children_and_stop_later_hooks() {
+fn plugin_failures_reap_real_children_and_stop_later_hooks() {
     for mode in ["hang", "crash", "malformed", "flood", "stderr_flood", "partial",
         "duplicate_annotation", "escaped_duplicate", "namespace", "long_reason",
         "long_annotation", "wrong_id", "mutation"] {
@@ -40,7 +40,7 @@ fn w5_failures_reap_real_children_and_stop_later_hooks() {
     }
 }
 #[test]
-fn w5_registration_is_atomic_and_drop_reaps() {
+fn plugin_registration_is_atomic_and_drop_reaps() {
     let cancel = CancellationToken::default();
     for mode in ["version", "identity", "plugin_version", "unsupported_hook", "duplicate_hook", "handshake_hang"] {
         let dir = tempfile::tempdir().unwrap();
@@ -56,7 +56,7 @@ fn w5_registration_is_atomic_and_drop_reaps() {
     assert_reaped(pid);
 }
 #[test]
-fn w5_cancellation_isolated_and_after_failure_is_warning_only() {
+fn plugin_cancellation_isolated_and_after_failure_is_warning_only() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
     let independent = CancellationToken::default();
@@ -82,7 +82,7 @@ fn w5_cancellation_isolated_and_after_failure_is_warning_only() {
     assert_reaped(observed_pid(dir.path(), "c"));
 }
 #[test]
-fn w5_capability_subsets_fragmentation_and_real_zero_effect_marker() {
+fn plugin_capability_subsets_fragmentation_and_real_zero_effect_marker() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
     let mut host = PluginHost::start(vec![config(dir.path(), "a", "before_only"), config(dir.path(), "b", "after_only"),
@@ -102,7 +102,7 @@ fn w5_capability_subsets_fragmentation_and_real_zero_effect_marker() {
 }
 #[cfg(target_os = "macos")]
 #[test]
-fn w5_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
+fn plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
     let dir = tempfile::tempdir().unwrap();
     let denied = tempfile::tempdir().unwrap();
     let good = dir.path().join("good");
@@ -136,7 +136,7 @@ fn w5_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
 }
 
 #[test]
-fn w5_inherited_descriptor_is_closed_on_exec() {
+fn plugin_inherited_descriptor_is_closed_on_exec() {
     use std::os::fd::AsRawFd;
     unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
     let file = std::fs::File::open("/dev/null").unwrap();
@@ -154,7 +154,7 @@ fn w5_inherited_descriptor_is_closed_on_exec() {
 }
 
 #[test]
-fn w5_invalid_limits_and_duplicate_registration_spawn_nothing() {
+fn plugin_invalid_limits_and_duplicate_registration_spawn_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
     let mut too_large = limits(); too_large.message_bytes = 8 * 1024 * 1024 + 1;
@@ -165,7 +165,7 @@ fn w5_invalid_limits_and_duplicate_registration_spawn_nothing() {
 }
 
 #[test]
-fn w5_blocked_stdin_deadline_reaps_owned_process() {
+fn plugin_blocked_stdin_deadline_reaps_owned_process() {
     let dir = tempfile::tempdir().unwrap();
     let cancel = CancellationToken::default();
     let mut l = limits(); l.message_bytes = 1024 * 1024;
@@ -182,16 +182,17 @@ fn w5_blocked_stdin_deadline_reaps_owned_process() {
 
 // Re-exec the Rust test harness so resource-limit changes cannot affect parallel tests.
 #[test]
-fn w5_high_fd_above_lowered_limit_is_not_inherited() {
+fn plugin_high_fd_above_lowered_limit_is_not_inherited() {
     let result = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "w5_high_fd_isolated_helper", "--nocapture"])
+        .args(["--exact", "plugin_high_fd_isolated_helper", "--nocapture"])
+        .env("ALLOY_W5_FD_FIXTURE", fixture())
         .env("ALLOY_W5_FD_HELPER", "1").output().unwrap();
     assert!(result.status.success(), "helper status={:?}\nstdout={}\nstderr={}",
         result.status, String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
     assert!(String::from_utf8_lossy(&result.stdout).contains("W5_HIGH_FD_REGRESSION_PASSED"));
 }
 #[test]
-fn w5_high_fd_isolated_helper() {
+fn plugin_high_fd_isolated_helper() {
     if std::env::var("ALLOY_W5_FD_HELPER").as_deref() != Ok("1") { return; }
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     #[repr(C)]

@@ -33,7 +33,7 @@ use tool_registry::{
 mod fixture {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../tool-registry/tests/fixtures/w4_http_server.rs"
+        "/../tool-registry/tests/fixtures/http_server.rs"
     ));
 }
 use fixture::{Server, response};

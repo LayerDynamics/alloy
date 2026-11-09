@@ -247,7 +247,7 @@ fn unresolved_tool_name_remains_data_not_a_registration() {
 }
 
 #[test]
-fn w3_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes() {
+fn approval_storage_boundary_duplicate_keys_fail_in_atomic_and_streaming_modes() {
     for body in [
         r#"{"name":"a","name":"b","arguments":{}}"#,
         r#"{"name":"a","arguments":{"x":1,"x":2}}"#,

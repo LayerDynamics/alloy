@@ -7,6 +7,7 @@ export type CliArgs = {
   artifact?: string;
   alloydBin?: string;
   corpusModels?: string;
+  toolsConfig?: string;
   message?: string;
   resume?: string;
   help: boolean;
@@ -81,6 +82,11 @@ export function parseArgv(argv: string[]): CliArgs {
         break;
       case "--alloyd-bin":
         out.alloydBin = need();
+        break;
+      case "--tools-config":
+        if (command !== "start") throw new Error("--tools-config is only valid with alloy start");
+        out.toolsConfig = need();
+        if (!out.toolsConfig.trim()) throw new Error("--tools-config requires a nonempty path");
         break;
       case "--corpus-models":
         out.corpusModels = need();

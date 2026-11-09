@@ -720,7 +720,7 @@ fn run_crash(dir: &Path, stage: &str) {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "store::durable::failure_recovery::crash_child_probe",
+            "store::session_store::durable::receipts::failure_recovery::crash_child_probe",
             "--nocapture",
         ])
         .env("ALLOY_W3_C_CRASH_DIR", dir)
