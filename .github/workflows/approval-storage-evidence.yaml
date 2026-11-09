@@ -86,10 +86,11 @@ jobs:
           retention-days: 30
 
   mac:
-    name: approval-storage-macos-arm64
+    # PR evidence and its required status are produced once by ci/mac_core.
+    # Manual and feature-branch runs retain the standalone collector.
+    name: approval-storage-macos-standalone
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 180
     env:

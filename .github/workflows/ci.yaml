@@ -240,6 +240,7 @@ jobs:
     timeout-minutes: 180
     env:
       # A pre-provisioned flat artifact directory; empty uses the documented local default.
+      CI_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
       ALLOY_QWEN3_ARTIFACT: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
       ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
 
@@ -247,7 +248,20 @@ jobs:
       - name: checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          clean: false
           persist-credentials: false
+
+      - name: Clean source while retaining the Cargo build cache
+        id: clean_source
+        run: |
+          set -euo pipefail
+          git reset --hard "$CI_CANDIDATE"
+          git clean -ffdx -e /target/
+          rm -rf -- target/w4-acceptance target/w5-acceptance target/phase-1-acceptance
+          test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
 
       - name: Node runtime
         uses: actions/setup-node@v5
@@ -262,75 +276,52 @@ jobs:
       - name: Host lock regression
         run: python3 -B -m unittest discover -s scripts/tests -p test_mac_ci_lock.py
 
-      - name: Tool registry tests
+      # This collector retains W3 gates/source evidence and executes the full
+      # serial workspace suite, check, Clippy, doctests, strict rustdoc, and
+      # parallel harness suite. Share that verification with mac-core.
+      - name: Approval/storage and complete native workspace verification
         run: |
           set -euo pipefail
-          cargo test --locked -p tool-registry --all-targets
-          cargo test --locked -p tool-registry --doc
+          test "$(git rev-parse HEAD)" = "$CI_CANDIDATE"
+          evidence="$RUNNER_TEMP/approval-storage-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-macos"
+          mkdir -p "$evidence"
+          printf 'candidate=%s\nrun=%s/%s/actions/runs/%s\nattempt=%s\n' \
+            "$CI_CANDIDATE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > "$evidence/workflow.txt"
+          python3 scripts/approval_storage_evidence.py \
+            --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results"
 
-      - name: Metal and unified tests
-        run: |
-          set -euo pipefail
+      - name: Retain approval/storage macOS evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: approval-storage-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/approval-storage-evidence-${{ github.run_id }}-${{ github.run_attempt }}-macos/
+          if-no-files-found: error
+          retention-days: 30
 
-          cargo test --locked -p mlx-ffi \
-            --no-fail-fast \
-            -- --test-threads=1
-
-      - name: Native infrastructure and KV block transfers
-        run: cargo test --locked -p inference-infra --all-targets
-
-      - name: Qwen3 tests
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p qwen3 --all-targets
-          cargo test --locked -p qwen3 --doc
-
-      - name: engine all-target check
-        run: |
-          set -euo pipefail
-
-          cargo check --locked -p engine --all-targets
-
-      - name: engine all-target tests
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --all-targets
-
-      - name: engine documentation tests
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p engine --doc
-
-      - name: engine documentation build
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          set -euo pipefail
-
-          cargo doc --locked -p engine --no-deps
+      # Preserve the previous default-parallel schedules in addition to the
+      # collector's serial run. MLX remains serial; harness runs in parallel
+      # in the collector and W5. No package's former schedule is dropped.
+      - name: Native parallel package regression
+        run: cargo test --locked --workspace --exclude mlx-ffi --exclude harness-core --all-targets
 
       - name: W4 scoped named gates and candidate evidence
         env:
-          ALLOY_W4_CANDIDATE: ${{ github.sha }}
+          ALLOY_W4_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
           ALLOY_W4_OUTPUT: ${{ github.workspace }}/target/w4-acceptance/macos
           CI_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CI_CANDIDATE"
           mkdir -p "$ALLOY_W4_OUTPUT"
-          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$GITHUB_SHA" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W4_OUTPUT/ci-identity.txt"
-          cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p tool-registry -p harness-core -p engine --no-deps
+          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$CI_CANDIDATE" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W4_OUTPUT/ci-identity.txt"
           bash scripts/builtin_acceptance.sh
           grep -Fx 'exit_code=0' "$ALLOY_W4_OUTPUT/status.txt"
           test -s "$ALLOY_W4_OUTPUT/p2-07-run.log" && test -s "$ALLOY_W4_OUTPUT/p2-09-run.log"
 
       - name: Retain builtin macOS evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.clean_source.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
@@ -340,38 +331,24 @@ jobs:
 
       - name: W5 named hooks, owned-process and sandbox gates
         env:
-          ALLOY_W5_CANDIDATE: ${{ github.sha }}
+          ALLOY_W5_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
           ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
           CI_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CI_CANDIDATE"
           mkdir -p "$ALLOY_W5_OUTPUT"
-          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$GITHUB_SHA" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W5_OUTPUT/ci-identity.txt"
+          printf 'checkout=%s\npr_head=%s\ntree=%s\n' "$CI_CANDIDATE" "$CI_PR_HEAD" "$(git rev-parse 'HEAD^{tree}')" > "$ALLOY_W5_OUTPUT/ci-identity.txt"
           bash scripts/plugin_acceptance.sh
           test -s "$ALLOY_W5_OUTPUT/report.json"
 
       - name: Retain plugin macOS evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.clean_source.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: w5-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w5-acceptance/macos/
           if-no-files-found: error
           retention-days: 30
-
-      # The W5 collector above executes harness-core all-target and doc tests.
-
-      - name: alloyd all-target tests
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --all-targets
-
-      - name: alloyd documentation tests
-        run: |
-          set -euo pipefail
-
-          cargo test --locked -p alloyd --doc
 
   # Independent physical Macs enable these two jobs to run simultaneously.
   # A single registered Mac serializes them; never run two model jobs on the
@@ -387,13 +364,27 @@ jobs:
         shell: python3 scripts/ci/mac_locked_step.py {0}
     timeout-minutes: 180
     env:
+      CI_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
       ALLOY_QWEN3_ARTIFACT: ${{ vars.ALLOY_QWEN3_ARTIFACT }}
       ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
     steps:
       - name: checkout
         uses: actions/checkout@v5
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          clean: false
           persist-credentials: false
+      - name: Clean source while retaining the Cargo build cache
+        id: clean_source
+        run: |
+          set -euo pipefail
+          git reset --hard "$CI_CANDIDATE"
+          git clean -ffdx -e /target/
+          rm -rf -- target/w4-acceptance target/w5-acceptance target/phase-1-acceptance
+          test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+
       - name: Node runtime
         uses: actions/setup-node@v5
         with:
@@ -404,7 +395,7 @@ jobs:
         run: node scripts/homebrew/host-check.mjs
 
       - name: Retain early Homebrew host evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.clean_source.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: homebrew-host-${{ github.run_id }}-${{ github.run_attempt }}
@@ -453,7 +444,7 @@ jobs:
         run: exec node scripts/homebrew/ci.mjs --cleanup-owned
 
       - name: Retain Phase 1 and Homebrew acceptance evidence
-        if: ${{ always() }}
+        if: ${{ always() && steps.clean_source.outcome == 'success' }}
         uses: actions/upload-artifact@v6
         with:
           name: phase-1-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
@@ -474,3 +465,16 @@ jobs:
           CORE: ${{ needs.mac_core.result }}
           INTEGRATION: ${{ needs.mac_integration.result }}
         run: test "$CORE" = success && test "$INTEGRATION" = success
+
+  approval_storage_mac:
+    # Preserve the required approval check without queuing a duplicate complete
+    # workspace run on the same physical Mac. mac-core also requires its upload.
+    name: approval-storage-macos-arm64
+    needs: [mac_core]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require collected approval/storage macOS evidence
+        env:
+          CORE: ${{ needs.mac_core.result }}
+        run: test "$CORE" = success
