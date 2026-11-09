@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, installedPluginSource, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
+import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, assertOwnedPluginPid, installedPluginSource, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
 
 const COMMIT = "c".repeat(40);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -232,4 +232,24 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
     targetGroups.delete(targetGroup);
     assert((await unrelated.liveMembers()).length > 0, "smoke cancellation signalled an unrelated group");
   }
+});
+
+
+test("installed plugin ownership requires a live isolated supervisor and private groups", () => {
+  const rows = [
+    { pid: 100, parent: 1, group: 100, state: "S" },
+    { pid: 101, parent: 100, group: 101, state: "S" },
+    { pid: 102, parent: 101, group: 102, state: "S" },
+  ];
+  assert.equal(assertOwnedPluginPid(100, 102, rows), 101);
+  for (const change of [
+    { index: 2, parent: 100 }, { index: 1, parent: 99 },
+    { index: 1, state: "Z" }, { index: 2, state: "Z" },
+    { index: 1, group: 100 }, { index: 2, group: 101 },
+  ]) {
+    const altered = rows.map(row => ({ ...row }));
+    Object.assign(altered[change.index], change);
+    assert.throws(() => assertOwnedPluginPid(100, 102, altered));
+  }
+  assert.throws(() => assertOwnedPluginPid(100, 102, rows.filter(row => row.pid !== 101)));
 });

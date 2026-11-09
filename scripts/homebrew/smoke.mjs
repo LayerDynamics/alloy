@@ -154,6 +154,18 @@ export function assertOwnedDaemonPid(group, daemonPid, table) {
   assert(row && row.group === group && !row.state.startsWith("Z"), `Daemon PID ${daemonPid} is not a live descendant in owned process group ${group}`);
 }
 
+/** Verify the installed macOS ownership chain, including the isolated reaper. */
+export function assertOwnedPluginPid(daemonPid, pluginPid, table) {
+  assert(Number.isSafeInteger(pluginPid) && pluginPid > 1 && pluginPid !== daemonPid, "Invalid installed plugin PID");
+  const plugin = table.find(entry => entry.pid === pluginPid);
+  assert(plugin && plugin.group === pluginPid && !plugin.state.startsWith("Z"), "Installed plugin is not a live private-group leader");
+  const supervisor = table.find(entry => entry.pid === plugin.parent);
+  assert(supervisor && supervisor.pid !== daemonPid && supervisor.parent === daemonPid &&
+    supervisor.group === supervisor.pid && !supervisor.state.startsWith("Z"),
+  "Installed plugin is not owned by the daemon's live isolated supervisor");
+  return supervisor.pid;
+}
+
 /** A fresh process group owns the complete child tree, even if its parent exits first. */
 export class OwnedProcess {
   constructor(command, args, { cwd, env, output, label, recordChunks = false }) {
@@ -545,16 +557,14 @@ export async function runSmoke(options) {
       const pluginObservation = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
       assert.equal(pluginObservation.method, "initialize");
       assert(Number.isInteger(pluginObservation.pid) && pluginObservation.pid > 1);
-      const pluginRow = (await processTable()).find(entry => entry.pid === pluginObservation.pid);
-      assert(pluginRow && pluginRow.parent === pluginOwner.group && !pluginRow.state.startsWith("Z"),
-        "Installed plugin is not a live child of the installed daemon");
+      const supervisorPid = assertOwnedPluginPid(pluginOwner.group, pluginObservation.pid, await processTable());
       const pluginStop = await pluginOwner.stop();
       const pluginExitDeadline = Date.now() + 5000;
-      while ((await processTable()).some(entry => entry.pid === pluginObservation.pid && !entry.state.startsWith("Z"))) {
-        assert(Date.now() < pluginExitDeadline, "Installed plugin remained alive after daemon stop");
+      while ((await processTable()).some(entry => [pluginObservation.pid, supervisorPid].includes(entry.pid) && !entry.state.startsWith("Z"))) {
+        assert(Date.now() < pluginExitDeadline, "Installed plugin or supervisor remained alive after daemon stop");
         await sleep(50);
       }
-      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, cleanup: pluginStop };
+      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, supervisor_pid: supervisorPid, cleanup: pluginStop };
       jsonFile(path.join(options.output, "installed-plugin.json"), result.plugin_startup);
     }
     check();
