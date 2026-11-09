@@ -1,5 +1,13 @@
 use super::*;
 
+#[cfg(target_os = "macos")]
+fn install_exec_helper(dir: &Path) {
+    let link = dir.join("alloy-plugin-exec-helper");
+    if !link.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_alloy-plugin-exec-helper"), link).unwrap();
+    }
+}
+
 // Plugin-host boundary tests share the parent test target's fixture/config helpers.
 fn observed_pid(dir: &Path, id: &str) -> i32 {
     std::fs::read_to_string(dir.join(format!("events.{id}.pid")))
@@ -38,6 +46,7 @@ fn assert_reaped(pid: i32) {
 fn fileport_helper_failure_and_cancellation_reap_exact_child() {
     for mode in ["crash", "hang", "cancel"] {
         let dir = tempfile::tempdir().unwrap();
+        install_exec_helper(dir.path());
         let marker = dir.path().join("helper.pid");
         let source = dir.path().join("helper.rs");
         let binary = dir.path().join("helper");
@@ -105,6 +114,7 @@ fn fileport_helper_failure_and_cancellation_reap_exact_child() {
 #[test]
 fn fileport_rejects_malformed_helper_message() {
     let dir = tempfile::tempdir().unwrap();
+    install_exec_helper(dir.path());
     let helper = dir.path().join("malformed-helper");
     let source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fileport_malformed_helper.c");
@@ -221,6 +231,7 @@ fn fileport_rejects_wrong_sender_and_complex_messages() {
     let dir = tempfile::tempdir().unwrap();
     let source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fileport_adversarial_helper.c");
+    install_exec_helper(dir.path());
     for mode in 1..=3 {
         let helper = dir.path().join(format!("adversarial-helper-{mode}"));
         assert!(
@@ -1071,4 +1082,71 @@ fn plugin_high_fd_isolated_helper() {
     // SAFETY: restore this helper's original limit before final harness reporting.
     assert_eq!(unsafe { setrlimit(NOFILE, &original) }, 0);
     println!("W5_HIGH_FD_REGRESSION_PASSED fd={high} soft_limit=64");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn plugin_external_reaper_owns_supervisor_statuses() {
+    const MODE: &str = "ALLOY_W5_EXTERNAL_REAPER_HELPER";
+    if std::env::var_os(MODE).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hardening::plugin_external_reaper_owns_supervisor_statuses",
+                "--nocapture",
+            ])
+            .env(MODE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Compile before the process-global reaper starts so rustc retains its own
+    // exit status. This test runs alone in a separate test-harness process.
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = config(dir.path(), "external", "allow");
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
+    let reaper = std::thread::spawn(move || {
+        unsafe extern "C" {
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        let mut statuses = 0;
+        loop {
+            // SAFETY: this isolated test owns the process-wide reaper; status
+            // is deliberately ignored for supervisor children only.
+            let pid = unsafe { waitpid(-1, std::ptr::null_mut(), 1) };
+            if pid > 0 {
+                statuses += 1;
+                continue;
+            }
+            if stop.load(std::sync::atomic::Ordering::Acquire) && pid < 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        statuses
+    });
+    let host = PluginHost::start_with_external_reaper(
+        vec![plugin],
+        limits(),
+        deadline(),
+        &CancellationToken::default(),
+        Some(Path::new(env!("CARGO_BIN_EXE_alloy-plugin-pipe-helper"))),
+    )
+    .unwrap();
+    let pid = observed_pid(dir.path(), "external");
+    drop(host);
+    done.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        reaper.join().unwrap(),
+        2,
+        "external reaper must own both supervisor statuses"
+    );
+    assert_reaped(pid);
 }

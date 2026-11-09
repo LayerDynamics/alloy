@@ -121,6 +121,7 @@ rm -f crates/mlx-ffi/src/bindings.rs
 cargo build \
   --locked \
   -p mlx-ffi \
+  --features regenerate-bindings \
   --target-dir /tmp/target
 
 test -s crates/mlx-ffi/src/bindings.rs

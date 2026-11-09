@@ -39,10 +39,11 @@ export function selectNativeArtifacts(messages, metadata, sourceRoot) {
   const records = messages.split("\n").filter((line) => line.trim()).map((line) => JSON.parse(line));
   const daemon = unique(records.filter((r) => r.reason === "compiler-artifact" && r.package_id === daemonPackage.id && r.target?.name === "alloyd" && r.target.kind.includes("bin") && r.profile?.test === false && r.executable).map((r) => requiredFile(r.executable)), "candidate alloyd executable");
   const pipe_helper = unique(records.filter((r) => r.reason === "compiler-artifact" && r.package_id === harnessPackage.id && r.target?.name === "alloy-plugin-pipe-helper" && r.target.kind.includes("bin") && r.profile?.test === false && r.executable).map((r) => requiredFile(r.executable)), "candidate pipe helper");
+  const exec_helper = unique(records.filter((r) => r.reason === "compiler-artifact" && r.package_id === harnessPackage.id && r.target?.name === "alloy-plugin-exec-helper" && r.target.kind.includes("bin") && r.profile?.test === false && r.executable).map((r) => requiredFile(r.executable)), "candidate exec helper");
   const out = unique(records.filter((r) => r.reason === "build-script-executed" && r.package_id === ffiPackage.id && r.out_dir).map((r) => r.out_dir), "candidate MLX build directory");
   const libraries = ["lib", "lib64"].map((dir) => path.join(out, dir, "mlx.metallib")).filter((file) => fs.existsSync(file));
   const metal = unique(libraries.map(requiredFile), "candidate mlx.metallib");
-  return { daemon, pipe_helper, metal_library: metal, native_build_out_dir: out, version: daemonPackage.version };
+  return { daemon, pipe_helper, exec_helper, metal_library: metal, native_build_out_dir: out, version: daemonPackage.version };
 }
 
 function runtimeFiles(root) {
@@ -67,6 +68,7 @@ export function installPackage({ sourceRoot, prefix, optPrefix, nodeRuntime, sou
     [path.join(nodeRuntime, "LICENSE"), "libexec/node/LICENSE", false],
     [native.daemon, "libexec/native/alloyd", true],
     [native.pipe_helper, "libexec/native/alloy-plugin-pipe-helper", true],
+    [native.exec_helper, "libexec/native/alloy-plugin-exec-helper", true],
     [native.metal_library, "libexec/native/mlx.metallib", false],
     [path.join(cli, "bin/alloy.js"), "libexec/cli/bin/alloy.js", true],
     [path.join(cli, "package.json"), "libexec/cli/package.json", false],

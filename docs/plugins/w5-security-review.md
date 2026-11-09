@@ -48,19 +48,57 @@ Only stdin/stdout/stderr are deliberately inherited; no environment is inherited
 An isolated real-host regression retains FD >=128, lowers NOFILE to 64, and verifies
 that the executed plugin cannot observe the descriptor on either platform.
 
-The owner keeps a direct child handle unreaped until stop, sends SIGKILL to its
-private process group and direct child, retries interrupted wait, and reports
-cleanup errors in bounded retained diagnostics. Tests independently observe ESRCH
-and ECHILD for exact child PIDs after timeout, cancellation, invalid responses,
-failed registration, and drop. This is not an OS OOM prevention mechanism.
+On macOS, a dedicated `alloy-plugin-exec-helper` supervisor owns each helper or
+plugin as its direct child. It resets SIGCHLD to its default disposition, starts
+the target suspended in a new session, publishes its stable kernel identity,
+and resumes it only after the host commits the launch. Configured code never
+runs inside the supervisor. A daemon-wide `waitpid(-1)` reaper therefore cannot
+reap the target. The supervisor observes exit with `waitid(WNOWAIT)`, kills the
+private process group and target while the unreaped leader pins their numeric
+IDs, verifies that no live group members remain, then reaps the target. Trusted
+plugins may launch subprocesses; cleanup covers descendants remaining in that
+session's original process group. Trusted descendants that deliberately detach
+are outside this containment contract.
 
-Independent review found that an unrelated process-wide child reaper can consume
-an owned child before cleanup; its PID can then be reused before a SIGKILL. This
-applies to helper and plugin cleanup. The tests assume exclusive reaping and do
-not establish safety with a competing reaper or SIGCHLD auto-reaping. Acceptance
-is blocked until ownership is enforced or an identity-safe cleanup mechanism is
-implemented and tested. Do not embed this host in a process with competing child
-reapers and treat the warning as a complete fix.
+The host sends cancellation through shared atomic state, not a numeric PID.
+Cancellation is monotonic and survives host unmapping. The supervisor also
+checks the host's stable identity and cleans up when the host disappears.
+Fallback direct-target signals compare `PROC_PIDUNIQIDENTIFIERINFO` uniqueid and
+use `proc_signal_with_audittoken`; the kernel validates PID plus exec version.
+Exec-version changes are retried only while the stable uniqueid matches. There
+is no daemon raw PID/group signal fallback. These Darwin interfaces are checked
+at runtime; identity lookup failure rejects launch. The native regression runs
+an active competing reaper, SIGCHLD auto-reaping, exec transitions, stale
+identity signals against a live sentinel, and trusted descendant cleanup after
+both stop and natural leader exit. It models stale identity deterministically;
+it does not claim to force actual kernel PID wraparound.
+
+Cleanup waits are bounded. A caller timeout reports cleanup as unestablished
+and leaves the supervisor alive to finish; it does not destroy the process
+that owns group cleanup. This is not an OS OOM prevention mechanism.
+
+Remaining lifecycle limits must not be represented as accepted W5 guarantees:
+
+- A bootstrap wedged before publishing its identity cannot be safely signaled
+  by PID. Cancellation prevents it from subsequently starting configured code.
+- Unexpected supervisor death before target identity publication can leave a
+  suspended target. After publication, the host can signal the exact target,
+  but this does not establish cleanup of arbitrary trusted descendants.
+Host-owned mode exclusively owns supervisor exit statuses. Embedders with a
+process-wide child reaper or SIGCHLD auto-reaping must use
+`PluginHost::start_with_external_reaper`: this mode never waits for supervisor
+PIDs and leaves those statuses to the registered reaper. Plugin completion and
+errors still come from shared memory. This explicit mode closes the separate
+numeric-wait/PID-reuse exit-status race; mixing an uncoordinated reaper with
+host-owned mode is unsupported. The isolated integration test requires the
+external reaper to collect exactly both supervisor statuses (pipe and plugin).
+
+
+Research references: Apple's [process identity and audited signal implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c),
+[identity ABI](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h),
+[signal/group behavior](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c),
+and [libproc return conventions](https://github.com/apple-oss-distributions/xnu/blob/main/libsyscall/wrappers/libproc/libproc.c).
+The tested host is macOS 26.4 (25E246); this is not qualification of every macOS release.
 
 ## Protocol boundary
 
@@ -87,7 +125,7 @@ includes an intentionally inheritable positive control. The changed transport
 still requires candidate-bound CI and an independent review decision.
 
 Executable pathname checks do not pin an inode against replacement. Registration
-rejects a write tree containing any configured executable or the helper, scans
+rejects a write tree containing any configured executable or either helper, scans
 write trees for existing hard-linked regular files, and rejects trees exceeding
 16,384 entries. Seatbelt denies creation of new hard links. This conservative
 scan is point-in-time and cannot stop a trusted same-UID host process from racing
@@ -107,7 +145,7 @@ does not protect an artifact tree the operator has explicitly granted writable.
       denied loopback connection, denied fork, and independent child reaping.
 - [ ] Reviewer confirms executable deployment assumptions and grants are adequate
       for the supported plugin configuration; no claim of arbitrary-code isolation.
-- [ ] Candidate/run/artifact identities and logs are linked on #32/PR #46.
+- [ ] Candidate/run/artifact identities and logs are linked on #32/PR #100.
 - [ ] Reviewer records name, date, candidate SHA, and explicit acceptance decision.
 
 A shell script or passing test must not check off reviewer approval automatically.

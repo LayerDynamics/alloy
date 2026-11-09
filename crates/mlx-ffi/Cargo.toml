@@ -19,6 +19,9 @@ workspace = true
 # layer must stay dependency-free so the infra/family crates above it
 # (Phase 1+) own every choice. No [dependencies] until there is a reason.
 
+[features]
+regenerate-bindings = ["dep:bindgen"]
+
 [build-dependencies]
-bindgen.workspace = true
+bindgen = { workspace = true, optional = true }
 cmake.workspace = true

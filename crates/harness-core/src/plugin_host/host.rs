@@ -108,13 +108,15 @@ pub struct PluginHost {
 impl PluginHost {
     /// Handshake all plugins atomically before publishing a host. Failure drops
     /// and reaps already-started children. No tool is offered during registration.
+    /// On macOS, use `start_with_external_reaper` if the embedding daemon has a
+    /// process-wide reaper; the default owns supervisor exit statuses exclusively.
     pub fn start(
         configs: Vec<PluginConfig>,
         limits: Limits,
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<Self, HostError> {
-        Self::start_inner(configs, limits, deadline, cancel, None)
+        Self::start_inner(configs, limits, deadline, cancel, None, false)
     }
 
     /// Start with an explicitly selected absolute macOS pipe-helper path.
@@ -126,7 +128,23 @@ impl PluginHost {
         cancel: &CancellationToken,
         helper: &std::path::Path,
     ) -> Result<Self, HostError> {
-        Self::start_inner(configs, limits, deadline, cancel, Some(helper))
+        Self::start_inner(configs, limits, deadline, cancel, Some(helper), false)
+    }
+
+    /// Start on macOS with supervisor exit statuses owned by the embedding
+    /// daemon's reaper (including SIGCHLD auto-reaping). Alloy never calls wait
+    /// on supervisor PIDs in this mode; plugin status travels over shared memory.
+    /// The caller must keep that reaper active through all supervisor exits.
+    /// Configured plugins remain children of an isolated, exclusive supervisor.
+    #[cfg(target_os = "macos")]
+    pub fn start_with_external_reaper(
+        configs: Vec<PluginConfig>,
+        limits: Limits,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        helper: Option<&std::path::Path>,
+    ) -> Result<Self, HostError> {
+        Self::start_inner(configs, limits, deadline, cancel, helper, true)
     }
 
     fn start_inner(
@@ -135,6 +153,7 @@ impl PluginHost {
         deadline: Instant,
         cancel: &CancellationToken,
         helper: Option<&std::path::Path>,
+        external_reaper: bool,
     ) -> Result<Self, HostError> {
         if configs.len() > 64
             || limits.message_bytes > 8 * 1024 * 1024
@@ -171,7 +190,14 @@ impl PluginHost {
             if cancel.is_cancelled() || Instant::now() >= deadline {
                 return Err(HostError::new("registration cancelled/expired"));
             }
-            let mut process = Process::spawn(&config, limits, helper.as_deref(), deadline, cancel)?;
+            let mut process = Process::spawn(
+                &config,
+                limits,
+                helper.as_deref(),
+                deadline,
+                cancel,
+                external_reaper,
+            )?;
             let handshake: Handshake = process.rpc("initialize", serde_json::json!({
                 "protocol_version":VERSION, "plugin_id":config.id, "plugin_version":config.version,
                 "hooks":[BEFORE,AFTER]

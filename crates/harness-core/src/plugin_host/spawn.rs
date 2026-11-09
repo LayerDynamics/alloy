@@ -36,9 +36,10 @@ pub(super) fn spawn(
     helper: Option<&Path>,
     deadline: Instant,
     cancel: &CancellationToken,
+    external_reaper: bool,
 ) -> Result<Spawned, HostError> {
     let command = sandbox::command(config)?;
-    platform(command, helper, deadline, cancel).map_err(HostError::io)
+    platform(command, helper, deadline, cancel, external_reaper).map_err(HostError::io)
 }
 #[cfg(target_os = "linux")]
 fn platform(
@@ -46,6 +47,7 @@ fn platform(
     _helper: Option<&Path>,
     _deadline: Instant,
     _cancel: &CancellationToken,
+    _external_reaper: bool,
 ) -> std::io::Result<Spawned> {
     use std::{io, os::unix::process::CommandExt, process::Stdio};
     unsafe extern "C" {
@@ -80,8 +82,9 @@ fn platform(
     helper: Option<&Path>,
     deadline: Instant,
     cancel: &CancellationToken,
+    external_reaper: bool,
 ) -> std::io::Result<Spawned> {
-    macos::spawn(cmd, helper, deadline, cancel)
+    macos::spawn(cmd, helper, deadline, cancel, external_reaper)
 }
 
 #[cfg(target_os = "macos")]
@@ -102,13 +105,16 @@ mod macos {
     #[link(name = "System")]
     unsafe extern "C" {
         fn alloy_fileport_pipes(
+            launcher: *const c_char,
             helper: *const c_char,
             stop: extern "C" fn(*mut c_void) -> i32,
             context: *mut c_void,
+            reap_owner: i32,
             out: *mut i32,
         ) -> i32;
-        fn kill(pid: i32, signal: i32) -> i32;
-        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn alloy_owned_stop(control: Opaque) -> i32;
+        fn alloy_owned_wait(control: Opaque, status: *mut i32, nohang: i32) -> i32;
+        fn alloy_owned_close(control: Opaque);
         fn posix_spawnattr_init(attr: *mut Opaque) -> i32;
         fn posix_spawnattr_destroy(attr: *mut Opaque) -> i32;
         fn posix_spawnattr_setflags(attr: *mut Opaque, flags: i16) -> i32;
@@ -117,13 +123,19 @@ mod macos {
         fn posix_spawn_file_actions_adddup2(actions: *mut Opaque, fd: i32, target: i32) -> i32;
         fn posix_spawn_file_actions_addclose(actions: *mut Opaque, fd: i32) -> i32;
         fn posix_spawn_file_actions_addchdir_np(actions: *mut Opaque, path: *const c_char) -> i32;
-        fn posix_spawn(
-            pid: *mut i32,
+        fn alloy_owned_spawn(
+            launcher: *const c_char,
             path: *const c_char,
-            actions: *const Opaque,
-            attr: *const Opaque,
+            actions: *mut Opaque,
+            attr: *mut Opaque,
             argv: *const *mut c_char,
             envp: *const *mut c_char,
+            stop: extern "C" fn(*mut c_void) -> i32,
+            context: *mut c_void,
+            reap_owner: i32,
+            pid: *mut i32,
+            identity: *mut u64,
+            control: *mut Opaque,
         ) -> i32;
     }
     fn checked(code: i32) -> io::Result<()> {
@@ -163,7 +175,8 @@ mod macos {
                 "invalid pipe helper",
             ));
         }
-        let mut protected = vec![helper.clone()];
+        let launcher = launcher_path(&helper)?;
+        let mut protected = vec![helper.clone(), launcher];
         for config in configs {
             protected.push(config.program.canonicalize()?);
         }
@@ -258,6 +271,7 @@ mod macos {
         helper: Option<&std::path::Path>,
         deadline: std::time::Instant,
         cancel: &tool_registry::execution::CancellationToken,
+        external_reaper: bool,
     ) -> io::Result<[OwnedFd; 6]> {
         let selected = match helper {
             Some(path) if path.is_absolute() => path.to_owned(),
@@ -279,24 +293,19 @@ mod macos {
                 "invalid pipe helper",
             ));
         }
-        let selected = cstring(selected.as_os_str())?;
-        struct Stop<'a> {
-            deadline: std::time::Instant,
-            cancel: &'a tool_registry::execution::CancellationToken,
-        }
-        extern "C" fn stopped(context: *mut c_void) -> i32 {
-            // SAFETY: the synchronous C call retains this live stack value only for its duration.
-            let state = unsafe { &*(context.cast::<Stop<'_>>()) };
-            i32::from(state.cancel.is_cancelled() || std::time::Instant::now() >= state.deadline)
-        }
+        let selected_path = selected;
+        let selected = cstring(selected_path.as_os_str())?;
+        let launcher = cstring(launcher_path(&selected_path)?.as_os_str())?;
         let mut state = Stop { deadline, cancel };
         let mut raw = [-1; 6];
         // SAFETY: selected is NUL-terminated; callback/context and six output slots remain valid.
         let code = unsafe {
             alloy_fileport_pipes(
+                launcher.as_ptr(),
                 selected.as_ptr(),
                 stopped,
                 (&mut state as *mut Stop<'_>).cast(),
+                i32::from(!external_reaper),
                 raw.as_mut_ptr(),
             )
         };
@@ -306,40 +315,51 @@ mod macos {
         // SAFETY: the C function returns six distinct, owned CLOEXEC descriptors on success.
         Ok(raw.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
     }
+    fn launcher_path(helper: &std::path::Path) -> io::Result<std::path::PathBuf> {
+        let path = helper
+            .with_file_name("alloy-plugin-exec-helper")
+            .canonicalize()?;
+        if !path.is_file() {
+            return Err(io::Error::other("invalid exec helper"));
+        }
+        Ok(path)
+    }
+    struct Stop<'a> {
+        deadline: std::time::Instant,
+        cancel: &'a tool_registry::execution::CancellationToken,
+    }
+    extern "C" fn stopped(context: *mut c_void) -> i32 {
+        // SAFETY: the synchronous C call retains this live stack value only for its duration.
+        let state = unsafe { &*(context.cast::<Stop<'_>>()) };
+        i32::from(state.cancel.is_cancelled() || std::time::Instant::now() >= state.deadline)
+    }
     pub(crate) struct Child {
-        pid: i32,
+        control: Opaque,
         status: Option<ExitStatus>,
     }
     impl Child {
-        pub(crate) fn id(&self) -> u32 {
-            self.pid as u32
-        }
         pub(crate) fn kill(&mut self) -> io::Result<()> {
-            // SAFETY: targets the exact still-owned, unreaped direct child.
-            if unsafe { kill(self.pid, 9) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
+            // SAFETY: this uniquely owned record remains valid until Drop.
+            checked(unsafe { alloy_owned_stop(self.control) })
         }
         pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
             if let Some(status) = self.status {
                 return Ok(status);
             }
-            loop {
-                let mut raw = 0;
-                // SAFETY: raw is writable; only this exact direct child is reaped.
-                let result = unsafe { waitpid(self.pid, &mut raw, 0) };
-                if result == self.pid {
-                    let status = ExitStatus::from_raw(raw);
-                    self.status = Some(status);
-                    return Ok(status);
-                }
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
+            let mut raw = 0;
+            // SAFETY: control owns a live native supervisor record; raw is writable.
+            checked(unsafe { alloy_owned_wait(self.control, &mut raw, 0) })?;
+            let status = ExitStatus::from_raw(raw);
+            self.status = Some(status);
+            Ok(status)
+        }
+    }
+    // SAFETY: the uniquely owned native record is accessed only through &mut self.
+    unsafe impl Send for Child {}
+    impl Drop for Child {
+        fn drop(&mut self) {
+            // SAFETY: exactly one Child owns this native record.
+            unsafe { alloy_owned_close(self.control) };
         }
     }
     pub(super) fn spawn(
@@ -347,6 +367,7 @@ mod macos {
         helper: Option<&std::path::Path>,
         deadline: std::time::Instant,
         cancel: &tool_registry::execution::CancellationToken,
+        external_reaper: bool,
     ) -> io::Result<Spawned> {
         let program = cstring(cmd.get_program())?;
         let mut args = vec![program.clone()];
@@ -368,7 +389,7 @@ mod macos {
             output_write,
             error_read,
             error_write,
-        ] = pipes(helper, deadline, cancel)?;
+        ] = pipes(helper, deadline, cancel, external_reaper)?;
         let mut attr = Attr::new()?;
         let mut actions = Actions::new()?;
         // SAFETY: opaque handles are initialized, C strings/FDs remain live through
@@ -407,20 +428,35 @@ mod macos {
                 ))?;
             }
         }
+        let launcher = cstring(
+            launcher_path(helper.ok_or_else(|| io::Error::other("missing helper"))?)?.as_os_str(),
+        )?;
+        let mut state = Stop { deadline, cancel };
+        let mut identity = 0;
+        let mut control = std::ptr::null_mut();
         let mut pid = 0;
         // SAFETY: argv/envp are null-terminated and all referenced storage and
         // initialized spawn objects remain valid until the call returns.
         checked(unsafe {
-            posix_spawn(
-                &mut pid,
+            alloy_owned_spawn(
+                launcher.as_ptr(),
                 program.as_ptr(),
-                &actions.0,
-                &attr.0,
+                &mut actions.0,
+                &mut attr.0,
                 argv.as_ptr(),
                 environment.as_ptr(),
+                stopped,
+                (&mut state as *mut Stop<'_>).cast(),
+                i32::from(!external_reaper),
+                &mut pid,
+                &mut identity,
+                &mut control,
             )
         })?;
-        let child = Child { pid, status: None };
+        let child = Child {
+            control,
+            status: None,
+        };
         drop((input_read, output_write, error_write));
         Ok((
             child,

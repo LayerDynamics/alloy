@@ -51,13 +51,21 @@ Trusted is explicit and offers no sandbox claim. Linux does not implement the
 Mac policy and rejects it. Runtime reads must be explicitly declared; the Mac
 positive/negative test is mandatory, not ignored/skipped on a Mac runner.
 
-On macOS the host needs the `alloy-plugin-pipe-helper` executable. Production
-packages install it next to the daemon. For a source build, use
+On macOS the host needs both `alloy-plugin-pipe-helper` and
+`alloy-plugin-exec-helper`. Production packages install them next to the daemon. For a source build, use
 `cargo build --locked -p alloyd -p harness-core`; library embedders may instead
 provide its absolute path to `PluginHost::start_with_helper`. A missing or invalid
-helper fails registration. The helper creates pipe endpoints in a single-threaded
+helper fails registration. The exec helper must be beside the canonical pipe
+helper; it exclusively owns target reaping and group cleanup. The pipe helper creates pipe endpoints in a single-threaded
 process and transfers them through a private Mach port; the host checks the
 kernel-supplied sender identity and imports close-on-exec descriptors.
+
+Embedders with a process-wide child reaper must use the macOS
+`PluginHost::start_with_external_reaper` entry point and keep that reaper active
+through supervisor exit. It accepts an optional absolute pipe-helper path and
+never waits for supervisor PIDs. Default startup owns supervisor statuses and
+requires exclusive reaping. Both modes preserve trusted subprocesses in the
+plugin's original process group; neither contains malicious trusted descendants.
 
 The operator may keep a user-owned, writable installation. That model trusts the
 owner and unsandboxed processes running with the same privileges not to change

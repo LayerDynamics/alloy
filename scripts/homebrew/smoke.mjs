@@ -40,7 +40,7 @@ process.stdin.on("data", chunk => {
 const appendJson = (name, value) => fs.appendFileSync(name, `${JSON.stringify(value)}\n`);
 
 export const REQUIRED_FILES = [
-  "bin/alloy", "bin/alloyd", "libexec/node/bin/node", "libexec/native/alloyd", "libexec/native/alloy-plugin-pipe-helper", "libexec/native/mlx.metallib",
+  "bin/alloy", "bin/alloyd", "libexec/node/bin/node", "libexec/native/alloyd", "libexec/native/alloy-plugin-pipe-helper", "libexec/native/alloy-plugin-exec-helper", "libexec/native/mlx.metallib",
   "libexec/cli/package.json", "libexec/cli/bin/alloy.js", "libexec/cli/models/starter-model.json",
   "libexec/cli/dist/src/main.js", "libexec/cli/dist/src/version.js", "libexec/cli/dist/native/alloy-metrics",
 ];

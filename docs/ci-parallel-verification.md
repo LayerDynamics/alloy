@@ -56,3 +56,13 @@ The goal is to reduce execution time, not to skip checks. Ten minutes is a
 target rather than a guaranteed deadline: cold native builds, runner capacity,
 queue times, model loading, and artifact uploads can exceed it. Measure the
 complete run and each shard on the candidate before claiming a duration.
+
+Normal MLX builds now exclude the optional `bindgen` build dependency. Bindgen's
+proc-macro feature unification previously changed the build-script fingerprint
+between Cargo package selections and caused repeated native CMake/Metal builds
+inside one workflow. Checked-in bindings remain the normal build input;
+`scripts/bindgen_check.sh` explicitly enables `regenerate-bindings` for the
+pinned Linux regeneration gate. This removes that source of redundant work
+without dropping verification or adding competing runners to the same Mac.
+Complete candidate workflow timing is still required before claiming the
+ten-minute target.

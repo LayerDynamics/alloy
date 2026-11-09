@@ -1,3 +1,4 @@
+#include "owned_process.h"
 /* Private, bounded transfer of anonymous pipe ends from a single-threaded
  * child. No descriptors are created in the multithreaded daemon until
  * fileport_makefd atomically returns them with FD_CLOEXEC set. */
@@ -57,23 +58,18 @@ int alloy_fileport_helper(void) {
 }
 
 /* Cancellation callback is invoked only synchronously on the caller thread. */
-typedef int (*alloy_stop_callback)(void *);
 
-static void alloy_reap(pid_t pid, int terminate) {
-    if (pid <= 0) return;
-    if (terminate) (void)kill(pid, SIGKILL);
-    int status;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-}
 
 /* Return 0 on success; on failure close every imported descriptor, destroy the
  * receive right and kill/reap the exact helper. The plugin is not spawned here. */
-int alloy_fileport_pipes(const char *helper, alloy_stop_callback stop, void *context, int out[6]) {
+int alloy_fileport_pipes(const char *launcher, const char *helper, alloy_stop_callback stop, void *context, int reap_owner, int out[6]) {
     mach_port_t receiver = MACH_PORT_NULL;
     posix_spawnattr_t attr = NULL;
     posix_spawn_file_actions_t actions = NULL;
     int attr_ready = 0, actions_ready = 0, received = 0, result = EIO;
     pid_t pid = 0;
+    uint64_t identity = 0;
+    void *control = NULL;
     int endpoints[ALLOY_PIPE_COUNT] = {-1,-1,-1,-1,-1,-1};
     union { alloy_message message; unsigned char bytes[4096]; } buffer;
     memset(&buffer, 0, sizeof(buffer));
@@ -99,7 +95,7 @@ int alloy_fileport_pipes(const char *helper, alloy_stop_callback stop, void *con
     }
     char *argv[] = {(char *)helper, "--alloy-pipe-helper-v1", NULL};
     char *envp[] = {NULL};
-    error = posix_spawn(&pid, helper, &actions, &attr, argv, envp);
+    error = alloy_owned_spawn(launcher, helper, &actions, &attr, argv, envp, stop, context, reap_owner, &pid, &identity, &control);
     if (error) { pid = 0; result = error; goto done; }
     mach_msg_option_t options = MACH_RCV_MSG | MACH_RCV_TIMEOUT |
         MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
@@ -151,19 +147,12 @@ int alloy_fileport_pipes(const char *helper, alloy_stop_callback stop, void *con
     }
     for (;;) {
         int status = 0;
-        pid_t waited = waitpid(pid, &status, WNOHANG);
-        if (waited == pid) {
-            pid = 0;
+        int waited = alloy_owned_wait(control, &status, 1);
+        if (waited == 0) {
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) goto done;
             break;
         }
-        if (waited < 0 && errno != EINTR) {
-            result = errno;
-            /* A process-wide child reaper may have consumed this child. Do not
-             * signal a PID which could subsequently be reused. */
-            if (errno == ECHILD) pid = 0;
-            goto done;
-        }
+        if (waited != EAGAIN) { result = waited; goto done; }
         if (stop(context)) { result = ECANCELED; goto done; }
         struct timespec pause = {0, 10000000};
         (void)nanosleep(&pause, NULL);
@@ -176,7 +165,7 @@ int alloy_fileport_pipes(const char *helper, alloy_stop_callback stop, void *con
 done:
     for (int i = 0; i < ALLOY_PIPE_COUNT; ++i) if (endpoints[i] >= 0) close(endpoints[i]);
     if (received) mach_msg_destroy(&buffer.message.header);
-    if (pid > 0) alloy_reap(pid, 1);
+    if (control) alloy_owned_close(control);
     if (actions_ready) posix_spawn_file_actions_destroy(&actions);
     if (attr_ready) posix_spawnattr_destroy(&attr);
     if (receiver != MACH_PORT_NULL) {
