@@ -4,15 +4,16 @@
 
 **Naming (decided, v1.6):** the project is **alloy** — binaries `alloy` (TS CLI) and `alloyd` (Rust daemon), npm package `alloyml`, Homebrew tap formula `alloy`, config dir `~/.alloy/` (bare `alloy` is taken on crates.io and npm, hence the suffixed names).
 
-**Date:** 2026-11-03 (revised same day through v1.9; v1.10 2026-04-10 — oMLX-method memory parity)
+**Date:** 2026-11-03 (revised same day through v1.9; v1.10 2026-04-10 — oMLX-method memory parity; v1.11 2026-11-09 — M3 local-family scope and mandatory Ornith)
 **Author:** User (with Perplexity Computer)
 **Status:** Draft
-**Version:** 1.10
+**Version:** 1.11
 
 ## Revision History
 
 | Version | Date | Change |
 |---------|------|--------|
+| 1.11 | 2026-11-09 | User scope correction: native local text-family implementation and initial qualification belong to M3, including Qwen3 text/Coder, Llama 3.x, Gemma 3/4, Ornith/Qwen3.5, Phi, SmolLM and Mistral/Ministral. Ornith is a mandatory M3 exit gate; only an explicit user scope change can waive it. M7 retains conversion, multimodal/retrieval and requalification against later capabilities. FR-4a, goals, architecture, phase scopes/exits, milestone table, dependencies, launch coverage and R1/descope policy aligned with GitHub issues #53, #72, #73 and #95–#99. |
 | 1.10 | 2026-04-10 | oMLX-method memory parity REQUIRED for the native engine: live tiered memory guard (safe/balanced/aggressive/custom), soft/hard watermarks, Metal wired-limit policy matching oMLX, quantized-resident weights, multi-model pin/TTL/LRU, and hot RAM + cold SSD KV (amends v1.4 “KV persistence dropped from V1”). Live ceiling formula supersedes Appendix D’s 25%-headroom rule as the runtime controller; Appendix D rows remain profile/benchmark defaults. Design: `docs/designs/omlx-memory-method-parity.md`. |
 | 1.0 | 2026-11-03 | Initial spec: Rust control plane + Python MLX-LM inference worker |
 | 1.1 | 2026-11-03 | Runtime changed to pure-Rust mlx-c engine (per-family model crates, vendored mlx-c, single process); IPC gateway component removed; Python demoted to optional build-time conversion CLI; architecture, phases, risks, and appendices revised accordingly |
@@ -91,7 +92,7 @@ Sequencing note (why the native engine precedes harness polish in V1): the engin
 
 What V1 delivers — the consolidated counterpart to §2.4's Non-Goals:
 
-- **Native MLX engine (MUST):** a pure-Rust, mlx-c-based inference engine in-process with the harness — FR-4a text families (Qwen3 text + Coder, Llama 3.x, Gemma 3), KV-cache management with prefix reuse, admission control against unified-memory budgets, and the FR-17/18/19 unified-memory feature set across all Apple RAM tiers (8–128 GB; 36 GB first-class).
+- **Native MLX engine (MUST):** a pure-Rust, mlx-c-based inference engine in-process with the harness — FR-4a local text families (Qwen3 text + Coder, Llama 3.x, Gemma 3/4, Ornith/Qwen3.5, Phi, SmolLM and Mistral/Ministral), implemented and initially qualified by M3; KV-cache management with prefix reuse, admission control against unified-memory budgets, and the FR-17/18/19 unified-memory feature set across all Apple RAM tiers (8–128 GB; 36 GB first-class). Ornith is a mandatory M3 gate, not a SHOULD-level or M7 deferral.
 - **Agent harness (MUST):** the canonical tool loop with structured tool-call parsing, argument validation, and a policy engine with approval gating; MCP client + skills; context engine with exact token counting and transactional compaction (FR-26/FR-27); durable, resumable sessions (event log); automations with crash recovery; plugin host with the minimal V1 hook set (FR-24).
 - **User surface (MUST):** a TypeScript CLI (FR-30a) over the daemon's local JSON-RPC API (B.6); `alloy doctor`, benchmark/validation reports; required always-on telemetry (FR-35) with a privacy policy and published event schema.
 - **V1 SHOULD surface:** FR-4b multimodal families (Qwen-VL + OCR, Whisper STT, TTS: Kokoro-82M per Q7 — with recorded deferrals per the TTS acceptance rule); speculative decoding with draft models (FR-12, committed); the oMLX adapter (FR-5); the published TS SDK and the TUI (FR-30b); embeddings/reranking first cut (FR-10).
@@ -110,7 +111,7 @@ What V1 delivers — the consolidated counterpart to §2.4's Non-Goals:
 | FR-1 | MUST | The system MUST load and run supported model families from HF-style model directories (config.json + safetensors + tokenizer files), local or downloaded from Hugging Face, with streaming generation — entirely within the Rust process via vendored mlx-c. |
 | FR-2 | MUST | The engine MUST be a pure-Rust runtime on mlx-c: MLX/mlx-c sources vendored and statically linked via the build system, no Python interpreter, no system MLX installation, and no other runtime process required. |
 | FR-3 | MUST | Model architectures MUST be implemented as per-family Rust crates over a shared inference-infrastructure crate (KV cache, RoPE, attention, quantized matmuls), with a registry that maps `architectures` from config.json to an implementation. |
-| FR-4a | MUST | V1 MUST implement the text families: Qwen 3 (text + Coder), Llama 3.x, and Gemma 3 (text) — this is the MUST floor. |
+| FR-4a | MUST | By M3, the native engine MUST implement and initially qualify local text profiles for Qwen3 (text + Coder), Llama 3.x, Gemma 3 and Gemma 4, Ornith/Qwen3.5, Phi, SmolLM and Mistral/Ministral. At least one pinned native text profile per named family MUST pass FR-8 and the Phase 3 agent/context/cache gates. Ornith itself MUST qualify: an upstream Qwen3.5 profile does not substitute for an Ornith profile. Missing architecture support, artifacts or conversion work are implementation requirements, not reasons to defer Ornith. Only an explicit user scope change can waive or move the Ornith M3 gate; the original narrower spec or an upstream support list cannot override it. Later phases requalify these profiles against new capabilities; they do not own initial text-family implementation. |
 | FR-4b | SHOULD | V1 SHOULD implement the multimodal families: VLM (vision + OCR), STT, and TTS — planned for V1; under the R1 contingency they are cut after the oMLX adapter and speculative decoding (descope ladder slot 3; slip to v1.1 is a SHOULD-level deferral, not a MUST violation). Pinned artifacts (v1.9; revisable only in the Phase 7 execution plan, recorded as a decision): VLM = Qwen2.5-VL (mlx-community, 3B/7B class), STT = Whisper large-v3-turbo, TTS = Kokoro-82M (decision, v1.7 — Q7). Multimodal conformance criteria (M7 gate): VLM — fixture image-QA and OCR accuracy on a fixed image set; STT — word error rate on a fixed audio fixture set; TTS — misaki G2P phonemization correctness plus audio-output sanity (duration, sample rate, no clipping). TTS acceptance: Kokoro-82M passing its conformance criteria by M7; if it fails to qualify, TTS is recorded as deferred to v1.1. |
 | FR-5 | SHOULD | The system SHOULD ship an oMLX adapter (users opt in per model profile), including its tiered KV caching and continuous batching, via its local OpenAI/Anthropic-compatible API. Promotion trigger: promote to MUST if native-engine family coverage blocks target users, or when large-context workloads need oMLX's SSD-tiered KV caching. The capabilities contract makes late addition a transport change, not a redesign. Compatibility policy: the adapter targets oMLX's OpenAI/Anthropic-compatible API (its stable surface), tested against a pinned oMLX release per release cycle. |
 | FR-6 | MUST | The system MUST provide an optional build-time conversion CLI (Python, wrapping mlx-lm tooling) that converts raw checkpoints into MLX-format HF-style directories with configurable quantization recipes (bit width, group size, tensor exclusions), recording the recipe hash in the artifact manifest. The runtime MUST NOT depend on this CLI. |
@@ -333,7 +334,7 @@ One Rust daemon (`alloyd`) — harness and engine share the address space; the i
 - **Dependencies:** mlx-c FFI layer.
 
 #### Component: Model-Family Crates (Rust, one per architecture)
-- **Responsibility:** Implement each architecture (Qwen3, Llama 3.x, Gemma 3, Qwen-VL, Whisper, TTS) over the infra crate; register against `architectures` values from config.json; declare per-family capabilities (context limits, cache modes, multimodal inputs).
+- **Responsibility:** Implement the M3 local text architectures (Qwen3, Llama 3.x, Gemma 3/4, Ornith/Qwen3.5, Phi, SmolLM and Mistral/Ministral) and later multimodal architectures (Qwen-VL, Whisper, TTS) over the infra crate; register against actual `architectures` values from config.json; declare per-family capabilities (context limits, cache/state modes, multimodal inputs). A model brand or fine-tune name is not an architecture: share a correct implementation where compatible, but qualify each shipped profile and never alias incompatible weights to an existing family.
 - **Interfaces:** Family registry; weight loading from safetensors; forward/decode loops.
 - **Dependencies:** Infra crate, mlx-c FFI layer.
 
@@ -529,7 +530,8 @@ repo/
     mlx-ffi/           # vendored mlx-c bindings (build.rs + CMake, PINS.md)
     inference-infra/   # KV cache, RoPE, attention, sampling
     families/          # one crate per architecture
-      qwen3/ llama3/ gemma3/ qwen-vl/ whisper/ tts/
+      qwen3/ qwen3_5/ llama3/ gemma3/ gemma4/ phi/ smollm/ mistral/
+      qwen-vl/ whisper/ tts/
     om-adapter/        # oMLX backend adapter (SHOULD — conditional)
   ts/
     cli/               # TypeScript CLI (Node LTS per Phase 0 pin)
@@ -553,10 +555,13 @@ repo/
 - **Scope:** Tool registry, structured tool-call parsing per model family, argument validation, policy engine (effect classes, approvals), cancellation, artifact store for oversized outputs; plugin host with the minimal V1 hook set (FR-24: `tool.before_execute` / `tool.after_execute`).
 - **Exit criteria:** A model can call a builtin tool (file read, shell with policy), with approval gating on destructive effects; malformed tool calls rejected, never executed; a plugin receives before/after-execute events for a tool call and can veto or annotate it.
 
-#### Phase 3: Context, compaction, exact counting
-- **Goal:** Correct context accounting and transactional compaction.
-- **Scope:** render_and_count, context snapshots, token budgets with output reserve, compaction checkpoints, basic single-session prefix cache with cache-prefix invalidation on compaction (moved here from Phase 1 so the cache ships with its tests); second family crate (Llama 3.x) to prove the infra crate generalizes.
-- **Exit criteria:** A long session that would overflow context compacts to a checkpoint and continues without event-history loss; cache reuse never serves a stale prompt (property-based test); Llama runs through the same pipeline as Qwen.
+#### Phase 3: Context, compaction and local model families
+- **Goal:** Correct context accounting and transactional compaction across the required native local text-family matrix, including mandatory Ornith support.
+- **Scope:** render_and_count, context snapshots, token budgets with output reserve, compaction checkpoints, basic single-session prefix cache with cache-prefix invalidation on compaction (moved here from Phase 1 so the cache ships with its tests); native implementation and initial per-profile conformance for all FR-4a local text families. Reuse the completed memory guard, quantized-resident loading, residency and hot/cold KV infrastructure. Extend cache identity and restore tests to recurrent/linear-attention state where required by a family's actual architecture.
+- **Profile matrix:** Qwen3 text + Coder; Llama 3.x; small local Gemma 3 profiles plus the frozen Gemma-3-12B 4-bit artifact; Gemma 4 E4B; Ornith-1.5-9B plus a small upstream Qwen3.5 profile; Phi-4-mini-instruct; SmolLM3-3B; and a local-sized Mistral/Ministral instruct profile starting with Ministral-3-3B-Instruct-2512. The execution plan pins immutable source/artifact revisions, licenses, tokenizer/template/weight hashes and quantization recipes before qualification. Pin changes preserve the named-family obligations; replacing or deferring Ornith requires an explicit user scope change. Ornith profiles share the correct Qwen3.5 architecture implementation where compatible and remain separately qualified profiles, not a fictitious brand-specific architecture crate.
+- **Exit criteria:** A long session that would overflow context compacts to a checkpoint and continues without event-history loss; property-based tests prove cache/state reuse never serves a stale prompt; every FR-4a family has a pinned native text profile passing FR-8 numerical and must-pass agent conformance through the same daemon/harness pipeline. Tests cover tool syntax/schema, stops, exact counting, long context, compaction, streaming, cancellation, restart and cached-versus-uncached behavior. Measure weight/cache/temporary memory and validated context under simulated 8 GB and real 36 GB budgets; reject incompatible tiers honestly rather than assuming every profile fits every Mac.
+- **Mandatory Ornith gate:** M3 MUST NOT close until an Ornith profile runs natively and passes the real-model local agent/tool/context/cache suite. No alternative model, external inference server, GGUF fallback, missing upstream support or conflicting historical wording satisfies or waives this gate. Technical blockers keep it open; only the user may authorize a scope change.
+- **Sequencing and tracking:** The conformance harness and initial family qualification are M3 work and MUST NOT depend on M4 model-registry implementation, M5 concurrency/draft/compiled features or M7 conversion delivery. Use existing local/preconverted artifact loading or a reproducible offline conversion when necessary; do not add Python at inference time. Phase 5 and Phase 7 extend/re-run conformance for capabilities introduced there. Track context/cache in #49–#51, Llama in #52, qualification in #72, Gemma 3 in #73, Ornith/Qwen3.5 in #95, Gemma 4 in #96, Phi in #97, SmolLM in #98, Mistral/Ministral in #99, and the complete M3 exit in #53. The Phase 0 benchmark corpus remains frozen; additional M3 conformance fixtures do not silently change release-comparison scenarios.
 
 #### Phase 4: MCP and skills
 - **Goal:** External tool ecosystems and task guidance.
@@ -574,10 +579,10 @@ repo/
 - **Scope:** Automation engine (schedule/event triggers, jobs, overlap policy, approval pauses, crash recovery), oMLX adapter behind the capabilities contract. The oMLX adapter is FR-5 SHOULD — if capacity is short, it is the first Phase 6 item to drop without blocking v1.0. The Phase 6 execution plan delivers the job-definition YAML schema (trigger, overlap policy, deadline, retry policy, approval timeout, permission scope — FR-29) and pins the V1 trigger vocabulary: `schedule` (cron, with catch-up-on-restart) and `event` (V1: `session.completed` only; extension post-v1).
 - **Exit criteria:** A scheduled job survives a daemon restart without duplicate side effects (MUST); if the adapter is in scope, a model profile selects oMLX and uses its tiered cache through the same session semantics (SHOULD-level demo).
 
-#### Phase 7: Families, conversion, multimodal
-- **Goal:** Full model coverage and the conversion pipeline.
-- **Scope:** Remaining text families (Gemma 3) and the multimodal set (Qwen-VL with OCR, Whisper STT, TTS: Kokoro-82M per Q7) per FR-4b; optional Python conversion CLI with quantization recipes and manifest output; agent-conformance suite per profile; embeddings/rerankers if time permits (FR-10 SHOULD — in scope; first-cut candidate under the R1 contingency).
-- **Exit criteria:** All FR-4a text families pass their conformance suites (MUST); multimodal families per FR-4b SHOULD — image description, OCR, and voice-in/voice-out work through model profiles where implemented, evaluated against the FR-4b per-modality conformance criteria (M7 gate), with any deferrals recorded per the FR-4b TTS rule; a raw checkpoint converts via the build-time CLI to a verified MLX artifact.
+#### Phase 7: Conversion, multimodal and requalification
+- **Goal:** Deliver the conversion pipeline and multimodal/retrieval coverage, and requalify M3 text profiles against later engine capabilities.
+- **Scope:** Multimodal implementations (Qwen-VL with OCR, Whisper STT, TTS: Kokoro-82M per Q7) per FR-4b; optional Python conversion CLI with quantization recipes and manifest output; extension of the M3 conformance harness for modalities, converted artifacts and capabilities added in Phase 5; embeddings/rerankers if time permits (FR-10 SHOULD — in scope; first-cut candidate under the R1 contingency). Initial native Gemma, Ornith and other FR-4a local text-family implementation/qualification belongs to Phase 3, not Phase 7.
+- **Exit criteria:** M3-delivered FR-4a profiles retain passing conformance and are requalified against advertised later capabilities and converted artifacts (MUST; not a deferral of their M3 acceptance); multimodal families per FR-4b SHOULD — image description, OCR, and voice-in/voice-out work through model profiles where implemented, evaluated against the FR-4b per-modality conformance criteria (M7 gate), with any deferrals recorded per the FR-4b TTS rule; a raw checkpoint converts via the build-time CLI to a verified MLX artifact. Ornith's mandatory native-support gate must already have passed at M3.
 
 #### Phase 8: Benchmarks, docs, v1 release
 - **Goal:** Performance claims proven; project shippable.
@@ -615,14 +620,14 @@ repo/
 |-----------|------|---------------|-------------|-------|
 | M1 | Vertical slice | Phase 1 exit criteria | 2026-12-03 | Solo |
 | M2 | Tool loop + policy | Phase 2 exit criteria | 2027-01-07 | Solo |
-| M3 | Context + compaction + 2nd family | Phase 3 exit criteria | 2027-02-04 | Solo |
+| M3 | Context + compaction + local model families | Phase 3 exit criteria, including mandatory native Ornith and FR-4a local-family conformance | 2027-02-04 | Solo |
 | M4 | MCP + skills | Phase 4 exit criteria | 2027-02-25 | Solo |
 | M5 | Scheduling + admission | Phase 5 exit criteria | 2027-03-18 | Solo |
 | M6 | Automations + oMLX | Phase 6 exit criteria | 2027-04-08 | Solo |
-| M7 | Families + conversion + multimodal | Phase 7 exit criteria | 2027-04-29 | Solo |
+| M7 | Conversion + multimodal + requalification | Phase 7 exit criteria; M3 text families requalified against later capabilities | 2027-04-29 | Solo |
 | M8 | Benchmarks + v1.0 | Phase 8 exit criteria | 2027-05-31 | Solo |
 
-Slack and descope policy: each milestone carries ~1 week of implied slack via phase overlap (the dependency graph's M6/M7 parallelism); if a milestone slips more than one week, apply descope in this order — (1) drop Phase 6's oMLX adapter (FR-5 SHOULD), (2) drop speculative decoding (FR-12 SHOULD — a performance optimization; cut before user-facing capability), (3) defer FR-4b multimodal items to v1.1 per the R1 contingency (TTS first), (4) defer FR-10 embeddings first-cut, (5) defer the TUI (FR-30b SHOULD) — before touching any MUST item. v1.0 date moves only if MUST items are at risk.
+Slack and descope policy: each milestone carries ~1 week of implied slack via phase overlap (the dependency graph's M6/M7 parallelism); if a milestone slips more than one week, apply descope in this order — (1) drop Phase 6's oMLX adapter (FR-5 SHOULD), (2) drop speculative decoding (FR-12 SHOULD — a performance optimization; cut before user-facing capability), (3) defer FR-4b multimodal items to v1.1 per the R1 contingency (TTS first), (4) defer FR-10 embeddings first-cut, (5) defer the TUI (FR-30b SHOULD) — before touching any MUST item. FR-4a families remain M3 delivery requirements; no automatic text-family deferral is authorized. Ornith MUST remain an M3 exit gate unless the user explicitly changes that scope. v1.0 date moves only if MUST items are at risk. Dates are retained planning targets, not a new forecast for the expanded M3 scope.
 
 ### Dependency Graph
 
@@ -631,8 +636,9 @@ M1 ──▶ M2 ──▶ M3 ──▶ M4 ──▶ M5 ──▶ M6 ──▶ M8
                 │               │       ▲
                 └──────▶ M7 ◀──┘       │
                          └────────────┘
-(M7 families/conversion/multimodal depends on M3 context engine and M5 admission;
- it can proceed in parallel with M6 from M5 onward)
+(M7 conversion/multimodal/requalification depends on M3 context + local families
+ and M5 admission; it can proceed in parallel with M6 from M5 onward.
+ M3 family implementation and initial conformance have no M5/M7 prerequisite.)
 ```
 
 ---
@@ -645,7 +651,7 @@ M1 ──▶ M2 ──▶ M3 ──▶ M4 ──▶ M5 ──▶ M6 ──▶ M8
 |--------|--------|--------------------|
 | Daily driver | Author uses it as primary local agent harness for ≥ 80% of daily coding/research agent tasks within 4 weeks of v1 | Self-reported usage log, with an objective proxy: session counts and task mix recorded in the daemon's own SQLite event log over the final 4 weeks (queryable via `alloy stats`), so the claim is checkable without telemetry |
 | Community growth | ≥ 200 GitHub stars and ≥ 5 external contributors (merged PRs) within 3 months of v1 | GitHub metrics |
-| Model coverage | FR-4a text families passing the conformance suite (Qwen3 text+Coder, Llama 3.x, Gemma 3) — MUST; FR-4b multimodal (Qwen-VL, Whisper, TTS) — SHOULD with recorded deferrals | CI conformance matrix |
+| Model coverage | FR-4a local text profiles passing initial native conformance by M3 (Qwen3 text+Coder, Llama 3.x, Gemma 3/4, Ornith/Qwen3.5, Phi, SmolLM, Mistral/Ministral) — MUST, with Ornith a mandatory M3 gate; requalification when later capabilities land; FR-4b multimodal (Qwen-VL, Whisper, TTS) — SHOULD with recorded deferrals | CI conformance matrix |
 | Performance | Benchmark NFR targets met (≥ 70% meet-or-exceed vs. llama.cpp/Ollama; oMLX in all tables) | Release benchmark reports |
 | Stability | No P0 correctness bugs (wrong-context generation, event loss) in the first month | Issue tracker |
 
@@ -669,7 +675,7 @@ Note: if the R2 contingency (§7) is exercised, the performance success bar is t
 
 | ID | Risk | Impact | Likelihood | Mitigation | Contingency |
 |----|------|--------|-----------|------------|-------------|
-| R1 | Scope too large for one developer in ~7 months — now includes owning model implementations (per-family crates) plus conversion and multimodal | High | High | Proven precedent (mlex, OminiX-MLX) provides the pattern and reference code; infra crate amortizes family cost; mlx-community artifacts skip conversion; oMLX backend covers broad architecture needs | Slip FR-4b multimodal items to v1.1 (TTS first, per the FR-4b deferral rule — a SHOULD-level deferral, not a MUST violation); if capacity is still short, cut FR-4a text families (Gemma 3 first) to v1.1 — a conscious MUST-level scope cut recorded as such, never silent; adopt family crates from community |
+| R1 | Scope too large for one developer in ~7 months — expanded M3 now includes all local text-family implementations plus later conversion and multimodal | High | High | Proven precedent (mlex, OminiX-MLX) provides the pattern and reference code; shared infrastructure amortizes family cost; correct architecture implementations serve compatible fine-tuned profiles; preconverted artifacts avoid conversion where available | Apply the §5 SHOULD descope ladder first, including multimodal deferral (TTS first). FR-4a local text families remain M3 requirements; any MUST scope change needs an explicit user decision. Ornith cannot be deferred, substituted or moved out of M3 without that decision; missing support or artifacts are implementation blockers, not an automatic waiver. Adopt suitable community implementation work where compatible and licensed. |
 | R2 | "Beat llama.cpp/Ollama" performance bar not met on enough scenarios | Medium | Medium | Scoped honestly (≥ 70% scenarios, published tables); direct in-process control avoids IPC overhead; optimize where MLX is structurally advantaged (prefill, unified memory); oMLX backend gives users the fastest MLX path where the native engine lags | Reframe NFR as "within 10% on 90% of scenarios" and lead with harness features; document losing scenarios |
 | R3 | mlx-c API churn or maturity gaps vs. the Python API (younger surface; some features arrive late or differ) | High | Medium | Pin vendored commits (PINS.md); conformance suite catches regressions per family; the own bindgen layer is regenerated on pin bump, so new MLX-C surface is callable immediately (coverage inventory fails CI on drift); mlx-c is Apple-official and Swift-aligned (same path as MLX Swift) | Hold pin at last-good version; report upstream; gate affected features off by capability registry |
 | R4 | Owning the binding layer becomes a maintenance liability (~bindgen upkeep across MLX-C releases; the cost ironbark accepted at ~26k lines for a full wrapper) | Medium | Medium | The own layer is thin and policy-free (raw ABI + RAII handles only — the engine crate owns semantics); regeneration is mechanical (bindgen + coverage inventory); the infra-crate API isolates family crates from the binding layer | Adopt or fork mlx-c-rust (complete, production-hardened bridge) — a drop-in replacement at the same boundary; the decision is recorded and reversible |
@@ -694,6 +700,7 @@ Note: if the R2 contingency (§7) is exercised, the performance success bar is t
 | 5 | **RESOLVED (v1.7, 2026-11-03):** speculative decoding **committed to shipping** — FR-12 promoted COULD → SHOULD, scheduled into Phase 5 scope and exit criteria; a family is draft-enabled only when its conformance suite passes with drafting enabled | User | Resolved |
 | 6 | **RESOLVED (v1.6, 2026-11-03):** benchmark corpus adopted ex-ante — tiers: 36 GB (hardware) + 8 GB (simulated budget); models: Qwen3-4B/14B 4-bit, Llama-3.1-8B 4-bit and 8-bit, Gemma-3-12B 4-bit (all mlx-community artifacts; same model+quant on llama.cpp/Ollama/oMLX); scenario classes: code Q&A on a fixed repo snapshot (50 questions), agentic tool loops (20 multi-turn tasks), long-context summarization (8k/32k documents), prefill-heavy large prompts; metrics: decode tokens/s, TTFT p50/p95, peak memory, agent-loop overhead; published in-repo at `bench/corpus/` in Phase 0 and frozen | User | Resolved |
 | 7 | **RESOLVED (v1.7, 2026-11-03):** **Kokoro-82M** is the V1 TTS family — mlx-community artifacts (Kokoro-82M-bf16/8bit/4bit), 82M params fits every tier, Apache-2.0 weights, 24 kHz output; a native non-Python MLX implementation is proven (kokoro-swift), so the Rust family crate is feasible; misaki G2P phonemization is part of the family crate's pipeline; the M7 conformance gate and the FR-4b deferral rule are unchanged | User | Resolved |
+| 8 | **RESOLVED (v1.11, 2026-11-09):** M3 delivers native local text-family implementation and initial qualification for the expanded FR-4a matrix. **Ornith is required in M3 regardless of conflicting historical spec wording or upstream support.** Only an explicit user scope change can waive or move that gate. Gemma and the other local text families are not M7 implementation work; M7 owns conversion, multimodal/retrieval and later-capability requalification. Tracking: [M3 exit #53](https://github.com/LayerDynamics/alloy/issues/53), [conformance #72](https://github.com/LayerDynamics/alloy/issues/72), [Gemma 3 #73](https://github.com/LayerDynamics/alloy/issues/73), [Ornith #95](https://github.com/LayerDynamics/alloy/issues/95), and family issues #96–#99. | User | Resolved |
 
 ---
 
@@ -966,4 +973,4 @@ Admission flow: inspect live ceiling → estimate (formula + calibration table; 
 
 ---
 
-*End of SPEC-1. Status: Draft v1.10 — v1.9 baseline plus oMLX-method memory parity (live guard, quantized-resident weights, multi-model reclaim, hot/cold SSD KV). Zero open decisions for that amend — design in `docs/designs/omlx-memory-method-parity.md`.*
+*End of SPEC-1. Status: Draft v1.11 — retains oMLX-method memory parity and requires M3 native local text-family delivery, including mandatory Ornith. M7 covers conversion, multimodal and later requalification. The M3 scope decision is resolved in §8; artifact pins and observed qualification results belong to the execution plan and acceptance evidence.*

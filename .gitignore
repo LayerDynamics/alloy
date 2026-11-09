@@ -28,3 +28,5 @@ bench/corpus/.venv
 .gradle/
 node_modules/
 dist/
+# Local work directories, including /work/ and nested work/ folders.
+work/
