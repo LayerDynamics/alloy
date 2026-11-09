@@ -100,7 +100,7 @@ impl Process {
         }
         self.dead = true;
         self.input.take();
-        // SAFETY: process_group(0) created a child-owned group. Negative PID
+        // SAFETY: spawn created a child-owned process group. Negative PID
         // targets that group, not the daemon. SIGKILL is 9 on Linux and macOS.
         unsafe {
             kill(-(self.child.id() as i32), 9);

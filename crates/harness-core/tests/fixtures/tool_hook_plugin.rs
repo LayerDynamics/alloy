@@ -77,6 +77,27 @@ fn main() {
                     assert!(std::net::TcpStream::connect_timeout(&args[6].parse().unwrap(), Duration::from_millis(100)).is_err());
                     #[cfg(target_os = "macos")]
                     {
+                        unsafe extern "C" {
+                            fn getpid() -> i32;
+                            fn getpgid(pid: i32) -> i32;
+                            fn getsid(pid: i32) -> i32;
+                            fn setpgid(pid: i32, group: i32) -> i32;
+                            fn setsid() -> i32;
+                        }
+                        let parent_group: i32 = args[9].parse().unwrap();
+                        // SAFETY: identity queries and denied session/group operations
+                        // affect only this isolated fixture process.
+                        let own = unsafe { getpid() };
+                        assert_eq!(unsafe { getpgid(0) }, own);
+                        assert_eq!(unsafe { getsid(0) }, own);
+                        assert_eq!(unsafe { setpgid(0, parent_group) }, -1, "plugin escaped into daemon group");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { setsid() }, -1, "plugin created another session");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { setpgid(0, 0) }, -1, "session leader changed group");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { getpgid(0) }, own);
+                        assert_eq!(unsafe { getsid(0) }, own);
                         let link_error = std::fs::hard_link(&args[7], &args[8]).expect_err("sandbox permitted a new hard link");
                         assert_eq!(link_error.kind(), io::ErrorKind::PermissionDenied);
                         unsafe extern "C" { fn fork() -> i32; }

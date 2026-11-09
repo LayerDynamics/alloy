@@ -97,7 +97,7 @@ mod macos {
         process::{Command, ExitStatus},
     };
     type Opaque = *mut c_void;
-    const POSIX_SPAWN_SETPGROUP: i16 = 0x0002;
+    const POSIX_SPAWN_SETSID: i16 = 0x0400;
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
     #[link(name = "System")]
     unsafe extern "C" {
@@ -112,7 +112,6 @@ mod macos {
         fn posix_spawnattr_init(attr: *mut Opaque) -> i32;
         fn posix_spawnattr_destroy(attr: *mut Opaque) -> i32;
         fn posix_spawnattr_setflags(attr: *mut Opaque, flags: i16) -> i32;
-        fn posix_spawnattr_setpgroup(attr: *mut Opaque, group: i32) -> i32;
         fn posix_spawn_file_actions_init(actions: *mut Opaque) -> i32;
         fn posix_spawn_file_actions_destroy(actions: *mut Opaque) -> i32;
         fn posix_spawn_file_actions_adddup2(actions: *mut Opaque, fd: i32, target: i32) -> i32;
@@ -378,9 +377,8 @@ mod macos {
         unsafe {
             checked(posix_spawnattr_setflags(
                 &mut attr.0,
-                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP,
+                POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSID,
             ))?;
-            checked(posix_spawnattr_setpgroup(&mut attr.0, 0))?;
             for (source, target) in [
                 (input_read.as_raw_fd(), 0),
                 (output_write.as_raw_fd(), 1),

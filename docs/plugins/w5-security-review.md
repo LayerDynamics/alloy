@@ -11,6 +11,18 @@ outside its canonical configured program. V1 sandboxed plugins therefore cannot
 use helper processes. Trusted local plugins remain explicitly trusted; this is
 not a Linux sandbox or containment guarantee for malicious trusted code.
 
+The fork restriction does not confine the original plugin to its initial
+process group. A native macOS probe using the W5-style deny-default profile
+observed a sandboxed group leader join its parent's group with `setpgid` and
+then create a new session with `setsid`. Both test children were reaped.
+The host now launches macOS plugins as session leaders using
+`POSIX_SPAWN_SETSID`, and the real sandboxed-host test attempts the same
+operations. Candidate-bound tests and independent review are still required.
+This does not by itself solve competing reapers or trusted descendants.
+Trusted macOS plugins also start in a new session without a controlling
+terminal; plugins must use their configured standard streams rather than rely
+on the daemon's terminal or job-control session.
+
 Only declared existing file resources are granted content access. Exact ancestor
 metadata rules cover traversal of original and canonical path spellings, without
 blanket metadata access. Startup grants remain the root-directory data probe and

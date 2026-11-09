@@ -846,6 +846,11 @@ fn plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut c = config(dir.path(), "s", "probe");
+    unsafe extern "C" {
+        fn getpgrp() -> i32;
+    }
+    // SAFETY: getpgrp only reads this test process's group identity.
+    let parent_group = unsafe { getpgrp() };
     c.cwd = c.cwd.canonicalize().unwrap();
     c.program = c.program.canonicalize().unwrap();
     c.args[2] = c.cwd.join("events").to_str().unwrap().into();
@@ -855,6 +860,7 @@ fn plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork() {
         listener.local_addr().unwrap().to_string(),
         c.program.to_str().unwrap().into(),
         c.cwd.join("forbidden-link").to_str().unwrap().into(),
+        parent_group.to_string(),
     ]);
     c.sandbox = Sandbox::MacOs {
         read_files: vec![
