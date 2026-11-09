@@ -95,3 +95,10 @@ to build a separate fresh installation and verify its candidate manifest, with
 the original build tree made unavailable during installed testing. Cache misses
 and toolchain/vendor changes still require rebuilds and can exceed the timing
 target.
+
+The Homebrew formula also retains a dedicated dependency cache under
+`HOMEBREW_CACHE/alloy-cargo`, checks it with locked offline fetch first, and
+fetches online only on a miss. Its native target directory stays inside the
+fresh Homebrew build tree. This removes repeated registry downloads without
+reusing compiled installation outputs. HTTP timeouts are per request; network
+outages and empty caches are not covered by a guaranteed ten-minute bound.
