@@ -109,6 +109,17 @@ total fetch deadline. Empty caches and registry outages can still exceed the
 CI timing target. This replaces repeated empty-cache downloads with ten
 120-second retries, which stalled the measured CI fetch.
 
+CI explicitly prepares this dependency cache before invoking Homebrew, using
+`cargo +<repository-pin> fetch --locked` from the exact candidate checkout.
+It records Cargo version, lockfile SHA-256, cache path and offline hit/miss,
+checks that the lockfile did not change, and applies a two-minute overall
+online-command deadline. Preparation downloads dependencies only. The formula
+still validates its cache, compiles in Homebrew's sandbox, and runs the unchanged
+installed tests. Preparation time is included in workflow timing. This avoids
+the observed Homebrew-specific registry stalls; the underlying environmental
+cause of those stalls is not established. Standalone empty-cache installations
+still depend on Homebrew's network-enabled fetch phase.
+
 Static MLX linkage does not embed `mlx.metallib`. Vendored MLX first searches
 beside its binary, then other resource locations and a build-time fallback.
 Packaging only `alloyd` can therefore appear to work while the build directory

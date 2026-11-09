@@ -102,3 +102,9 @@ fetches online only on a miss. Its native target directory stays inside the
 fresh Homebrew build tree. This removes repeated registry downloads without
 reusing compiled installation outputs. HTTP timeouts are per request; network
 outages and empty caches are not covered by a guaranteed ten-minute bound.
+
+The CI installation driver prepares locked Cargo dependencies with the pinned
+toolchain before Homebrew invocation and records the cache state, commands,
+Cargo version and lockfile digest. This is a fresh compiled installation with
+prepared dependencies; its total includes preparation. Homebrew sandboxing,
+fresh native compilation and installed acceptance remain unchanged.
