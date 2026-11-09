@@ -4,11 +4,40 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
+import { spawn } from "node:child_process";
+import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, installedPluginSource, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
 
 const COMMIT = "c".repeat(40);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const argumentsFor = (prefix, output) => ["--prefix", prefix, "--expected-commit", COMMIT, "--output", output];
+
+test("installed plugin fixture exits on EOF before and after its real handshake", async (t) => {
+  const root = directory(t);
+  const script = path.join(root, "fixture.cjs");
+  fs.writeFileSync(script, installedPluginSource());
+  for (const handshake of [false, true]) {
+    const marker = path.join(root, `marker-${handshake}`);
+    const child = spawn(process.execPath, [script, marker], { stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => { output += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    if (handshake) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 42 }) + "\n");
+    child.stdin.end();
+    const exit = await Promise.race([exited, new Promise((_, reject) => {
+      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("fixture did not exit on EOF")); }, 5000);
+      exited.then(() => clearTimeout(timer), () => clearTimeout(timer));
+    })]);
+    assert.deepEqual(exit, { code: 0, signal: null });
+    if (handshake) {
+      assert.equal(JSON.parse(output).id, 42);
+      assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).pid, child.pid);
+    } else assert.equal(fs.existsSync(marker), false);
+  }
+});
 
 function directory(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-installed-smoke-test-"));

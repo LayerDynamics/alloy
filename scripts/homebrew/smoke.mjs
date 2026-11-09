@@ -19,6 +19,24 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Match the wire recorder's monotonic clock, so stdout/terminal ordering is exact.
 const now = () => Number(process.hrtime.bigint() / 1000n) / 1000;
 const jsonFile = (name, value) => fs.writeFileSync(name, `${JSON.stringify(value, null, 2)}\n`);
+export const installedPluginSource = () => `const fs = require("node:fs");
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => process.stdout.end());
+process.stdin.on("data", chunk => {
+  input += chunk;
+  const end = input.indexOf("\\n");
+  if (end < 0) return;
+  const request = JSON.parse(input.slice(0, end));
+  if (request.method !== "initialize") process.exit(3);
+  fs.writeFileSync(process.argv[2], JSON.stringify({ pid: process.pid, method: request.method }));
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+    protocol_version: 1, plugin_id: "installed-smoke", plugin_version: "1.0.0",
+    hooks: ["tool.before_execute", "tool.after_execute"]
+  } }) + "\\n");
+  input = input.slice(end + 1);
+});
+`;
 const appendJson = (name, value) => fs.appendFileSync(name, `${JSON.stringify(value)}\n`);
 
 export const REQUIRED_FILES = [
@@ -358,6 +376,7 @@ export async function runSmoke(options) {
   const socket = path.join(runtime, "daemon.sock");
   const env = isolatedEnvironment(config);
   const owned = [];
+  let pluginMarker;
   const result = { schema_version: 1, test: "homebrew_installed_package", mode: options.artifact === undefined ? "native_installation" : "real_model", status: "running", started_at: new Date().toISOString(),
     source_commit: options.expectedCommit, prefix: options.prefix, output: options.output,
     cwd, runtime_path: SYSTEM_PATH, artifact_requested: options.artifact ?? null, cleanup: [] };
@@ -490,6 +509,53 @@ export async function runSmoke(options) {
       await assert.rejects(rpc(socket, "daemon.status", {}, 1000), "Daemon API still responds after owner cleanup");
       result.foreground_stop = { owner_pid: owner.group, daemon_pid: ready.daemon_pid, exit: stopped, live_descendants: [] };
       jsonFile(path.join(options.output, "foreground-stop.json"), result.foreground_stop);
+
+      // Exercise the packaged daemon's default sibling-helper discovery using
+      // an actual JSON-RPC child, independently of model-generated tool calls.
+      const pluginFile = path.join(runtime, "installed-plugin.cjs");
+      pluginMarker = path.join(runtime, "installed-plugin.json");
+      const pluginSocket = path.join(runtime, "plugin.sock");
+      const toolsFile = path.join(runtime, "tools.json");
+      fs.writeFileSync(pluginFile, installedPluginSource());
+      jsonFile(toolsFile, {
+        read_root: cwd, write_root: cwd, shell_executables: [fs.realpathSync("/bin/echo")],
+        shell_cwd_roots: [cwd], http_destinations: [{ origin: "http://fixture.invalid/", address: "127.0.0.1" }],
+        policy: { rules: [] },
+        plugins: [{ id: "installed-smoke", version: "1.0.0", program: fs.realpathSync(node),
+          args: [pluginFile, pluginMarker], cwd, sandbox: { mode: "trusted" } }]
+      });
+      const pluginOwner = launch(daemon, ["--artifact", options.artifact, "--socket", pluginSocket,
+        "--db", path.join(runtime, "plugin.sqlite"), "--tools-config", toolsFile], "installed-plugin");
+      const pluginDeadline = Date.now() + 240000;
+      let pluginReady = false;
+      let pluginError = "no API response";
+      while (Date.now() < pluginDeadline) {
+        check();
+        assert(!pluginOwner.closed, `Installed plugin daemon exited before readiness: ${pluginOwner.stderr.slice(-2000)}`);
+        try {
+          const status = await rpc(pluginSocket, "daemon.status", {}, 2000);
+          assert.equal(status.api_version, 1);
+          assert(fs.existsSync(pluginMarker), "Plugin handshake marker was not written");
+          pluginReady = true;
+          break;
+        } catch (error) { pluginError = error.message; }
+        await sleep(200);
+      }
+      assert(pluginReady, `Installed plugin daemon did not become ready: ${pluginError}`);
+      const pluginObservation = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
+      assert.equal(pluginObservation.method, "initialize");
+      assert(Number.isInteger(pluginObservation.pid) && pluginObservation.pid > 1);
+      const pluginRow = (await processTable()).find(entry => entry.pid === pluginObservation.pid);
+      assert(pluginRow && pluginRow.parent === pluginOwner.group && !pluginRow.state.startsWith("Z"),
+        "Installed plugin is not a live child of the installed daemon");
+      const pluginStop = await pluginOwner.stop();
+      const pluginExitDeadline = Date.now() + 5000;
+      while ((await processTable()).some(entry => entry.pid === pluginObservation.pid && !entry.state.startsWith("Z"))) {
+        assert(Date.now() < pluginExitDeadline, "Installed plugin remained alive after daemon stop");
+        await sleep(50);
+      }
+      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, cleanup: pluginStop };
+      jsonFile(path.join(options.output, "installed-plugin.json"), result.plugin_startup);
     }
     check();
     const after = await verifyInstallation(options.prefix, options.expectedCommit);
@@ -512,10 +578,24 @@ export async function runSmoke(options) {
     }
     cancellation.dispose();
     try {
+      // The fixture exits on stdin EOF. Its private process group is distinct
+      // from the daemon's, so observe it separately on success and failure.
+      if (pluginMarker && fs.existsSync(pluginMarker)) {
+        const { pid } = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
+        assert(Number.isInteger(pid) && pid > 1, "Invalid installed plugin PID");
+        const deadline = Date.now() + 5000;
+        while ((await processTable()).some(entry => entry.pid === pid && !entry.state.startsWith("Z"))) {
+          assert(Date.now() < deadline, `Installed plugin ${pid} survived daemon cleanup`);
+          await sleep(50);
+        }
+      }
+    } catch (error) { failure ??= error; }
+    try {
       const settingsFile = path.join(config, "settings.json");
       if (fs.existsSync(settingsFile)) fs.copyFileSync(settingsFile, path.join(options.output, "settings.json"));
-      fs.rmSync(runtime, { recursive: true, force: true });
     } catch (error) { failure ??= error; }
+    try { fs.rmSync(runtime, { recursive: true, force: true }); }
+    catch (error) { failure ??= error; }
   }
   result.status = failure ? "failed" : "passed";
   result.finished_at = new Date().toISOString();
