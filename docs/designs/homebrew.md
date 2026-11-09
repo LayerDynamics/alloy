@@ -86,6 +86,11 @@ dependencies and Rust crates follow their checked-in lockfiles. Source
 fetching includes the pinned vendored native dependencies; no runtime code is
 downloaded on the first invocation.
 
+The formula uses Homebrew's configured build-job count, capped at four, for both
+Cargo and CMake. Set `HOMEBREW_MAKE_JOBS=1` or `2` to reduce load. Increasing
+parallelism can shorten a cold build but uses more CPU and memory; actual
+duration depends on the machine and cache state.
+
 Installation builds start from an empty per-build `CARGO_HOME`, so the
 network-enabled fetch phase downloads the full crate set on every install.
 The formula hardens that path rather than caching across builds: Cargo's

@@ -67,8 +67,8 @@ jobs:
             -e APPROVAL_STORAGE_CANDIDATE -e CARGO_TERM_COLOR=never \
             -w /work alloy-approval-storage-native:local \
             bash -euo pipefail -c '
-              apt-get update
-              apt-get install -y --no-install-recommends python3
+              # Dockerfile.repro already installs and verifies Python.
+              python3 --version
               tar -C /src --exclude=target -cf - . | tar --no-same-owner -C /work -xf -
               test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
               rustup component add rustfmt clippy

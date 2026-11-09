@@ -40,8 +40,11 @@ class Alloy < Formula
     ENV["RUSTC_WRAPPER"] = nil
     ENV["CARGO_HOME"] = (buildpath/"target/homebrew/cargo-home").to_s
     ENV["CARGO_TARGET_DIR"] = (buildpath/"target/homebrew/cargo-target").to_s
-    ENV["CARGO_BUILD_JOBS"] = "2"
-    ENV["CMAKE_BUILD_PARALLEL_LEVEL"] = "2"
+    # Respect Homebrew's configured parallelism, with a bounded cap to avoid
+    # multiplying Cargo and native compiler work without limit.
+    build_jobs = [[ENV.make_jobs, 1].max, 4].min.to_s
+    ENV["CARGO_BUILD_JOBS"] = build_jobs
+    ENV["CMAKE_BUILD_PARALLEL_LEVEL"] = build_jobs
     # Every install starts from an empty CARGO_HOME and downloads all crates.
     # Tolerate transient stalls instead of failing the fetch: two CI
     # acceptance failures were low-speed aborts on a healthy network.

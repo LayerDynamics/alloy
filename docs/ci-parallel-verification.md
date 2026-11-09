@@ -20,6 +20,9 @@ configured local model artifacts, including the M9 models. Runner workspaces,
 model-memory resources, and Homebrew installations must be isolated. Registering
 multiple runner processes on one Mac does not provide that isolation. With one
 eligible runner, GitHub queues the macOS jobs and runs them serially.
+The separate approval/storage workflow also uses a macOS runner. Running all
+three macOS jobs at once requires a third suitable physical runner, or a
+different measured schedule; two runners alone do not eliminate that queue.
 
 Cooperating macOS CI shell steps also take an advisory lock at
 `/tmp/alloy-ci-mac-host.lock`, shared by runner users on that host. The
