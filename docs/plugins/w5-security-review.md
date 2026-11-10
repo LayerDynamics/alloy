@@ -38,15 +38,23 @@ not provide supply-chain verification or protection against adversarial changes
 by those trusted host processes. Do not grant plugins write access to their code
 or runtime resources.
 
-Descriptor sanitization is independent of allocation limits. Linux uses
-close_range(3, UINT_MAX, CLOSE_RANGE_CLOEXEC) in the child; failure rejects spawn,
-with no incomplete limit-based fallback. This requires the supported Linux image
-and a kernel/libc providing close_range with CLOEXEC support. Rust's exec-error
-pipe remains usable until exec. macOS uses POSIX_SPAWN_CLOEXEC_DEFAULT with explicit
+Descriptor sanitization is independent of allocation limits. Linux's isolated
+supervisor uses close_range to exclude inherited non-stdio descriptors from the
+plugin; failure rejects spawn, with no incomplete limit-based fallback. Linux
+also requires atomic CLONE_PIDFD, waitid(P_PIDFD), and readable /proc process
+group metadata as described in tool-hooks-v1.md. macOS uses POSIX_SPAWN_CLOEXEC_DEFAULT with explicit
 stdio duplication, source-end closes, working directory, and a private group.
 Only stdin/stdout/stderr are deliberately inherited; no environment is inherited.
 An isolated real-host regression retains FD >=128, lowers NOFILE to 64, and verifies
 that the executed plugin cannot observe the descriptor on either platform.
+
+On Linux the host owns a kernel-created pidfd for the supervisor and communicates
+through a private control channel. The supervisor owns its target and keeps the
+target unreaped while signaling and checking its group. Concurrent daemon reapers
+or SIGCHLD auto-reaping cannot cause the host to signal a recycled numeric PID.
+Cleanup failures and deferred-waiter exhaustion are reported as unestablished;
+they do not authorize numeric fallback. The lifecycle and exceptional resource
+limits in tool-hooks-v1.md are part of this supported contract.
 
 On macOS, a dedicated `alloy-plugin-exec-helper` supervisor owns each helper or
 plugin as its direct child. It resets SIGCHLD to its default disposition, starts

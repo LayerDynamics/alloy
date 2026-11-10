@@ -152,11 +152,12 @@ test("cleanup stops orphaned descendants and a hung child while preserving anoth
     try { await Promise.all([orphan.stop(500), unrelated.stop(500)]); }
     finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
-  assert.equal((await orphan.wait(4000)).code, 0);
+  const finished = await orphan.wait(4000);
+  assert.equal(finished.code, 0);
   const descendant = JSON.parse(orphan.stdout.trim()).orphan;
-  assert((await processTable()).some((entry) => entry.pid === descendant && entry.group === orphan.group && !entry.state.startsWith("Z")));
-  const cleaned = await orphan.stop(500);
-  assert.equal(cleaned.escalated, true, "SIGTERM-ignoring descendant requires bounded escalation");
+  assert(finished.live_before_cleanup.includes(descendant), "owner must observe the orphan before cleanup");
+  assert(!(await processTable()).some((entry) => entry.pid === descendant && !entry.state.startsWith("Z")));
+  await orphan.stop(500);
   assert.equal((await orphan.liveMembers()).length, 0);
   assert((await unrelated.liveMembers()).length > 0, "cleanup must not signal another group");
   await assert.rejects(unrelated.wait(30), /timed out/);
@@ -172,11 +173,6 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
   const unrelated = new OwnedProcess(process.execPath, ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);"], options("unrelated"));
   t.after(async () => {
     try {
-      // These IDs come only from children created by the test fixture. Drop each
-      // as soon as its absence is verified, so retired groups are never signalled.
-      for (const group of targetGroups) {
-        try { process.kill(-group, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-      }
       await Promise.all([...runners, unrelated].map((child) => child.stop(500)));
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -219,7 +215,7 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
     assert(Number.isSafeInteger(targetGroup) && targetGroup > 1);
     targetGroups.add(targetGroup);
     const started = performance.now();
-    assert(runner.child.kill(signal)); // Signal the smoke owner, not its detached target.
+    assert(runner.ownedProcess.request(signal, true)); // Signal the smoke owner, not its detached target.
     const exit = await runner.wait(5500);
     assert.equal(exit.code, 143, runner.stderr);
     assert(performance.now() - started < 6000, "smoke cleanup must finish before its outer owner escalates");
@@ -252,4 +248,14 @@ test("installed plugin ownership requires a live isolated supervisor and private
     assert.throws(() => assertOwnedPluginPid(100, 102, altered));
   }
   assert.throws(() => assertOwnedPluginPid(100, 102, rows.filter(row => row.pid !== 101)));
+});
+
+
+test("unestablished supervisor cleanup never becomes a successful smoke cleanup", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-failed-owner-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const owned = new OwnedProcess(path.join(root, "missing-command"), [], { cwd: root, env: process.env, output: root, label: "missing" });
+  const outcome = await owned.wait(5000);
+  assert(outcome.error, "missing executable must report supervisor failure");
+  await assert.rejects(owned.stop(500), /cleanup was not established/);
 });

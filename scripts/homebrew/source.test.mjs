@@ -32,6 +32,8 @@ function configure(source) {
   git(["-C", source, "config", "user.name", "Alloy fixture"]);
   git(["-C", source, "config", "user.email", "fixture@alloy.invalid"]);
   git(["-C", source, "config", "commit.gpgsign", "false"]);
+  git(["-C", source, "config", "maintenance.auto", "false"]);
+  git(["-C", source, "config", "gc.auto", "0"]);
 }
 function write(root, relative, text) {
   const filename = path.join(root, relative);

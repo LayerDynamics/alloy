@@ -43,6 +43,18 @@ multiple runner agents happen to share a Mac; separate machines have separate
 locks. This coordinates trusted jobs, not other host processes, an administrator
 changing the lock file, or conflicting runner workspaces. Do not rely on it to
 turn one Mac into two independent machines.
+
+The Homebrew CI, source-snapshot, and installed-smoke drivers use a separate
+process supervisor instead of signaling numeric process groups from Node. The
+supervisor retains its direct child with `waitid(WNOWAIT)` until it has killed
+and checked the original process group, then reaps it. Control messages use a
+private descriptor; a missing cleanup result is an error, not evidence that
+descendants exited. The helper requires a Python 3 interpreter exposing
+`os.waitid` and `os.WNOWAIT`; it probes an absolute interpreter path and fails
+closed if unavailable. Python startup is isolated, and loader injection
+variables are removed from the supervisor environment while the intended target
+environment is relayed privately. Deliberately detached descendants and an
+unexpectedly killed supervisor are outside the group-cleanup guarantee.
 Every successful step must stop and join the resource-using descendants it
 starts before returning. A detached child that closes inherited descriptors
 can survive a successful step, and the lock alone cannot detect it. Treat

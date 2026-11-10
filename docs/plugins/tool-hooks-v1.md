@@ -67,6 +67,22 @@ never waits for supervisor PIDs. Default startup owns supervisor statuses and
 requires exclusive reaping. Both modes preserve trusted subprocesses in the
 plugin's original process group; neither contains malicious trusted descendants.
 
+On Linux an isolated supervisor owns each plugin as its direct child. The host
+obtains the supervisor's pidfd atomically at creation, commits startup over a
+private control channel, and never signals a numeric child or group ID. The
+supervisor retains the target unreaped while terminating and checking its
+original group; its pidfd also permits safe collection if another host reaper
+has consumed the supervisor status. Linux requires `CLONE_PIDFD`,
+`waitid(P_PIDFD)`, `close_range`, and readable `/proc` process-group metadata;
+unsupported or denied operations fail closed. These pidfd operations require
+kernel support (Linux 5.4 or later for `waitid(P_PIDFD)`) and may be restricted
+by seccomp. Cleanup can remain unestablished if process inspection or signaling
+fails. A supervisor retains identity and retries in that case. Up to 64 deferred
+pidfd waiters collect supervisors that outlive the caller's bounded wait; if
+the limit is reached or a waiter cannot start, a later supervisor zombie is
+possible and cleanup is reported as unestablished. Deliberately detached trusted
+descendants and unexpected supervisor death are outside group cleanup.
+
 The operator may keep a user-owned, writable installation. That model trusts the
 owner and unsandboxed processes running with the same privileges not to change
 the plugin, helper, runtime resources, or paths while the host uses them; the

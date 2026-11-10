@@ -13,8 +13,6 @@ use tool_registry::execution::CancellationToken;
 
 unsafe extern "C" {
     fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
-    #[cfg(target_os = "linux")]
-    fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
 }
 fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
@@ -103,13 +101,7 @@ impl Process {
         }
         self.dead = true;
         self.input.take();
-        // On macOS the isolated supervisor owns group cleanup and exclusive
-        // reaping. Linux retains its existing trusted child/group contract.
-        // SAFETY: the Linux spawn creates a private process group.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            kill(-(self.child.id() as i32), 9);
-        }
+        // Both platform supervisors receive cancellation through their control channel.
         let _ = self.child.kill();
         loop {
             match self.child.wait() {

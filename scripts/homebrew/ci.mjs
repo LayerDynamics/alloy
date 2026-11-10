@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawnOwned } from "./group-supervisor.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { renderFormula } from "./formula.mjs";
 import { createSourceSnapshot } from "./source.mjs";
@@ -18,13 +18,11 @@ function execute(command, args, { cwd = ROOT, env = process.env, log, allowed = 
   if (stopping && !allowDuringShutdown) return Promise.reject(new Error("Homebrew acceptance cancelled"));
   return new Promise((resolve, reject) => {
     const file = log ? fs.openSync(log, "a") : null;
-    const child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const ownedProcess = spawnOwned(command, args, { cwd, env });
+    const child = ownedProcess.child;
     let stdout = "", stderr = "", error;
     let escalation;
-    const signalGroup = (signal) => {
-      if (!Number.isSafeInteger(child.pid) || child.pid <= 1) return;
-      try { process.kill(-child.pid, signal); } catch (e) { if (e.code !== "ESRCH") error ??= e; }
-    };
+    const signalGroup = (signal) => { ownedProcess.request(signal); };
     const stop = (reason) => {
       error ??= new Error(reason);
       signalGroup("SIGTERM");
@@ -43,9 +41,8 @@ function execute(command, args, { cwd = ROOT, env = process.env, log, allowed = 
     };
     child.stdout.on("data", (chunk) => consume(chunk, false));
     child.stderr.on("data", (chunk) => consume(chunk, true));
-    child.once("close", (code, signal) => {
-      // A command may exit before a descendant. Retire only its own process group.
-      signalGroup("SIGKILL");
+    ownedProcess.done.then(({ code, signal, error: supervisorError }) => {
+      if (supervisorError) error ??= new Error(supervisorError);
       clearTimeout(timer); clearTimeout(escalation); owned.delete(stop);
       if (file !== null) fs.closeSync(file);
       if (error) reject(error);
