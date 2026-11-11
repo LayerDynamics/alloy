@@ -1145,8 +1145,8 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
     done.store(true, std::sync::atomic::Ordering::Release);
     assert_eq!(
         reaper.join().unwrap(),
-        2,
-        "external reaper must own both supervisor statuses"
+        1,
+        "external reaper owns the pipe supervisor; launchd owns the workload supervisor"
     );
     assert_reaped(pid);
 }
