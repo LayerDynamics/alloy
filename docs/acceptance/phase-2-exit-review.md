@@ -1,6 +1,12 @@
 # Phase 2 exit review
 
-**Review record.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
+**Decision: blocked.** A competing reaper can invalidate `shell.run`'s child
+identity before its numeric process-group or PID signal. P2-09's unrelated-work
+safety is therefore not established under that condition; [issue #31](https://github.com/LayerDynamics/alloy/issues/31)
+is reopened. No unrelated process was observed being signalled. Do not close
+Phase 2 until PID-safe shell ownership and Linux/Mac regression evidence pass.
+
+**Earlier candidate evidence.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
 passed the complete [Linux and Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43018696590)
 and the [supplemental approval/storage run](https://github.com/LayerDynamics/alloy/actions/runs/43018696710).
 The final reviewed candidate and closure decision are recorded on
@@ -24,7 +30,8 @@ or failed named test cannot be replaced by a local mock or by W5 acceptance.
 
 ## Candidate evidence and exit statements
 
-- P2-01 through P2-14 passed in the full Linux and Mac suites. The retained
+- P2-01 through P2-14 passed the existing Linux and Mac suites, but P2-09 did
+  not test a competing shell-child reaper and does not close the blocker. The retained
   W5 Linux and Mac artifacts each contain passing P2-10/P2-11 results and
   identical before/after source snapshots. Their checkout commits differ
   because the Linux lane tested the PR merge commit, but their source-tree

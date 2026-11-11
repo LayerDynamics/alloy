@@ -365,3 +365,42 @@ fn configured_invocation_limit_prevents_execution() {
     assert!(!e.started);
     assert!(!d.0.join("marker").exists());
 }
+
+// Run this probe in its own test process: SIGCHLD disposition is process-wide.
+#[test]
+fn shell_survives_external_auto_reaping() {
+    const PROBE: &str = "ALLOY_SHELL_REAPER_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let output = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_survives_external_auto_reaping",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    #[cfg(target_os = "macos")]
+    let sigchld = 20;
+    #[cfg(target_os = "linux")]
+    let sigchld = 17;
+    // SAFETY: this is a short-lived isolated subprocess; SIG_IGN is the
+    // platform's conventional value 1 and affects only this process.
+    assert_ne!(unsafe { signal(sigchld, 1) }, usize::MAX);
+    let d = Temp::new();
+    let (result, bytes) = execute(&d, "echo:REAPER_SAFE");
+    assert!(result.success);
+    assert!(String::from_utf8_lossy(&stream(&bytes, "stdout")).contains("REAPER_SAFE"));
+}
