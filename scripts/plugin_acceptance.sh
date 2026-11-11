@@ -164,6 +164,29 @@ if [[ "$(uname -s)" == Darwin ]]; then
   gate fileport-exhaustion cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_descriptor_exhaustion_fails_closed_without_fd_leaks -- --exact --nocapture
   gate fileport-malformed cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_malformed_helper_message -- --exact --nocapture
   gate fileport-adversarial cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_wrong_sender_and_complex_messages -- --exact --nocapture
+  cargo test --locked -p alloy-process-owner --test macos_broker_recovery -- --list > "$OUT/broker-recovery-discovery.txt"
+  BROKER_TESTS=(
+    broker_loss_before_launch_recovers_without_replay
+    broker_loss_during_launch_releases_other_launches
+    broker_loss_during_execution_preserves_control
+    broker_loss_during_cancellation_preserves_cleanup
+    restart_budget_refuses_excess_reconnects_then_recovers
+    stale_generation_never_launches_or_replays_a_command
+    peer_audit_authentication_rejects_unrelated_code
+    live_supervisor_capacity_survives_broker_restart
+    unconfirmed_stopped_supervisor_stays_charged_until_proven_exit
+    repeated_confirmed_presend_cancellation_does_not_exhaust_capacity
+    inconclusive_host_identity_preserves_other_live_service
+    concurrent_host_retirement_does_not_break_registration
+    completion_published_before_supervisor_exit_keeps_real_status
+    malformed_message_does_not_retire_authenticated_service
+    native_framework_command_retains_bootstrap_access
+    registration_and_workloads_create_no_embedding_host_children
+  )
+  for name in "${BROKER_TESTS[@]}"; do
+    grep -Fx "$name: test" "$OUT/broker-recovery-discovery.txt"
+  done
+  gate broker-recovery cargo test --locked -p alloy-process-owner --test macos_broker_recovery -- --nocapture --test-threads=1
   cargo test --locked -p harness-core --test tool_artifacts -- --list > "$OUT/artifact-discovery.txt"
   grep -Fx 'plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes: test' "$OUT/artifact-discovery.txt"
   gate artifact-sandbox cargo test --locked -p harness-core --test tool_artifacts plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes -- --exact --nocapture

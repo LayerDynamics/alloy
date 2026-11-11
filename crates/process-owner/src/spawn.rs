@@ -502,6 +502,12 @@ mod macos {
                         "plugin writable tree includes a protected executable",
                     ));
                 }
+                if crate::macos_service::protected_registry_path().starts_with(&root) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "plugin writable tree includes the broker registry",
+                    ));
+                }
                 let mut pending = vec![root];
                 while let Some(directory) = pending.pop() {
                     if cancel() || std::time::Instant::now() >= deadline {
@@ -699,6 +705,7 @@ mod macos {
         unsafe extern "C" {
             fn alloy_shell_spawn(
                 launcher: *const c_char,
+                service: *const c_char,
                 program: *const c_char,
                 cwd: *const c_char,
                 argv: *const *mut c_char,
@@ -715,9 +722,13 @@ mod macos {
                 .ok_or_else(|| io::Error::other("shell cwd missing"))?
                 .as_os_str(),
         )?;
-        let launcher = cstring(
-            launcher_path(helper.ok_or_else(|| io::Error::other("missing helper"))?)?.as_os_str(),
-        )?;
+        let launcher_path =
+            launcher_path(helper.ok_or_else(|| io::Error::other("missing helper"))?)?;
+        let service = crate::macos_service::prepare(&launcher_path, || {
+            cancel() || std::time::Instant::now() >= deadline
+        })?;
+        let service = cstring(std::ffi::OsStr::new(&service))?;
+        let launcher = cstring(launcher_path.as_os_str())?;
         let mut args = vec![program.clone()];
         for arg in cmd.get_args() {
             args.push(cstring(arg)?);
@@ -732,6 +743,7 @@ mod macos {
         checked(unsafe {
             alloy_shell_spawn(
                 launcher.as_ptr(),
+                service.as_ptr(),
                 program.as_ptr(),
                 cwd.as_ptr(),
                 argv.as_ptr(),
@@ -964,6 +976,21 @@ mod shell_broker_tests {
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+    #[test]
+    fn launchd_service_runs_native_child() {
+        let helper = default_helper().unwrap();
+        let mut command = Command::new("/usr/bin/true");
+        command.current_dir("/private/tmp");
+        let (mut child, input, _, _) = spawn_shell(
+            command,
+            Some(&helper),
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        )
+        .unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
+    }
     #[test]
     fn cancelled_launch_does_not_execute_late_or_disable_next_launch() {
         let helper = default_helper().unwrap();

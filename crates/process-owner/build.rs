@@ -11,12 +11,16 @@ fn main() {
             .compile("alloy_linux_supervisor");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        cc::Build::new()
+        let mut native = cc::Build::new();
+        native
             .file("native/fileport.c")
             .file("native/owned_process.c")
             .flag("-std=c11")
-            .warnings(true)
-            .compile("alloy_fileport");
+            .warnings(true);
+        if std::env::var("PROFILE").as_deref() == Ok("debug") {
+            native.define("ALLOY_OWNED_PROCESS_TEST", None);
+        }
+        native.compile("alloy_fileport");
         println!("cargo:rustc-link-lib=bsm");
         println!("cargo:rerun-if-changed=native/helper_main.c");
         if std::env::var("PROFILE").as_deref() == Ok("debug") {
