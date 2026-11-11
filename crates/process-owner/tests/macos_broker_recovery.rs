@@ -23,6 +23,8 @@ unsafe extern "C" {
     fn __error() -> *mut i32;
     fn alloy_test_shell_diagnostic() -> *const std::ffi::c_char;
     fn alloy_test_identity_unknown(pid: i32);
+    fn alloy_test_shell_owner_pause(target: i32, paused: i32) -> i32;
+    fn alloy_test_shell_cancellation_pending(target: i32) -> i32;
 }
 
 fn start(program: &str, arguments: &[&str], root: &Path) -> std::io::Result<Child> {
@@ -200,11 +202,45 @@ fn crash_case(root: &Path, stage: i32) {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(5));
         }
-        if stage == 4 {
-            child.kill().unwrap();
+        struct PausedOwner(i32);
+        impl Drop for PausedOwner {
+            fn drop(&mut self) {
+                // SAFETY: resume only the exact test-owned supervisor. This
+                // guard runs before Child drop even if an assertion unwinds.
+                assert_eq!(unsafe { alloy_test_shell_owner_pause(self.0, 0) }, 0);
+            }
         }
+        let paused = if stage == 4 {
+            // SAFETY: stop the real supervisor by kernel identity and wait
+            // until the OS reports SSTOP, before publishing cancellation.
+            assert_eq!(
+                unsafe { alloy_test_shell_owner_pause(child.id() as i32, 1) },
+                0
+            );
+            let guard = PausedOwner(child.id() as i32);
+            child.kill().unwrap();
+            // SAFETY: observes both shared STOP and the real supervisor's
+            // stopped OS state. Cancellation cannot finish behind this barrier.
+            assert_eq!(
+                unsafe { alloy_test_shell_cancellation_pending(child.id() as i32) },
+                1
+            );
+            Some(guard)
+        } else {
+            None
+        };
         // SAFETY: the hook uses the broker's retained stable identity, not a raw kill PID.
         kill_broker();
+        if stage == 4 {
+            // SAFETY: cancellation must still be pending after broker death.
+            assert_eq!(
+                unsafe { alloy_test_shell_cancellation_pending(child.id() as i32) },
+                1
+            );
+            // SAFETY: the workload still exists; cleanup has not already won.
+            assert_eq!(unsafe { kill(child.id() as i32, 0) }, 0);
+        }
+        drop(paused);
         if stage == 3 {
             assert!(
                 child.try_wait().unwrap().is_none(),

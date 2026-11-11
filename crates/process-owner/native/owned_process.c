@@ -757,6 +757,38 @@ static void retire_shell_slot(int slot) {
     collect_shell_slots();pthread_mutex_unlock(&shell_slots_lock);
 }
 #ifdef ALLOY_OWNED_PROCESS_TEST
+int alloy_test_shell_owner_pause(int target,int paused) {
+    int error=ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        int pid=state->pid;uint64_t identity=state->identity;
+        error=identity_signal(pid,identity,paused?SIGSTOP:SIGCONT);
+        uint64_t until=milliseconds()+2000;
+        while(!error && paused){
+            struct proc_bsdinfo info;
+            if(proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,sizeof(info))==sizeof(info) && info.pbi_status==SSTOP)break;
+            if(milliseconds()>=until){error=ETIMEDOUT;(void)identity_signal(pid,identity,SIGCONT);break;}
+            pause_briefly();
+        }
+        break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);return error;
+}
+int alloy_test_shell_cancellation_pending(int target) {
+    int pending=0;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        struct proc_bsdinfo info;
+        pending=atomic_load_explicit(&state->state,memory_order_acquire)==STOP &&
+            proc_pidinfo(state->pid,PROC_PIDTBSDINFO,0,&info,sizeof(info))==sizeof(info) && info.pbi_status==SSTOP;
+        break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);return pending;
+}
 static launch_state *test_stalled_state;
 static pid_t test_stalled_pid;
 int alloy_test_pid_only_slot(void) {
