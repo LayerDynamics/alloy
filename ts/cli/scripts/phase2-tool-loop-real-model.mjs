@@ -66,7 +66,14 @@ async function sendTurn(a, session, prompt, allow, marker, label) {
     assert.equal(events.filter((e) => e.event === "tool_requested" && e.body.tool_id === "shell.run").length, 1);
     assert.equal(events.filter((e) => e.event === "tool_call_started" && e.body.tool_id === "shell.run").length, Number(allow));
     assert(final.assistant_text?.includes("indigo-saffron-83"), "final answer must consume the fixture result");
-    if (allow) assert(final.assistant_text.includes("violet-signal-61"), "final answer must consume the shell result");
+    if (allow) {
+      const shellCall = events.find((e) => e.event === "tool_requested" && e.body.tool_id === "shell.run");
+      const shellResult = events.find((e) => e.event === "tool_result" && e.body.call_id === shellCall.body.call_id);
+      const chunks = shellResult.body.result.content.ndjson.trim().split("\n").map(JSON.parse);
+      const stdout = chunks.filter((chunk) => chunk.stream === "stdout").flatMap((chunk) => chunk.data);
+      assert.equal(Buffer.from(stdout).toString("utf8"), "violet-signal-61\n");
+      assert(final.assistant_text.includes("violet-signal-61") || final.assistant_text.replace(/\s/g, "").includes(stdout.join(",")), "final answer must consume the unseen shell output, either as text or bytes");
+    }
     return { final, events, history };
   } finally {
     clearTimeout(timer);
