@@ -381,9 +381,11 @@ export class Acceptance {
     this.metadata.binary = this.binary;
     this.metadata.binary_sha256 = createHash("sha256").update(fs.readFileSync(this.binary)).digest("hex");
     if (this.testName === "phase2_tool_loop_real_model") {
-      await this.command("cargo", ["build", "--locked", "--manifest-path", path.join(ROOT, "Cargo.toml"), "-p", "harness-core", "--bin", "alloy-plugin-pipe-helper", "--release"], "plugin-helper-build", this.buildTimeout);
+      await this.command("cargo", ["build", "--locked", "--manifest-path", path.join(ROOT, "Cargo.toml"), "-p", "harness-core", "--bins", "--release"], "plugin-helper-build", this.buildTimeout);
       this.metadata.plugin_helper = fs.realpathSync(path.join(path.dirname(this.binary), "alloy-plugin-pipe-helper"));
       this.metadata.plugin_helper_sha256 = createHash("sha256").update(fs.readFileSync(this.metadata.plugin_helper)).digest("hex");
+      this.metadata.plugin_exec_helper = fs.realpathSync(path.join(path.dirname(this.binary), "alloy-plugin-exec-helper"));
+      this.metadata.plugin_exec_helper_sha256 = createHash("sha256").update(fs.readFileSync(this.metadata.plugin_exec_helper)).digest("hex");
     }
     await this.command("npm", ["run", "build"], "cli-build", this.buildTimeout, path.join(ROOT, "ts/cli"));
     await this.candidateSnapshot("candidate-after-build", beforeBuild);
