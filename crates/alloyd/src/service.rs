@@ -261,7 +261,7 @@ impl<E: Engine> DaemonService<E> {
             Ok(())
         };
         let outcome = if let Some(runtime) = &self.tools {
-            self.supervisor.run_tool_turn(
+            self.supervisor.run_tool_turn_with_lifecycle(
                 &self.store,
                 runtime,
                 &session_id,
@@ -269,21 +269,20 @@ impl<E: Engine> DaemonService<E> {
                 crate::tool_config::loop_config(self.max_output_tokens),
                 &cancellation,
                 on_started,
-                |event| {
-                    // A tool is admitted only after its generation has fully
-                    // completed. Keep cancellation scoped to a live generation:
-                    // the scheduler may evict the completed ID while a hook,
-                    // approval or subprocess remains in flight.
-                    if event.event == "tool_requested" {
-                        let mut guard = self
-                            .inflight
-                            .lock()
-                            .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
-                        let slot = guard
-                            .get_mut(&session_id)
-                            .ok_or_else(|| HarnessError::Engine("missing inflight slot".into()))?;
+                |request_id| {
+                    let mut guard = self
+                        .inflight
+                        .lock()
+                        .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
+                    let slot = guard
+                        .get_mut(&session_id)
+                        .ok_or_else(|| HarnessError::Engine("missing inflight slot".into()))?;
+                    if slot.request_id.as_ref() == Some(request_id) {
                         slot.request_id = None;
                     }
+                    Ok(())
+                },
+                |event| {
                     write_tool_notification(
                         writer,
                         &session_id,
@@ -387,9 +386,27 @@ impl<E: Engine> DaemonService<E> {
                 None
             }
         };
-        self.supervisor
-            .pause_session(&self.store, session_id, inflight_request.as_ref())
-            .map_err(map_harness)?;
+        let pause =
+            self.supervisor
+                .pause_session(&self.store, session_id, inflight_request.as_ref());
+        match pause {
+            // The scheduler may evict a completed request after this method
+            // copied its ID. NotFound for that exact request means there is
+            // no registered generation left to cancel; the per-turn token was
+            // already cancelled while holding the inflight lock.
+            Err(HarnessError::EngineFailure(EngineError::NotFound {
+                resource: "request",
+                id,
+            })) if inflight_request
+                .as_ref()
+                .is_some_and(|request| request.as_str() == id) =>
+            {
+                self.supervisor
+                    .pause_session(&self.store, session_id, None)
+                    .map_err(map_harness)?;
+            }
+            other => other.map_err(map_harness)?,
+        }
         Ok(json!({ "ok": true, "session_id": session_id, "status": "paused" }))
     }
 
@@ -903,5 +920,111 @@ mod tool_loop_tool_notification_tests {
             RpcTransportLimits::new(encoded.len(), std::time::Duration::from_secs(1)).unwrap();
         write_tool_notification(&mut bytes, "s", "text_delta", body, exact).unwrap();
         assert_eq!(bytes, encoded.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod pause_finished_request_tests {
+    use super::*;
+    #[allow(dead_code)]
+    mod scripted {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../harness-core/tests/support/scripted.rs"
+        ));
+    }
+
+    #[test]
+    fn pause_succeeds_when_copied_request_was_evicted_before_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = scripted::ScriptedEngine::new(vec![]);
+        engine.cancel_not_found = true;
+        let service = DaemonService::open(
+            dir.path().join("db"),
+            engine,
+            Arc::new(TelemetryClient::new(
+                "test",
+                harness_core::HardwareTier::Unknown,
+                "https://telemetry.invalid",
+            )),
+            128,
+            0,
+            0,
+        )
+        .unwrap();
+        service
+            .supervisor
+            .create_session(&service.store, "s", "p")
+            .unwrap();
+        service.inflight.lock().unwrap().insert(
+            "s".into(),
+            InflightSlot {
+                cancellation: tool_registry::execution::CancellationToken::default(),
+                request_id: Some(RequestId::new("already-finished").unwrap()),
+                cancel_requested: false,
+            },
+        );
+        let result = service.session_pause(&json!({"session_id":"s"}));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            service
+                .store
+                .lock()
+                .unwrap()
+                .get_session("s")
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Paused
+        );
+        assert!(
+            service.inflight.lock().unwrap()["s"]
+                .cancellation
+                .is_cancelled()
+        );
+    }
+    #[test]
+    fn pause_propagates_not_found_for_a_different_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = scripted::ScriptedEngine::new(vec![]);
+        engine.cancel_not_found = true;
+        engine.cancel_not_found_id = Some("different-request".into());
+        let service = DaemonService::open(
+            dir.path().join("db"),
+            engine,
+            Arc::new(TelemetryClient::new(
+                "test",
+                harness_core::HardwareTier::Unknown,
+                "https://telemetry.invalid",
+            )),
+            128,
+            0,
+            0,
+        )
+        .unwrap();
+        service
+            .supervisor
+            .create_session(&service.store, "s", "p")
+            .unwrap();
+        service.inflight.lock().unwrap().insert(
+            "s".into(),
+            InflightSlot {
+                cancellation: tool_registry::execution::CancellationToken::default(),
+                request_id: Some(RequestId::new("expected-request").unwrap()),
+                cancel_requested: false,
+            },
+        );
+        assert!(service.session_pause(&json!({"session_id":"s"})).is_err());
+        assert_eq!(
+            service
+                .store
+                .lock()
+                .unwrap()
+                .get_session("s")
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Active
+        );
     }
 }

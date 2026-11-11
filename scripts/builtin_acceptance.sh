@@ -27,7 +27,7 @@ hash_file() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 { printf '%s\n' Cargo.toml Cargo.lock scripts/builtin_acceptance.sh .github/workflows/ci.yaml;
-  find crates/tool-registry crates/harness-core -type f \( -name '*.rs' -o -name 'Cargo.toml' \);
+  find crates/tool-registry crates/harness-core crates/process-owner -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' \);
 } | LC_ALL=C sort -u | while IFS= read -r path; do printf '%s  %s\n' "$(hash_file "$path")" "$path"; done > "$out/w4-source-sha256.txt"
 run_gate() {
   local label="$1" package="$2" target="$3" name="$4"

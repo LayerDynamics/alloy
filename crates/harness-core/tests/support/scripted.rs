@@ -18,6 +18,7 @@ pub struct ScriptedEngine {
     pub batches: Mutex<VecDeque<Vec<GenerationEvent>>>,
     pub contexts: Mutex<Vec<ContextSnapshot>>,
     pub cancel_not_found: bool,
+    pub cancel_not_found_id: Option<String>,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -32,6 +33,7 @@ impl ScriptedEngine {
             batches: Mutex::new(batches.into()),
             contexts: Mutex::new(Vec::new()),
             cancel_not_found: false,
+            cancel_not_found_id: None,
         }
     }
 }
@@ -102,11 +104,12 @@ impl Engine for ScriptedEngine {
     }
     fn cancel(&self, id: RequestId) -> EngineFuture<'_, CancelOutcome> {
         let missing = self.cancel_not_found;
+        let missing_id = self.cancel_not_found_id.clone();
         Box::pin(async move {
             if missing {
                 Err(engine::error::EngineError::NotFound {
                     resource: "request",
-                    id: id.as_str().to_owned(),
+                    id: missing_id.unwrap_or_else(|| id.as_str().to_owned()),
                 })
             } else {
                 Ok(CancelOutcome::Requested)

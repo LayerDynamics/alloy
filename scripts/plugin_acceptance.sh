@@ -172,6 +172,9 @@ else
   cargo test --locked -p harness-core --test linux_reaper -- --list > "$OUT/linux-reaper-discovery.txt"
   grep -Fx 'linux_plugin_reaping_survives_competing_reapers: test' "$OUT/linux-reaper-discovery.txt"
   gate linux-reaper cargo test --locked -p harness-core --test linux_reaper linux_plugin_reaping_survives_competing_reapers -- --exact --nocapture
+  cargo test --locked -p alloy-process-owner --lib -- --list > "$OUT/owner-unit-discovery.txt"
+  grep -Fx 'spawn::linux_supervisor_tests::deferred_wait_reaps_exact_supervisor_after_timeout: test' "$OUT/owner-unit-discovery.txt"
+  gate owner-deferred-reaper cargo test --locked -p alloy-process-owner --lib spawn::linux_supervisor_tests::deferred_wait_reaps_exact_supervisor_after_timeout -- --exact --nocapture
 fi
 gate all-targets cargo test --locked -p harness-core --all-targets
 gate doctests cargo test --locked -p harness-core --doc

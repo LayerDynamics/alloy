@@ -54,11 +54,43 @@ impl<E: Engine> Supervisor<E> {
         user: &str,
         config: ToolLoopConfig,
         cancel: &CancellationToken,
+        started: S,
+        emit: F,
+    ) -> HarnessResult<TurnOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(ToolLoopEvent) -> HarnessResult<()>,
+    {
+        self.run_tool_turn_with_lifecycle(
+            store,
+            runtime,
+            session,
+            user,
+            config,
+            cancel,
+            started,
+            |_| Ok(()),
+            emit,
+        )
+    }
+
+    /// Run a turn while notifying the caller when each generation has finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tool_turn_with_lifecycle<S, D, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        runtime: &ToolRuntime,
+        session: &str,
+        user: &str,
+        config: ToolLoopConfig,
+        cancel: &CancellationToken,
         mut started: S,
+        mut finished: D,
         mut emit: F,
     ) -> HarnessResult<TurnOutcome>
     where
         S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
         F: FnMut(ToolLoopEvent) -> HarnessResult<()>,
     {
         if user.is_empty() || config.max_calls == 0 || config.inline_bytes == 0 {
@@ -131,6 +163,7 @@ impl<E: Engine> Supervisor<E> {
                         emit(ToolLoopEvent { event: name, body })
                     },
                 )?;
+                finished(&outcome.request_id)?;
                 total_usage.input_tokens = total_usage
                     .input_tokens
                     .checked_add(outcome.usage.input_tokens)
