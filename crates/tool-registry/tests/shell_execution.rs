@@ -116,6 +116,7 @@ fn shell_child_fixture() {
         "binary" => io::stdout().write_all(&[0, 255, 10, 128]).unwrap(),
         "exit7" => std::process::exit(7),
         "exit127" => std::process::exit(127),
+        "exit23" => std::process::exit(23),
         "signal" => {
             unsafe extern "C" {
                 fn raise(signal: i32) -> i32;
@@ -469,4 +470,90 @@ fn exited_leader_descendant_is_stopped_before_completion() {
                 .starts_with('Z'),
         "live descendant: {result:?}"
     );
+}
+
+// An actual host waitpid(-1) loop must collect unrelated statuses without
+// being able to reap a shell target or its supervisor on macOS.
+#[test]
+fn shell_survives_competing_waiter_without_stealing_statuses() {
+    const PROBE: &str = "ALLOY_ACTIVE_REAPER_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let result = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_survives_competing_waiter_without_stealing_statuses",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let waiter = {
+        let stop = stop.clone();
+        let observed = observed.clone();
+        std::thread::spawn(move || {
+            unsafe extern "C" {
+                fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            }
+            while !stop.load(Ordering::Acquire) {
+                let mut status = 0;
+                // SAFETY: isolated probe intentionally owns all host child reaping.
+                let pid = unsafe { waitpid(-1, &mut status, 1) };
+                if pid > 0 {
+                    observed.lock().unwrap().push((pid as u32, status));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+    };
+    let d = Temp::new();
+    let mut sentinels = vec![];
+    for _ in 0..12 {
+        let child = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_child_fixture",
+                "--nocapture",
+                "--skip",
+                "exit23",
+            ])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        sentinels.push(child.id());
+        drop(child);
+        assert_eq!(execute(&d, "exit7").0.exit_code, Some(7));
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !sentinels
+        .iter()
+        .all(|pid| observed.lock().unwrap().iter().any(|(seen, _)| seen == pid))
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    stop.store(true, Ordering::Release);
+    waiter.join().unwrap();
+    let observed = observed.lock().unwrap();
+    for pid in sentinels {
+        assert!(
+            observed.contains(&(pid, 23 << 8)),
+            "unrelated child status missing/corrupted: {pid}: {observed:?}"
+        );
+    }
 }

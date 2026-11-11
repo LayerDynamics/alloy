@@ -18,6 +18,14 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <mach/mach.h>
+#include <mach/task_special_ports.h>
+#include <sys/fileport.h>
+
+static int shell_broker(int argc, char **argv);
 
 /* Stable Darwin libproc ABI, not exported by the public SDK header. */
 struct alloy_unique_info {
@@ -48,7 +56,11 @@ int alloy_owned_alive(int pid, uint64_t identity) {
     struct alloy_unique_info info;
     int error = identity_info(pid, &info);
     if (error == ESRCH || (!error && info.uniqueid != identity)) return 0;
-    return error ? -error : 1;
+    if(error)return -error;
+    struct proc_bsdinfo state;
+    int size=proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&state,sizeof(state));
+    if(size==sizeof(state) && state.pbi_status==SZOMB)return 0;
+    return 1;
 }
 static int identity_signal(int pid, uint64_t identity, int signal) {
     if (pid <= 0 || identity == 0) return EINVAL;
@@ -123,6 +135,7 @@ static int cleanup_group(pid_t target) {
 /* Only this single-threaded process reaps the target. No configured code runs
  * in the supervisor. It retains an exited child until group cleanup is done. */
 int alloy_exec_helper(int argc, char **argv) {
+    if (argc == 5 && !strcmp(argv[1], "--alloy-shell-broker-v1")) return shell_broker(argc, argv);
     if (argc < 3 || strcmp(argv[1], "--alloy-owned-exec-v1")) return 125;
     struct stat st;
     if (fstat(3, &st) || st.st_size < (off_t)sizeof(launch_state)) return 125;
@@ -358,4 +371,232 @@ done:
     if (state != MAP_FAILED) munmap(state, sizeof(*state));
     close(fd);
     return result;
+}
+
+/* Shell supervisors are children of one isolated, single-threaded reaper.
+ * The host never waits on a broker/supervisor PID. On host death the broker
+ * drains its children, then exits under launchd. A broken channel fails closed. */
+enum { SHELL_MESSAGE=0x41534f57, SHELL_READY=0x41535244 };
+typedef struct {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t ports[3];uint32_t size;char data[131072];} shell_packet;
+static int new_receiver(mach_port_t *port) {
+    if(mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_RECEIVE,port)!=KERN_SUCCESS)return EIO;
+    return 0;
+}
+static int packet_send(mach_port_t destination,mach_port_t reply,const void *data,uint32_t size,const int *fds,int count,alloy_stop_callback stop,void *context) {
+    if(size>131072 || count>3)return E2BIG;
+    shell_packet *packet=calloc(1,sizeof(*packet));if(!packet)return ENOMEM;
+    packet->header.msgh_bits=MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,reply?MACH_MSG_TYPE_MAKE_SEND:0)|MACH_MSGH_BITS_COMPLEX;
+    packet->header.msgh_size=sizeof(*packet);packet->header.msgh_remote_port=destination;packet->header.msgh_local_port=reply;packet->header.msgh_id=SHELL_MESSAGE;
+    packet->body.msgh_descriptor_count=3;packet->size=size;memcpy(packet->data,data,size);
+    int error=0;
+    /* Fixed descriptor layout. Unused slots carry ordinary send rights to a
+     * private dummy port; receive validates the declared fd count via capacity. */
+    mach_port_t dummy=MACH_PORT_NULL;
+    if(count<3){if(new_receiver(&dummy)){free(packet);return EIO;}mach_port_insert_right(mach_task_self(),dummy,dummy,MACH_MSG_TYPE_MAKE_SEND);}
+    for(int i=0;i<3;++i){
+        fileport_t port=MACH_PORT_NULL;
+        if(i<count && fileport_makeport(fds[i],&port)){error=errno;break;}
+        packet->ports[i].name=i<count?port:dummy;packet->ports[i].type=MACH_MSG_PORT_DESCRIPTOR;packet->ports[i].disposition=MACH_MSG_TYPE_COPY_SEND;
+    }
+    if(!error)for(;;){
+        if(stop && stop(context)){error=ECANCELED;break;}
+        kern_return_t r=mach_msg(&packet->header,MACH_SEND_MSG|MACH_SEND_TIMEOUT,packet->header.msgh_size,0,MACH_PORT_NULL,25,MACH_PORT_NULL);
+        if(r==MACH_MSG_SUCCESS)break;
+        if(r!=MACH_SEND_TIMED_OUT && r!=MACH_SEND_INTERRUPTED){error=EPIPE;break;}
+        if(!stop){error=EPIPE;break;}
+    }
+    for(int i=0;i<count;++i)if(packet->ports[i].name)mach_port_deallocate(mach_task_self(),packet->ports[i].name);
+    if(dummy){mach_port_deallocate(mach_task_self(),dummy);mach_port_mod_refs(mach_task_self(),dummy,MACH_PORT_RIGHT_RECEIVE,-1);}
+    free(packet);return error;
+}
+static int packet_receive(mach_port_t receiver,mach_port_t *reply,void *data,uint32_t capacity,uint32_t *size,int *fds,int expected,alloy_stop_callback stop,void *context) {
+    size_t room=sizeof(shell_packet)+512;
+    shell_packet *packet=calloc(1,room);if(!packet)return ENOMEM;
+    kern_return_t r;
+    for(;;){
+        if(stop && stop(context)){free(packet);return ECANCELED;}
+        r=mach_msg(&packet->header,MACH_RCV_MSG|MACH_RCV_TIMEOUT,0,(mach_msg_size_t)room,receiver,25,MACH_PORT_NULL);
+        if(r==MACH_MSG_SUCCESS)break;
+        if(r!=MACH_RCV_TIMED_OUT && r!=MACH_RCV_INTERRUPTED){free(packet);return EPIPE;}
+        if(!stop){free(packet);return EAGAIN;}
+    }
+    int error=0,received=0;
+    if(packet->header.msgh_id!=SHELL_MESSAGE || packet->header.msgh_size!=sizeof(*packet) || !(packet->header.msgh_bits&MACH_MSGH_BITS_COMPLEX) || packet->body.msgh_descriptor_count!=3 || packet->size>capacity)error=EPROTO;
+    if(!error)for(int i=0;i<3;++i){
+        if(packet->ports[i].type!=MACH_MSG_PORT_DESCRIPTOR || packet->ports[i].disposition!=MACH_MSG_TYPE_PORT_SEND){error=EPROTO;break;}
+        if(i<expected){int fd=fileport_makefd(packet->ports[i].name);if(fd<0){error=errno;break;}fds[received++]=fd;}
+    }
+    if(!error){*size=packet->size;memcpy(data,packet->data,*size);if(reply){*reply=packet->header.msgh_remote_port;packet->header.msgh_remote_port=MACH_PORT_NULL;}}
+    if(error)for(int i=0;i<received;++i){close(fds[i]);fds[i]=-1;}
+    mach_msg_destroy(&packet->header);free(packet);return error;
+}
+static int shell_broker(int argc, char **argv) {
+    (void)argc;
+    int parent=(int)strtol(argv[3],NULL,10);
+    uint64_t parent_identity=strtoull(argv[4],NULL,10);
+    struct sigaction action={0};action.sa_handler=SIG_DFL;sigemptyset(&action.sa_mask);
+    if(sigaction(SIGCHLD,&action,NULL)) return 125;
+    mach_port_t host=MACH_PORT_NULL, receiver=MACH_PORT_NULL;
+    if(task_get_special_port(mach_task_self(),TASK_BOOTSTRAP_PORT,&host)!=KERN_SUCCESS || new_receiver(&receiver))return 125;
+    struct {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t port;} ready={0};
+    ready.header.msgh_bits=MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,0)|MACH_MSGH_BITS_COMPLEX;ready.header.msgh_size=sizeof(ready);ready.header.msgh_remote_port=host;ready.header.msgh_id=SHELL_READY;
+    ready.body.msgh_descriptor_count=1;ready.port.name=receiver;ready.port.type=MACH_MSG_PORT_DESCRIPTOR;ready.port.disposition=MACH_MSG_TYPE_MAKE_SEND;
+    if(mach_msg(&ready.header,MACH_SEND_MSG|MACH_SEND_TIMEOUT,sizeof(ready),0,MACH_PORT_NULL,2000,MACH_PORT_NULL)!=KERN_SUCCESS)return 125;
+    mach_port_deallocate(mach_task_self(),host);
+    task_set_special_port(mach_task_self(),TASK_BOOTSTRAP_PORT,MACH_PORT_NULL);
+    int connected=1,children=0;
+    for (;;) {
+        int status;pid_t reaped;
+        while((reaped=waitpid(-1,&status,WNOHANG))>0) --children;
+        if (!connected || alloy_owned_alive(parent,parent_identity)!=1) {
+            if (!children) return 0;
+            connected=0;pause_briefly();continue;
+        }
+        char data[131072];uint32_t size=0;int statefd=-1;mach_port_t reply_port=MACH_PORT_NULL;
+        int error=packet_receive(receiver,&reply_port,data,sizeof(data),&size,&statefd,1,NULL,NULL);
+        if(error==EAGAIN)continue;
+        if(error){connected=0;continue;}
+        if(statefd<10){int copy=fcntl(statefd,F_DUPFD_CLOEXEC,10);close(statefd);statefd=copy;if(copy<0){mach_port_deallocate(mach_task_self(),reply_port);continue;}}
+        char *strings[4098];size_t count=0,offset=0;
+        while(offset<size && count<4098) {
+            char *end=memchr(data+offset,0,size-offset);
+            if(!end)break;
+            strings[count++]=data+offset;offset=(size_t)(end-data)+1;
+        }
+        int endpoints[6]={-1,-1,-1,-1,-1,-1};
+        pid_t child=0;
+        posix_spawnattr_t attr=NULL;posix_spawn_file_actions_t actions=NULL;
+        if(offset!=size || count<2 || children>=64) error=EINVAL;
+        if(!error && (pipe(endpoints)||pipe(endpoints+2)||pipe(endpoints+4))) error=errno;
+        if(!error) error=posix_spawnattr_init(&attr);
+        if(!error) error=posix_spawn_file_actions_init(&actions);
+        if(!error) error=posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT|POSIX_SPAWN_SETSID);
+        if(!error) error=posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0);
+        if(!error) error=posix_spawn_file_actions_adddup2(&actions,endpoints[3],1);
+        if(!error) error=posix_spawn_file_actions_adddup2(&actions,endpoints[5],2);
+        if(!error) error=posix_spawn_file_actions_adddup2(&actions,statefd,3);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if(!error) error=posix_spawn_file_actions_addchdir_np(&actions,strings[0]);
+#pragma clang diagnostic pop
+        char *arguments[4100]={argv[2],"--alloy-owned-exec-v1",NULL};
+        for(size_t i=1;i<count;++i) arguments[i+1]=strings[i];
+        char *environment[]={NULL};
+        if(!error) error=posix_spawn(&child,argv[2],&actions,&attr,arguments,environment);
+        if(!error) ++children;
+        if(actions)posix_spawn_file_actions_destroy(&actions);
+        if(attr)posix_spawnattr_destroy(&attr);
+        close(statefd);
+        int reply[2]={error,child};
+        int exported[3]={endpoints[1],endpoints[2],endpoints[4]};
+        /* Always supply three valid descriptors; error replies use /dev/null. */
+        if(error)for(int i=0;i<3;++i)exported[i]=open("/dev/null",O_RDWR|O_CLOEXEC);
+        (void)packet_send(reply_port,MACH_PORT_NULL,reply,sizeof(reply),exported,3,NULL,NULL);
+        mach_port_deallocate(mach_task_self(),reply_port);
+        if(error)for(int i=0;i<3;++i)if(exported[i]>=0)close(exported[i]);
+        for(int i=0;i<6;++i)if(endpoints[i]>=0)close(endpoints[i]);
+    }
+}
+static pthread_mutex_t shell_broker_lock=PTHREAD_MUTEX_INITIALIZER;
+static mach_port_t shell_broker_port=MACH_PORT_NULL, shell_pending_receiver=MACH_PORT_NULL;
+static uint64_t shell_pending_deadline;
+static int shell_broker_error;
+static int connect_shell_broker(const char *launcher,alloy_stop_callback stop,void *context) {
+    if(shell_broker_port)return 0;
+    if(shell_broker_error)return shell_broker_error;
+    mach_port_t receiver=shell_pending_receiver;
+    int error=0;
+    if(!receiver){
+    error=new_receiver(&receiver);if(error)return error;
+    mach_port_insert_right(mach_task_self(),receiver,receiver,MACH_MSG_TYPE_MAKE_SEND);
+    struct alloy_unique_info parent={0};error=identity_info(getpid(),&parent);
+    char pidtext[24],identitytext[32];snprintf(pidtext,sizeof(pidtext),"%d",getpid());snprintf(identitytext,sizeof(identitytext),"%llu",(unsigned long long)parent.uniqueid);
+    posix_spawnattr_t attr=NULL;posix_spawn_file_actions_t actions=NULL;
+    if(!error)error=posix_spawnattr_init(&attr);if(!error)error=posix_spawn_file_actions_init(&actions);
+    if(!error)error=posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT|POSIX_SPAWN_SETSID);
+    if(!error)error=posix_spawnattr_setspecialport_np(&attr,receiver,TASK_BOOTSTRAP_PORT);
+    for(int fd=0;!error && fd<3;++fd)error=posix_spawn_file_actions_addopen(&actions,fd,"/dev/null",fd?O_WRONLY:O_RDONLY,0);
+    char *arguments[]={(char *)launcher,"--alloy-shell-broker-v1",(char *)launcher,pidtext,identitytext,NULL};char *environment[]={NULL};pid_t broker=0;
+    if(!error)error=posix_spawn(&broker,launcher,&actions,&attr,arguments,environment);
+    if(actions)posix_spawn_file_actions_destroy(&actions);if(attr)posix_spawnattr_destroy(&attr);
+    if(!error){shell_pending_receiver=receiver;shell_pending_deadline=milliseconds()+5000;}
+    }
+    if(!error){
+        union {mach_msg_header_t header;char bytes[1024];} reply={0};
+        uint64_t until=shell_pending_deadline;
+        for(;;){
+            if(stop(context)){return ECANCELED;}
+            kern_return_t result=mach_msg(&reply.header,MACH_RCV_MSG|MACH_RCV_TIMEOUT,0,sizeof(reply),receiver,25,MACH_PORT_NULL);
+            if(result==MACH_RCV_TIMED_OUT||result==MACH_RCV_INTERRUPTED){if(milliseconds()>=until){error=ETIMEDOUT;break;}continue;}
+            if(result!=KERN_SUCCESS){error=EPIPE;break;}
+            struct ready_message {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t port;} *ready=(void *)&reply;
+            if(ready->header.msgh_id!=SHELL_READY||ready->header.msgh_size!=sizeof(*ready)||!(ready->header.msgh_bits&MACH_MSGH_BITS_COMPLEX)||ready->body.msgh_descriptor_count!=1||ready->port.type!=MACH_MSG_PORT_DESCRIPTOR||ready->port.disposition!=MACH_MSG_TYPE_PORT_SEND){mach_msg_destroy(&reply.header);error=EPROTO;break;}
+            shell_broker_port=ready->port.name;ready->port.name=MACH_PORT_NULL;mach_msg_destroy(&reply.header);break;
+        }
+    }
+    mach_port_deallocate(mach_task_self(),receiver);
+    mach_port_mod_refs(mach_task_self(),receiver,MACH_PORT_RIGHT_RECEIVE,-1);
+    shell_pending_receiver=MACH_PORT_NULL;
+    if(error)shell_broker_error=error;
+    return error;
+}
+int alloy_shell_spawn(const char *launcher,const char *program,const char *cwd,
+    char *const argv[],alloy_stop_callback stop,void *context,int *pid,void **out_control,int result_fds[3]) {
+    *pid=0;*out_control=NULL;
+    for(int i=0;i<3;++i)result_fds[i]=-1;
+    while(pthread_mutex_trylock(&shell_broker_lock)!=0) {if(stop(context))return ECANCELED;pause_briefly();}
+    int error=connect_shell_broker(launcher,stop,context);
+    mach_port_t reply_port=MACH_PORT_NULL;
+    char name[32];snprintf(name,sizeof(name),"/alloy-%016llx",(unsigned long long)(((uint64_t)arc4random()<<32)|arc4random()));
+    int fd=-1;launch_state *state=MAP_FAILED;owned_control *control=NULL;char *data=NULL;
+    if(error)goto done;
+    fd=shm_open(name,O_CREAT|O_EXCL|O_RDWR,0600);if(fd<0){error=errno;goto done;}shm_unlink(name);
+    if(ftruncate(fd,sizeof(*state))){error=errno;goto done;}
+    state=mmap(NULL,sizeof(*state),PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    if(state==MAP_FAILED){error=errno;goto done;}
+    memset(state,0,sizeof(*state));atomic_init(&state->state,INITIAL);
+    struct alloy_unique_info parent;error=identity_info(getpid(),&parent);if(error)goto done;
+    state->parent_pid=getpid();state->parent_identity=parent.uniqueid;
+    size_t size=strlen(cwd)+1;for(size_t i=0;argv[i];++i){size+=strlen(argv[i])+1;if(size>131072){error=E2BIG;goto done;}}
+    data=malloc(size);control=calloc(1,sizeof(*control));if(control)control->state=state; if(!data||!control){error=ENOMEM;goto done;}
+    size_t offset=strlen(cwd)+1;memcpy(data,cwd,offset);
+    for(size_t i=0;argv[i];++i){size_t n=strlen(argv[i])+1;memcpy(data+offset,argv[i],n);offset+=n;}
+    (void)program;
+    error=new_receiver(&reply_port);
+    if(!error)error=packet_send(shell_broker_port,reply_port,data,(uint32_t)size,&fd,1,stop,context);
+    int reply[2]={0};uint32_t reply_size=0;
+    if(!error)error=packet_receive(reply_port,NULL,reply,sizeof(reply),&reply_size,result_fds,3,stop,context);
+    if(error)goto done;
+    if(reply_size!=sizeof(reply)){error=EPROTO;goto done;}
+    if(reply[0]){error=reply[0];goto done;}
+    control->state=state;control->owner_pid=reply[1];control->reap_owner=0;
+    for(;;) {
+        unsigned phase=atomic_load_explicit(&state->state,memory_order_acquire);
+        if(phase==READY) {
+            if(state->pid!=reply[1] || !state->identity){error=EIO;break;}
+            control->owner_identity=state->identity;
+            if(stop(context)){error=ECANCELED;break;}
+            unsigned expected=READY;atomic_compare_exchange_strong(&state->state,&expected,CREATE);
+        } else if(phase==TARGET_READY) {
+            if(stop(context)){error=ECANCELED;break;}
+            unsigned expected=TARGET_READY;
+            if(!atomic_compare_exchange_strong(&state->state,&expected,RUN))continue;
+            *pid=state->target_pid;*out_control=control;control=NULL;state=MAP_FAILED;break;
+        } else if(phase==DONE){error=state->error?state->error:EIO;break;}
+        if(stop(context)){error=ECANCELED;break;}pause_briefly();
+    }
+done:
+    if(error && state!=MAP_FAILED) {
+        /* STOP before CREATE/RUN prevents an abandoned request executing later. */
+        unsigned phase=atomic_load_explicit(&state->state,memory_order_acquire);
+        while(phase!=DONE && phase!=STOP && !atomic_compare_exchange_weak(&state->state,&phase,STOP)){}
+    }
+    if(control && control->owner_pid){alloy_owned_close(control);state=MAP_FAILED;}
+    else free(control);
+    if(state!=MAP_FAILED)munmap(state,sizeof(*state));
+    if(fd>=0)close(fd);free(data);
+    if(error)for(int i=0;i<3;++i)if(result_fds[i]>=0){close(result_fds[i]);result_fds[i]=-1;}
+    if(reply_port)mach_port_mod_refs(mach_task_self(),reply_port,MACH_PORT_RIGHT_RECEIVE,-1);
+    pthread_mutex_unlock(&shell_broker_lock);
+    return error;
 }

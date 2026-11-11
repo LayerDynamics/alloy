@@ -13,4 +13,8 @@ int alloy_owned_stop(void *control);
 int alloy_owned_wait(void *control, int *status, int nohang);
 void alloy_owned_close(void *control);
 int alloy_exec_helper(int argc, char **argv);
+int alloy_shell_spawn(const char *launcher, const char *program, const char *cwd,
+    char *const argv[], alloy_stop_callback stop, void *context,
+    int *pid, void **control, int result_fds[3]);
+
 #endif

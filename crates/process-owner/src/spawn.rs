@@ -165,21 +165,17 @@ impl std::error::Error for CommittedLaunchError {}
 
 /// Installed helper path; development builds also carry freshly compiled native helpers.
 pub fn default_helper() -> std::io::Result<std::path::PathBuf> {
-    let exe = std::env::current_exe()?;
-    let installed = exe
-        .parent()
-        .ok_or_else(|| std::io::Error::other("executable parent missing"))?
-        .join("alloy-plugin-pipe-helper");
-    if installed.is_file() {
-        return Ok(installed);
-    }
     #[cfg(all(target_os = "macos", debug_assertions))]
     {
         Ok(std::path::PathBuf::from(env!("ALLOY_DEV_HELPER")))
     }
     #[cfg(not(all(target_os = "macos", debug_assertions)))]
     {
-        Ok(installed)
+        let exe = std::env::current_exe()?;
+        Ok(exe
+            .parent()
+            .ok_or_else(|| std::io::Error::other("executable parent missing"))?
+            .join("alloy-plugin-pipe-helper"))
     }
 }
 
@@ -196,7 +192,7 @@ pub fn spawn_shell(
     }
     #[cfg(target_os = "macos")]
     {
-        macos::spawn_impl(command, helper, deadline, cancel, false, true)
+        macos::spawn_shell(command, helper, deadline, cancel)
     }
 }
 #[cfg(target_os = "linux")]
@@ -694,6 +690,72 @@ mod macos {
             unsafe { alloy_owned_close(self.control) };
         }
     }
+    pub(super) fn spawn_shell(
+        cmd: Command,
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &dyn Fn() -> bool,
+    ) -> io::Result<Spawned> {
+        unsafe extern "C" {
+            fn alloy_shell_spawn(
+                launcher: *const c_char,
+                program: *const c_char,
+                cwd: *const c_char,
+                argv: *const *mut c_char,
+                stop: unsafe extern "C" fn(*mut c_void) -> i32,
+                context: *mut c_void,
+                pid: *mut i32,
+                control: *mut Opaque,
+                fds: *mut i32,
+            ) -> i32;
+        }
+        let program = cstring(cmd.get_program())?;
+        let cwd = cstring(
+            cmd.get_current_dir()
+                .ok_or_else(|| io::Error::other("shell cwd missing"))?
+                .as_os_str(),
+        )?;
+        let launcher = cstring(
+            launcher_path(helper.ok_or_else(|| io::Error::other("missing helper"))?)?.as_os_str(),
+        )?;
+        let mut args = vec![program.clone()];
+        for arg in cmd.get_args() {
+            args.push(cstring(arg)?);
+        }
+        let mut argv: Vec<*mut c_char> = args.iter().map(|arg| arg.as_ptr().cast_mut()).collect();
+        argv.push(std::ptr::null_mut());
+        let mut state = Stop { deadline, cancel };
+        let mut pid = 0;
+        let mut control = std::ptr::null_mut();
+        let mut fds = [-1; 3];
+        // SAFETY: null-terminated C strings and callback state remain live for this synchronous call.
+        checked(unsafe {
+            alloy_shell_spawn(
+                launcher.as_ptr(),
+                program.as_ptr(),
+                cwd.as_ptr(),
+                argv.as_ptr(),
+                stopped,
+                (&mut state as *mut Stop<'_>).cast(),
+                &mut pid,
+                &mut control,
+                fds.as_mut_ptr(),
+            )
+        })?;
+        // SAFETY: success transfers three distinct, close-on-exec descriptors and one native control record.
+        let owned = unsafe { fds.map(|fd| OwnedFd::from_raw_fd(fd)) };
+        let [input, output, error] = owned;
+        Ok((
+            Child {
+                control,
+                status: None,
+                target_pid: pid as u32,
+            },
+            input.into(),
+            output.into(),
+            error.into(),
+        ))
+    }
     pub(super) fn spawn(
         cmd: Command,
         helper: Option<&std::path::Path>,
@@ -891,5 +953,71 @@ mod linux_supervisor_tests {
             assert!(Instant::now() < until, "deferred waiter did not reap child");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod shell_broker_tests {
+    use super::*;
+    use std::{
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    #[test]
+    fn cancelled_launch_does_not_execute_late_or_disable_next_launch() {
+        let helper = default_helper().unwrap();
+        let root = std::env::temp_dir().join(format!("alloy-broker-cancel-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let mut bootstrap = Command::new("/usr/bin/true");
+        bootstrap.current_dir(&root);
+        assert!(
+            spawn_shell(
+                bootstrap,
+                Some(&helper),
+                Instant::now() + Duration::from_secs(5),
+                &|| true
+            )
+            .is_err()
+        );
+        std::thread::sleep(Duration::from_millis(5100));
+        let mut cancelled = 0;
+        for limit in [1, 2, 3, 5, 8, 13, 21, 34] {
+            let marker = root.join(format!("marker-{limit}"));
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", &format!("printf executed > {}", marker.display())])
+                .current_dir(&root);
+            let calls = AtomicUsize::new(0);
+            let result = spawn_shell(
+                cmd,
+                Some(&helper),
+                Instant::now() + Duration::from_secs(5),
+                &|| calls.fetch_add(1, Ordering::Relaxed) >= limit,
+            );
+            match result {
+                Ok((mut child, input, _, _)) => {
+                    drop(input);
+                    child.wait().unwrap();
+                }
+                Err(_) => {
+                    cancelled += 1;
+                    std::thread::sleep(Duration::from_millis(30));
+                    assert!(!marker.exists(), "cancelled launch executed later");
+                }
+            }
+            let mut next = Command::new("/usr/bin/true");
+            next.current_dir(&root);
+            let (mut child, input, _, _) = spawn_shell(
+                next,
+                Some(&helper),
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+            )
+            .unwrap();
+            drop(input);
+            assert!(child.wait().unwrap().success());
+        }
+        assert!(cancelled > 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

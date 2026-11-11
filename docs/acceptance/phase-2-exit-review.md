@@ -1,18 +1,21 @@
 # Phase 2 exit review
 
-**Decision: blocked.** Shell targets now run beneath the shared isolated native
-owner, which retains its target through group cleanup. The auto-reaping regression
-passes on Linux and macOS. This does not establish complete host-reaper safety:
-the macOS owner cleanup still waits for its supervisor by numeric PID under the
-host-owned reaping contract. A competing host waiter can consume that supervisor
-before this wait and permit reuse. Independent review requires resolving that
-supervisor-status ownership gap before closing [issue #31](https://github.com/LayerDynamics/alloy/issues/31).
+**Decision: awaiting final candidate acceptance.** Shell targets now run beneath
+shared isolated native owners. Linux uses a kernel-pinned supervisor pidfd;
+macOS uses a private Mach/fileport broker that exclusively reaps its supervisors.
+The daemon never numerically waits for shell supervisors or signals target PIDs.
+The broker lasts for the embedding host's lifetime and drains its children on host
+exit. Unexpected broker death fails closed; it is not automatically respawned or
+numerically reaped by the host. A host restart restores service after that fatal
+infrastructure failure. These are process-lifetime resources, not per-call workers.
 
-The pause completion callback and exact-request NotFound handling have local
-regression coverage. The final candidate still needs refreshed Linux/Mac CI,
-real-model acceptance, packaging and exit review for
-[issue #34](https://github.com/LayerDynamics/alloy/issues/34). Earlier green runs
-are historical evidence and do not authorize merging the changed candidate.
+Local tests cover auto-reaping, a competing `waitpid(-1)` loop collecting unrelated
+child statuses, exact exit/signal status, descendant cleanup, cancellation and
+cancelled-bootstrap recovery after its original deadline. Pause completion and
+exact-request NotFound handling also have regression coverage. Final Linux/Mac CI,
+real-model acceptance, packaging and exit review must pass before closing
+[issue #31](https://github.com/LayerDynamics/alloy/issues/31) and
+[issue #34](https://github.com/LayerDynamics/alloy/issues/34).
 
 **Earlier candidate evidence.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
 passed the complete [Linux and Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43018696590)
