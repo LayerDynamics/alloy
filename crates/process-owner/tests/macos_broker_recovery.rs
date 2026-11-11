@@ -214,6 +214,7 @@ fn crash_case(root: &Path, stage: i32) {
             // SAFETY: stop the real supervisor by kernel identity and wait
             // until the OS reports SSTOP, before publishing cancellation.
             assert_eq!(
+                // SAFETY: this host retains the exact supervisor for this child.
                 unsafe { alloy_test_shell_owner_pause(child.id() as i32, 1) },
                 0
             );
@@ -222,6 +223,7 @@ fn crash_case(root: &Path, stage: i32) {
             // SAFETY: observes both shared STOP and the real supervisor's
             // stopped OS state. Cancellation cannot finish behind this barrier.
             assert_eq!(
+                // SAFETY: only observes this live child's retained control state.
                 unsafe { alloy_test_shell_cancellation_pending(child.id() as i32) },
                 1
             );
@@ -234,6 +236,7 @@ fn crash_case(root: &Path, stage: i32) {
         if stage == 4 {
             // SAFETY: cancellation must still be pending after broker death.
             assert_eq!(
+                // SAFETY: Child still owns this independent supervisor channel.
                 unsafe { alloy_test_shell_cancellation_pending(child.id() as i32) },
                 1
             );
