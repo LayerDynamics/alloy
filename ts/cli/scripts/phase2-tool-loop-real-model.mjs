@@ -113,7 +113,7 @@ async function main() {
     };
     const configPath = path.join(a.output, "tools.json");
     save(configPath, config);
-    await a.startDaemon("daemon-phase2", ["--tools-config", configPath]);
+    await a.startDaemon("daemon-phase2", ["--tools-config", configPath, "--hot-cache-only"]);
     const prompt = `Use the tools. First call fs.read with exactly ${JSON.stringify(readArgs)}. Then call shell.run with exactly ${JSON.stringify(shellArgs)}. After receiving both results, reply with the fixture text and the shell result. /no_think`;
     for (const [label, allow] of [["denied", false], ["approved", true]]) {
       const created = await rpc(a.socket, "session.create", { profile: "qwen3-4b-4bit" });
