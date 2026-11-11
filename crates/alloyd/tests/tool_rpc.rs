@@ -316,15 +316,20 @@ fn configured_tool_notifications_abort_before_approval_or_execution_on_overflow(
 
 #[test]
 fn pause_running_shell_reaps_process_without_affecting_another_session() {
-    pause_running_shell(false);
+    pause_running_operation(false, false);
 }
 
 #[test]
 fn pause_running_shell_after_finished_request_eviction() {
-    pause_running_shell(true);
+    pause_running_operation(true, false);
 }
 
-fn pause_running_shell(evicted: bool) {
+#[test]
+fn pause_running_plugin_hook_reaps_plugin_without_tool_effects() {
+    pause_running_operation(true, true);
+}
+
+fn pause_running_operation(evicted: bool, hook: bool) {
     let dir = tempfile::tempdir().unwrap();
     let cwd = std::fs::canonicalize(dir.path()).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
@@ -334,6 +339,12 @@ fn pause_running_shell(evicted: bool) {
         vec![
             engine::types::GenerationEvent::TextDelta {
                 text: "other session completed".into(),
+            },
+            done(),
+        ],
+        vec![
+            engine::types::GenerationEvent::TextDelta {
+                text: "other session still active".into(),
             },
             done(),
         ],
@@ -357,13 +368,51 @@ fn pause_running_shell(evicted: bool) {
     let config = json!({"read_root":cwd,"write_root":cwd,"shell_executables":[shell],"shell_cwd_roots":[cwd],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"shell.run","allowed_arguments":[args],"require_approval":true,"timeout_ms":30000,"max_output_bytes":65536}]},"plugins":[]});
     let path = dir.path().join("tools.json");
     std::fs::write(&path, config.to_string()).unwrap();
-    let runtime = alloyd::tool_config::load(
+    let mut runtime = alloyd::tool_config::load(
         &path,
         service
             .open_artifacts(&dir.path().join("artifacts"))
             .unwrap(),
     )
     .unwrap();
+    let hook_log = dir.path().join("hook-events");
+    if hook {
+        use harness_core::plugin_host::{Limits, PluginConfig, PluginHost, sandbox::Sandbox};
+        use tool_registry::execution::CancellationToken;
+        let fixture = dir.path().join("hook-fixture");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-o"])
+            .arg(&fixture)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../harness-core/tests/fixtures/tool_hook_plugin.rs"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let host = PluginHost::start_with_helper(
+            vec![PluginConfig {
+                id: "p".into(),
+                version: "1.0.0".into(),
+                program: fixture,
+                args: vec!["p".into(), "hang".into(), hook_log.to_str().unwrap().into()],
+                cwd: cwd.clone(),
+                sandbox: Sandbox::Trusted,
+            }],
+            Limits {
+                message_bytes: 16384,
+                diagnostic_bytes: 4096,
+                annotation_bytes: 1024,
+                reason_bytes: 256,
+                timeout: Duration::from_secs(30),
+            },
+            std::time::Instant::now() + Duration::from_secs(30),
+            &CancellationToken::default(),
+            &alloy_process_owner::spawn::default_helper().unwrap(),
+        )
+        .unwrap();
+        runtime.plugins = std::sync::Mutex::new(host);
+    }
     let service = Arc::new(service.with_tools(runtime));
     let listener = bind_listener(&dir.path().join("rpc.sock")).unwrap();
     let (mut stream, worker) = connect(&listener, service.clone());
@@ -401,20 +450,35 @@ fn pause_running_shell(evicted: bool) {
         json!({"session_id":session,"call_id":call,"allow":true}),
     );
     assert!(receive(&mut control).get("result").is_some());
-    loop {
-        let event = receive(&mut stream);
-        assert!(event.get("error").is_none(), "{event}");
-        if event["params"]["event"] == "tool_call_started" {
-            break;
+    let pid = if hook {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&hook_log)
+            .unwrap_or_default()
+            .contains("p:before")
+        {
+            assert!(std::time::Instant::now() < until, "hook did not start");
+            thread::sleep(Duration::from_millis(5));
         }
-    }
-    let pidfile = dir.path().join("owned.pid");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !pidfile.exists() {
-        assert!(std::time::Instant::now() < deadline, "shell did not start");
-        thread::sleep(Duration::from_millis(10));
-    }
-    let pid = std::fs::read_to_string(pidfile).unwrap().trim().to_owned();
+        std::fs::read_to_string(format!("{}.p.pid", hook_log.display()))
+            .unwrap()
+            .trim()
+            .to_owned()
+    } else {
+        loop {
+            let event = receive(&mut stream);
+            assert!(event.get("error").is_none(), "{event}");
+            if event["params"]["event"] == "tool_call_started" {
+                break;
+            }
+        }
+        let pidfile = dir.path().join("owned.pid");
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() {
+            assert!(std::time::Instant::now() < until, "shell did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(pidfile).unwrap().trim().to_owned()
+    };
     struct Sentinel(std::process::Child);
     impl Drop for Sentinel {
         fn drop(&mut self) {
@@ -460,7 +524,8 @@ fn pause_running_shell(evicted: bool) {
         "session.pause",
         json!({"session_id":session}),
     );
-    assert!(receive(&mut control).get("result").is_some());
+    let paused = receive(&mut control);
+    assert_eq!(paused["result"]["status"], "paused", "{paused}");
     let mut terminals = 0;
     loop {
         let event = receive(&mut stream);
@@ -475,6 +540,59 @@ fn pause_running_shell(evicted: bool) {
         }
     }
     assert_eq!(terminals, 1);
+    send(
+        &mut control,
+        7,
+        "sessions.resume",
+        json!({"session_id":session}),
+    );
+    let paused_history = receive(&mut control);
+    assert_eq!(paused_history["result"]["status"], "paused");
+    if hook {
+        assert!(
+            !paused_history["result"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "tool.started")
+        );
+    }
+    send(
+        &mut control,
+        8,
+        "sessions.resume",
+        json!({"session_id":other}),
+    );
+    let other_history = receive(&mut control);
+    assert_eq!(other_history["result"]["status"], "active");
+    assert!(
+        other_history["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "assistant.message"
+                && event["payload"]["content"] == "other session completed")
+    );
+    send(
+        &mut control,
+        9,
+        "session.send",
+        json!({"session_id":other,"content":"continue after independent pause"}),
+    );
+    loop {
+        let event = receive(&mut control);
+        if event["id"] == 9 {
+            assert!(event.get("result").is_some(), "{event}");
+            break;
+        }
+    }
+
+    if hook {
+        assert!(
+            !dir.path().join("owned.pid").exists(),
+            "tool executed while before hook was cancelled"
+        );
+    }
     assert!(
         sentinel.0.try_wait().unwrap().is_none(),
         "unrelated sentinel died during pause"
@@ -496,9 +614,6 @@ fn pause_running_shell(evicted: bool) {
         }
         let status = std::str::from_utf8(&output.stdout).unwrap().trim();
         assert!(!status.is_empty(), "ps succeeded without process state");
-        if status.starts_with('Z') {
-            break;
-        }
         assert!(
             std::time::Instant::now() < deadline,
             "paused shell {pid} survived"

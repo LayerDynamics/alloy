@@ -42,6 +42,7 @@ dependencies = [
 name = "alloyd"
 version = "0.1.0"
 dependencies = [
+ "alloy-process-owner",
  "engine",
  "harness-core",
  "mlx-ffi",
