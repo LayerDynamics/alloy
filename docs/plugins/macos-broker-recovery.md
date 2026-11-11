@@ -1,7 +1,8 @@
 # Native macOS shell broker recovery
 
 The shell broker runs as a per-host user launchd job. A broker crash interrupts
-the affected launch but permits the next command to connect to a fresh instance.
+the affected launch; subsequent commands can connect to a fresh instance when
+the bounded retry budget permits.
 Workloads execute directly on the host Mac with ordinary macOS subprocess APIs.
 This mechanism does not establish containment of deliberately detached descendants.
 
@@ -105,3 +106,9 @@ therefore insufficient. No verified policy preserving normal macOS subprocess
 APIs has been established. Execution must remain directly on the host, so a VM
 backend is outside the accepted scope. Hard containment remains an open
 requirement; this recovery implementation must not be presented as satisfying it.
+
+A separate acceptance probe through the actual owner also double-forked, called
+`setsid`, and closed inherited streams. The leader completed successfully while
+the detached descendant remained alive. The probe subsequently terminated that
+descendant by stable identity and independently verified its disappearance. This
+is a failing hard-containment result, not evidence that containment is implemented.

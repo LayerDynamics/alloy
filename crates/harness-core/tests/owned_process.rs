@@ -18,6 +18,7 @@ fn macos_identity_signals_survive_exec_reaping_and_pid_mismatch() {
         .arg(root.join("../process-owner/native"))
         .arg(root.join("tests/fixtures/owned_process.c"))
         .arg(root.join("../process-owner/native/owned_process.c"))
+        .arg("-lbsm")
         .arg("-o")
         .arg(&driver)
         .output()
