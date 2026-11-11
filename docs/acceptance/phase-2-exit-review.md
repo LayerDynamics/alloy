@@ -1,96 +1,72 @@
 # Phase 2 exit review
 
-**Decision: awaiting final candidate acceptance.** Shell targets now run beneath
-shared isolated native owners. Linux uses a kernel-pinned supervisor pidfd;
-macOS uses a private Mach/fileport broker that exclusively reaps its supervisors.
-The daemon never numerically waits for shell supervisors or signals target PIDs.
-The broker lasts for the embedding host's lifetime and drains its children on host
-exit. Unexpected broker death fails closed; it is not automatically respawned or
-numerically reaped by the host. A host restart restores service after that fatal
-infrastructure failure. These are process-lifetime resources, not per-call workers.
+**Decision: accepted for implementation candidate `9faba79f9ed27d11bcf1d8e7e7776826517587d0` on 2026-11-11.** All P2-01 through P2-16 requirements and the preserved Phase 1 regressions passed. Independent implementation, integration and acceptance reviews found no remaining blocker after the ownership and pause fixes. This sign-off is documentation-only; the final PR head must also have passing required checks before merge.
 
-Local tests cover auto-reaping, a competing `waitpid(-1)` loop collecting unrelated
-child statuses, exact exit/signal status, descendant cleanup, cancellation and
-cancelled-bootstrap recovery after its original deadline. Pause completion and
-exact-request NotFound handling also have regression coverage. Final Linux/Mac CI,
-real-model acceptance, packaging and exit review must pass before closing
-[issue #31](https://github.com/LayerDynamics/alloy/issues/31) and
-[issue #34](https://github.com/LayerDynamics/alloy/issues/34).
+## Candidate and retained evidence
 
-**Earlier candidate evidence.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
-passed the complete [Linux and Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43018696590)
-and the [supplemental approval/storage run](https://github.com/LayerDynamics/alloy/actions/runs/43018696710).
-The final reviewed candidate and closure decision are recorded on
-[issue #34](https://github.com/LayerDynamics/alloy/issues/34). A later code or
-test change requires fresh applicable acceptance evidence.
+- [Complete Linux/Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43072447930): every job passed, including CLI, Linux foundation/core/engine/reproducibility, Mac core/Metal, approval/storage, real-model and installed Homebrew acceptance.
+- [Supplemental approval/storage run](https://github.com/LayerDynamics/alloy/actions/runs/43072447906): Linux evidence passed. Its standalone Mac job was intentionally skipped because the complete Mac evidence is collected and required by the main run.
+- [Real-model, latency, Phase 1 and Homebrew artifact](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13880006792).
+- W4 artifacts: [Linux](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13880246011), [Mac](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13879131457).
+- W5 artifacts: [Linux](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13880131107), [Mac](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13877579288).
+- [Mac approval/storage artifact](https://github.com/LayerDynamics/alloy/actions/runs/43072447930/artifacts/13878243478).
 
-## Required evidence
+Mac tested the candidate SHA directly. Linux tested PR merge commit `a5b0fa9d5459d18b25b0955b13b1fb33ea312989`; both retained the identical tracked source tree `ad597e206b4ecc7ad9d27e72a2ea6d20451eab03`. The W4 source manifests match across platforms. W5 before/after working-directory snapshots match within each lane; those lane-specific working-directory hashes are not claimed to match each other.
 
-| Requirement | Evidence needed on the final candidate |
-| --- | --- |
-| Real model reads a file and requests a policy-governed shell tool; execution waits for bound approval | P2-06, P2-12–15. The Mac `phase2_tool_loop_real_model` driver records the candidate, pinned model, daemon identity, RPC stream, durable history, denial and approval runs. It checks that the marker is absent before either decision, absent after denial, and present after approval. The model must consume file and shell output. |
-| Malformed calls and invalid arguments never execute | P2-02–04 and P2-07 on Linux and Mac, including the zero-effect assertions. |
-| Real plugin receives before/after hooks and obeys veto, annotation, ordering and sandbox contracts | P2-10–11 on Linux and Mac and P2-15 on Mac. The real-model driver retains the plugin's ordered hook log; the negative and sandbox tests remain required separately. |
-| Supporting invariants | P2-01 and P2-05–14, including rendering, durable approval and artifacts, cancellation, history, RPC responsiveness and CLI behavior. Preserve the existing Phase 1 gates. |
-| Harness overhead | P2-16 on Mac, with mocked inference and no approval wait or client transport. The test logs the count, all samples, min, median, p95, max, mean and timed boundary; every sampled round must be below 50 ms. |
+Collectors retain automated evidence and deliberately do not grant acceptance themselves. Their `accepted: false` / `source_review_complete: false` defaults are preserved. This exit review supplies the explicit source/design and requirement sign-off, after inspection of the raw results and independent reviews; it does not rewrite collector output or claim an exhaustive security audit.
 
-The automatic Mac lane retains the Phase 2 output alongside the Phase 1
-acceptance artifact under `always()`. Acceptance must name the exact candidate,
-corpus hash, model revision and artifact digest recorded by that lane. A skipped
-or failed named test cannot be replaced by a local mock or by W5 acceptance.
+## Final requirement matrix
 
-## Candidate evidence and exit statements
+| Requirement | Result | Candidate evidence |
+| --- | --- | --- |
+| P2-01 registry/schema normalization | PASS, Linux + Mac | Tool-registry all-targets and named registration/validation gates |
+| P2-02 arguments rejected before execution | PASS, Linux + Mac | Invalid/missing/extra/type-invalid arguments and unknown IDs have zero effects |
+| P2-03 Qwen chunk boundaries | PASS, Linux + Mac | Qwen parser chunk/split regressions |
+| P2-04 malformed tool calls never execute | PASS, Linux + Mac | Malformed, ambiguous and truncated parser/dispatch regressions |
+| P2-05 exact rendering/count/identity | PASS, Linux + Mac | Engine tool-rendering and compatibility gates |
+| P2-06 bound destructive approval | PASS, Linux + Mac | Named policy gate, durable approval/storage and real-model denial/approval |
+| P2-07 builtin scope/output/deadline limits | PASS, Linux + Mac | W4 named gates and complete builtin suites |
+| P2-08 durable oversized artifacts | PASS, Linux + Mac | Named artifact roundtrip and interruption/provenance regressions |
+| P2-09 pause/cancellation/resource ownership | PASS, Linux + Mac | Named cancellation gate plus real RPC pause during generation, approval, shell and plugin hook; owned PID disappears, one terminal outcome, durable paused status, unaffected session history and subsequent turn |
+| P2-10 real hook order/veto/annotations | PASS, Linux + Mac | W5 named gates and actual P2-15 correlated hook requests |
+| P2-11 protocol/timeout/sandbox | PASS, Linux + Mac protocol; Mac sandbox | W5 negative cases, allowed/denied resources, fork/network/descriptor/artifact hardening |
+| P2-12 canonical loop/history/reopen | PASS, Linux + Mac | Named loop gate and no-replay/reopen regressions |
+| P2-13 responsive approval/control RPC | PASS, Linux + Mac | Seven tool-RPC tests including active-hook and active-shell pause |
+| P2-14 CLI approval/result behavior | PASS, Linux + Mac, Node 26.13.0 | CLI and monitor suites on both platforms |
+| P2-15 real deployed model tool loop | PASS, Mac/Metal | Candidate-built daemon and matching helpers; pinned Qwen3; retained RPC, history, marker and correlated hook evidence |
+| P2-16 harness roundtrip under 50 ms | PASS, Mac | 32 recorded samples; every sample below 50 ms |
 
-- P2-01 through P2-14 passed the existing Linux and Mac suites, but P2-09 did
-  not test a competing shell-child reaper and does not close the blocker. The retained
-  W5 Linux and Mac artifacts each contain passing P2-10/P2-11 results and
-  identical before/after source snapshots. Their checkout commits differ
-  because the Linux lane tested the PR merge commit, but their source-tree
-  identities match the Mac candidate tree.
-- The retained Mac `phase-1-acceptance` artifact contains P2-15's candidate and
-  binary/helper identities, pinned corpus, RPC/history, denial/approval
-  observations, and actual ordered before/after plugin requests. Before both
-  decisions the marker was absent; it remained absent after denial and appeared
-  after approval. The final answer used both the read result and the unseen
-  shell output. These observations satisfy the real-model exit statement and
-  supply integrated plugin evidence.
-- Invalid-call and zero-effect gates P2-02–04/07 passed in the full suites;
-  plugin veto, annotation, ordering and sandbox gates P2-10/11 passed on their
-  required lanes. Together with P2-15 they support the other two exit statements.
-- P2-16 recorded 32 samples: 6.773 ms minimum, 8.118 ms median, 9.016 ms p95,
-  and 12.573 ms maximum. The boundary is `run_tool_turn` with mocked inference
-  and a real scoped file read; human approval and client transport are excluded.
-- The pinned model is `mlx-community/Qwen3-4B-4bit` at revision
-  `4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25`, aggregate SHA-256
-  `95d369e2b999429fd8f02efdd9c0916718e653cb0a62d58e7f6a2770fee447a5`;
-  the corpus file SHA-256 is
-  `dc2eac48c5522fa53360855950eba4527dc6c21dc943f1d1c9282bd8535b2534`.
-- The main workflow took 8m56s from the first job start to the last aggregate,
-  and 10m27s from workflow creation through completion including queue time.
-  The latter exceeds ten minutes; this run does not establish a queue-inclusive
-  ten-minute guarantee. One self-hosted Mac serializes the Mac lanes.
+## Three exit statements
 
-## Preliminary observations
+1. **Real governed tool use:** Qwen3 read the synthetic fixture, requested the shell tool, and waited for explicit bound approval. The marker was absent before either decision, remained absent after denial, and appeared after approval. Durable execution records show one approved shell start. The final answer consumed the file content and previously unseen shell output.
+2. **Invalid input has zero effects:** parser, registry, validation, builtin and policy tests reject malformed or unauthorized calls without fallback execution; execution counters and filesystem/network markers establish the zero-effect assertions.
+3. **Actual out-of-process hooks:** the deployed plugin received correlated before/after requests. Separate W5 gates prove ordering, veto, bounded annotations, protocol/version handling, limits, fail-closed before-hook behavior, after-hook warning behavior and Mac sandbox restrictions.
 
-On 2026-11-11, local candidate `d8bb02c806397c9aab15ccaa278a860bc88e2bbb`
-passed the real-model acceptance, both Phase 1 real-model streaming/restart
-checks, and the standalone latency test on macOS 26.4. The 32 latency samples
-had median 7.919 ms and maximum 15.540 ms. This local candidate is historical
-if the source or test tree changes; final candidate CI must be reviewed again.
+## Ownership and pause review
 
-The first deployed run exposed a missing tool-parser selection and later a
-workspace admission failure. The candidate enables explicitly bounded parser
-allocation only for configured tools and uses a 64-token prefill chunk for
-those daemons, keeping the memory admission guard enabled. Text-only boot keeps
-its prior parser and prefill configuration. These changes need final CI and
-regression review, including the existing native memory and real-model gates.
+Shell targets run beneath shared isolated native owners. Linux pins its supervisor with a pidfd and returns the target's actual exit/signal status. Completion framing and launch acknowledgment reads remain nonblocking and cancellation-aware. Failed exec is distinguished from a program exiting 127.
 
-## W5 boundaries carried forward
+On Mac, a private Mach/fileport broker exclusively reaps shell supervisors. The daemon never numerically waits for those supervisors or signals shell target/group IDs. Atomic close-on-exec fileport imports preserve descriptor isolation. Abandoned requests publish STOP before releasing their mapping, per-request reply ports prevent reply crossover, and the bootstrap receiver survives cancellation or a caller timeout. The supervisor retains its target unreaped until process-group cleanup is complete.
 
-[PR #100](https://github.com/LayerDynamics/alloy/pull/100) records W5 component
-acceptance and its constraints: trusted descendants deliberately leaving their
-original group and unexpected supervisor death are outside the cleanup
-contract; Linux requires the stated kernel/procfs support; macOS private
-identity interfaces were qualified on the tested macOS 26.4 host. The full list
-and platform evidence are in that PR and the plugin security review. Do not
-infer broader sandbox or platform certification from this exit review.
+Regression coverage includes SIGCHLD auto-reaping, a real competing `waitpid(-1)` loop that collects unrelated child statuses, exact exit/signal status, exited-leader descendant cleanup, cancellation/bootstrap recovery, closed host standard descriptors, large argv, byte limits and cold standalone Mac builds without cached harness helpers. Generation completion clears cancellation identity before proposal handling. Pause tolerates only NotFound for the exact copied request ID and propagates unrelated errors.
+
+The Mac broker is one host-lifetime infrastructure process. It drains its supervisors when the host exits, including an unreaped zombie host. Unexpected broker death fails closed until host restart; the host does not automatically respawn or numerically reap it. A fatal broker failure can retain that bounded process resource until host exit. This explicit abnormal-failure boundary is accepted; normal per-call cancellation does not disable other sessions or leave a target running.
+
+Trusted commands can deliberately escape a process group with setsid/setpgid; arbitrary escaped-descendant containment requires a stronger OS sandbox. The reviewed less-trusted Mac plugin sandbox continues to deny subprocess creation. Trusted plugin subprocess support and the existing plugin reaper-ownership API remain intact.
+
+## Model, latency and workflow measurements
+
+- Model: `mlx-community/Qwen3-4B-4bit`, revision `4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25`, aggregate SHA-256 `95d369e2b999429fd8f02efdd9c0916718e653cb0a62d58e7f6a2770fee447a5`.
+- Corpus SHA-256: `dc2eac48c5522fa53360855950eba4527dc6c21dc943f1d1c9282bd8535b2534`.
+- P2-15 daemon SHA-256: `22375a5d1883cf630eeba0f93bb2c877a32cfd8bce8ef76bffd6c3a1fcddcbdc`; the retained artifact also records both helper identities and the verified clean candidate before/after build.
+- P2-16: 32 samples, minimum **7.303 ms**, median **8.891 ms**, p95 **9.491 ms**, maximum **10.488 ms**, mean **8.691 ms**. Boundary: `run_tool_turn(mock_inference,fs.read,no_approval,no_client_transport)`; human approval and client transport are excluded. All samples are retained.
+- Preserved Phase 1 real-model stream and restart/SSD-cache tests passed on the same implementation candidate. Installed Homebrew CPU/Metal and real-model acceptance passed.
+- Main CI took **9m41s** from first job start to final job completion and **9m44s** from workflow creation, including queue time. This run meets the ten-minute target with one Mac runner; it is an observation, not a guarantee for future queues, cold caches or host contention.
+
+## Historical failures and superseded evidence
+
+Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390` had green CI and real-model results, but did not establish shell ownership under a competing reaper or integrated pause during active hooks/processes. The retained SIGCHLD regression subsequently failed on Linux and Mac with lost child ownership. No actual PID-wrap collision or unrelated signal was observed. Those earlier results were not used to close the defect.
+
+The shared-owner implementation replaced the direct-child observation-then-numeric-signal path rather than weakening the regression or changing a process-wide SIGCHLD disposition. Independent review then identified supervisor-status reuse, blocking partial frames, cwd-audit conflation, helper provisioning and cancellation-isolation issues. The final candidate fixes those issues and adds their corresponding tests. Earlier real-model timing and workflow observations remain historical; the measurements above identify the accepted implementation.
+
+Issues [#31](https://github.com/LayerDynamics/alloy/issues/31) and [#34](https://github.com/LayerDynamics/alloy/issues/34) may close when PR #101's final documentation sign-off head also passes its required checks and merges. The W5 tracking issue [#32](https://github.com/LayerDynamics/alloy/issues/32) retains the integration evidence and documented boundaries.
