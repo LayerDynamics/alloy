@@ -3,6 +3,7 @@
  * them. Daemon fallback signals use kernel-validated stable process identity.
  * See Apple's xnu bsd/sys/proc_info_private.h and bsd/kern/proc_info.c. */
 #include "owned_process.h"
+#include "macos_containment.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -31,6 +32,7 @@
 #include <dlfcn.h>
 
 static int shell_broker(int argc, char **argv);
+static int cohort_service(int argc, char **argv);
 
 /* Stable Darwin libproc ABI, not exported by the public SDK header. */
 struct alloy_unique_info {
@@ -42,12 +44,6 @@ struct alloy_unique_info {
 _Static_assert(sizeof(struct alloy_unique_info) == 56, "Darwin unique identity ABI");
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "identity atomics must be lock-free");
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "shared state must be lock-free");
-enum { INITIAL, READY, CREATE, TARGET_READY, RUN, STOP, DONE };
-typedef struct {
-    _Atomic unsigned state;
-    _Atomic int pid, target_pid, parent_pid, status, error;
-    _Atomic uint64_t identity, target_identity, parent_identity;
-} launch_state;
 typedef struct {
     launch_state *state;
     int owner_pid, reap_owner;
@@ -57,6 +53,7 @@ typedef struct {
 static int reserve_shell_slot(launch_state *state);
 static void retire_shell_slot(int slot);
 #ifdef ALLOY_OWNED_PROCESS_TEST
+
 static _Atomic int test_wait_for_owner_exit;
 static _Atomic int test_unknown_identity_pid;
 void alloy_test_identity_unknown(int pid) {atomic_store(&test_unknown_identity_pid,pid);}
@@ -231,6 +228,7 @@ static int cleanup_group(pid_t target) {
 /* Only this single-threaded process reaps the target. No configured code runs
  * in the supervisor. It retains an exited child until group cleanup is done. */
 int alloy_exec_helper(int argc, char **argv) {
+    if (argc == 6 && !strcmp(argv[1], "--alloy-cohort-service-v1")) return cohort_service(argc, argv);
     if (argc == 7 && !strcmp(argv[1], "--alloy-shell-service-v2")) return shell_broker(argc, argv);
     if (argc < 3 || strcmp(argv[1], "--alloy-owned-exec-v1")) return 125;
     struct stat st;
@@ -308,7 +306,8 @@ int alloy_exec_helper(int argc, char **argv) {
     }
     /* Exclusive reaping is structural, not an assumption about the daemon.
      * Even an exited target still pins this PID/group until the wait below. */
-    int cleanup_error = cleanup_group(target);
+    int cleanup_error = alloy_containment_gate ?
+        (kill(target, SIGKILL) && errno != ESRCH ? errno : 0) : cleanup_group(target);
     if (!error) error = cleanup_error;
     int status = 0;
     until = milliseconds() + 2000;
@@ -335,6 +334,40 @@ int alloy_owned_stop(void *opaque) {
                   memory_order_acq_rel, memory_order_acquire)) {}
     return 0;
 }
+static void *recover_cohort_worker(void *opaque) {
+    launch_state *state=opaque;
+    int error=alloy_containment_recover(state);
+    state->recovery_error=error;
+    /* A dropped caller cannot abandon the obligation. One bounded-resource
+     * watcher stays with this charged slot. After successful revocation it
+     * retries bounded attempts with a one-second backoff; before revocation
+     * it waits for holder acknowledgement or positive kernel absence. */
+    while(error){
+        struct timespec delay={1,0};nanosleep(&delay,NULL);
+        int revoked=atomic_load_explicit(&state->fork_revoked,memory_order_acquire);
+        if(revoked==1 || alloy_containment_empty(state->cohort_identity)==1){
+            state->recovery_error=0;
+            error=alloy_containment_recover(state);
+            state->recovery_error=error;
+        }
+    }
+    /* The retired-slot collector pins this mapping until this final store. */
+    atomic_store_explicit(&state->recovery_done,1,memory_order_release);
+    return NULL;
+}
+static int start_cohort_recovery(launch_state *state) {
+    int expected=0;
+    if(!atomic_compare_exchange_strong(&state->recovery_started,&expected,1))return 0;
+    pthread_attr_t attributes;
+    int error=pthread_attr_init(&attributes);
+    if(!error){
+        error=pthread_attr_setdetachstate(&attributes,PTHREAD_CREATE_DETACHED);
+        if(!error){pthread_t thread;error=pthread_create(&thread,&attributes,recover_cohort_worker,state);}
+        pthread_attr_destroy(&attributes);
+    }
+    if(error)atomic_store(&state->recovery_started,0);
+    return error;
+}
 int alloy_owned_wait(void *opaque, int *status, int nohang) {
     owned_control *control = opaque;
     uint64_t until = milliseconds() + 2000;
@@ -354,6 +387,15 @@ int alloy_owned_wait(void *opaque, int *status, int nohang) {
              * before the exclusive supervisor exited. Preserve its real status. */
             if(atomic_load_explicit(&control->state->state,memory_order_acquire)==DONE) {
                 *status=control->state->status;return control->state->error;
+            }
+            if (control->state->cohort_identity) {
+                int error=start_cohort_recovery(control->state);
+                if(error)return error;
+                if(atomic_load_explicit(&control->state->recovery_done,memory_order_acquire))
+                    return control->state->recovery_error?control->state->recovery_error:EIO;
+                if(nohang)return EAGAIN;
+                if(milliseconds()>=until)return ETIMEDOUT;
+                pause_briefly();continue;
             }
             /* Supervisor death cannot authorize a raw PID/group kill. */
             if (control->state->target_identity)
@@ -488,25 +530,25 @@ done:
  * The host never waits on a broker/supervisor PID. On host death the broker
  * drains its children, then exits under launchd. A broken channel fails closed. */
 enum { SHELL_MESSAGE=0x41534f57, SHELL_HELLO=0x41535244 };
-typedef struct {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t ports[3];uint64_t generation[2];uint32_t size;char data[131072];} shell_packet;
+typedef struct {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t ports[4];uint64_t generation[2];uint32_t size,fd_count;char data[131072];} shell_packet;
 typedef struct { int pid; uint64_t identity; } broker_identity;
 static int new_receiver(mach_port_t *port) {
     if(mach_port_allocate(mach_task_self(),MACH_PORT_RIGHT_RECEIVE,port)!=KERN_SUCCESS)return EIO;
     return 0;
 }
 static int packet_send_tracked(mach_port_t destination,mach_port_t reply,int kind,const uint64_t generation[2],const void *data,uint32_t size,const int *fds,int count,alloy_stop_callback stop,void *context,int *possible) {
-    if(size>131072 || count>3)return E2BIG;
+    if(size>131072 || count<0 || count>4)return E2BIG;
     shell_packet *packet=calloc(1,sizeof(*packet));if(!packet)return ENOMEM;
     packet->header.msgh_bits=MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,reply?MACH_MSG_TYPE_MAKE_SEND:0)|MACH_MSGH_BITS_COMPLEX;
     packet->header.msgh_size=sizeof(*packet);packet->header.msgh_remote_port=destination;packet->header.msgh_local_port=reply;packet->header.msgh_id=kind;
     memcpy(packet->generation,generation,sizeof(packet->generation));
-    packet->body.msgh_descriptor_count=3;packet->size=size;if(size)memcpy(packet->data,data,size);
+    packet->body.msgh_descriptor_count=4;packet->fd_count=(uint32_t)count;packet->size=size;if(size)memcpy(packet->data,data,size);
     int error=0;
     /* Fixed descriptor layout. Unused slots carry ordinary send rights to a
      * private dummy port; receive validates the declared fd count via capacity. */
     mach_port_t dummy=MACH_PORT_NULL;
-    if(count<3){if(new_receiver(&dummy)){free(packet);return EIO;}mach_port_insert_right(mach_task_self(),dummy,dummy,MACH_MSG_TYPE_MAKE_SEND);}
-    for(int i=0;i<3;++i){
+    if(count<4){if(new_receiver(&dummy)){free(packet);return EIO;}mach_port_insert_right(mach_task_self(),dummy,dummy,MACH_MSG_TYPE_MAKE_SEND);}
+    for(int i=0;i<4;++i){
         fileport_t port=MACH_PORT_NULL;
         if(i<count && fileport_makeport(fds[i],&port)){error=errno;break;}
         packet->ports[i].name=i<count?port:dummy;packet->ports[i].type=MACH_MSG_PORT_DESCRIPTOR;packet->ports[i].disposition=MACH_MSG_TYPE_COPY_SEND;
@@ -538,11 +580,12 @@ static int packet_receive(mach_port_t receiver,mach_port_t *reply,int *kind,uint
         if(!stop){free(packet);return EAGAIN;}
     }
     int error=0,received=0;
-    if((packet->header.msgh_id!=SHELL_MESSAGE && packet->header.msgh_id!=SHELL_HELLO) || packet->header.msgh_size!=sizeof(*packet) || !(packet->header.msgh_bits&MACH_MSGH_BITS_COMPLEX) || packet->body.msgh_descriptor_count!=3 || packet->size>capacity)error=EPROTO;
+    if((packet->header.msgh_id!=SHELL_MESSAGE && packet->header.msgh_id!=SHELL_HELLO) || packet->header.msgh_size!=sizeof(*packet) || !(packet->header.msgh_bits&MACH_MSGH_BITS_COMPLEX) || packet->body.msgh_descriptor_count!=4 || packet->size>capacity)error=EPROTO;
     mach_msg_audit_trailer_t *trailer=(void *)((char *)packet+round_msg(packet->header.msgh_size));
     if(!error && (trailer->msgh_trailer_type!=MACH_MSG_TRAILER_FORMAT_0 || trailer->msgh_trailer_size<sizeof(*trailer)))error=EPROTO;
-    if(expected<0)expected=packet->header.msgh_id==SHELL_HELLO?0:1;
-    if(!error)for(int i=0;i<3;++i){
+    if(expected<0)expected=packet->header.msgh_id==SHELL_HELLO?0:(expected==-4?(int)packet->fd_count:1);
+    if(expected<0 || expected>4 || packet->fd_count!=(uint32_t)expected)error=EPROTO;
+    if(!error)for(int i=0;i<4;++i){
         if(packet->ports[i].type!=MACH_MSG_PORT_DESCRIPTOR || packet->ports[i].disposition!=MACH_MSG_TYPE_PORT_SEND){error=EPROTO;break;}
         if(i<expected){
             int fd=fileport_makefd(packet->ports[i].name);if(fd<0){error=errno;break;}
@@ -599,6 +642,7 @@ static int authenticate_host(audit_token_t audit,int parent,uint64_t identity) {
     if(identity_info(parent,&info) || info.uniqueid!=identity || info.idversion!=audit_token_to_pidversion(audit))return EPERM;
     return 0;
 }
+#include "macos_cohort_service.inc"
 static int shell_broker(int argc, char **argv) {
     (void)argc;
     int parent=(int)strtol(argv[3],NULL,10);
@@ -611,23 +655,17 @@ static int shell_broker(int argc, char **argv) {
     if(bootstrap_check_in(bootstrap_port,argv[5],&receiver)!=KERN_SUCCESS)return 125;
 #pragma clang diagnostic pop
     uint64_t generation[2];arc4random_buf(generation,sizeof(generation));
-    int connected=1,children=0;
     for (;;) {
-        int status;pid_t reaped;
-        while((reaped=waitpid(-1,&status,WNOHANG))>0) --children;
-        if (!connected || alloy_owned_alive(parent,parent_identity)!=1) {
-            /* KeepAlive=false leaves an inactive job, not a respawning process.
-             * Registry retirement has one writer under the cross-host flock. */
-            if (!children) return 0;
-            connected=0;pause_briefly();continue;
-        }
-        char data[131072];uint32_t size=0;int statefd=-1,kind=0;mach_port_t reply_port=MACH_PORT_NULL;
+        /* Invocation jobs own their cleanup independently of this broker. */
+        if (alloy_owned_alive(parent,parent_identity)!=1) return 0;
+        char data[131072];uint32_t size=0;int incoming[4]={-1,-1,-1,-1},kind=0;mach_port_t reply_port=MACH_PORT_NULL;
         uint64_t requested_generation[2];audit_token_t audit;
-        int error=packet_receive(receiver,&reply_port,&kind,requested_generation,&audit,data,sizeof(data),&size,&statefd,-1,NULL,NULL);
+        int error=packet_receive(receiver,&reply_port,&kind,requested_generation,&audit,data,sizeof(data),&size,incoming,-4,NULL,NULL);
+        int statefd=incoming[0];
         if(error==EAGAIN)continue;
         if(error)continue;
         error=authenticate_host(audit,parent,parent_identity);
-        if(error){if(statefd>=0)close(statefd);if(reply_port)mach_port_deallocate(mach_task_self(),reply_port);continue;}
+        if(error){for(int i=0;i<4;++i)if(incoming[i]>=0)close(incoming[i]);if(reply_port)mach_port_deallocate(mach_task_self(),reply_port);continue;}
         if(kind==SHELL_HELLO){
             broker_identity identity={getpid(),alloy_process_identity(getpid())};
             (void)packet_send(reply_port,MACH_PORT_NULL,SHELL_HELLO,generation,&identity,sizeof(identity),NULL,0,NULL,NULL);
@@ -636,52 +674,22 @@ static int shell_broker(int argc, char **argv) {
         if(memcmp(generation,requested_generation,sizeof(generation))){
             int rejected[2]={ESTALE,0};int empty[3];for(int i=0;i<3;++i)empty[i]=open("/dev/null",O_RDWR|O_CLOEXEC);
             (void)packet_send(reply_port,MACH_PORT_NULL,SHELL_MESSAGE,generation,rejected,sizeof(rejected),empty,3,NULL,NULL);
-            for(int i=0;i<3;++i)if(empty[i]>=0)close(empty[i]);close(statefd);
+            for(int i=0;i<3;++i)if(empty[i]>=0)close(empty[i]);for(int i=0;i<4;++i)if(incoming[i]>=0)close(incoming[i]);
             mach_port_deallocate(mach_task_self(),reply_port);continue;
         }
-        if(statefd<10){int copy=fcntl(statefd,F_DUPFD_CLOEXEC,10);close(statefd);statefd=copy;if(copy<0){mach_port_deallocate(mach_task_self(),reply_port);continue;}}
-        char **strings=calloc((size_t)size+1,sizeof(char *));size_t count=0,offset=0;
-        if(!strings)error=ENOMEM;
-        while(!error && offset<size && count<size) {
-            char *end=memchr(data+offset,0,size-offset);
-            if(!end)break;
-            strings[count++]=data+offset;offset=(size_t)(end-data)+1;
-        }
-        int endpoints[6]={-1,-1,-1,-1,-1,-1};
+        if(statefd<10){int copy=fcntl(statefd,F_DUPFD_CLOEXEC,10);close(statefd);statefd=copy;incoming[0]=copy;if(copy<0){for(int i=1;i<4;++i)if(incoming[i]>=0)close(incoming[i]);mach_port_deallocate(mach_task_self(),reply_port);continue;}}
         pid_t child=0;
-        posix_spawnattr_t attr=NULL;posix_spawn_file_actions_t actions=NULL;
-        if(offset!=size || count<2 || children>=64) error=EINVAL;
-        if(!error && (pipe(endpoints)||pipe(endpoints+2)||pipe(endpoints+4))) error=errno;
-        if(!error) error=posix_spawnattr_init(&attr);
-        if(!error) error=posix_spawn_file_actions_init(&actions);
-        if(!error) error=posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT|POSIX_SPAWN_SETSID);
-        if(!error) error=posix_spawn_file_actions_addopen(&actions,0,"/dev/null",O_RDONLY,0);
-        if(!error) error=posix_spawn_file_actions_adddup2(&actions,endpoints[3],1);
-        if(!error) error=posix_spawn_file_actions_adddup2(&actions,endpoints[5],2);
-        if(!error) error=posix_spawn_file_actions_adddup2(&actions,statefd,3);
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        if(!error) error=posix_spawn_file_actions_addchdir_np(&actions,strings[0]);
-#pragma clang diagnostic pop
-        char **arguments=calloc(count+3,sizeof(char *));
-        if(!arguments)error=ENOMEM;
-        if(arguments){arguments[0]=argv[2];arguments[1]="--alloy-owned-exec-v1";
-        for(size_t i=1;i<count;++i) arguments[i+1]=strings[i];}
-        char *environment[]={NULL};
-        if(!error) error=posix_spawn(&child,argv[2],&actions,&attr,arguments,environment);
-        if(!error) ++children;
-        free(arguments);free(strings);
-        if(actions)posix_spawn_file_actions_destroy(&actions);
-        if(attr)posix_spawnattr_destroy(&attr);
-        close(statefd);
+        int exported[3]={-1,-1,-1};
+        error=start_cohort(argv[2],argv[6],data,size,incoming,incoming[3]>=0?4:1,&child,exported);
+        for(int i=0;i<4;++i)if(incoming[i]>=0)close(incoming[i]);
         int reply[2]={error,child};
-        int exported[3]={endpoints[1],endpoints[2],endpoints[4]};
-        /* Always supply three valid descriptors; error replies use /dev/null. */
-        if(error)for(int i=0;i<3;++i)exported[i]=open("/dev/null",O_RDWR|O_CLOEXEC);
+        if(error)for(int i=0;i<3;++i){
+            if(exported[i]>=0)close(exported[i]);
+            exported[i]=open("/dev/null",O_RDWR|O_CLOEXEC);
+        }
         (void)packet_send(reply_port,MACH_PORT_NULL,SHELL_MESSAGE,generation,reply,sizeof(reply),exported,3,NULL,NULL);
         mach_port_deallocate(mach_task_self(),reply_port);
-        if(error)for(int i=0;i<3;++i)if(exported[i]>=0)close(exported[i]);
-        for(int i=0;i<6;++i)if(endpoints[i]>=0)close(endpoints[i]);
+        for(int i=0;i<3;++i)if(exported[i]>=0)close(exported[i]);
     }
 }
 static pthread_mutex_t shell_broker_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -738,10 +746,12 @@ static void collect_shell_slots(void) {
         if(!state || !shell_slots[i].retired)continue;
         unsigned phase=atomic_load_explicit(&state->state,memory_order_acquire);
         int finished=phase==DONE;
-        if(!finished && state->pid && state->identity)finished=alloy_owned_alive(state->pid,state->identity)==0;
+        if(!finished && !state->cohort_job[0] && state->pid && state->identity)finished=alloy_owned_alive(state->pid,state->identity)==0;
+        if(finished && atomic_load(&state->recovery_started) && !atomic_load_explicit(&state->recovery_done,memory_order_acquire))finished=0;
         /* STOP prevents a late workload, but elapsed time cannot prove that
          * an unscheduled supervisor has exited. Unknown ownership stays
          * charged, including across service generations, until proven done. */
+        if(finished && state->cohort_record_path[0] && alloy_cohort_record_retire(state->cohort_record_path))finished=0;
         if(finished){munmap(state,sizeof(*state));memset(&shell_slots[i],0,sizeof(shell_slots[i]));}
     }
 }
@@ -757,6 +767,107 @@ static void retire_shell_slot(int slot) {
     collect_shell_slots();pthread_mutex_unlock(&shell_slots_lock);
 }
 #ifdef ALLOY_OWNED_PROCESS_TEST
+int alloy_test_cohort_fail_recovery(int target) {
+    int error=ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
+        if(state && state->target_pid==target){atomic_store(&state->test_recovery_fail,1);error=0;break;}}
+    pthread_mutex_unlock(&shell_slots_lock);return error;
+}
+int alloy_test_cohort_startup_stage(int setup) {
+    int result=0;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
+        if(state && atomic_load(setup?&state->test_setup_paused:&state->test_submit_paused)){result=1;break;}}
+    pthread_mutex_unlock(&shell_slots_lock);return result;
+}
+int alloy_test_cohort_recovery(int target,int revoked) {
+    int result=-ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
+        if(state && state->target_pid==target){result=revoked?atomic_load(&state->fork_revoked):atomic_load(&state->recovery_error);break;}}
+    pthread_mutex_unlock(&shell_slots_lock);return result;
+}
+int alloy_test_uncertain_cohort_record(int target) {
+    char directory[1024]={0};
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
+        if(state && state->target_pid==target){snprintf(directory,sizeof(directory),"%s",state->cohort_record_path);break;}}
+    pthread_mutex_unlock(&shell_slots_lock);
+    char *slash=strrchr(directory,'/');if(!slash)return EINVAL;*slash=0;
+    /* This fixture never submits a job. Give its record a proven-dead identity
+     * so retirement must distinguish an indeterminate RPC from no reservation. */
+    pid_t child=fork();if(!child)_exit(0);if(child<0)return errno;
+    uint64_t identity=alloy_process_identity(child);int status;
+    while(waitpid(child,&status,0)<0){if(errno!=EINTR)return errno;}
+    if(!identity)return EIO;
+    launch_state state={0};state.parent_pid=child;state.parent_identity=identity;
+    uint64_t random[2];arc4random_buf(random,sizeof(random));
+    snprintf(state.cohort_job,sizeof(state.cohort_job),"com.layerdynamics.alloy.cohort.%u.%d.%llu.%016llx%016llx",getuid(),child,
+        (unsigned long long)identity,(unsigned long long)random[0],(unsigned long long)random[1]);
+    int lease=-1,error=alloy_cohort_record_create(directory,&state,&lease);
+    if(error)return error;
+    error=alloy_cohort_record_submitting(state.cohort_record_path);close(lease);
+    if(!error){int retired=alloy_cohort_record_retire(state.cohort_record_path);
+        if(retired!=EAGAIN || access(state.cohort_record_path,F_OK))error=EIO;}
+    /* The fixture knows it never called SMJobSubmit, so it can publish that
+     * no-workload fact and remove its own synthetic record after the assertion. */
+    int complete=alloy_cohort_record_complete(state.cohort_record_path,0);
+    int retired=complete?complete:alloy_cohort_record_retire(state.cohort_record_path);
+    return error?error:retired;
+}
+static int cohort_holder_pause(int target,int gate,int paused) {
+    int error=ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        error=identity_signal(gate?state->gate_pid:state->revoker_pid,
+            gate?state->gate_identity:state->revoker_identity,paused?SIGSTOP:SIGCONT);break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);return error;
+}
+int alloy_test_cohort_revoker_pause(int target,int paused) {return cohort_holder_pause(target,0,paused);}
+int alloy_test_cohort_gate_pause(int target,int paused) {return cohort_holder_pause(target,1,paused);}
+int alloy_test_cohort_revoke_barrier(int target,int operation) {
+    int result=-ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        if(operation==1)atomic_store(&state->test_revoke_pause,1);
+        if(operation==0)atomic_store(&state->test_revoke_pause,0);
+        result=atomic_load(&state->test_revoke_paused);break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);return result;
+}
+int alloy_test_cohort_record(int target,char *path,char *label,size_t capacity) {
+    int error=ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        if(strlen(state->cohort_record_path)>=capacity || strlen(state->cohort_job)>=capacity){error=E2BIG;break;}
+        snprintf(path,capacity,"%s",state->cohort_record_path);
+        snprintf(label,capacity,"%s",state->cohort_job);error=0;break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);
+    return error;
+}
+int alloy_test_cohort_kill(int target,int revoker) {
+    int error=ESRCH;
+    pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){
+        launch_state *state=shell_slots[i].state;
+        if(!state || state->target_pid!=target)continue;
+        int pid=revoker==2?state->pid:(revoker?state->revoker_pid:state->gate_pid);
+        uint64_t identity=revoker==2?state->identity:(revoker?state->revoker_identity:state->gate_identity);
+        if(pid>0 && identity)error=alloy_owned_signal(pid,identity);
+        break;
+    }
+    pthread_mutex_unlock(&shell_slots_lock);
+    return error;
+}
 int alloy_test_shell_owner_pause(int target,int paused) {
     int error=ESRCH;
     pthread_mutex_lock(&shell_slots_lock);
@@ -878,7 +989,7 @@ static int connect_shell_broker(const char *launcher,const char *service,alloy_s
     if(receiver)mach_port_mod_refs(mach_task_self(),receiver,MACH_PORT_RIGHT_RECEIVE,-1);
     return error;
 }
-int alloy_shell_spawn(const char *launcher,const char *service,const char *program,const char *cwd,
+static int broker_spawn(const char *mode,const char *launcher,const char *service,const char *program,const char *cwd,const int io[3],
     char *const argv[],alloy_stop_callback stop,void *context,int *pid,void **out_control,int result_fds[3]) {
     SHELL_STAGE("broker connection");
 #ifdef ALLOY_OWNED_PROCESS_TEST
@@ -902,16 +1013,22 @@ int alloy_shell_spawn(const char *launcher,const char *service,const char *progr
     memset(state,0,sizeof(*state));atomic_init(&state->state,INITIAL);
     struct alloy_unique_info parent;error=identity_info(getpid(),&parent);if(error)goto done;
     state->parent_pid=getpid();state->parent_identity=parent.uniqueid;
-    size_t size=strlen(cwd)+1;for(size_t i=0;argv[i];++i){size+=strlen(argv[i])+1;if(size>131072){error=E2BIG;goto done;}}
+#ifdef ALLOY_OWNED_PROCESS_TEST
+    if(broker_fault==4){state->test_submit_pause=1;broker_fault=0;}
+    if(broker_fault==5){state->test_setup_pause=1;broker_fault=0;}
+#endif
+    size_t size=strlen(mode)+1+strlen(cwd)+1;for(size_t i=0;argv[i];++i){size+=strlen(argv[i])+1;if(size>131072){error=E2BIG;goto done;}}
     data=malloc(size);control=calloc(1,sizeof(*control));if(control)control->state=state; if(!data||!control){error=ENOMEM;goto done;}
     control->shell_slot=reserve_shell_slot(state);if(!control->shell_slot){error=EBUSY;goto done;}
-    size_t offset=strlen(cwd)+1;memcpy(data,cwd,offset);
+    size_t offset=strlen(mode)+1;memcpy(data,mode,offset);
+    size_t cwd_size=strlen(cwd)+1;memcpy(data+offset,cwd,cwd_size);offset+=cwd_size;
     for(size_t i=0;argv[i];++i){size_t n=strlen(argv[i])+1;memcpy(data+offset,argv[i],n);offset+=n;}
     (void)program;
     error=new_receiver(&reply_port);
     SHELL_STAGE("launch request send");
     broker_wait wait={stop,context,shell_broker_port,shell_broker_identity,milliseconds()+5000,0,0};
-    if(!error)error=packet_send_tracked(shell_broker_port,reply_port,SHELL_MESSAGE,shell_broker_generation,data,(uint32_t)size,&fd,1,broker_wait_stopped,&wait,&possible);
+    int request_fds[4]={fd,io?io[0]:-1,io?io[1]:-1,io?io[2]:-1};
+    if(!error)error=packet_send_tracked(shell_broker_port,reply_port,SHELL_MESSAGE,shell_broker_generation,data,(uint32_t)size,request_fds,io?4:1,broker_wait_stopped,&wait,&possible);
     if(!error)broker_checkpoint(2);
     SHELL_STAGE("launch reply receive");
     int reply[2]={0};uint32_t reply_size=0;int kind=0;uint64_t generation[2];audit_token_t audit;
@@ -963,4 +1080,13 @@ done:
     if(error==EPIPE || error==ESTALE)disconnect_shell_broker();
     pthread_mutex_unlock(&shell_broker_lock);
     return error;
+}
+
+int alloy_shell_spawn(const char *launcher,const char *service,const char *program,const char *cwd,const int io[3],
+    char *const argv[],alloy_stop_callback stop,void *context,int *pid,void **out_control,int result_fds[3]) {
+    return broker_spawn("shell",launcher,service,program,cwd,io,argv,stop,context,pid,out_control,result_fds);
+}
+int alloy_trusted_spawn(const char *launcher,const char *service,const char *program,const char *cwd,const int io[3],
+    char *const argv[],alloy_stop_callback stop,void *context,int *pid,void **out_control,int result_fds[3]) {
+    return broker_spawn("plugin",launcher,service,program,cwd,io,argv,stop,context,pid,out_control,result_fds);
 }

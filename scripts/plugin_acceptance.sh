@@ -182,6 +182,22 @@ if [[ "$(uname -s)" == Darwin ]]; then
     malformed_message_does_not_retire_authenticated_service
     native_framework_command_retains_bootstrap_access
     registration_and_workloads_create_no_embedding_host_children
+    containment::detached_descendants_are_cleaned_after_normal_exit
+    containment::detached_descendants_are_cleaned_after_cancellation
+    containment::trusted_plugin_detached_descendants_are_cleaned
+    containment::concurrent_fork_and_spawn_cannot_outlive_cancellation
+    containment::independent_revoker_cleans_after_gate_death
+    containment::gate_revokes_after_independent_revoker_death
+    containment::host_finishes_detached_cleanup_after_cleaner_death
+    containment::new_host_retires_crashed_cleaner_and_detached_workload
+    containment::try_wait_does_not_block_on_paused_revocation_after_cleaner_loss
+    containment::host_loss_between_record_and_submit_cannot_leave_untracked_job
+    containment::empty_cohort_without_revocation_marker_is_retired_after_setup_crash
+    containment::indeterminate_submission_stays_charged_until_positive_resolution
+    containment::recovery_retries_after_timed_out_revoker_resumes
+    containment::dropped_control_keeps_recovery_after_holder_timeout
+    containment::workload_cannot_modify_or_hardlink_recovery_metadata
+    containment::recovery_retries_transient_failure_after_revocation_is_already_known
   )
   for name in "${BROKER_TESTS[@]}"; do
     grep -Fx "$name: test" "$OUT/broker-recovery-discovery.txt"

@@ -153,6 +153,25 @@ pub fn spawn(
     platform(command, helper, deadline, cancel, external_reaper)
 }
 
+/// Launch a command whose enforced sandbox denies all descendant creation.
+/// The caller must supply that sandbox; trusted commands use [`spawn`] instead.
+pub fn spawn_single_process_sandbox(
+    command: std::process::Command,
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+    external_reaper: bool,
+) -> std::io::Result<Spawned> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::spawn_impl(command, helper, deadline, cancel, external_reaper, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform(command, helper, deadline, cancel, external_reaper)
+    }
+}
+
 /// Launch was committed but the exec acknowledgement was lost. Effects may exist.
 #[derive(Debug)]
 pub struct CommittedLaunchError(pub std::io::Error);
@@ -702,12 +721,36 @@ mod macos {
         deadline: std::time::Instant,
         cancel: &dyn Fn() -> bool,
     ) -> io::Result<Spawned> {
+        spawn_managed(cmd, helper, deadline, cancel, true, false)
+    }
+    fn spawn_managed(
+        cmd: Command,
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &dyn Fn() -> bool,
+        shell: bool,
+        external_reaper: bool,
+    ) -> io::Result<Spawned> {
         unsafe extern "C" {
             fn alloy_shell_spawn(
                 launcher: *const c_char,
                 service: *const c_char,
                 program: *const c_char,
                 cwd: *const c_char,
+                io: *const i32,
+                argv: *const *mut c_char,
+                stop: unsafe extern "C" fn(*mut c_void) -> i32,
+                context: *mut c_void,
+                pid: *mut i32,
+                control: *mut Opaque,
+                fds: *mut i32,
+            ) -> i32;
+            fn alloy_trusted_spawn(
+                launcher: *const c_char,
+                service: *const c_char,
+                program: *const c_char,
+                cwd: *const c_char,
+                io: *const i32,
                 argv: *const *mut c_char,
                 stop: unsafe extern "C" fn(*mut c_void) -> i32,
                 context: *mut c_void,
@@ -724,6 +767,16 @@ mod macos {
         )?;
         let launcher_path =
             launcher_path(helper.ok_or_else(|| io::Error::other("missing helper"))?)?;
+        // Allocate the configured pipe helper before creating any cached broker
+        // connection. Failure must preserve the helper contract and leak no rights.
+        let plugin_pipes = if shell {
+            None
+        } else {
+            Some(pipes(helper, deadline, cancel, external_reaper)?)
+        };
+        let stdio = plugin_pipes
+            .as_ref()
+            .map(|fds| [fds[0].as_raw_fd(), fds[3].as_raw_fd(), fds[5].as_raw_fd()]);
         let service = crate::macos_service::prepare(&launcher_path, || {
             cancel() || std::time::Instant::now() >= deadline
         })?;
@@ -739,13 +792,19 @@ mod macos {
         let mut pid = 0;
         let mut control = std::ptr::null_mut();
         let mut fds = [-1; 3];
+        let launch = if shell {
+            alloy_shell_spawn
+        } else {
+            alloy_trusted_spawn
+        };
         // SAFETY: null-terminated C strings and callback state remain live for this synchronous call.
         checked(unsafe {
-            alloy_shell_spawn(
+            launch(
                 launcher.as_ptr(),
                 service.as_ptr(),
                 program.as_ptr(),
                 cwd.as_ptr(),
+                stdio.as_ref().map_or(std::ptr::null(), |fds| fds.as_ptr()),
                 argv.as_ptr(),
                 stopped,
                 (&mut state as *mut Stop<'_>).cast(),
@@ -756,7 +815,23 @@ mod macos {
         })?;
         // SAFETY: success transfers three distinct, close-on-exec descriptors and one native control record.
         let owned = unsafe { fds.map(|fd| OwnedFd::from_raw_fd(fd)) };
-        let [input, output, error] = owned;
+        let [input, output, error] = if let Some(
+            [
+                read_input,
+                write_input,
+                read_output,
+                write_output,
+                read_error,
+                write_error,
+            ],
+        ) = plugin_pipes
+        {
+            drop(owned);
+            drop((read_input, write_output, write_error));
+            [write_input, read_output, read_error]
+        } else {
+            owned
+        };
         Ok((
             Child {
                 control,
@@ -775,7 +850,7 @@ mod macos {
         cancel: &dyn Fn() -> bool,
         external_reaper: bool,
     ) -> io::Result<Spawned> {
-        spawn_impl(cmd, helper, deadline, cancel, external_reaper, false)
+        spawn_managed(cmd, helper, deadline, cancel, false, external_reaper)
     }
     pub(super) fn spawn_impl(
         cmd: Command,

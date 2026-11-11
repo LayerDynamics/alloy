@@ -200,6 +200,21 @@ fn registry(stopped: &impl Fn() -> bool) -> io::Result<(PathBuf, fs::File)> {
             retained += 1;
             continue;
         }
+        unsafe extern "C" {
+            fn alloy_cohort_records_retire(directory: *const std::ffi::c_char) -> i32;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let directory = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+            .map_err(|_| io::Error::other("invalid cohort record directory"))?;
+        // SAFETY: the NUL-terminated directory remains live; the registry lock
+        // is held, and this host's original stable identity was proven dead.
+        let cleanup = unsafe { alloy_cohort_records_retire(directory.as_ptr()) };
+        if cleanup != 0 {
+            // Unconfirmed cleanup remains charged; it does not prevent a new
+            // host while the bounded shared registration budget has capacity.
+            retained += 1;
+            continue;
+        }
         if registered(&name)? {
             let removal = service_job(&name, None);
             if let Err(error) = removal

@@ -1,5 +1,8 @@
 #![cfg(all(target_os = "macos", debug_assertions))]
 
+#[path = "macos_broker_recovery/containment.rs"]
+mod containment;
+
 use alloy_process_owner::spawn::{Child, default_helper, spawn_shell};
 use std::{
     fs,
@@ -163,7 +166,8 @@ fn isolated(name: &str, run: impl FnOnce(&Path)) {
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
         "isolated {name} failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
