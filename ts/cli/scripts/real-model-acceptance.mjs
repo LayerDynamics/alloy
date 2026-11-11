@@ -256,7 +256,7 @@ export async function recordProxy(socketPath, daemonPath, evidenceFile) {
   };
 }
 
-class Acceptance {
+export class Acceptance {
   owned = new Set();
   aborted = false;
   constructor(testName) {
@@ -408,8 +408,8 @@ class Acceptance {
     throw new Error(`${label}: KV cache evidence did not satisfy acceptance within ${this.cacheTimeout} ms: ${lastError}`);
   }
 
-  async startDaemon(label) {
-    const args = ["--artifact", this.artifact, "--profile", PROFILE, "--socket", this.socket, "--db", this.db, "--corpus-models", this.corpus, "--metal", "--paged-ssd-cache-dir", this.cache, "--hot-cache-max-size", "0", "--max-output-tokens", "256", "--telemetry-endpoint", "https://127.0.0.1:1"];
+  async startDaemon(label, extraArgs = []) {
+    const args = ["--artifact", this.artifact, "--profile", PROFILE, "--socket", this.socket, "--db", this.db, "--corpus-models", this.corpus, "--metal", "--paged-ssd-cache-dir", this.cache, "--hot-cache-max-size", "0", "--max-output-tokens", "256", "--telemetry-endpoint", "https://127.0.0.1:1", ...extraArgs];
     // The daemon boot path verifies every pinned corpus file before readiness.
     const owned = this.start(this.binary, args, label);
     const deadline = Date.now() + this.startTimeout;

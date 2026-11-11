@@ -416,6 +416,20 @@ jobs:
         timeout-minutes: 40
         run: bash ts/cli/scripts/session_restart_real_model.sh
 
+      - name: "P2-16: mocked-inference tool round-trip latency"
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ALLOY_ACCEPTANCE_OUTPUT_DIR/phase-2"
+          cargo test --locked -p harness-core --test tool_latency tool_roundtrip_overhead_under_50ms -- --exact --nocapture 2>&1 | tee "$ALLOY_ACCEPTANCE_OUTPUT_DIR/phase-2/tool-latency.log"
+
+      - name: "P2-15: real Qwen3 tool loop and plugin hooks"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        env:
+          ALLOY_E2E_EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ts/cli/scripts/phase2_tool_loop_real_model.sh
+
       - name: "M9: real 4B and 14B memory acceptance"
         if: ${{ !cancelled() }}
         timeout-minutes: 45
