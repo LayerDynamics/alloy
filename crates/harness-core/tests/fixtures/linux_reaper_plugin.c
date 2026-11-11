@@ -9,11 +9,13 @@ int main(int argc, char **argv) {
     struct sigaction action;
     if (sigaction(SIGCHLD, NULL, &action)) return 7;
     int ignored = action.sa_handler == SIG_IGN;
+    if (sigaction(SIGABRT, NULL, &action)) return 8;
+    int abrt_ignored = action.sa_handler == SIG_IGN;
     pid_t child = fork();
     if (child < 0) return 3;
     if (!child) { execl("/bin/sleep", "sleep", "120", (char *)0); _exit(4); }
     FILE *f = fopen(argv[1], "w"); if (!f) return 5;
-    fprintf(f, "%ld %ld %d\n", (long)getpid(), (long)child, ignored); fclose(f);
+    fprintf(f, "%ld %ld %d %d\n", (long)getpid(), (long)child, ignored, abrt_ignored); fclose(f);
     char line[32768];
     while (fgets(line, sizeof(line), stdin)) {
         char *p = line, *last = NULL;

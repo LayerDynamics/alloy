@@ -82,6 +82,9 @@ pidfd waiters collect supervisors that outlive the caller's bounded wait; if
 the limit is reached or a waiter cannot start, a later supervisor zombie is
 possible and cleanup is reported as unestablished. Deliberately detached trusted
 descendants and unexpected supervisor death are outside group cleanup.
+The Linux signal ABI is implemented for aarch64 and x86_64 only; other Linux
+architectures fail at build time. The regression and constrained-load evidence
+were collected on Linux aarch64, not x86_64.
 
 The operator may keep a user-owned, writable installation. That model trusts the
 owner and unsandboxed processes running with the same privileges not to change

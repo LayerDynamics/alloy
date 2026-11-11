@@ -20,6 +20,14 @@ fn linux_plugin_reaping_survives_competing_reapers() {
             fn waitpid(pid: i32, status: *mut i32, flags: i32) -> i32;
             fn kill(pid: i32, signal: i32) -> i32;
         }
+        extern "C" fn caught_signal(_: i32) {}
+        let abrt_handler = if mode == "ignore" {
+            1
+        } else {
+            caught_signal as *const () as usize
+        };
+        // SAFETY: this isolated helper sets only its own SIGABRT disposition.
+        assert_ne!(unsafe { signal(6, abrt_handler) }, usize::MAX);
         let fixture = std::env::var("ALLOY_LINUX_REAPER_FIXTURE").unwrap();
         let mut sentinel = Command::new("/bin/sleep").arg("120").spawn().unwrap();
         let sentinel_pid = sentinel.id() as i32;
@@ -70,11 +78,16 @@ fn linux_plugin_reaping_survives_competing_reapers() {
                 .split_whitespace()
                 .map(|v| v.parse().unwrap())
                 .collect();
-            assert_eq!(pids.len(), 3);
+            assert_eq!(pids.len(), 4);
             assert_eq!(
                 pids[2],
                 u32::from(mode == "ignore"),
                 "SIGCHLD ignore must survive exec"
+            );
+            assert_eq!(
+                pids[3],
+                u32::from(mode == "ignore"),
+                "SIGABRT ignore must survive exec while caught handler resets"
             );
             drop(host);
             // SAFETY: sentinel is our live, unreaped fixture child.
