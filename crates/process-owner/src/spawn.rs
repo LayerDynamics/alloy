@@ -6,6 +6,10 @@ pub use macos::Child;
 pub struct Child {
     control: std::os::unix::net::UnixStream,
     pidfd: Option<std::os::fd::OwnedFd>,
+    target_pid: u32,
+    shell: bool,
+    completion: Vec<u8>,
+    status: Option<std::process::ExitStatus>,
 }
 #[cfg(target_os = "linux")]
 static DEFERRED_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -49,29 +53,59 @@ impl Child {
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.control.shutdown(std::net::Shutdown::Write)
     }
+    pub fn id(&self) -> u32 {
+        self.target_pid
+    }
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        use std::io::Read;
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let expected = if self.shell { 5 } else { 1 };
+        self.control.set_nonblocking(true)?;
+        while self.completion.len() < expected {
+            let mut bytes = [0u8; 5];
+            match self
+                .control
+                .read(&mut bytes[..expected - self.completion.len()])
+            {
+                Ok(0) => return Err(std::io::Error::other("owner ended without completion")),
+                Ok(n) => self.completion.extend_from_slice(&bytes[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if self.completion[0] != b'D' {
+            return Err(std::io::Error::other("supervisor cleanup not established"));
+        }
+        let mut raw = [0u8; 4];
+        if self.shell {
+            raw.copy_from_slice(&self.completion[1..]);
+        }
+        let status = std::process::ExitStatus::from_raw(i32::from_le_bytes(raw));
+        self.status = Some(status);
+        Ok(Some(status))
+    }
     pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        use std::os::{fd::AsRawFd, unix::process::ExitStatusExt};
+        use std::os::fd::AsRawFd;
         unsafe extern "C" {
             fn alloy_linux_wait_pidfd(fd: i32) -> i32;
         }
-        // SAFETY: pidfd identifies the supervisor even if another reaper has consumed it.
-        let code = unsafe {
-            alloy_linux_wait_pidfd(self.pidfd.as_ref().expect("wait called once").as_raw_fd())
+        let code = match self.pidfd.as_ref() {
+            // SAFETY: descriptor pins the exact supervisor, independent of host reapers.
+            Some(fd) => unsafe { alloy_linux_wait_pidfd(fd.as_raw_fd()) },
+            None => return Err(std::io::Error::other("supervisor wait already deferred")),
         };
-        if code == 0 {
-            use std::io::Read;
-            let mut completion = [0u8; 1];
-            self.control.read_exact(&mut completion)?;
-            if completion != *b"D" {
-                return Err(std::io::Error::other("supervisor cleanup not established"));
-            }
-            Ok(std::process::ExitStatus::from_raw(0))
-        } else {
+        if code != 0 {
             if let Some(fd) = self.pidfd.take() {
                 defer_supervisor_wait(fd)?;
             }
-            Err(std::io::Error::from_raw_os_error(code))
+            return Err(std::io::Error::from_raw_os_error(code));
         }
+        self.try_wait()?
+            .ok_or_else(|| std::io::Error::other("missing supervisor completion"))
     }
 }
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
@@ -119,13 +153,70 @@ pub fn spawn(
     platform(command, helper, deadline, cancel, external_reaper)
 }
 
+/// Launch was committed but the exec acknowledgement was lost. Effects may exist.
+#[derive(Debug)]
+pub struct CommittedLaunchError(pub std::io::Error);
+impl std::fmt::Display for CommittedLaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "committed launch: {}", self.0)
+    }
+}
+impl std::error::Error for CommittedLaunchError {}
+
+/// Installed helper path; development builds also carry freshly compiled native helpers.
+pub fn default_helper() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let installed = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("executable parent missing"))?
+        .join("alloy-plugin-pipe-helper");
+    if installed.is_file() {
+        return Ok(installed);
+    }
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    {
+        Ok(std::path::PathBuf::from(env!("ALLOY_DEV_HELPER")))
+    }
+    #[cfg(not(all(target_os = "macos", debug_assertions)))]
+    {
+        Ok(installed)
+    }
+}
+
+/// Launch a shell command through the same isolated owner as plugins.
+pub fn spawn_shell(
+    command: std::process::Command,
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+) -> std::io::Result<Spawned> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_platform(command, helper, deadline, cancel, false, true)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::spawn_impl(command, helper, deadline, cancel, false, true)
+    }
+}
 #[cfg(target_os = "linux")]
 fn platform(
+    command: std::process::Command,
+    helper: Option<&Path>,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
+    external_reaper: bool,
+) -> std::io::Result<Spawned> {
+    linux_platform(command, helper, deadline, cancel, external_reaper, false)
+}
+#[cfg(target_os = "linux")]
+fn linux_platform(
     cmd: std::process::Command,
     _helper: Option<&Path>,
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
     _external_reaper: bool,
+    shell: bool,
 ) -> std::io::Result<Spawned> {
     use std::{
         ffi::CString,
@@ -214,7 +305,10 @@ fn platform(
                 "plugin launch deadline",
             ));
         }
-        parent.write_all(b"R")
+        if shell {
+            parent.set_nonblocking(true)?;
+        }
+        parent.write_all(if shell { b"Q" } else { b"R" })
     })();
     if let Err(error) = setup {
         let _ = parent.shutdown(std::net::Shutdown::Write);
@@ -227,10 +321,71 @@ fn platform(
         }
         return Err(error);
     }
+    let mut target_pid = 0;
+    if shell {
+        use std::io::Read;
+        let mut response = [0u8; 5];
+        let read_ack = (|| {
+            let mut used = 0;
+            while used < response.len() {
+                if cancel() || Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "committed launch cancelled or expired",
+                    ));
+                }
+                match parent.read(&mut response[used..]) {
+                    Ok(0) => {
+                        return Err(std::io::Error::other(
+                            "owner ended before launch acknowledgement",
+                        ));
+                    }
+                    Ok(n) => used += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = read_ack {
+            let _ = parent.shutdown(std::net::Shutdown::Write);
+            let cleanup = defer_supervisor_wait(pidfd);
+            return Err(std::io::Error::other(CommittedLaunchError(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => std::io::Error::other(format!("{error}; {cleanup}")),
+            })));
+        }
+        let value = i32::from_le_bytes(response[1..].try_into().expect("four bytes"));
+        if response[0] != b'S' || value <= 1 {
+            let _ = parent.shutdown(std::net::Shutdown::Write);
+            let cleanup = defer_supervisor_wait(pidfd);
+            let error = if response[0] == b'F' && value > 0 {
+                std::io::Error::from_raw_os_error(value)
+            } else {
+                std::io::Error::other(CommittedLaunchError(std::io::Error::other(
+                    "invalid launch acknowledgement",
+                )))
+            };
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => std::io::Error::other(CommittedLaunchError(std::io::Error::other(
+                    format!("{error}; {cleanup}"),
+                ))),
+            });
+        }
+        target_pid = value as u32;
+    }
     Ok((
         Child {
             control: parent,
             pidfd: Some(pidfd),
+            target_pid,
+            shell,
+            completion: Vec::new(),
+            status: None,
         },
         input,
         output,
@@ -494,8 +649,27 @@ mod macos {
     pub struct Child {
         control: Opaque,
         status: Option<ExitStatus>,
+        target_pid: u32,
     }
     impl Child {
+        pub fn id(&self) -> u32 {
+            self.target_pid
+        }
+        pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            if let Some(status) = self.status {
+                return Ok(Some(status));
+            }
+            let mut raw = 0;
+            // SAFETY: the owned native record is valid through Drop.
+            let code = unsafe { alloy_owned_wait(self.control, &mut raw, 1) };
+            if code == 35 {
+                return Ok(None);
+            } // Darwin EAGAIN
+            checked(code)?;
+            let status = ExitStatus::from_raw(raw);
+            self.status = Some(status);
+            Ok(Some(status))
+        }
         pub fn kill(&mut self) -> io::Result<()> {
             // SAFETY: this uniquely owned record remains valid until Drop.
             checked(unsafe { alloy_owned_stop(self.control) })
@@ -526,6 +700,16 @@ mod macos {
         deadline: std::time::Instant,
         cancel: &dyn Fn() -> bool,
         external_reaper: bool,
+    ) -> io::Result<Spawned> {
+        spawn_impl(cmd, helper, deadline, cancel, external_reaper, false)
+    }
+    pub(super) fn spawn_impl(
+        cmd: Command,
+        helper: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+        cancel: &dyn Fn() -> bool,
+        external_reaper: bool,
+        shell: bool,
     ) -> io::Result<Spawned> {
         let program = cstring(cmd.get_program())?;
         let mut args = vec![program.clone()];
@@ -563,11 +747,30 @@ mod macos {
                 (output_write.as_raw_fd(), 1),
                 (error_write.as_raw_fd(), 2),
             ] {
-                checked(posix_spawn_file_actions_adddup2(
-                    &mut actions.0,
-                    source,
-                    target,
-                ))?;
+                if shell && target == 0 {
+                    unsafe extern "C" {
+                        fn posix_spawn_file_actions_addopen(
+                            actions: *mut Opaque,
+                            fd: i32,
+                            path: *const c_char,
+                            flags: i32,
+                            mode: u16,
+                        ) -> i32;
+                    }
+                    checked(posix_spawn_file_actions_addopen(
+                        &mut actions.0,
+                        0,
+                        c"/dev/null".as_ptr(),
+                        0,
+                        0,
+                    ))?;
+                } else {
+                    checked(posix_spawn_file_actions_adddup2(
+                        &mut actions.0,
+                        source,
+                        target,
+                    ))?;
+                }
             }
             for fd in [
                 input_read.as_raw_fd(),
@@ -614,6 +817,7 @@ mod macos {
         let child = Child {
             control,
             status: None,
+            target_pid: pid as u32,
         };
         drop((input_read, output_write, error_write));
         Ok((
@@ -635,6 +839,27 @@ mod linux_supervisor_tests {
         time::{Duration, Instant},
     };
     #[test]
+    fn partial_completion_frame_does_not_block_or_lose_status() {
+        use std::{io::Write, os::unix::process::ExitStatusExt};
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        let mut owned = Child {
+            control,
+            pidfd: None,
+            target_pid: 2,
+            shell: true,
+            completion: vec![],
+            status: None,
+        };
+        peer.write_all(b"D").unwrap();
+        let before = Instant::now();
+        assert!(owned.try_wait().unwrap().is_none());
+        assert!(before.elapsed() < Duration::from_millis(50));
+        peer.write_all(&1792i32.to_le_bytes()[..2]).unwrap();
+        assert!(owned.try_wait().unwrap().is_none());
+        peer.write_all(&1792i32.to_le_bytes()[2..]).unwrap();
+        assert_eq!(owned.try_wait().unwrap().unwrap().into_raw(), 1792);
+    }
+    #[test]
     fn deferred_wait_reaps_exact_supervisor_after_timeout() {
         unsafe extern "C" {
             fn syscall(number: isize, ...) -> isize;
@@ -650,6 +875,10 @@ mod linux_supervisor_tests {
         let mut owned = Child {
             control,
             pidfd: Some(pidfd),
+            target_pid: pid,
+            shell: false,
+            completion: Vec::new(),
+            status: None,
         };
         assert!(
             owned.wait().is_err(),

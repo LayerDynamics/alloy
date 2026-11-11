@@ -8,23 +8,17 @@
 //! own arguments. Process groups do not contain descendants that escape via
 //! setsid/setpgid. Only the direct child is reaped here; this is not a subreaper.
 //! Do not retain store/session locks or the native generation slot across run.
-//! No other waiter/SIGCHLD handler may reap the owned child. Blocking spawn,
+//! An isolated native owner retains the target through group cleanup. Blocking spawn,
 //! kernel I/O, sink calls and final wait are not universally interruptible.
 
 use crate::execution::{ExecutionContext, ExecutionError, OutputSink};
-use rustix::{
-    fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
-};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use std::{
     fmt, fs,
     io::{self, Read},
-    os::unix::{
-        fs::MetadataExt,
-        process::{CommandExt, ExitStatusExt},
-    },
+    os::unix::{fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -245,7 +239,8 @@ impl ShellScope {
                 output.abort();
                 let cleanup_errors = owned.as_mut().map_or_else(Vec::new, OwnedChild::cleanup);
                 Err(ShellFailure {
-                    started: pid.is_some(),
+                    started: pid.is_some()
+                        || matches!(&cause, ShellError::Io(error) if error.get_ref().is_some_and(|source|source.is::<alloy_process_owner::spawn::CommittedLaunchError>())),
                     pid,
                     cause,
                     cleanup_errors,
@@ -264,30 +259,36 @@ impl ShellScope {
         context.check()?;
         self.validate(r)?;
         context.check()?;
-        let child = Command::new(&r.executable)
+        let mut command = Command::new(&r.executable);
+        command
             .args(&r.args)
             .current_dir(&r.cwd)
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()?;
+            .stderr(Stdio::piped());
+        let helper_path = alloy_process_owner::spawn::default_helper()?;
+        let helper = alloy_process_owner::spawn::prepare_helper(
+            &[alloy_process_owner::spawn::AuditConfig {
+                program: r.executable.clone(),
+                write_trees: vec![],
+            }],
+            Some(&helper_path),
+            std::time::Instant::now() + context.remaining()?,
+            &|| context.check().is_err(),
+        )?;
+        let (child, stdin, mut stdout, mut stderr) = alloy_process_owner::spawn::spawn_shell(
+            command,
+            helper.as_deref(),
+            std::time::Instant::now() + context.remaining()?,
+            &|| context.check().is_err(),
+        )?;
+        drop(stdin);
         *pid = Some(child.id());
-        *owned = Some(OwnedChild::new(child)?);
+        *owned = Some(OwnedChild::new(child));
         let child = owned
             .as_mut()
             .ok_or(ShellError::Policy("missing child ownership"))?;
-        let mut stdout = child
-            .child
-            .stdout
-            .take()
-            .ok_or(ShellError::Policy("missing stdout pipe"))?;
-        let mut stderr = child
-            .child
-            .stderr
-            .take()
-            .ok_or(ShellError::Policy("missing stderr pipe"))?;
         fcntl_setfl(
             &stdout,
             fcntl_getfl(&stdout).map_err(os)? | OFlags::NONBLOCK,
@@ -324,9 +325,6 @@ impl ShellScope {
                 &mut capture,
             )?;
             let exited = child.exited()?;
-            if exited {
-                child.stop_group()?;
-            }
             if exited && out_done && err_done {
                 break;
             }
@@ -422,76 +420,23 @@ fn pump<R: Read>(
     }
 }
 
-// Retain the unreaped leader until all group signals have been sent. try_wait
-// would reap early and permit PID reuse before a later group signal.
+// Only the isolated native owner can signal or reap the target/group.
 struct OwnedChild {
-    child: Child,
-    pid: Pid,
+    child: alloy_process_owner::spawn::Child,
+    status: Option<ExitStatus>,
     active: bool,
-    group_stopped: bool,
-    identity_lost: bool,
 }
 impl OwnedChild {
-    fn new(mut child: Child) -> io::Result<Self> {
-        let id = i32::try_from(child.id())
-            .ok()
-            .filter(|id| *id > 1)
-            .and_then(Pid::from_raw);
-        match id {
-            Some(pid) => Ok(Self {
-                child,
-                pid,
-                active: true,
-                group_stopped: false,
-                identity_lost: false,
-            }),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(io::Error::other("invalid owned process-group ID"))
-            }
+    fn new(child: alloy_process_owner::spawn::Child) -> Self {
+        Self {
+            child,
+            status: None,
+            active: true,
         }
     }
     fn exited(&mut self) -> Result<bool, ShellError> {
-        match waitid(
-            WaitId::Pid(self.pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        ) {
-            Ok(status) => Ok(status.is_some()),
-            Err(rustix::io::Errno::CHILD) => {
-                self.identity_lost = true;
-                Err(ShellError::Policy(
-                    "owned child was reaped by another waiter",
-                ))
-            }
-            Err(rustix::io::Errno::INTR) => Ok(false),
-            Err(e) => Err(os(e)),
-        }
-    }
-    fn stop_group(&mut self) -> Result<(), ShellError> {
-        if self.group_stopped {
-            return Ok(());
-        }
-        match kill_process_group(self.pid, Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => {
-                self.group_stopped = true;
-                Ok(())
-            }
-            Err(rustix::io::Errno::PERM) => {
-                // Darwin can reject a zombie-only group. An exited leader alone
-                // is insufficient evidence: a live, unsignalable member may
-                // remain. Keep the leader unreaped while verifying the group.
-                #[cfg(target_os = "macos")]
-                {
-                    if self.exited()? && macos_zombie_only_group(self.child.id())? {
-                        self.group_stopped = true;
-                        return Ok(());
-                    }
-                }
-                Err(os(rustix::io::Errno::PERM))
-            }
-            Err(error) => Err(os(error)),
-        }
+        self.status = self.child.try_wait()?;
+        Ok(self.status.is_some())
     }
     fn reap(&mut self) -> io::Result<ExitStatus> {
         let status = self.child.wait()?;
@@ -500,21 +445,11 @@ impl OwnedChild {
     }
     fn cleanup(&mut self) -> Vec<String> {
         if !self.active {
-            return Vec::new();
+            return vec![];
         }
-        if self.identity_lost {
-            self.active = false;
-            return vec!["child ownership lost; no potentially reused PID was signalled".into()];
-        }
-        let mut errors = Vec::new();
-        if let Err(e) = self.stop_group() {
+        let mut errors = vec![];
+        if let Err(e) = self.child.kill() {
             errors.push(e.to_string());
-        }
-        match self.child.kill() {
-            Err(e) if e.kind() != io::ErrorKind::InvalidInput => {
-                errors.push(e.to_string());
-            }
-            _ => {}
         }
         if let Err(e) = self.child.wait() {
             errors.push(e.to_string());
@@ -526,210 +461,6 @@ impl OwnedChild {
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.cleanup();
-    }
-}
-
-// Read-only Darwin inspection for EPERM after a confirmed, unreaped leader
-// exit. No fallback swallows errors or signals a PID/group after reaping it.
-// Snapshot visibility and the trusted-OS/no-other-waiter assumptions are part
-// of this candidate's boundary; this is not kernel-atomic group containment.
-#[cfg(target_os = "macos")]
-fn macos_zombie_only_group(leader: u32) -> Result<bool, ShellError> {
-    const MAX_SNAPSHOT: usize = 1024 * 1024;
-    let command = Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,pgid=,stat="])
-        .env_clear()
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut probe = MacPsProbe {
-        child: command,
-        active: true,
-    };
-    let mut stdout = probe
-        .child
-        .stdout
-        .take()
-        .ok_or(ShellError::Policy("missing Darwin process-table pipe"))?;
-    fcntl_setfl(
-        &stdout,
-        fcntl_getfl(&stdout).map_err(os)? | OFlags::NONBLOCK,
-    )
-    .map_err(os)?;
-    let start = std::time::Instant::now();
-    let mut bytes = Vec::new();
-    let mut eof = false;
-    let mut status = None;
-    loop {
-        if start.elapsed() >= Duration::from_secs(1) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Darwin process-group inspection exceeded cleanup budget",
-            )
-            .into());
-        }
-        let mut progressed = false;
-        if !eof {
-            let mut buffer = [0u8; 4096];
-            match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    eof = true;
-                    progressed = true;
-                }
-                Ok(n) => {
-                    if n > MAX_SNAPSHOT.saturating_sub(bytes.len()) {
-                        return Err(ShellError::Policy(
-                            "Darwin process snapshot exceeds byte bound",
-                        ));
-                    }
-                    bytes
-                        .try_reserve(n)
-                        .map_err(|_| ExecutionError::AllocationFailed)?;
-                    bytes.extend_from_slice(&buffer[..n]);
-                    progressed = true;
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if status.is_none() {
-            match probe.child.try_wait() {
-                Ok(Some(exit)) => {
-                    probe.active = false;
-                    status = Some(exit);
-                }
-                Ok(None) => (),
-                Err(error) => {
-                    if error.raw_os_error()
-                        == io::Error::from(rustix::io::Errno::CHILD).raw_os_error()
-                    {
-                        probe.active = false;
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        if eof && status.is_some() {
-            break;
-        }
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-    if !status.is_some_and(|exit| exit.success()) {
-        return Err(ShellError::Policy("Darwin process-table inspection failed"));
-    }
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| ShellError::Policy("non-UTF-8 Darwin process snapshot"))?;
-    zombie_only_snapshot(text, leader)
-}
-
-// This trusted /bin/ps probe cannot spawn arbitrary descendants. Its guard only
-// kills/reaps its own still-unreaped direct child; it never recurses into group
-// inspection or signals a process after try_wait has reaped it.
-#[cfg(target_os = "macos")]
-struct MacPsProbe {
-    child: Child,
-    active: bool,
-}
-#[cfg(target_os = "macos")]
-impl Drop for MacPsProbe {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-            self.active = false;
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn zombie_only_snapshot(text: &str, leader: u32) -> Result<bool, ShellError> {
-    let mut leader_seen = false;
-    let mut all_zombies = true;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = line.split_whitespace();
-        let invalid = || ShellError::Policy("malformed Darwin process snapshot");
-        let pid = fields
-            .next()
-            .ok_or_else(invalid)?
-            .parse::<u32>()
-            .map_err(|_| invalid())?;
-        let pgid = fields
-            .next()
-            .ok_or_else(invalid)?
-            .parse::<u32>()
-            .map_err(|_| invalid())?;
-        let state = fields.next().ok_or_else(invalid)?;
-        if fields.next().is_some() {
-            return Err(invalid());
-        }
-        if pgid == leader {
-            if !state.starts_with('Z') {
-                all_zombies = false;
-            }
-            if pid == leader {
-                leader_seen = state.starts_with('Z');
-            }
-        }
-    }
-    Ok(leader_seen && all_zombies)
-}
-
-#[cfg(test)]
-mod group_teardown_tests {
-    use super::*;
-
-    #[test]
-    fn zombie_only_group_requires_observed_zombie_leader() {
-        assert!(zombie_only_snapshot("100 100 Z\n101 100 Z+\n7 7 S\n", 100).unwrap());
-        assert!(!zombie_only_snapshot("101 100 Z\n", 100).unwrap());
-        assert!(!zombie_only_snapshot("", 100).unwrap());
-    }
-
-    #[test]
-    fn live_group_member_does_not_justify_ignoring_permission_denial() {
-        assert!(!zombie_only_snapshot("100 100 Z\n101 100 S\n", 100).unwrap());
-        assert!(!zombie_only_snapshot("100 100 R\n", 100).unwrap());
-    }
-
-    #[test]
-    fn malformed_snapshot_fails_closed() {
-        for snapshot in ["PID PGID STAT", "100 100", "100 100 Z extra", "x 100 Z"] {
-            assert!(zombie_only_snapshot(snapshot, 100).is_err());
-        }
-    }
-
-    #[test]
-    fn unrelated_live_groups_do_not_change_zombie_group_observation() {
-        assert!(zombie_only_snapshot("1 1 S\n100 100 Z\n200 200 R\n", 100).unwrap());
-    }
-
-    #[test]
-    fn exited_unreaped_child_group_can_be_settled_then_reaped() {
-        let child = Command::new("/usr/bin/true")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let mut child = OwnedChild::new(child).unwrap();
-        let start = std::time::Instant::now();
-        while !child.exited().unwrap() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "fixture did not exit"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        child.stop_group().unwrap();
-        assert!(child.reap().unwrap().success());
-        assert!(!child.active);
     }
 }
 

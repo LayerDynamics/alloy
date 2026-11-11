@@ -115,6 +115,29 @@ fn shell_child_fixture() {
         "stderr" => io::stderr().write_all(b"EXACT_STDERR").unwrap(),
         "binary" => io::stdout().write_all(&[0, 255, 10, 128]).unwrap(),
         "exit7" => std::process::exit(7),
+        "exit127" => std::process::exit(127),
+        "signal" => {
+            unsafe extern "C" {
+                fn raise(signal: i32) -> i32;
+            }
+            // SAFETY: isolated owned fixture sends SIGTERM to itself.
+            unsafe { raise(15) };
+            panic!("SIGTERM did not terminate fixture");
+        }
+        "descendant" => {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shell_child_fixture",
+                    "--nocapture",
+                    "--skip",
+                    "hang",
+                ])
+                .spawn()
+                .unwrap();
+            fs::write("descendant.pid", child.id().to_string()).unwrap();
+            std::process::exit(0);
+        }
         "stdin" => {
             let mut bytes = Vec::new();
             io::stdin().read_to_end(&mut bytes).unwrap();
@@ -403,4 +426,47 @@ fn shell_survives_external_auto_reaping() {
     let (result, bytes) = execute(&d, "echo:REAPER_SAFE");
     assert!(result.success);
     assert!(String::from_utf8_lossy(&stream(&bytes, "stdout")).contains("REAPER_SAFE"));
+}
+
+#[test]
+fn signal_exit_preserves_actual_status() {
+    let d = Temp::new();
+    let (r, _) = execute(&d, "signal");
+    assert!(!r.success);
+    assert_eq!(r.exit_code, None);
+    assert_eq!(r.signal, Some(15));
+}
+#[test]
+fn exec_failure_is_distinct_from_program_exit_127() {
+    let d = Temp::new();
+    let (report, _) = execute(&d, "exit127");
+    assert_eq!(report.exit_code, Some(127));
+    assert!(!report.success);
+    let path = d.0.join("not-executable");
+    fs::write(&path, "not an executable").unwrap();
+    let s = ShellScope::new(vec![path.clone()], vec![d.0.clone()], 65536).unwrap();
+    let r = ShellRequest::new(path.to_str().unwrap(), vec![], d.0.to_str().unwrap()).unwrap();
+    let c = context(10000, 65536, CancellationToken::default());
+    let mut out = BoundedOutput::new(&c, 65536).unwrap();
+    let failure = s.run(&r, &c, &mut out).unwrap_err();
+    assert!(!failure.started, "{failure:?}");
+    assert!(matches!(failure.cause, ShellError::Io(_)), "{failure:?}");
+}
+#[test]
+fn exited_leader_descendant_is_stopped_before_completion() {
+    let d = Temp::new();
+    assert!(execute(&d, "descendant").0.success);
+    let pid = fs::read_to_string(d.0.join("descendant.pid")).unwrap();
+    let result = std::process::Command::new("/bin/ps")
+        .args(["-p", pid.trim(), "-o", "stat="])
+        .output()
+        .unwrap();
+    assert!(result.stderr.is_empty());
+    assert!(
+        !result.status.success()
+            || String::from_utf8_lossy(&result.stdout)
+                .trim()
+                .starts_with('Z'),
+        "live descendant: {result:?}"
+    );
 }

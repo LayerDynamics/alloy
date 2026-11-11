@@ -1,12 +1,18 @@
 # Phase 2 exit review
 
-**Decision: blocked.** A competing reaper can invalidate `shell.run`'s child
-identity before its numeric process-group or PID signal. P2-09's unrelated-work
-safety is therefore not established under that condition; [issue #31](https://github.com/LayerDynamics/alloy/issues/31)
-is reopened. No unrelated process was observed being signalled. Integrated
-`session.pause` coverage while a real hook or shell is active is also missing;
-see [issue #34](https://github.com/LayerDynamics/alloy/issues/34). Do not close
-Phase 2 until PID-safe shell ownership and Linux/Mac regression evidence pass.
+**Decision: blocked.** Shell targets now run beneath the shared isolated native
+owner, which retains its target through group cleanup. The auto-reaping regression
+passes on Linux and macOS. This does not establish complete host-reaper safety:
+the macOS owner cleanup still waits for its supervisor by numeric PID under the
+host-owned reaping contract. A competing host waiter can consume that supervisor
+before this wait and permit reuse. Independent review requires resolving that
+supervisor-status ownership gap before closing [issue #31](https://github.com/LayerDynamics/alloy/issues/31).
+
+The pause completion callback and exact-request NotFound handling have local
+regression coverage. The final candidate still needs refreshed Linux/Mac CI,
+real-model acceptance, packaging and exit review for
+[issue #34](https://github.com/LayerDynamics/alloy/issues/34). Earlier green runs
+are historical evidence and do not authorize merging the changed candidate.
 
 **Earlier candidate evidence.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
 passed the complete [Linux and Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43018696590)
