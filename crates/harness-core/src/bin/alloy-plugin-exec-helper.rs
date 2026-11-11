@@ -1,6 +1,7 @@
 //! Isolated macOS supervisor: own child reaping and clean its process group.
 #[cfg(target_os = "macos")]
 fn main() {
+    alloy_process_owner::link_native_supervisor();
     #[link(name = "alloy_fileport", kind = "static")]
     unsafe extern "C" {
         fn alloy_exec_helper(argc: i32, argv: *mut *mut std::ffi::c_char) -> i32;

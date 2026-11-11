@@ -313,3 +313,315 @@ fn configured_tool_notifications_abort_before_approval_or_execution_on_overflow(
             .any(|e| e["kind"] == "tool.completed" && e["payload"]["state"] == "Withdrawn")
     );
 }
+
+#[test]
+fn pause_running_shell_reaps_process_without_affecting_another_session() {
+    pause_running_operation(false, false);
+}
+
+#[test]
+fn pause_running_shell_after_finished_request_eviction() {
+    pause_running_operation(true, false);
+}
+
+#[test]
+fn pause_running_plugin_hook_reaps_plugin_without_tool_effects() {
+    pause_running_operation(true, true);
+}
+
+fn pause_running_operation(evicted: bool, hook: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let args = json!({"executable":shell,"args":["-c","echo $$ > owned.pid; exec /bin/sleep 60"],"cwd":cwd});
+    let engine = ScriptedEngine::new(vec![
+        vec![proposal("shell.run", args.clone()), done()],
+        vec![
+            engine::types::GenerationEvent::TextDelta {
+                text: "other session completed".into(),
+            },
+            done(),
+        ],
+        vec![
+            engine::types::GenerationEvent::TextDelta {
+                text: "other session still active".into(),
+            },
+            done(),
+        ],
+    ]);
+    let mut engine = engine;
+    engine.cancel_not_found = evicted;
+    let service = DaemonService::open(
+        dir.path().join("db"),
+        engine,
+        Arc::new(TelemetryClient::new(
+            "test",
+            HardwareTier::Unknown,
+            "https://telemetry.invalid",
+        )),
+        128,
+        0,
+        0,
+    )
+    .unwrap()
+    .with_metrics_source(Arc::new(Metrics));
+    let config = json!({"read_root":cwd,"write_root":cwd,"shell_executables":[shell],"shell_cwd_roots":[cwd],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"shell.run","allowed_arguments":[args],"require_approval":true,"timeout_ms":30000,"max_output_bytes":65536}]},"plugins":[]});
+    let path = dir.path().join("tools.json");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let mut runtime = alloyd::tool_config::load(
+        &path,
+        service
+            .open_artifacts(&dir.path().join("artifacts"))
+            .unwrap(),
+    )
+    .unwrap();
+    let hook_log = dir.path().join("hook-events");
+    if hook {
+        use harness_core::plugin_host::{Limits, PluginConfig, PluginHost, sandbox::Sandbox};
+        use tool_registry::execution::CancellationToken;
+        let fixture = dir.path().join("hook-fixture");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-o"])
+            .arg(&fixture)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../harness-core/tests/fixtures/tool_hook_plugin.rs"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let host = PluginHost::start_with_helper(
+            vec![PluginConfig {
+                id: "p".into(),
+                version: "1.0.0".into(),
+                program: fixture,
+                args: vec!["p".into(), "hang".into(), hook_log.to_str().unwrap().into()],
+                cwd: cwd.clone(),
+                sandbox: Sandbox::Trusted,
+            }],
+            Limits {
+                message_bytes: 16384,
+                diagnostic_bytes: 4096,
+                annotation_bytes: 1024,
+                reason_bytes: 256,
+                timeout: Duration::from_secs(30),
+            },
+            std::time::Instant::now() + Duration::from_secs(30),
+            &CancellationToken::default(),
+            &alloy_process_owner::spawn::default_helper().unwrap(),
+        )
+        .unwrap();
+        runtime.plugins = std::sync::Mutex::new(host);
+    }
+    let service = Arc::new(service.with_tools(runtime));
+    let listener = bind_listener(&dir.path().join("rpc.sock")).unwrap();
+    let (mut stream, worker) = connect(&listener, service.clone());
+    let (mut control, control_worker) = connect(&listener, service.clone());
+    send(&mut control, 1, "session.create", json!({"profile":"p"}));
+    let session = receive(&mut control)["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(&mut control, 2, "session.create", json!({"profile":"p"}));
+    let other = receive(&mut control)["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(
+        &mut stream,
+        3,
+        "session.send",
+        json!({"session_id":session,"content":"run shell"}),
+    );
+    let call = loop {
+        let event = receive(&mut stream);
+        assert!(event.get("error").is_none(), "{event}");
+        if event["params"]["event"] == "approval_requested" {
+            break event["params"]["body"]["call_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    };
+    send(
+        &mut control,
+        4,
+        "session.approve",
+        json!({"session_id":session,"call_id":call,"allow":true}),
+    );
+    assert!(receive(&mut control).get("result").is_some());
+    let pid = if hook {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&hook_log)
+            .unwrap_or_default()
+            .contains("p:before")
+        {
+            assert!(std::time::Instant::now() < until, "hook did not start");
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::read_to_string(format!("{}.p.pid", hook_log.display()))
+            .unwrap()
+            .trim()
+            .to_owned()
+    } else {
+        loop {
+            let event = receive(&mut stream);
+            assert!(event.get("error").is_none(), "{event}");
+            if event["params"]["event"] == "tool_call_started" {
+                break;
+            }
+        }
+        let pidfile = dir.path().join("owned.pid");
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() {
+            assert!(std::time::Instant::now() < until, "shell did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(pidfile).unwrap().trim().to_owned()
+    };
+    struct Sentinel(std::process::Child);
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let mut sentinel = Sentinel(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    assert!(sentinel.0.try_wait().unwrap().is_none());
+    send(
+        &mut control,
+        5,
+        "session.send",
+        json!({"session_id":other,"content":"independent turn"}),
+    );
+    let mut other_done = false;
+    loop {
+        let event = receive(&mut control);
+        if event["params"]["event"] == "generation_completed" {
+            other_done = true;
+        }
+        if event["id"] == 5 {
+            assert!(event.get("result").is_some(), "{event}");
+            break;
+        }
+    }
+    assert!(
+        other_done,
+        "other session did not finish while shell was active"
+    );
+    send(
+        &mut control,
+        6,
+        "session.pause",
+        json!({"session_id":session}),
+    );
+    let paused = receive(&mut control);
+    assert_eq!(paused["result"]["status"], "paused", "{paused}");
+    let mut terminals = 0;
+    loop {
+        let event = receive(&mut stream);
+        if event["params"]["event"] == "generation_completed"
+            || event["params"]["event"] == "request_failed"
+        {
+            terminals += 1;
+        }
+        if event["id"] == 3 {
+            assert!(event.get("error").is_some());
+            break;
+        }
+    }
+    assert_eq!(terminals, 1);
+    send(
+        &mut control,
+        7,
+        "sessions.resume",
+        json!({"session_id":session}),
+    );
+    let paused_history = receive(&mut control);
+    assert_eq!(paused_history["result"]["status"], "paused");
+    if hook {
+        assert!(
+            !paused_history["result"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "tool.started")
+        );
+    }
+    send(
+        &mut control,
+        8,
+        "sessions.resume",
+        json!({"session_id":other}),
+    );
+    let other_history = receive(&mut control);
+    assert_eq!(other_history["result"]["status"], "active");
+    assert!(
+        other_history["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "assistant.message"
+                && event["payload"]["content"] == "other session completed")
+    );
+    send(
+        &mut control,
+        9,
+        "session.send",
+        json!({"session_id":other,"content":"continue after independent pause"}),
+    );
+    loop {
+        let event = receive(&mut control);
+        if event["id"] == 9 {
+            assert!(event.get("result").is_some(), "{event}");
+            break;
+        }
+    }
+
+    if hook {
+        assert!(
+            !dir.path().join("owned.pid").exists(),
+            "tool executed while before hook was cancelled"
+        );
+    }
+    assert!(
+        sentinel.0.try_wait().unwrap().is_none(),
+        "unrelated sentinel died during pause"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid, "-o", "stat="])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            assert_eq!(output.status.code(), Some(1), "ps failed unexpectedly");
+            assert!(
+                output.stderr.is_empty(),
+                "ps inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        let status = std::str::from_utf8(&output.stdout).unwrap().trim();
+        assert!(!status.is_empty(), "ps succeeded without process state");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "paused shell {pid} survived"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(stream);
+    drop(control);
+    worker.join().unwrap();
+    control_worker.join().unwrap();
+}

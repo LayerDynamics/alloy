@@ -1,6 +1,7 @@
 //! Minimal macOS pipe broker. It never starts or supervises a plugin.
 #[cfg(target_os = "macos")]
 fn main() {
+    alloy_process_owner::link_native_supervisor();
     #[link(name = "alloy_fileport", kind = "static")]
     #[link(name = "bsm")]
     unsafe extern "C" {

@@ -58,7 +58,11 @@ const runningBody = `
 const fs = require('node:fs');
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
-fs.writeFileSync(process.env.START_RECORD, JSON.stringify({pid:process.pid,args:process.argv.slice(2)}));
+// Publish only a complete record: an existence probe must never observe the
+// open-before-write window of the synthetic readiness file.
+const pendingRecord = process.env.START_RECORD + '.partial';
+fs.writeFileSync(pendingRecord, JSON.stringify({pid:process.pid,args:process.argv.slice(2)}));
+setTimeout(() => fs.renameSync(pendingRecord, process.env.START_RECORD), 50);
 setInterval(() => {}, 1000);
 `;
 
@@ -173,7 +177,7 @@ test("owned foreground startup waits for its PID, passes configuration literally
     output: output.output, errorOutput: output.output,
     log: (text) => { logs.push(text); if (text.startsWith("READY")) abort.abort(); },
   });
-  assert.equal(result, 130);
+  assert.equal(result, 130, logs.join("\n"));
   assert.ok(logs.some((text) => text.startsWith("READY")));
   const actual = JSON.parse(fs.readFileSync(record, "utf8")) as { pid: number; args: string[] };
   assert.equal(alive(actual.pid), false);

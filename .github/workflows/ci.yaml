@@ -93,6 +93,7 @@ jobs:
             -e CARGO_TERM_COLOR=never -w /work alloy-native-builder:phase0 \
             bash -euo pipefail -c '
               tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf -
+              cargo test --locked -p alloy-process-owner --all-targets
               cargo test --locked -p tool-registry --all-targets
               cargo test --locked -p tool-registry --doc
               cargo test --locked -p mlx-ffi --all-targets -- --test-threads=1
@@ -415,6 +416,20 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 40
         run: bash ts/cli/scripts/session_restart_real_model.sh
+
+      - name: "P2-16: mocked-inference tool round-trip latency"
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ALLOY_ACCEPTANCE_OUTPUT_DIR/phase-2"
+          cargo test --locked -p harness-core --test tool_latency tool_roundtrip_overhead_under_50ms -- --exact --nocapture 2>&1 | tee "$ALLOY_ACCEPTANCE_OUTPUT_DIR/phase-2/tool-latency.log"
+
+      - name: "P2-15: real Qwen3 tool loop and plugin hooks"
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        env:
+          ALLOY_E2E_EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash ts/cli/scripts/phase2_tool_loop_real_model.sh
 
       - name: "M9: real 4B and 14B memory acceptance"
         if: ${{ !cancelled() }}

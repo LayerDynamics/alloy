@@ -185,6 +185,58 @@ fn canonical_tool_loop_persists_results() {
     assert_eq!(reopened.list_events("s").unwrap(), history);
 }
 #[test]
+fn completed_generation_is_cleared_before_invalid_proposal_handling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SessionStore::open(dir.path().join("db")).unwrap();
+    store.create_session("s", "p").unwrap();
+    let runtime = setup(dir.path(), &mut store, false);
+    let store = Mutex::new(store);
+    let supervisor = Supervisor::new(
+        ScriptedEngine::new(vec![
+            vec![proposal("fs.write", json!({"path":"marker.txt"})), done()],
+            vec![
+                GenerationEvent::TextDelta {
+                    text: "finished".into(),
+                },
+                done(),
+            ],
+        ]),
+        telemetry(),
+    );
+    let active = std::cell::RefCell::new(None);
+    let completed = std::cell::Cell::new(0);
+    supervisor
+        .run_tool_turn_with_lifecycle(
+            &store,
+            &runtime,
+            "s",
+            "write",
+            config(),
+            &CancellationToken::default(),
+            |id| {
+                assert!(active.borrow().is_none());
+                *active.borrow_mut() = Some(id.clone());
+                Ok(())
+            },
+            |id| {
+                assert_eq!(active.borrow().as_ref(), Some(id));
+                *active.borrow_mut() = None;
+                completed.set(completed.get() + 1);
+                Ok(())
+            },
+            |event| {
+                if event.event == "tool_requested" {
+                    assert!(active.borrow().is_none());
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(completed.get(), 2);
+    assert!(active.borrow().is_none());
+    assert!(!dir.path().join("marker.txt").exists());
+}
+#[test]
 fn approval_denial_protocol_errors_and_call_limit_have_zero_writes() {
     for mode in ["deny", "invalid", "unknown", "limit"] {
         let dir = tempfile::tempdir().unwrap();

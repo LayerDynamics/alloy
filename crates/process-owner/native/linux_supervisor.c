@@ -29,6 +29,11 @@ static _Noreturn void child_exit(int status) {
     syscall(SYS_exit_group, status);
     __builtin_unreachable();
 }
+static _Noreturn void target_failure(int error) {
+    if (!error) error=EIO;
+    (void)syscall(SYS_write, 5, &error, sizeof(error));
+    child_exit(125);
+}
 static int child_close(int fd) { return (int)syscall(SYS_close, fd); }
 static int child_poll(struct pollfd *pfd, int milliseconds) {
     struct timespec timeout = {milliseconds / 1000, (long)(milliseconds % 1000) * 1000000};
@@ -119,17 +124,45 @@ int alloy_linux_supervise(int control, int parent_end) {
     int ready_result;
     do { ready_result = child_poll(&ready, 5000); } while (ready_result < 0 && errno == EINTR);
     char commit = 0;
-    if (ready_result <= 0 || syscall(SYS_recvfrom, 3, &commit, 1, 0, 0, 0) != 1 || commit != 'R') child_exit(125);
+    if (ready_result <= 0 || syscall(SYS_recvfrom, 3, &commit, 1, 0, 0, 0) != 1 || (commit != 'R' && commit != 'Q')) child_exit(125);
+    int exec_pipe[2] = {-1, -1};
+    if (commit == 'Q' && syscall(SYS_pipe2, exec_pipe, O_CLOEXEC | O_NONBLOCK)) child_exit(125);
     pid_t target = (pid_t)syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
     if (target < 0) child_exit(125);
     if (target == 0) {
         (void)syscall(SYS_close, 3);
-        if (syscall(SYS_setpgid, 0, 0)) child_exit(125);
+        if (commit == 'Q') {
+            child_close(exec_pipe[0]);
+            if (exec_pipe[1] != 5 && syscall(SYS_dup3, exec_pipe[1], 5, O_CLOEXEC) < 0) child_exit(125);
+        }
+        if (syscall(SYS_setpgid, 0, 0)) target_failure(errno);
+        if (commit == 'Q') {
+            int null = syscall(SYS_openat, AT_FDCWD, "/dev/null", O_RDONLY | O_CLOEXEC, 0);
+            if (null < 0 || (null != 0 && syscall(SYS_dup3, null, 0, 0) < 0)) target_failure(errno);
+            if (null != 0) child_close(null);
+        }
         /* exec preserves ignored dispositions. Only the supervisor needs its
          * private SIGCHLD reset to retain target ownership. */
         if (original_sigchld.handler == (uintptr_t)SIG_IGN &&
-            kernel_sigaction(SIGCHLD, &original_sigchld, 0)) child_exit(125);
+            kernel_sigaction(SIGCHLD, &original_sigchld, 0)) target_failure(errno);
         return 0;
+    }
+    if (commit == 'Q') {
+        child_close(exec_pipe[1]);
+        int exec_error = 0;
+        long n;
+        for (;;) {
+            n = syscall(SYS_read, exec_pipe[0], &exec_error, sizeof(exec_error));
+            if (n >= 0 || (errno != EINTR && errno != EAGAIN)) break;
+            struct pollfd cancel = {3, POLLIN | POLLHUP, 0};
+            if (child_poll(&cancel, 1) > 0) { exec_error = ECANCELED; n = sizeof(exec_error); break; }
+        }
+        child_close(exec_pipe[0]);
+        char response[5];
+        response[0] = n == 0 ? 'S' : 'F';
+        int value = n == 0 ? target : (n == sizeof(exec_error) ? exec_error : EIO);
+        for (unsigned i=0; i<4; ++i) response[i+1] = (unsigned)value >> (i*8);
+        (void)syscall(SYS_sendto, 3, response, sizeof(response), MSG_NOSIGNAL, 0, 0);
     }
     /* The child sets its own group before executing configured code. */
     child_close(0); child_close(1); child_close(2);
@@ -170,8 +203,14 @@ int alloy_linux_supervise(int control, int parent_end) {
         struct timespec delay = {0, reported ? 100000000 : 1000000};
         syscall(SYS_nanosleep, &delay, 0);
     } while (1);
-    if (cleanup_ok && !reported && waited == target)
+    if (cleanup_ok && !reported && waited == target) {
         child_send(3, "D");
+        if (commit == 'Q') {
+            unsigned char bytes[4];
+            for (unsigned i=0; i<4; ++i) bytes[i] = (unsigned)status >> (i*8);
+            (void)syscall(SYS_sendto, 3, bytes, sizeof(bytes), MSG_NOSIGNAL, 0, 0);
+        }
+    }
     child_close(3);
     child_exit(0);
 }
@@ -214,13 +253,15 @@ int alloy_linux_launch(const char *program, char *const argv[], const char *cwd,
             if (kernel_sigaction(sig, 0, &old) != 0) continue;
             if (old.handler != (uintptr_t)SIG_DFL && old.handler != (uintptr_t)SIG_IGN) {
                 struct kernel_sigaction clean = {0};
-                if (kernel_sigaction(sig, &clean, 0)) child_exit(125);
+                if (kernel_sigaction(sig, &clean, 0)) target_failure(errno);
             }
         }
         if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &previous, 0, sizeof(uint64_t)) ||
-            syscall(SYS_chdir, cwd)) child_exit(125);
+            syscall(SYS_chdir, cwd)) { int e = errno; syscall(SYS_write, 5, &e, sizeof(e)); child_exit(125); }
         char *environment[] = {0};
         syscall(SYS_execve, program, argv, environment);
+        int exec_error = errno;
+        syscall(SYS_write, 5, &exec_error, sizeof(exec_error));
         child_exit(127);
     }
     int restore_error = pthread_sigmask(SIG_SETMASK, &previous, 0);

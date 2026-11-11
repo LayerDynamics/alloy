@@ -115,6 +115,30 @@ fn shell_child_fixture() {
         "stderr" => io::stderr().write_all(b"EXACT_STDERR").unwrap(),
         "binary" => io::stdout().write_all(&[0, 255, 10, 128]).unwrap(),
         "exit7" => std::process::exit(7),
+        "exit127" => std::process::exit(127),
+        "exit23" => std::process::exit(23),
+        "signal" => {
+            unsafe extern "C" {
+                fn raise(signal: i32) -> i32;
+            }
+            // SAFETY: isolated owned fixture sends SIGTERM to itself.
+            unsafe { raise(15) };
+            panic!("SIGTERM did not terminate fixture");
+        }
+        "descendant" => {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shell_child_fixture",
+                    "--nocapture",
+                    "--skip",
+                    "hang",
+                ])
+                .spawn()
+                .unwrap();
+            fs::write("descendant.pid", child.id().to_string()).unwrap();
+            std::process::exit(0);
+        }
         "stdin" => {
             let mut bytes = Vec::new();
             io::stdin().read_to_end(&mut bytes).unwrap();
@@ -364,4 +388,231 @@ fn configured_invocation_limit_prevents_execution() {
         .unwrap_err();
     assert!(!e.started);
     assert!(!d.0.join("marker").exists());
+}
+
+// Run this probe in its own test process: SIGCHLD disposition is process-wide.
+#[test]
+fn shell_survives_external_auto_reaping() {
+    const PROBE: &str = "ALLOY_SHELL_REAPER_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let output = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_survives_external_auto_reaping",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    #[cfg(target_os = "macos")]
+    let sigchld = 20;
+    #[cfg(target_os = "linux")]
+    let sigchld = 17;
+    // SAFETY: this is a short-lived isolated subprocess; SIG_IGN is the
+    // platform's conventional value 1 and affects only this process.
+    assert_ne!(unsafe { signal(sigchld, 1) }, usize::MAX);
+    let d = Temp::new();
+    let (result, bytes) = execute(&d, "echo:REAPER_SAFE");
+    assert!(result.success);
+    assert!(String::from_utf8_lossy(&stream(&bytes, "stdout")).contains("REAPER_SAFE"));
+}
+
+#[test]
+fn signal_exit_preserves_actual_status() {
+    let d = Temp::new();
+    let (r, _) = execute(&d, "signal");
+    assert!(!r.success);
+    assert_eq!(r.exit_code, None);
+    assert_eq!(r.signal, Some(15));
+}
+#[test]
+fn exec_failure_is_distinct_from_program_exit_127() {
+    let d = Temp::new();
+    let (report, _) = execute(&d, "exit127");
+    assert_eq!(report.exit_code, Some(127));
+    assert!(!report.success);
+    let path = d.0.join("not-executable");
+    fs::write(&path, "not an executable").unwrap();
+    let s = ShellScope::new(vec![path.clone()], vec![d.0.clone()], 65536).unwrap();
+    let r = ShellRequest::new(path.to_str().unwrap(), vec![], d.0.to_str().unwrap()).unwrap();
+    let c = context(10000, 65536, CancellationToken::default());
+    let mut out = BoundedOutput::new(&c, 65536).unwrap();
+    let failure = s.run(&r, &c, &mut out).unwrap_err();
+    assert!(!failure.started, "{failure:?}");
+    assert!(matches!(failure.cause, ShellError::Io(_)), "{failure:?}");
+}
+#[test]
+fn exited_leader_descendant_is_stopped_before_completion() {
+    let d = Temp::new();
+    assert!(execute(&d, "descendant").0.success);
+    let pid = fs::read_to_string(d.0.join("descendant.pid")).unwrap();
+    let result = std::process::Command::new("/bin/ps")
+        .args(["-p", pid.trim(), "-o", "stat="])
+        .output()
+        .unwrap();
+    assert!(result.stderr.is_empty());
+    assert!(
+        !result.status.success()
+            || String::from_utf8_lossy(&result.stdout)
+                .trim()
+                .starts_with('Z'),
+        "live descendant: {result:?}"
+    );
+}
+
+// An actual host waitpid(-1) loop must collect unrelated statuses without
+// being able to reap a shell target or its supervisor on macOS.
+#[test]
+fn shell_survives_competing_waiter_without_stealing_statuses() {
+    const PROBE: &str = "ALLOY_ACTIVE_REAPER_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let result = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_survives_competing_waiter_without_stealing_statuses",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let waiter = {
+        let stop = stop.clone();
+        let observed = observed.clone();
+        std::thread::spawn(move || {
+            unsafe extern "C" {
+                fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            }
+            while !stop.load(Ordering::Acquire) {
+                let mut status = 0;
+                // SAFETY: isolated probe intentionally owns all host child reaping.
+                let pid = unsafe { waitpid(-1, &mut status, 1) };
+                if pid > 0 {
+                    observed.lock().unwrap().push((pid as u32, status));
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+    };
+    let d = Temp::new();
+    let mut sentinels = vec![];
+    for _ in 0..12 {
+        let child = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_child_fixture",
+                "--nocapture",
+                "--skip",
+                "exit23",
+            ])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        sentinels.push(child.id());
+        drop(child);
+        assert_eq!(execute(&d, "exit7").0.exit_code, Some(7));
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !sentinels
+        .iter()
+        .all(|pid| observed.lock().unwrap().iter().any(|(seen, _)| seen == pid))
+        && std::time::Instant::now() < until
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    stop.store(true, Ordering::Release);
+    waiter.join().unwrap();
+    let observed = observed.lock().unwrap();
+    for pid in sentinels {
+        assert!(
+            observed.contains(&(pid, 23 << 8)),
+            "unrelated child status missing/corrupted: {pid}: {observed:?}"
+        );
+    }
+}
+
+#[test]
+fn shell_preserves_closed_host_standard_descriptors() {
+    const PROBE: &str = "ALLOY_SHELL_CLOSED_STDIO_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let result = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_preserves_closed_host_standard_descriptors",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    unsafe extern "C" {
+        fn close(fd: i32) -> i32;
+        fn fcntl(fd: i32, command: i32, ...) -> i32;
+    }
+    // SAFETY: this isolated fixture owns its standard descriptors and exits directly.
+    for fd in 0..3 {
+        // SAFETY: only this isolated probe owns these standard descriptors.
+        unsafe { close(fd) };
+    }
+    let d = Temp::new();
+    assert_eq!(execute(&d, "exit7").0.exit_code, Some(7));
+    for fd in 0..3 {
+        assert_eq!(
+            // SAFETY: F_GETFD inspects the numeric descriptor without variadic arguments.
+            unsafe { fcntl(fd, 1) },
+            -1,
+            "closed host descriptor was retained"
+        );
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn approved_large_argv_preserves_existing_byte_limit_contract() {
+    let d = Temp::new();
+    let executable = fs::canonicalize("/usr/bin/true").unwrap();
+    let scope = ShellScope::new(vec![executable.clone()], vec![d.0.clone()], 65536).unwrap();
+    let request = ShellRequest::new(
+        executable.to_str().unwrap(),
+        vec![String::new(); 5000],
+        d.0.to_str().unwrap(),
+    )
+    .unwrap();
+    let c = context(10000, 65536, CancellationToken::default());
+    let mut output = BoundedOutput::new(&c, 65536).unwrap();
+    assert!(scope.run(&request, &c, &mut output).unwrap().success);
 }

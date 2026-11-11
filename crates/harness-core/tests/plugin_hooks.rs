@@ -183,28 +183,46 @@ fn plugin_protocol_timeout_and_sandbox() {
     // Protocol half of P2-11. Native Seatbelt evidence is a separate Mac test.
     let cancel = CancellationToken::default();
     let dir = tempfile::tempdir().unwrap();
+    // This protocol fixture also initializes several children in the parallel
+    // suite. Budget startup separately from the short-deadline hardening cases;
+    // the hung exchange must still veto within the existing three-second bound.
+    let protocol_limits = Limits {
+        timeout: Duration::from_secs(2),
+        ..limits()
+    };
+    let version_error = start_host(
+        vec![config(dir.path(), "a", "version")],
+        protocol_limits,
+        deadline(),
+        &cancel,
+    )
+    .err()
+    .expect("incompatible version was accepted");
     assert!(
-        start_host(
-            vec![config(dir.path(), "a", "version")],
-            limits(),
-            deadline(),
-            &cancel
-        )
-        .is_err()
+        version_error
+            .to_string()
+            .contains("plugin handshake mismatch"),
+        "{version_error}"
     );
     for mode in ["hang", "crash", "malformed", "flood", "mutation"] {
         let mut host = start_host(
             vec![config(dir.path(), "a", mode)],
-            limits(),
+            protocol_limits,
             deadline(),
             &cancel,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{mode} fixture initialization failed: {error}"));
         let now = Instant::now();
         let outcome = host.before(&invocation(), deadline(), &cancel);
         assert_eq!(outcome.decision, Decision::Veto, "{mode}");
         assert!(now.elapsed() < Duration::from_secs(3), "{mode}");
-        assert!(outcome.receipts[0].diagnostic.is_some());
+        let diagnostic = outcome.receipts[0]
+            .diagnostic
+            .as_deref()
+            .expect("veto diagnostic missing");
+        if mode == "hang" {
+            assert!(diagnostic.contains("hook deadline"), "{diagnostic}");
+        }
     }
 }
 #[test]

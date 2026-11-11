@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Real Qwen3 acceptance: candidate build, owned process, recorded CLI wire stream. */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawnOwned } from "../../../scripts/homebrew/group-supervisor.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
@@ -256,8 +256,9 @@ export async function recordProxy(socketPath, daemonPath, evidenceFile) {
   };
 }
 
-class Acceptance {
+export class Acceptance {
   owned = new Set();
+  ownerErrors = [];
   aborted = false;
   constructor(testName) {
     this.testName = testName;
@@ -281,12 +282,14 @@ class Acceptance {
     assert(!this.aborted, "acceptance interrupted");
     // A fresh process group contains only this invocation's child and its
     // descendants (including Cargo/rustc). Never signal unrelated daemons.
-    const child = spawn(command, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    const processOwner = spawnOwned(command, args, { cwd, env: process.env });
+    const child = processOwner.child;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    const owned = { child, alive: true, stdout: "", stdoutChunks: [], stderr: "" };
+    const owned = { child, processOwner, alive: true, pid: null, stdout: "", stdoutChunks: [], stderr: "" };
+    owned.ready = processOwner.ready.then((pid) => { owned.pid = pid; return pid; });
     this.owned.add(owned);
-    appendJson(path.join(this.output, "processes.ndjson"), { command, args, cwd, pid: child.pid, process_group: child.pid, at: new Date().toISOString() });
+    owned.ready.then((pid) => appendJson(path.join(this.output, "processes.ndjson"), { command, args, cwd, pid, process_group: pid, at: new Date().toISOString() }));
     const stdoutPath = path.join(this.output, `${label}.stdout.log`);
     const stderrPath = path.join(this.output, `${label}.stderr.log`);
     fs.writeFileSync(stdoutPath, "");
@@ -305,21 +308,18 @@ class Acceptance {
       fs.appendFileSync(stderrPath, chunk);
       owned.stderr = (owned.stderr + chunk.toString()).slice(-16000);
     });
-    owned.done = new Promise((resolve) => {
-      child.once("error", (error) => { owned.error = error; });
-      child.once("close", (code, signal) => {
-        owned.alive = false;
-        this.owned.delete(owned);
-        resolve({ code, signal, error: owned.error });
-      });
+    owned.done = processOwner.done.then(({ code, signal, error }) => {
+      owned.alive = false;
+      this.owned.delete(owned);
+      if (error) this.ownerErrors.push(`${label}: ${error}`);
+      return { code, signal, error: error ? new Error(error) : null };
     });
     return owned;
   }
 
   signal(owned, signal) {
-    if (!owned?.alive || !owned.child.pid) return;
-    try { process.kill(-owned.child.pid, signal); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
+    if (!owned?.alive) return;
+    owned.processOwner.request(signal);
   }
 
   async stop(owned) {
@@ -330,7 +330,7 @@ class Acceptance {
     clearTimeout(timer);
     if (owned.alive) {
       this.signal(owned, "SIGKILL");
-      await Promise.race([owned.done, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`owned PID ${owned.child.pid} did not exit after SIGKILL`)), 5000); })]);
+      await Promise.race([owned.done, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`owned PID ${owned.pid} did not exit after SIGKILL`)), 5000); })]);
       clearTimeout(timer);
     }
   }
@@ -380,6 +380,13 @@ class Acceptance {
     this.binary = fs.realpathSync(artifacts.at(-1).executable);
     this.metadata.binary = this.binary;
     this.metadata.binary_sha256 = createHash("sha256").update(fs.readFileSync(this.binary)).digest("hex");
+    if (this.testName === "phase2_tool_loop_real_model") {
+      await this.command("cargo", ["build", "--locked", "--manifest-path", path.join(ROOT, "Cargo.toml"), "-p", "harness-core", "--bins", "--release"], "plugin-helper-build", this.buildTimeout);
+      this.metadata.plugin_helper = fs.realpathSync(path.join(path.dirname(this.binary), "alloy-plugin-pipe-helper"));
+      this.metadata.plugin_helper_sha256 = createHash("sha256").update(fs.readFileSync(this.metadata.plugin_helper)).digest("hex");
+      this.metadata.plugin_exec_helper = fs.realpathSync(path.join(path.dirname(this.binary), "alloy-plugin-exec-helper"));
+      this.metadata.plugin_exec_helper_sha256 = createHash("sha256").update(fs.readFileSync(this.metadata.plugin_exec_helper)).digest("hex");
+    }
     await this.command("npm", ["run", "build"], "cli-build", this.buildTimeout, path.join(ROOT, "ts/cli"));
     await this.candidateSnapshot("candidate-after-build", beforeBuild);
     this.metadata.source_verified_after_build = true;
@@ -408,15 +415,16 @@ class Acceptance {
     throw new Error(`${label}: KV cache evidence did not satisfy acceptance within ${this.cacheTimeout} ms: ${lastError}`);
   }
 
-  async startDaemon(label) {
-    const args = ["--artifact", this.artifact, "--profile", PROFILE, "--socket", this.socket, "--db", this.db, "--corpus-models", this.corpus, "--metal", "--paged-ssd-cache-dir", this.cache, "--hot-cache-max-size", "0", "--max-output-tokens", "256", "--telemetry-endpoint", "https://127.0.0.1:1"];
+  async startDaemon(label, extraArgs = []) {
+    const args = ["--artifact", this.artifact, "--profile", PROFILE, "--socket", this.socket, "--db", this.db, "--corpus-models", this.corpus, "--metal", "--paged-ssd-cache-dir", this.cache, "--hot-cache-max-size", "0", "--max-output-tokens", "256", "--telemetry-endpoint", "https://127.0.0.1:1", ...extraArgs];
     // The daemon boot path verifies every pinned corpus file before readiness.
     const owned = this.start(this.binary, args, label);
+    await owned.ready;
     const deadline = Date.now() + this.startTimeout;
     let lastError = "no API response";
     while (Date.now() < deadline) {
       assert(!this.aborted, "acceptance interrupted");
-      assert(owned.alive && owned.child.pid, `${label} exited before API readiness; see ${label}.stderr.log\n${owned.stderr}`);
+      assert(owned.alive && owned.pid, `${label} exited before API readiness; see ${label}.stderr.log\n${owned.stderr}`);
       try {
         const status = await rpc(this.socket, "daemon.status", {}, Math.min(2000, Math.max(1, deadline - Date.now())));
         const metrics = await rpc(this.socket, "daemon.metrics", {}, Math.min(2000, Math.max(1, deadline - Date.now())));
@@ -424,10 +432,10 @@ class Acceptance {
         // Legacy daemon.status reports configured boot metadata; weights load
         // lazily. Live residency is checked only after actual generation below.
         assert(status.models_resident > 0, "daemon boot configured no model");
-        assert.equal(metrics.process_id, owned.child.pid, "API listener does not belong to the launched daemon PID");
+        assert.equal(metrics.process_id, owned.pid, "API listener does not belong to the launched daemon PID");
         assert.equal(metrics.residency?.worker_alive, true, "native worker is not alive");
         assert(owned.alive, "daemon exited during readiness verification");
-        const ready = { pid: owned.child.pid, status, metrics, at: new Date().toISOString() };
+        const ready = { pid: owned.pid, status, metrics, at: new Date().toISOString() };
         jsonFile(path.join(this.output, `${label}.ready.json`), ready);
         return owned;
       } catch (error) {
@@ -466,11 +474,11 @@ class Acceptance {
       assertRecoveredHistory(before, before, firstTurn);
       jsonFile(path.join(this.output, "history-before.json"), before);
       const spilled = await this.waitForCache("before", assertCacheSpill);
-      const firstPid = first.child.pid;
+      const firstPid = first.pid;
       await this.stop(first);
       assert(!first.alive, "first daemon is still running");
       const second = await this.startDaemon("daemon-after");
-      assert.notEqual(second.child.pid, firstPid, "test did not launch a distinct daemon process");
+      assert.notEqual(second.pid, firstPid, "test did not launch a distinct daemon process");
       const recovered = await this.call("sessions.resume", { session_id: firstTurn.session_id });
       const recovery = assertRecoveredHistory(before, recovered, firstTurn);
       jsonFile(path.join(this.output, "history-recovered.json"), recovered);
@@ -484,7 +492,7 @@ class Acceptance {
       assert(after.events.some((e) => e.kind === "assistant.message" && e.payload?.content === resumed.assistant_text));
       jsonFile(path.join(this.output, "history-after.json"), after);
       const restored = await this.waitForCache("after", assertCacheRestore);
-      this.metadata.restart = { before_pid: firstPid, after_pid: second.child.pid, ...recovery, events_after_resumed_turn: after.event_count, first_turn: firstTurn, resumed_turn: resumed, cache_before_restart: spilled, cache_after_restart: restored };
+      this.metadata.restart = { before_pid: firstPid, after_pid: second.pid, ...recovery, events_after_resumed_turn: after.event_count, first_turn: firstTurn, resumed_turn: resumed, cache_before_restart: spilled, cache_after_restart: restored };
     }
     this.metadata.final_metrics = await this.call("daemon.metrics");
     const residency = this.metadata.final_metrics.residency;
@@ -497,6 +505,7 @@ class Acceptance {
     fs.rmSync(this.runtime, { recursive: true, force: true });
     const failure = results.find((result) => result.status === "rejected");
     if (failure) throw failure.reason;
+    if (this.ownerErrors.length) throw new Error(`owned process cleanup failed: ${this.ownerErrors.join("; ")}`);
   }
 }
 

@@ -8,6 +8,7 @@ publish = false
 description = "Agent supervision, durable sessions, policy, approvals, bounded artifacts, and telemetry"
 
 [dependencies]
+alloy-process-owner = { path = "../process-owner" }
 engine = { path = "../engine" }
 getrandom = "=0.3.4"
 rusqlite = { workspace = true }
@@ -21,8 +22,6 @@ ureq = { workspace = true }
 tempfile = "=3.27.0"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 
-[build-dependencies]
-cc = "=1.11.0"
 
 [lints]
 workspace = true

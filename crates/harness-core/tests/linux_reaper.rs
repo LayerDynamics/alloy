@@ -162,7 +162,7 @@ fn linux_plugin_reaping_survives_competing_reapers() {
     let status = Command::new("cc")
         .args(["-std=c11", "-Wall", "-Wextra", "-Werror"])
         .arg(manifest.join("tests/fixtures/linux_supervisor_cancel.c"))
-        .arg(manifest.join("native/linux_supervisor.c"))
+        .arg(manifest.join("../process-owner/native/linux_supervisor.c"))
         .arg("-o")
         .arg(&cancel_driver)
         .status()
