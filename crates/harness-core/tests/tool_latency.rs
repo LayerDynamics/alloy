@@ -124,7 +124,7 @@ fn tool_roundtrip_overhead_under_50ms() {
     std::fs::write(dir.path().join("fixture.txt"), "actual fixture bytes").unwrap();
     let mut store = SessionStore::open(dir.path().join("session.db")).unwrap();
     for i in 0..SAMPLES {
-        store.create_session(&format!("latency-{i}"), "p").unwrap();
+        store.create_session(format!("latency-{i}"), "p").unwrap();
     }
     let runtime = setup(dir.path(), &mut store, false);
     let store = Mutex::new(store);
