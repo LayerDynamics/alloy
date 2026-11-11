@@ -313,3 +313,159 @@ fn configured_tool_notifications_abort_before_approval_or_execution_on_overflow(
             .any(|e| e["kind"] == "tool.completed" && e["payload"]["state"] == "Withdrawn")
     );
 }
+
+#[test]
+fn pause_running_shell_reaps_process_without_affecting_another_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    let args = json!({"executable":shell,"args":["-c","echo $$ > owned.pid; exec /bin/sleep 60"],"cwd":cwd});
+    let engine = ScriptedEngine::new(vec![
+        vec![proposal("shell.run", args.clone()), done()],
+        vec![
+            engine::types::GenerationEvent::TextDelta {
+                text: "other session completed".into(),
+            },
+            done(),
+        ],
+    ]);
+    let service = DaemonService::open(
+        dir.path().join("db"),
+        engine,
+        Arc::new(TelemetryClient::new(
+            "test",
+            HardwareTier::Unknown,
+            "https://telemetry.invalid",
+        )),
+        128,
+        0,
+        0,
+    )
+    .unwrap()
+    .with_metrics_source(Arc::new(Metrics));
+    let config = json!({"read_root":cwd,"write_root":cwd,"shell_executables":[shell],"shell_cwd_roots":[cwd],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"shell.run","allowed_arguments":[args],"require_approval":true,"timeout_ms":30000,"max_output_bytes":65536}]},"plugins":[]});
+    let path = dir.path().join("tools.json");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let runtime = alloyd::tool_config::load(
+        &path,
+        service
+            .open_artifacts(&dir.path().join("artifacts"))
+            .unwrap(),
+    )
+    .unwrap();
+    let service = Arc::new(service.with_tools(runtime));
+    let listener = bind_listener(&dir.path().join("rpc.sock")).unwrap();
+    let (mut stream, worker) = connect(&listener, service.clone());
+    let (mut control, control_worker) = connect(&listener, service.clone());
+    send(&mut control, 1, "session.create", json!({"profile":"p"}));
+    let session = receive(&mut control)["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(&mut control, 2, "session.create", json!({"profile":"p"}));
+    let other = receive(&mut control)["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    send(
+        &mut stream,
+        3,
+        "session.send",
+        json!({"session_id":session,"content":"run shell"}),
+    );
+    let call = loop {
+        let event = receive(&mut stream);
+        assert!(event.get("error").is_none(), "{event}");
+        if event["params"]["event"] == "approval_requested" {
+            break event["params"]["body"]["call_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    };
+    send(
+        &mut control,
+        4,
+        "session.approve",
+        json!({"session_id":session,"call_id":call,"allow":true}),
+    );
+    assert!(receive(&mut control).get("result").is_some());
+    loop {
+        let event = receive(&mut stream);
+        assert!(event.get("error").is_none(), "{event}");
+        if event["params"]["event"] == "tool_call_started" {
+            break;
+        }
+    }
+    let pidfile = dir.path().join("owned.pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pidfile.exists() {
+        assert!(std::time::Instant::now() < deadline, "shell did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pid = std::fs::read_to_string(pidfile).unwrap().trim().to_owned();
+    send(
+        &mut control,
+        5,
+        "session.send",
+        json!({"session_id":other,"content":"independent turn"}),
+    );
+    let mut other_done = false;
+    loop {
+        let event = receive(&mut control);
+        if event["params"]["event"] == "generation_completed" {
+            other_done = true;
+        }
+        if event["id"] == 5 {
+            assert!(event.get("result").is_some(), "{event}");
+            break;
+        }
+    }
+    assert!(
+        other_done,
+        "other session did not finish while shell was active"
+    );
+    send(
+        &mut control,
+        6,
+        "session.pause",
+        json!({"session_id":session}),
+    );
+    assert!(receive(&mut control).get("result").is_some());
+    let mut terminals = 0;
+    loop {
+        let event = receive(&mut stream);
+        if event["params"]["event"] == "generation_completed"
+            || event["params"]["event"] == "request_failed"
+        {
+            terminals += 1;
+        }
+        if event["id"] == 3 {
+            assert!(event.get("error").is_some());
+            break;
+        }
+    }
+    assert_eq!(terminals, 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid, "-o", "stat="])
+            .output()
+            .unwrap();
+        if !output.status.success()
+            || output.stdout.iter().all(u8::is_ascii_whitespace)
+            || output.stdout.first() == Some(&b'Z')
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "paused shell {pid} survived"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(stream);
+    drop(control);
+    worker.join().unwrap();
+    control_worker.join().unwrap();
+}

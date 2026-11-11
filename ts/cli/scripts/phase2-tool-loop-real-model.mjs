@@ -115,9 +115,13 @@ async function main() {
     save(configPath, config);
     await a.startDaemon("daemon-phase2", ["--tools-config", configPath, "--hot-cache-only"]);
     const prompt = `Use the tools. First call fs.read with exactly ${JSON.stringify(readArgs)}. Then call shell.run with exactly ${JSON.stringify(shellArgs)}. After receiving both results, reply with the fixture text and the shell result. /no_think`;
+    const startedCalls = [];
     for (const [label, allow] of [["denied", false], ["approved", true]]) {
       const created = await rpc(a.socket, "session.create", { profile: "qwen3-4b-4bit" });
-      await sendTurn(a, created.session_id, prompt, allow, marker, label);
+      const turn = await sendTurn(a, created.session_id, prompt, allow, marker, label);
+      startedCalls.push(...turn.events.filter((event) => event.event === "tool_call_started").map((event) => ({
+        session_id: created.session_id, call_id: event.body.call_id, tool_id: event.body.tool_id,
+      })));
     }
     const hooks = fs.readFileSync(hookLog, "utf8").trim().split("\n").map(JSON.parse);
     const before = hooks.filter((h) => h.method === "tool.before_execute");
@@ -125,6 +129,17 @@ async function main() {
     assert.equal(before.length, 3, "both reads and the approved shell require before hooks");
     assert.equal(after.length, 3, "both reads and the approved shell require after hooks");
     assert.deepEqual(hooks.filter((h) => h.method !== "initialize").map((h) => h.method), Array(3).fill(["tool.before_execute", "tool.after_execute"]).flat());
+    assert.deepEqual(startedCalls.map((call) => call.tool_id), ["fs.read", "fs.read", "shell.run"]);
+    for (const [index, call] of startedCalls.entries()) {
+      const b = before[index].params.invocation;
+      const a = after[index].params.invocation;
+      for (const invocation of [b, a]) {
+        assert.equal(invocation.session_id, call.session_id);
+        assert.equal(invocation.call_id, call.call_id);
+        assert.equal(invocation.definition.id, call.tool_id);
+      }
+      assert.equal(b.invocation_id, a.invocation_id, "hook pair must describe the same invocation");
+    }
     a.metadata.status = "passed";
   } catch (error) {
     failure = error;

@@ -3,7 +3,9 @@
 **Decision: blocked.** A competing reaper can invalidate `shell.run`'s child
 identity before its numeric process-group or PID signal. P2-09's unrelated-work
 safety is therefore not established under that condition; [issue #31](https://github.com/LayerDynamics/alloy/issues/31)
-is reopened. No unrelated process was observed being signalled. Do not close
+is reopened. No unrelated process was observed being signalled. Integrated
+`session.pause` coverage while a real hook or shell is active is also missing;
+see [issue #34](https://github.com/LayerDynamics/alloy/issues/34). Do not close
 Phase 2 until PID-safe shell ownership and Linux/Mac regression evidence pass.
 
 **Earlier candidate evidence.** Candidate `1b767a2285d0f2fe7473f74796924d37e85f2390`
