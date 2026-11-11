@@ -67,8 +67,8 @@ jobs:
             -e APPROVAL_STORAGE_CANDIDATE -e CARGO_TERM_COLOR=never \
             -w /work alloy-approval-storage-native:local \
             bash -euo pipefail -c '
-              apt-get update
-              apt-get install -y --no-install-recommends python3
+              # Dockerfile.repro already installs and verifies Python.
+              python3 --version
               tar -C /src --exclude=target -cf - . | tar --no-same-owner -C /work -xf -
               test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
               rustup component add rustfmt clippy
@@ -86,10 +86,11 @@ jobs:
           retention-days: 30
 
   mac:
-    name: approval-storage-macos-arm64
+    # PR evidence and its required status are produced once by ci/mac_core.
+    # Manual and feature-branch runs retain the standalone collector.
+    name: approval-storage-macos-standalone
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name != 'pull_request'
     runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 180
     env:
@@ -125,13 +126,16 @@ jobs:
       - name: Collect approval and storage gates and complete source sections
         shell: bash
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
-          rustup component add rustfmt clippy
-          python3 scripts/approval_storage_evidence.py \
-            --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
-            --output "$APPROVAL_STORAGE_EVIDENCE/results" \
-            2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+          # Expansion intentionally happens in the locked child shell.
+          # shellcheck disable=SC2016
+          python3 scripts/ci/mac_locked_step.py -- bash -euo pipefail -c '
+            test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
+            rustup component add rustfmt clippy
+            python3 scripts/approval_storage_evidence.py \
+              --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
+              --output "$APPROVAL_STORAGE_EVIDENCE/results" \
+              2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
+          '
       - name: Retain approval and storage macOS evidence even after failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

@@ -12,6 +12,20 @@ use tool_registry::{
     builtins::fs::{FileReadTool, FileWriteTool, ReadScope, WriteScope},
     execution::CancellationToken,
 };
+fn start_host(
+    configs: Vec<PluginConfig>,
+    limits: Limits,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<PluginHost, HostError> {
+    PluginHost::start_with_helper(
+        configs,
+        limits,
+        deadline,
+        cancel,
+        std::path::Path::new(env!("CARGO_BIN_EXE_alloy-plugin-pipe-helper")),
+    )
+}
 fn setup(root: &std::path::Path, store: &mut SessionStore, prompt: bool) -> ToolRuntime {
     let mut executor = ReceiptExecutor::default();
     let definitions = tool_registry::builtins::definitions(1000, 65536).unwrap();
@@ -58,7 +72,7 @@ fn setup(root: &std::path::Path, store: &mut SessionStore, prompt: bool) -> Tool
         policy: DaemonPolicy::new(PolicyConfig { rules }).unwrap(),
         artifacts: ArtifactStore::open(store, root.join("artifacts"), Default::default()).unwrap(),
         plugins: Mutex::new(
-            PluginHost::start(
+            start_host(
                 vec![],
                 Limits {
                     message_bytes: 16384,
@@ -312,7 +326,7 @@ fn integrated_hooks_veto_before_effect_and_annotate_original_result_once() {
         store.create_session("s", "p").unwrap();
         let mut runtime = setup(dir.path(), &mut store, false);
         runtime.plugins = Mutex::new(
-            PluginHost::start(
+            start_host(
                 vec![
                     PluginConfig {
                         id: "first".into(),
@@ -782,7 +796,7 @@ fn cancelled_after_hook_host_wait_records_warning_without_changing_executed_resu
     store.create_session("s", "p").unwrap();
     let mut runtime = setup(dir.path(), &mut store, false);
     runtime.plugins = Mutex::new(
-        PluginHost::start(
+        start_host(
             vec![PluginConfig {
                 id: "observer".into(),
                 version: "1.0.0".into(),

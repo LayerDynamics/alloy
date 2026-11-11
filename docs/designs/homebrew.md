@@ -86,16 +86,39 @@ dependencies and Rust crates follow their checked-in lockfiles. Source
 fetching includes the pinned vendored native dependencies; no runtime code is
 downloaded on the first invocation.
 
-Installation builds start from an empty per-build `CARGO_HOME`, so the
-network-enabled fetch phase downloads the full crate set on every install.
-The formula hardens that path rather than caching across builds: Cargo's
-HTTP multiplexing is disabled and its retry count and transfer timeout are
-raised (`CARGO_HTTP_MULTIPLEXING=false`, `CARGO_NET_RETRY=10`,
-`CARGO_HTTP_TIMEOUT=120`). Lockfile hashes still govern all fetched content.
-Two CI acceptance failures came from transient registry stalls on an
-otherwise healthy network; if such stalls persist, vendoring the crate set
-into the source snapshot — matching the offline toolchain resources — is the
-recorded follow-up, not a per-user cache.
+The formula uses Homebrew's configured build-job count, capped at four, for both
+Cargo and CMake. Set `HOMEBREW_MAKE_JOBS=1` or `2` to reduce load. Increasing
+parallelism can shorten a cold build but uses more CPU and memory; actual
+duration depends on the machine and cache state.
+
+The formula retains only Cargo dependencies in the dedicated
+`HOMEBREW_CACHE/alloy-cargo` directory. It first runs `cargo fetch --locked
+--offline --target aarch64-apple-darwin`; an incomplete cache falls back to
+locked online fetch. Failure stops installation. Cargo's own cache locking
+coordinates access, and the existing trusted Homebrew cache-owner boundary
+applies. The user's general Cargo configuration and credentials are not used.
+
+`CARGO_TARGET_DIR` remains inside the fresh build directory: every installed
+acceptance builds Alloy and MLX anew, and the build tree is unavailable during
+installed tests. The package build remains locked and offline. Cache reuse
+does not substitute a previously compiled package.
+
+Network misses use `CARGO_HTTP_MULTIPLEXING=false`, `CARGO_NET_RETRY=3`, and
+`CARGO_HTTP_TIMEOUT=30`. These are per-request retry/timeout controls, not a
+total fetch deadline. Empty caches and registry outages can still exceed the
+CI timing target. This replaces repeated empty-cache downloads with ten
+120-second retries, which stalled the measured CI fetch.
+
+CI explicitly prepares this dependency cache before invoking Homebrew, using
+`cargo +<repository-pin> fetch --locked` from the exact candidate checkout.
+It records Cargo version, lockfile SHA-256, cache path and offline hit/miss,
+checks that the lockfile did not change, and applies a two-minute overall
+online-command deadline. Preparation downloads dependencies only. The formula
+still validates its cache, compiles in Homebrew's sandbox, and runs the unchanged
+installed tests. Preparation time is included in workflow timing. This avoids
+the observed Homebrew-specific registry stalls; the underlying environmental
+cause of those stalls is not established. Standalone empty-cache installations
+still depend on Homebrew's network-enabled fetch phase.
 
 Static MLX linkage does not embed `mlx.metallib`. Vendored MLX first searches
 beside its binary, then other resource locations and a build-time fallback.

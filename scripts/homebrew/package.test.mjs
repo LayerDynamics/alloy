@@ -29,15 +29,22 @@ function fixture(t) {
   fs.mkdirSync(path.join(nodeRuntime, "bin"), { recursive: true });
   fs.symlinkSync(process.execPath, path.join(nodeRuntime, "bin/node"));
   const daemon = path.join(sourceRoot, "target/release/alloyd");
+  const execHelper = path.join(sourceRoot, "target/release/alloy-plugin-exec-helper");
+  const pipeHelper = path.join(sourceRoot, "target/release/alloy-plugin-pipe-helper");
   const out = path.join(sourceRoot, "target/release/build/mlx-ffi/out");
   write(daemon, '#!/bin/sh\nprintf "%s\\n" "$@"\n', 0o755);
+  write(execHelper, '#!/bin/sh\nexit 0\n', 0o755);
+  write(pipeHelper, '#!/bin/sh\nexit 0\n', 0o755);
   write(path.join(out, "lib/mlx.metallib"), "candidate metallib");
   const metadata = { packages: [
     { name: "alloyd", id: "candidate-daemon", manifest_path: path.join(sourceRoot, "crates/alloyd/Cargo.toml"), version: "0.1.0" },
+    { name: "harness-core", id: "candidate-harness", manifest_path: path.join(sourceRoot, "crates/harness-core/Cargo.toml"), version: "0.1.0" },
     { name: "mlx-ffi", id: "candidate-ffi", manifest_path: path.join(sourceRoot, "crates/mlx-ffi/Cargo.toml"), version: "0.1.0" },
   ] };
   const records = [
     { reason: "compiler-artifact", package_id: "candidate-daemon", target: { name: "alloyd", kind: ["bin"] }, profile: { test: false }, executable: daemon },
+    { reason: "compiler-artifact", package_id: "candidate-harness", target: { name: "alloy-plugin-pipe-helper", kind: ["bin"] }, profile: { test: false }, executable: pipeHelper },
+    { reason: "compiler-artifact", package_id: "candidate-harness", target: { name: "alloy-plugin-exec-helper", kind: ["bin"] }, profile: { test: false }, executable: execHelper },
     { reason: "build-script-executed", package_id: "candidate-ffi", out_dir: out },
   ];
   const messages = records.map((r) => JSON.stringify(r)).join("\n");
@@ -67,6 +74,8 @@ test("installed wrappers retain exact arguments and paired runtime outside the d
   assert(!fs.existsSync(path.join(f.prefix, "libexec/cli/src")));
   for (const file of receipt.files) assert.equal(sha256(path.join(f.prefix, file.path)), file.sha256);
   assert(receipt.files.some((file) => file.path === "libexec/native/mlx.metallib"));
+  assert(receipt.files.some((file) => file.path === "libexec/native/alloy-plugin-pipe-helper"));
+  assert(receipt.files.some((file) => file.path === "libexec/native/alloy-plugin-exec-helper"));
 });
 test("missing Metal kernels fail before a partial package is installed", (t) => {
   const f = fixture(t);

@@ -38,24 +38,28 @@ class Alloy < Formula
     ENV["RUSTC"] = (rust_root/"bin/rustc").to_s
     ENV["RUSTDOC"] = (rust_root/"bin/rustdoc").to_s
     ENV["RUSTC_WRAPPER"] = nil
-    ENV["CARGO_HOME"] = (buildpath/"target/homebrew/cargo-home").to_s
+    ENV["CARGO_HOME"] = (HOMEBREW_CACHE/"alloy-cargo").to_s
     ENV["CARGO_TARGET_DIR"] = (buildpath/"target/homebrew/cargo-target").to_s
-    ENV["CARGO_BUILD_JOBS"] = "2"
-    ENV["CMAKE_BUILD_PARALLEL_LEVEL"] = "2"
-    # Every install starts from an empty CARGO_HOME and downloads all crates.
-    # Tolerate transient stalls instead of failing the fetch: two CI
-    # acceptance failures were low-speed aborts on a healthy network.
+    # Respect Homebrew's configured parallelism, with a bounded cap to avoid
+    # multiplying Cargo and native compiler work without limit.
+    build_jobs = [[ENV.make_jobs, 1].max, 4].min.to_s
+    ENV["CARGO_BUILD_JOBS"] = build_jobs
+    ENV["CMAKE_BUILD_PARALLEL_LEVEL"] = build_jobs
+    # Retain dependencies, not compiled package outputs. Locked offline fetch
+    # avoids registry requests on a complete cache; misses use bounded retries.
     ENV["CARGO_HTTP_MULTIPLEXING"] = "false"
-    ENV["CARGO_NET_RETRY"] = "10"
-    ENV["CARGO_HTTP_TIMEOUT"] = "120"
+    ENV["CARGO_NET_RETRY"] = "3"
+    ENV["CARGO_HTTP_TIMEOUT"] = "30"
     ENV["npm_config_cache"] = (buildpath/"target/homebrew/npm-cache").to_s
     node_root
   end
 
-  # Homebrew's network-enabled fetch phase populates only this build's caches.
+  # The network-enabled fetch phase fills the dedicated dependency cache.
   def fetch
     node_root = prepare_toolchains
-    system "cargo", "fetch", "--locked", "--target", "aarch64-apple-darwin"
+    unless quiet_system "cargo", "fetch", "--locked", "--offline", "--target", "aarch64-apple-darwin"
+      system "cargo", "fetch", "--locked", "--target", "aarch64-apple-darwin"
+    end
     system node_root/"bin/node", node_root/"lib/node_modules/npm/bin/npm-cli.js",
            "ci", "--prefix", "ts/cli", "--ignore-scripts", "--no-audit", "--no-fund"
   end

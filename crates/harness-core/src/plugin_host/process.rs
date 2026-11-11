@@ -13,7 +13,6 @@ use tool_registry::execution::CancellationToken;
 
 unsafe extern "C" {
     fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
-    fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
 }
 fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
@@ -34,9 +33,10 @@ fn nonblocking(fd: std::ffi::c_int) -> Result<(), HostError> {
 #[derive(Serialize)]
 struct Request<'a, T> {
     jsonrpc: &'static str,
-    id: u64,
     method: &'a str,
     params: T,
+    // The unpredictable challenge comes last, after the complete payload.
+    id: u64,
 }
 struct LimitedWriter {
     bytes: Vec<u8>,
@@ -64,12 +64,19 @@ pub(crate) struct Process {
     stderr: Option<ChildStderr>,
     diagnostics: Vec<u8>,
     limits: Limits,
-    next_id: u64,
     dead: bool,
 }
 impl Process {
-    pub fn spawn(config: &PluginConfig, limits: Limits) -> Result<Self, HostError> {
-        let (child, input, output, stderr) = spawn::spawn(config)?;
+    pub fn spawn(
+        config: &PluginConfig,
+        limits: Limits,
+        helper: Option<&std::path::Path>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        external_reaper: bool,
+    ) -> Result<Self, HostError> {
+        let (child, input, output, stderr) =
+            spawn::spawn(config, helper, deadline, cancel, external_reaper)?;
         let owned = Self {
             child,
             input: Some(input),
@@ -77,7 +84,6 @@ impl Process {
             stderr: Some(stderr),
             diagnostics: Vec::new(),
             limits,
-            next_id: 0,
             dead: false,
         };
         for fd in [
@@ -95,11 +101,7 @@ impl Process {
         }
         self.dead = true;
         self.input.take();
-        // SAFETY: process_group(0) created a child-owned group. Negative PID
-        // targets that group, not the daemon. SIGKILL is 9 on Linux and macOS.
-        unsafe {
-            kill(-(self.child.id() as i32), 9);
-        }
+        // Both platform supervisors receive cancellation through their control channel.
         let _ = self.child.kill();
         loop {
             match self.child.wait() {
@@ -122,6 +124,18 @@ impl Process {
     }
     pub fn diagnostics(&self) -> &[u8] {
         &self.diagnostics
+    }
+    fn reject_pending_output(&mut self) -> Result<(), HostError> {
+        let mut byte = [0u8; 1];
+        loop {
+            match self.output.as_mut().unwrap().read(&mut byte) {
+                Ok(0) => return Err(HostError::new("plugin stdout closed")),
+                Ok(_) => return Err(HostError::new("unsolicited plugin output")),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(HostError::io(e)),
+            }
+        }
     }
     pub fn rpc<T: DeserializeOwned>(
         &mut self,
@@ -177,14 +191,17 @@ impl Process {
         if cancel.is_cancelled() || Instant::now() >= outer_deadline {
             return Err(HostError::new("hook cancelled/expired before encoding"));
         }
+        // A child must not send a frame between requests, including a partial
+        // frame. Check the nonblocking pipe before issuing the next request.
+        self.reject_pending_output()?;
         let deadline = Instant::now()
             .checked_add(self.limits.timeout)
             .ok_or_else(|| HostError::new("timeout overflow"))?
             .min(outer_deadline);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| HostError::new("request id overflow"))?;
+        let mut nonce = [0u8; 8];
+        getrandom::fill(&mut nonce).map_err(|_| HostError::new("request entropy unavailable"))?;
+        // Keep IDs exact in IEEE-754 JSON clients while retaining fresh entropy.
+        let request_id = u64::from_ne_bytes(nonce) & ((1u64 << 53) - 1);
         let mut writer = LimitedWriter {
             bytes: Vec::new(),
             max: self.limits.message_bytes - 1,
@@ -193,13 +210,14 @@ impl Process {
             &mut writer,
             &Request {
                 jsonrpc: "2.0",
-                id: self.next_id,
                 method,
                 params,
+                id: request_id,
             },
         )
         .map_err(|_| HostError::new("request encoding/byte limit"))?;
         writer.bytes.push(b'\n');
+        self.reject_pending_output()?;
         let mut written = 0;
         let mut received = Vec::new();
         let mut stderr_total = 0usize;
@@ -256,7 +274,7 @@ impl Process {
                         }
                         let reply: super::protocol::Envelope<T> =
                             super::strict_json::decode(&received[..end])?;
-                        if reply.jsonrpc != "2.0" || reply.id != self.next_id {
+                        if reply.jsonrpc != "2.0" || reply.id != request_id {
                             return Err(HostError::new("response identity mismatch"));
                         }
                         if cancel.is_cancelled() || Instant::now() >= deadline {

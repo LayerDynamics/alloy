@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawnOwned } from "./group-supervisor.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { renderFormula } from "./formula.mjs";
 import { createSourceSnapshot } from "./source.mjs";
@@ -18,13 +18,11 @@ function execute(command, args, { cwd = ROOT, env = process.env, log, allowed = 
   if (stopping && !allowDuringShutdown) return Promise.reject(new Error("Homebrew acceptance cancelled"));
   return new Promise((resolve, reject) => {
     const file = log ? fs.openSync(log, "a") : null;
-    const child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const ownedProcess = spawnOwned(command, args, { cwd, env });
+    const child = ownedProcess.child;
     let stdout = "", stderr = "", error;
     let escalation;
-    const signalGroup = (signal) => {
-      if (!Number.isSafeInteger(child.pid) || child.pid <= 1) return;
-      try { process.kill(-child.pid, signal); } catch (e) { if (e.code !== "ESRCH") error ??= e; }
-    };
+    const signalGroup = (signal) => { ownedProcess.request(signal); };
     const stop = (reason) => {
       error ??= new Error(reason);
       signalGroup("SIGTERM");
@@ -43,9 +41,8 @@ function execute(command, args, { cwd = ROOT, env = process.env, log, allowed = 
     };
     child.stdout.on("data", (chunk) => consume(chunk, false));
     child.stderr.on("data", (chunk) => consume(chunk, true));
-    child.once("close", (code, signal) => {
-      // A command may exit before a descendant. Retire only its own process group.
-      signalGroup("SIGKILL");
+    ownedProcess.done.then(({ code, signal, error: supervisorError }) => {
+      if (supervisorError) error ??= new Error(supervisorError);
       clearTimeout(timer); clearTimeout(escalation); owned.delete(stop);
       if (file !== null) fs.closeSync(file);
       if (error) reject(error);
@@ -273,6 +270,30 @@ export async function installOwnedFormula(context, owner, { run = execute, env =
   await run(owner.brew, ["install", "--build-from-source", owner.formula], options);
 }
 
+// Download only: the formula still validates the cache and compiles in its sandbox.
+export async function prepareCargoDependencies({ brew, env = process.env, log, sourceRoot = ROOT, run = execute }) {
+  const lock = path.join(sourceRoot, "Cargo.lock");
+  const lockHash = fingerprint(fs.readFileSync(lock));
+  const pin = fs.readFileSync(path.join(sourceRoot, "rust-toolchain.toml"), "utf8").match(/channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/)?.[1];
+  assert(pin, "dependency preparation requires an exact Rust version");
+  const cacheRoot = (await run(brew, ["--cache"], { env, log, timeoutMs: 15000 })).stdout.trim();
+  assert(path.isAbsolute(cacheRoot) && !/[\r\n]/.test(cacheRoot), "invalid Homebrew cache root");
+  const cache = path.join(cacheRoot, "alloy-cargo");
+  const cargoEnv = { ...env, CARGO_HOME: cache, CARGO_HTTP_MULTIPLEXING: "false", CARGO_HTTP_TIMEOUT: "30", CARGO_NET_RETRY: "3" };
+  const options = { cwd: sourceRoot, env: cargoEnv, log, timeoutMs: 120000 };
+  const version = (await run("cargo", [`+${pin}`, "--version"], options)).stdout.trim();
+  assert(version.startsWith(`cargo ${pin} `), "dependency preparation Cargo version mismatch");
+  const args = [`+${pin}`, "fetch", "--locked", "--target", "aarch64-apple-darwin"];
+  const commands = [["cargo", ...args, "--offline"]];
+  const offline = await run("cargo", [...args, "--offline"], { ...options, timeoutMs: 30000, allowed: [0, 101] });
+  if (offline.code !== 0) {
+    commands.push(["cargo", ...args]);
+    await run("cargo", args, options);
+  }
+  assert.equal(fingerprint(fs.readFileSync(lock)), lockHash, "dependency preparation changed Cargo.lock");
+  return { cargo_version: version, cache_path: cache, cache_hit: offline.code === 0, lockfile_sha256: lockHash, commands };
+}
+
 export async function main() {
   assert(process.platform === "darwin" && process.arch === "arm64", "real Homebrew acceptance requires physical Apple Silicon with Metal");
   process.on("SIGINT", stopOwned); process.on("SIGTERM", stopOwned);
@@ -315,6 +336,8 @@ export async function main() {
       xcode: (await execute("/usr/bin/xcodebuild", ["-version"], { env, log })).stdout.trim(),
       sdk_version: (await execute("/usr/bin/xcrun", ["--show-sdk-version"], { env, log })).stdout.trim(),
     };
+    result.cargo_dependencies = await prepareCargoDependencies({ brew, env, log: path.join(output, "cargo-prefetch.log") });
+    save();
     const taps = (await execute(brew, ["tap"], { env, log })).stdout.split("\n").map((x) => x.trim().toLowerCase());
     assert(!taps.includes(tap), `refusing to reuse an existing tap ${tap}`);
     const installed = await execute(brew, ["list", "--formula", "--versions", name], { env, log, allowed: [0, 1] });

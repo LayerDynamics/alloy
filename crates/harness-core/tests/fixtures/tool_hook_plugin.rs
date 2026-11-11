@@ -1,16 +1,32 @@
-use std::{env, fs::OpenOptions, io::{self, BufRead, Write}, thread, time::Duration};
+use std::{env, fs::OpenOptions, io::{self, BufRead, Read, Write}, thread, time::Duration};
 fn main() {
     let args: Vec<_> = env::args().collect();
     let id = &args[1];
     let mode = &args[2];
     let log = &args[3];
     std::fs::write(format!("{log}.{id}.pid"), std::process::id().to_string()).unwrap();
-    for line in io::stdin().lock().lines() {
-        let line = line.unwrap();
-        let start = line.find("\"id\":").unwrap() + 5;
-        let number: String = line[start..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).unwrap() == 0 { break; }
+        let line = line.trim_end_matches('\n');
+        let start = line.rfind("\"id\":").unwrap() + 5;
+        let id_start = line[start..].trim_start();
+        let end = id_start.chars().take_while(|c| c.is_ascii_digit()).count();
+        let number = &id_start[..end];
         let method = if line.contains("\"initialize\"") { "initialize" }
             else if line.contains("\"tool.before_execute\"") { "before" } else { "after" };
+        if mode == "payload" && method != "initialize" {
+            writeln!(OpenOptions::new().create(true).append(true).open(format!("{log}.{id}.request_ids")).unwrap(), "{number}").unwrap();
+            assert!(line.contains(&format!("\"invocation\":{}", args[4])));
+            assert!(line.contains("\"protocol_version\":1"));
+            assert!(line.ends_with(&format!(",\"id\":{number}}}")));
+            if method == "after" {
+                assert!(line.contains(&format!("\"result\":{}", args[5])));
+                assert!(line.contains("\"duration_ms\":37"));
+            }
+        }
         writeln!(OpenOptions::new().create(true).append(true).open(log).unwrap(), "{id}:{method}").unwrap();
         let result = if method == "initialize" {
             if mode == "handshake_hang" { thread::sleep(Duration::from_secs(60)); return; }
@@ -40,6 +56,12 @@ fn main() {
                 "long_annotation" => format!(r#"{{"decision":"allow","annotations":{{"{id}.x":"{}"}}}}"#, "x".repeat(2048)),
                 "mutation" => r#"{"decision":"allow","arguments":{"changed":true}}"#.into(),
                 "after_failure" if method == "after" => r#"{"decision":"allow"}"#.into(),
+                "after_mutation" if method == "after" => r#"{"annotations":{},"result":{"changed":true}}"#.into(),
+                "artifact_probe" if method == "after" => {
+                    let error = std::fs::write(&args[4], b"tampered").expect_err("sandbox allowed artifact mutation");
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    r#"{"annotations":{},"result":{"artifact_ref":"replacement"}}"#.into()
+                },
                 "fd_probe" if method == "before" => {
                     unsafe extern "C" { fn fcntl(fd: i32, cmd: i32, ...) -> i32; }
                     let fd: i32 = args[4].parse().unwrap();
@@ -55,11 +77,62 @@ fn main() {
                     assert!(std::net::TcpStream::connect_timeout(&args[6].parse().unwrap(), Duration::from_millis(100)).is_err());
                     #[cfg(target_os = "macos")]
                     {
+                        unsafe extern "C" {
+                            fn getpid() -> i32;
+                            fn getpgid(pid: i32) -> i32;
+                            fn getsid(pid: i32) -> i32;
+                            fn setpgid(pid: i32, group: i32) -> i32;
+                            fn setsid() -> i32;
+                        }
+                        let parent_group: i32 = args[9].parse().unwrap();
+                        // SAFETY: identity queries and denied session/group operations
+                        // affect only this isolated fixture process.
+                        let own = unsafe { getpid() };
+                        assert_eq!(unsafe { getpgid(0) }, own);
+                        assert_eq!(unsafe { getsid(0) }, own);
+                        assert_eq!(unsafe { setpgid(0, parent_group) }, -1, "plugin escaped into daemon group");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { setsid() }, -1, "plugin created another session");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { setpgid(0, 0) }, -1, "session leader changed group");
+                        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(1));
+                        assert_eq!(unsafe { getpgid(0) }, own);
+                        assert_eq!(unsafe { getsid(0) }, own);
+                        let link_error = std::fs::hard_link(&args[7], &args[8]).expect_err("sandbox permitted a new hard link");
+                        assert_eq!(link_error.kind(), io::ErrorKind::PermissionDenied);
                         unsafe extern "C" { fn fork() -> i32; }
                         // SAFETY: test-only probe expects fork to be denied by Seatbelt.
                         let pid = unsafe { fork() };
                         if pid == 0 { std::process::exit(87); }
                         assert_eq!(pid, -1, "sandbox must deny child creation");
+                        unsafe extern "C" {
+                            fn posix_spawn(pid: *mut i32, path: *const i8, actions: *const std::ffi::c_void, attr: *const std::ffi::c_void, argv: *const *mut i8, envp: *const *mut i8) -> i32;
+                            fn kill(pid: i32, signal: i32) -> i32;
+                            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+                        }
+                        let program = std::ffi::CString::new(args[7].as_bytes()).unwrap();
+                        let argv = [program.as_ptr().cast_mut(), std::ptr::null_mut()];
+                        let env = [std::ptr::null_mut()];
+                        let mut spawned = -1;
+                        // SAFETY: C strings and null-terminated arrays outlive the call.
+                        let status = unsafe { posix_spawn(&mut spawned, program.as_ptr(), std::ptr::null(), std::ptr::null(), argv.as_ptr(), env.as_ptr()) };
+                        if status == 0 {
+                            let mut child_status = 0;
+                            // SAFETY: only this unexpectedly spawned child is killed and reaped.
+                            unsafe { kill(spawned, 9); waitpid(spawned, &mut child_status, 0); }
+                            panic!("sandbox permitted posix_spawn");
+                        }
+                        assert_eq!(status, 1, "posix_spawn was not denied by sandbox");
+                        // Exercise the normal process-spawn path as well as fork.
+                        // Always reap a surprising successful child before failing.
+                        match std::process::Command::new(&args[7]).spawn() {
+                            Ok(mut child) => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                panic!("sandbox permitted process spawn");
+                            }
+                            Err(error) => assert_eq!(error.raw_os_error(), Some(1), "unexpected spawn failure: {error}"),
+                        }
                     }
                     format!(r#"{{"decision":"allow","annotations":{{"{id}.probes":true}}}}"#)
                 },
@@ -70,12 +143,29 @@ fn main() {
                 _ => format!(r#"{{"annotations":{{"{id}.seen":true}}}}"#),
             }
         };
-        let response_id = if mode == "wrong_id" && method != "initialize" { "999" } else { &number };
+        let response_id = if mode == "wrong_id" && method != "initialize" { "0" } else { number };
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{response_id},"result":{result}}}"#);
         if mode == "fragmented" {
             for byte in frame.bytes().chain(std::iter::once(b'\n')) { io::stdout().write_all(&[byte]).unwrap(); io::stdout().flush().unwrap(); }
         } else {
             println!("{frame}"); io::stdout().flush().unwrap();
+        }
+        if mode == "unsolicited" && method == "initialize" {
+            thread::sleep(Duration::from_millis(20));
+            println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"decision":"allow"}}}}"#);
+            io::stdout().flush().unwrap();
+            std::fs::write(format!("{log}.{id}.unsolicited"), b"sent").unwrap();
+        }
+        if mode == "raced_stale" && method == "initialize" {
+            let mut byte = [0u8; 1];
+            input.read_exact(&mut byte).unwrap();
+            std::fs::write(format!("{log}.{id}.race_started"), b"started").unwrap();
+            println!(r#"{{"jsonrpc":"2.0","id":0,"result":{{"decision":"allow"}}}}"#);
+            io::stdout().flush().unwrap();
+            let mut rest = String::new();
+            let _ = input.read_line(&mut rest);
+            thread::sleep(Duration::from_secs(2));
+            return;
         }
         if mode == "not_reading_after_initialize" && method == "initialize" {
             thread::sleep(Duration::from_secs(60));

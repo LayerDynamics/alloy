@@ -4,11 +4,40 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
+import { spawn } from "node:child_process";
+import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, assertOwnedPluginPid, installedPluginSource, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
 
 const COMMIT = "c".repeat(40);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const argumentsFor = (prefix, output) => ["--prefix", prefix, "--expected-commit", COMMIT, "--output", output];
+
+test("installed plugin fixture exits on EOF before and after its real handshake", async (t) => {
+  const root = directory(t);
+  const script = path.join(root, "fixture.cjs");
+  fs.writeFileSync(script, installedPluginSource());
+  for (const handshake of [false, true]) {
+    const marker = path.join(root, `marker-${handshake}`);
+    const child = spawn(process.execPath, [script, marker], { stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", chunk => { output += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    if (handshake) child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 42 }) + "\n");
+    child.stdin.end();
+    const exit = await Promise.race([exited, new Promise((_, reject) => {
+      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("fixture did not exit on EOF")); }, 5000);
+      exited.then(() => clearTimeout(timer), () => clearTimeout(timer));
+    })]);
+    assert.deepEqual(exit, { code: 0, signal: null });
+    if (handshake) {
+      assert.equal(JSON.parse(output).id, 42);
+      assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).pid, child.pid);
+    } else assert.equal(fs.existsSync(marker), false);
+  }
+});
 
 function directory(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-installed-smoke-test-"));
@@ -123,11 +152,12 @@ test("cleanup stops orphaned descendants and a hung child while preserving anoth
     try { await Promise.all([orphan.stop(500), unrelated.stop(500)]); }
     finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
-  assert.equal((await orphan.wait(4000)).code, 0);
+  const finished = await orphan.wait(4000);
+  assert.equal(finished.code, 0);
   const descendant = JSON.parse(orphan.stdout.trim()).orphan;
-  assert((await processTable()).some((entry) => entry.pid === descendant && entry.group === orphan.group && !entry.state.startsWith("Z")));
-  const cleaned = await orphan.stop(500);
-  assert.equal(cleaned.escalated, true, "SIGTERM-ignoring descendant requires bounded escalation");
+  assert(finished.live_before_cleanup.includes(descendant), "owner must observe the orphan before cleanup");
+  assert(!(await processTable()).some((entry) => entry.pid === descendant && !entry.state.startsWith("Z")));
+  await orphan.stop(500);
   assert.equal((await orphan.liveMembers()).length, 0);
   assert((await unrelated.liveMembers()).length > 0, "cleanup must not signal another group");
   await assert.rejects(unrelated.wait(30), /timed out/);
@@ -143,11 +173,6 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
   const unrelated = new OwnedProcess(process.execPath, ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);"], options("unrelated"));
   t.after(async () => {
     try {
-      // These IDs come only from children created by the test fixture. Drop each
-      // as soon as its absence is verified, so retired groups are never signalled.
-      for (const group of targetGroups) {
-        try { process.kill(-group, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
-      }
       await Promise.all([...runners, unrelated].map((child) => child.stop(500)));
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -190,7 +215,7 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
     assert(Number.isSafeInteger(targetGroup) && targetGroup > 1);
     targetGroups.add(targetGroup);
     const started = performance.now();
-    assert(runner.child.kill(signal)); // Signal the smoke owner, not its detached target.
+    assert(runner.ownedProcess.request(signal, true)); // Signal the smoke owner, not its detached target.
     const exit = await runner.wait(5500);
     assert.equal(exit.code, 143, runner.stderr);
     assert(performance.now() - started < 6000, "smoke cleanup must finish before its outer owner escalates");
@@ -203,4 +228,34 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
     targetGroups.delete(targetGroup);
     assert((await unrelated.liveMembers()).length > 0, "smoke cancellation signalled an unrelated group");
   }
+});
+
+
+test("installed plugin ownership requires a live isolated supervisor and private groups", () => {
+  const rows = [
+    { pid: 100, parent: 1, group: 100, state: "S" },
+    { pid: 101, parent: 100, group: 101, state: "S" },
+    { pid: 102, parent: 101, group: 102, state: "S" },
+  ];
+  assert.equal(assertOwnedPluginPid(100, 102, rows), 101);
+  for (const change of [
+    { index: 2, parent: 100 }, { index: 1, parent: 99 },
+    { index: 1, state: "Z" }, { index: 2, state: "Z" },
+    { index: 1, group: 100 }, { index: 2, group: 101 },
+  ]) {
+    const altered = rows.map(row => ({ ...row }));
+    Object.assign(altered[change.index], change);
+    assert.throws(() => assertOwnedPluginPid(100, 102, altered));
+  }
+  assert.throws(() => assertOwnedPluginPid(100, 102, rows.filter(row => row.pid !== 101)));
+});
+
+
+test("unestablished supervisor cleanup never becomes a successful smoke cleanup", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "alloy-failed-owner-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const owned = new OwnedProcess(path.join(root, "missing-command"), [], { cwd: root, env: process.env, output: root, label: "missing" });
+  const outcome = await owned.wait(5000);
+  assert(outcome.error, "missing executable must report supervisor failure");
+  await assert.rejects(owned.stop(500), /cleanup was not established/);
 });

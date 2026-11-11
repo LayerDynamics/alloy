@@ -7,7 +7,8 @@
 //
 // Environment switches:
 //   MLX_FFI_REGENERATE=1
-//       Regenerate src/bindings.rs using bindgen.
+//       Regenerate src/bindings.rs using bindgen; requires the
+//       regenerate-bindings Cargo feature. Normal builds omit bindgen.
 //
 //   MLX_FFI_BINDGEN_ONLY=1
 //       Requires MLX_FFI_REGENERATE=1. Skip CMake and native link
@@ -79,57 +80,67 @@ fn main() {
     let bindings_path = manifest_dir.join("src/bindings.rs");
 
     if regenerate {
-        let bindings = bindgen::Builder::default()
-            .header(
-                manifest_dir
-                    .join("wrapper.h")
-                    .to_str()
-                    .expect("wrapper.h path must be valid UTF-8"),
-            )
-            .clang_arg(format!("-I{}", mlx_c.display()))
-            // Public mlx-c declarations and internal helpers such as
-            // _mlx_array_is_available.
-            .allowlist_function("_?mlx_.*")
-            .allowlist_type("_?mlx_.*")
-            .allowlist_var("MLX_.*")
-            // FILE is used behind pointers in the mlx-c graph APIs.
-            // Supply an opaque pointer target instead of its libc layout.
-            .blocklist_type("FILE")
-            // Darwin stdio implementation types.
-            .blocklist_type("__sFILE")
-            .blocklist_type("__sFILEX")
-            .blocklist_type("__sbuf")
-            .blocklist_type("fpos_t")
-            .blocklist_type("__darwin_off_t")
-            .blocklist_type("__int64_t")
-            // glibc stdio implementation types.
-            .blocklist_type("_IO_.*")
-            .blocklist_type("__off_t")
-            .blocklist_type("__off64_t")
-            .raw_line(concat!(
-                "#[repr(C)]\n",
-                "#[derive(Debug)]\n",
-                "pub struct FILE {\n",
-                "    _private: [u8; 0],\n",
-                "}",
-            ))
-            .formatter(bindgen::Formatter::Rustfmt)
-            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-            .generate()
-            .expect("bindgen failed on wrapper.h; check vendored headers and Clang arguments");
-
-        bindings
-            .write_to_file(&bindings_path)
-            .expect("failed to write src/bindings.rs");
-
-        println!("cargo:warning=regenerated {}", bindings_path.display());
+        regenerate_bindings(&manifest_dir, &mlx_c, &bindings_path);
     } else if !bindings_path.is_file() {
         panic!(
             "src/bindings.rs is missing. Restore the checked-in file or \
              regenerate it with scripts/bindgen_check.sh --update, or \
-             MLX_FFI_REGENERATE=1 cargo build -p mlx-ffi"
+             MLX_FFI_REGENERATE=1 cargo build -p mlx-ffi --features regenerate-bindings"
         );
     }
+}
+
+#[cfg(not(feature = "regenerate-bindings"))]
+fn regenerate_bindings(_manifest_dir: &Path, _mlx_c: &Path, _bindings_path: &Path) {
+    panic!("MLX_FFI_REGENERATE requires --features mlx-ffi/regenerate-bindings");
+}
+
+#[cfg(feature = "regenerate-bindings")]
+fn regenerate_bindings(manifest_dir: &Path, mlx_c: &Path, bindings_path: &Path) {
+    let bindings = bindgen::Builder::default()
+        .header(
+            manifest_dir
+                .join("wrapper.h")
+                .to_str()
+                .expect("wrapper.h path must be valid UTF-8"),
+        )
+        .clang_arg(format!("-I{}", mlx_c.display()))
+        // Public mlx-c declarations and internal helpers such as
+        // _mlx_array_is_available.
+        .allowlist_function("_?mlx_.*")
+        .allowlist_type("_?mlx_.*")
+        .allowlist_var("MLX_.*")
+        // FILE is used behind pointers in the mlx-c graph APIs.
+        // Supply an opaque pointer target instead of its libc layout.
+        .blocklist_type("FILE")
+        // Darwin stdio implementation types.
+        .blocklist_type("__sFILE")
+        .blocklist_type("__sFILEX")
+        .blocklist_type("__sbuf")
+        .blocklist_type("fpos_t")
+        .blocklist_type("__darwin_off_t")
+        .blocklist_type("__int64_t")
+        // glibc stdio implementation types.
+        .blocklist_type("_IO_.*")
+        .blocklist_type("__off_t")
+        .blocklist_type("__off64_t")
+        .raw_line(concat!(
+            "#[repr(C)]\n",
+            "#[derive(Debug)]\n",
+            "pub struct FILE {\n",
+            "    _private: [u8; 0],\n",
+            "}",
+        ))
+        .formatter(bindgen::Formatter::Rustfmt)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("bindgen failed on wrapper.h; check vendored headers and Clang arguments");
+
+    bindings
+        .write_to_file(&bindings_path)
+        .expect("failed to write src/bindings.rs");
+
+    println!("cargo:warning=regenerated {}", bindings_path.display());
 }
 
 fn build_and_link(mlx_c: &Path, vendor: &Path, target_os: &str) {

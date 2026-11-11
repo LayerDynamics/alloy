@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /** Acceptance of an installed package; this driver never builds or provisions a model. */
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { spawnOwned } from "./group-supervisor.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -19,10 +20,28 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Match the wire recorder's monotonic clock, so stdout/terminal ordering is exact.
 const now = () => Number(process.hrtime.bigint() / 1000n) / 1000;
 const jsonFile = (name, value) => fs.writeFileSync(name, `${JSON.stringify(value, null, 2)}\n`);
+export const installedPluginSource = () => `const fs = require("node:fs");
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("end", () => process.stdout.end());
+process.stdin.on("data", chunk => {
+  input += chunk;
+  const end = input.indexOf("\\n");
+  if (end < 0) return;
+  const request = JSON.parse(input.slice(0, end));
+  if (request.method !== "initialize") process.exit(3);
+  fs.writeFileSync(process.argv[2], JSON.stringify({ pid: process.pid, method: request.method }));
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+    protocol_version: 1, plugin_id: "installed-smoke", plugin_version: "1.0.0",
+    hooks: ["tool.before_execute", "tool.after_execute"]
+  } }) + "\\n");
+  input = input.slice(end + 1);
+});
+`;
 const appendJson = (name, value) => fs.appendFileSync(name, `${JSON.stringify(value)}\n`);
 
 export const REQUIRED_FILES = [
-  "bin/alloy", "bin/alloyd", "libexec/node/bin/node", "libexec/native/alloyd", "libexec/native/mlx.metallib",
+  "bin/alloy", "bin/alloyd", "libexec/node/bin/node", "libexec/native/alloyd", "libexec/native/alloy-plugin-pipe-helper", "libexec/native/alloy-plugin-exec-helper", "libexec/native/mlx.metallib",
   "libexec/cli/package.json", "libexec/cli/bin/alloy.js", "libexec/cli/models/starter-model.json",
   "libexec/cli/dist/src/main.js", "libexec/cli/dist/src/version.js", "libexec/cli/dist/native/alloy-metrics",
 ];
@@ -136,6 +155,18 @@ export function assertOwnedDaemonPid(group, daemonPid, table) {
   assert(row && row.group === group && !row.state.startsWith("Z"), `Daemon PID ${daemonPid} is not a live descendant in owned process group ${group}`);
 }
 
+/** Verify the installed macOS ownership chain, including the isolated reaper. */
+export function assertOwnedPluginPid(daemonPid, pluginPid, table) {
+  assert(Number.isSafeInteger(pluginPid) && pluginPid > 1 && pluginPid !== daemonPid, "Invalid installed plugin PID");
+  const plugin = table.find(entry => entry.pid === pluginPid);
+  assert(plugin && plugin.group === pluginPid && !plugin.state.startsWith("Z"), "Installed plugin is not a live private-group leader");
+  const supervisor = table.find(entry => entry.pid === plugin.parent);
+  assert(supervisor && supervisor.pid !== daemonPid && supervisor.parent === daemonPid &&
+    supervisor.group === supervisor.pid && !supervisor.state.startsWith("Z"),
+  "Installed plugin is not owned by the daemon's live isolated supervisor");
+  return supervisor.pid;
+}
+
 /** A fresh process group owns the complete child tree, even if its parent exits first. */
 export class OwnedProcess {
   constructor(command, args, { cwd, env, output, label, recordChunks = false }) {
@@ -152,8 +183,18 @@ export class OwnedProcess {
     const stderrFile = path.join(output, `${label}.stderr.log`);
     fs.writeFileSync(stdoutFile, "", { flag: "wx" });
     fs.writeFileSync(stderrFile, "", { flag: "wx" });
-    this.child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    this.group = this.child.pid;
+    this.ownedProcess = spawnOwned(command, args, { cwd, env });
+    this.child = this.ownedProcess.child;
+    this.group = undefined;
+    this.ready = this.ownedProcess.ready.then(group => {
+      if (group !== null) {
+        this.group = group;
+        try {
+          appendJson(path.join(output, "processes.ndjson"), { command, args, cwd, pid: group, process_group: group, label, at: new Date().toISOString() });
+        } catch (error) { this.error ??= error; this.signal("SIGKILL"); }
+      }
+      return group;
+    });
     this.child.stdout.setEncoding("utf8");
     this.child.stderr.setEncoding("utf8");
     let bytes = 0;
@@ -176,24 +217,18 @@ export class OwnedProcess {
     };
     this.child.stdout.on("data", (text) => consume("stdout", stdoutFile, text));
     this.child.stderr.on("data", (text) => consume("stderr", stderrFile, text));
-    this.done = new Promise((resolve) => {
-      this.child.once("error", (error) => { this.error ??= error; });
-      this.child.once("close", (code, signal) => {
-        this.closed = true;
-        this.exit = { code, signal, error: this.error?.message ?? null };
-        resolve(this.exit);
-      });
+    this.done = this.ownedProcess.done.then(({ code, signal, error, live_before_cleanup }) => {
+      this.closed = true;
+      this.retired = true;
+      this.error ??= error ? new Error(error) : null;
+      this.exit = { code, signal, error: this.error?.message ?? null, live_before_cleanup };
+      return this.exit;
     });
-    try {
-      appendJson(path.join(output, "processes.ndjson"), { command, args, cwd, pid: this.group, process_group: this.group, label, at: new Date().toISOString() });
-    } catch (error) { this.error ??= error; this.signal("SIGKILL"); }
   }
 
   signal(signal) {
-    if (this.retired || this.group === undefined) return;
-    assert(this.group > 1 && this.group !== process.pid, "Refusing to signal an unowned process group");
-    try { process.kill(-this.group, signal); }
-    catch (error) { if (error.code !== "ESRCH") throw error; this.retired = true; }
+    if (this.retired) return;
+    this.ownedProcess.request(signal);
   }
 
   async wait(timeoutMs, signal) {
@@ -216,6 +251,7 @@ export class OwnedProcess {
   }
 
   async liveMembers(timeoutMs = 3000) {
+    await this.ready;
     if (this.retired || this.group === undefined) return [];
     const members = (await processTable(timeoutMs)).filter((entry) => entry.group === this.group && !entry.state.startsWith("Z"));
     if (members.length === 0) this.retired = true;
@@ -235,7 +271,8 @@ export class OwnedProcess {
       }
     }
     assert.equal((await this.liveMembers()).length, 0, `Owned process group ${this.group} survived cleanup`);
-    await this.wait(graceMs);
+    const outcome = await this.wait(graceMs);
+    assert.equal(outcome.error, null, `Owned process cleanup was not established: ${outcome.error}`);
     const result = { label: this.label, process_group: this.group, escalated, remaining_live_pids: [] };
     appendJson(path.join(this.output, "cleanup.ndjson"), result);
     return result;
@@ -262,7 +299,8 @@ export class OwnedProcess {
         if (members.length === 0) break;
         await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
       }
-      await this.wait(Math.max(1, deadline - Date.now()));
+      const outcome = await this.wait(Math.max(1, deadline - Date.now()));
+      assert.equal(outcome.error, null, `Owned process cleanup was not established: ${outcome.error}`);
       if (signalError) throw signalError;
       const result = { label: this.label, process_group: this.group, escalated, remaining_live_pids: [] };
       appendJson(path.join(this.output, "cleanup.ndjson"), result);
@@ -358,6 +396,7 @@ export async function runSmoke(options) {
   const socket = path.join(runtime, "daemon.sock");
   const env = isolatedEnvironment(config);
   const owned = [];
+  let pluginMarker;
   const result = { schema_version: 1, test: "homebrew_installed_package", mode: options.artifact === undefined ? "native_installation" : "real_model", status: "running", started_at: new Date().toISOString(),
     source_commit: options.expectedCommit, prefix: options.prefix, output: options.output,
     cwd, runtime_path: SYSTEM_PATH, artifact_requested: options.artifact ?? null, cleanup: [] };
@@ -441,12 +480,13 @@ export async function runSmoke(options) {
       result.model = { path: options.artifact, repository: model.repository, revision: model.revision, sha256: model.sha256 };
       assert(fs.existsSync(path.join(options.artifact, "config.json")), `Pinned model missing at ${options.artifact}; supply the complete local ${model.repository}@${model.revision} artifact (SHA-256 ${model.sha256}). This test does not download models.`);
       const owner = launch(cli, ["start", "--artifact", options.artifact, "--socket", socket, "--db", path.join(options.output, "sessions.sqlite")], "start");
+      assert(await owner.ready, "Could not start foreground CLI supervisor");
       const deadline = Date.now() + 240000;
       let ready;
       let lastError = "no API response";
       while (Date.now() < deadline) {
         check();
-        assert(!owner.closed && owner.child.exitCode === null, `Installed start exited before readiness; see start.stderr.log\n${owner.stderr.slice(-2000)}`);
+        assert(!owner.closed, `Installed start exited before readiness; see start.stderr.log\n${owner.stderr.slice(-2000)}`);
         try {
           const status = await rpc(socket, "daemon.status", {}, 2000);
           const metrics = await rpc(socket, "daemon.metrics", {}, 2000);
@@ -482,14 +522,60 @@ export async function runSmoke(options) {
       jsonFile(path.join(options.output, "final-metrics.json"), metrics);
       // Interrupt only the CLI owner here. Group cleanup below is a failure
       // fallback, so this gate proves that ordinary `alloy start` stops its child.
-      assert(owner.child.kill("SIGINT"), "Could not interrupt the owned foreground CLI");
+      assert(owner.ownedProcess.request("SIGINT", true), "Could not interrupt the owned foreground CLI");
       const stopped = await owner.wait(15000, cancellation.signal);
       assert.equal(stopped.error, null);
       assert.equal(stopped.code, 130, "Foreground start did not preserve Ctrl+C exit status");
-      assert.equal((await owner.liveMembers()).length, 0, "Foreground CLI left a live daemon/descendant after interruption");
+      assert.deepEqual(stopped.live_before_cleanup, [], "Foreground CLI left a live daemon/descendant after interruption");
       await assert.rejects(rpc(socket, "daemon.status", {}, 1000), "Daemon API still responds after owner cleanup");
       result.foreground_stop = { owner_pid: owner.group, daemon_pid: ready.daemon_pid, exit: stopped, live_descendants: [] };
       jsonFile(path.join(options.output, "foreground-stop.json"), result.foreground_stop);
+
+      // Exercise the packaged daemon's default sibling-helper discovery using
+      // an actual JSON-RPC child, independently of model-generated tool calls.
+      const pluginFile = path.join(runtime, "installed-plugin.cjs");
+      pluginMarker = path.join(runtime, "installed-plugin.json");
+      const pluginSocket = path.join(runtime, "plugin.sock");
+      const toolsFile = path.join(runtime, "tools.json");
+      fs.writeFileSync(pluginFile, installedPluginSource());
+      jsonFile(toolsFile, {
+        read_root: cwd, write_root: cwd, shell_executables: [fs.realpathSync("/bin/echo")],
+        shell_cwd_roots: [cwd], http_destinations: [{ origin: "http://fixture.invalid/", address: "127.0.0.1" }],
+        policy: { rules: [] },
+        plugins: [{ id: "installed-smoke", version: "1.0.0", program: fs.realpathSync(node),
+          args: [pluginFile, pluginMarker], cwd, sandbox: { mode: "trusted" } }]
+      });
+      const pluginOwner = launch(daemon, ["--artifact", options.artifact, "--socket", pluginSocket,
+        "--db", path.join(runtime, "plugin.sqlite"), "--tools-config", toolsFile], "installed-plugin");
+      const pluginDeadline = Date.now() + 240000;
+      let pluginReady = false;
+      let pluginError = "no API response";
+      while (Date.now() < pluginDeadline) {
+        check();
+        assert(!pluginOwner.closed, `Installed plugin daemon exited before readiness: ${pluginOwner.stderr.slice(-2000)}`);
+        try {
+          const status = await rpc(pluginSocket, "daemon.status", {}, 2000);
+          assert.equal(status.api_version, 1);
+          assert(fs.existsSync(pluginMarker), "Plugin handshake marker was not written");
+          pluginReady = true;
+          break;
+        } catch (error) { pluginError = error.message; }
+        await sleep(200);
+      }
+      assert(pluginReady, `Installed plugin daemon did not become ready: ${pluginError}`);
+      const pluginObservation = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
+      assert.equal(pluginObservation.method, "initialize");
+      assert(Number.isInteger(pluginObservation.pid) && pluginObservation.pid > 1);
+      await pluginOwner.ready;
+      const supervisorPid = assertOwnedPluginPid(pluginOwner.group, pluginObservation.pid, await processTable());
+      const pluginStop = await pluginOwner.stop();
+      const pluginExitDeadline = Date.now() + 5000;
+      while ((await processTable()).some(entry => [pluginObservation.pid, supervisorPid].includes(entry.pid) && !entry.state.startsWith("Z"))) {
+        assert(Date.now() < pluginExitDeadline, "Installed plugin or supervisor remained alive after daemon stop");
+        await sleep(50);
+      }
+      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, supervisor_pid: supervisorPid, cleanup: pluginStop };
+      jsonFile(path.join(options.output, "installed-plugin.json"), result.plugin_startup);
     }
     check();
     const after = await verifyInstallation(options.prefix, options.expectedCommit);
@@ -512,10 +598,24 @@ export async function runSmoke(options) {
     }
     cancellation.dispose();
     try {
+      // The fixture exits on stdin EOF. Its private process group is distinct
+      // from the daemon's, so observe it separately on success and failure.
+      if (pluginMarker && fs.existsSync(pluginMarker)) {
+        const { pid } = JSON.parse(fs.readFileSync(pluginMarker, "utf8"));
+        assert(Number.isInteger(pid) && pid > 1, "Invalid installed plugin PID");
+        const deadline = Date.now() + 5000;
+        while ((await processTable()).some(entry => entry.pid === pid && !entry.state.startsWith("Z"))) {
+          assert(Date.now() < deadline, `Installed plugin ${pid} survived daemon cleanup`);
+          await sleep(50);
+        }
+      }
+    } catch (error) { failure ??= error; }
+    try {
       const settingsFile = path.join(config, "settings.json");
       if (fs.existsSync(settingsFile)) fs.copyFileSync(settingsFile, path.join(options.output, "settings.json"));
-      fs.rmSync(runtime, { recursive: true, force: true });
     } catch (error) { failure ??= error; }
+    try { fs.rmSync(runtime, { recursive: true, force: true }); }
+    catch (error) { failure ??= error; }
   }
   result.status = failure ? "failed" : "passed";
   result.finished_at = new Date().toISOString();

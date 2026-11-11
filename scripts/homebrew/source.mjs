@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawnOwned } from "./group-supervisor.mjs";
 import { pathToFileURL } from "node:url";
 
 const MAX_OUTPUT = 4 * 1024 * 1024;
@@ -27,13 +27,10 @@ function gitRunner({ env, signal, deadline }) {
     if (signal?.aborted) { reject(new Error("Git source snapshot cancelled")); return; }
     const remaining = deadline - performance.now();
     if (remaining <= 0) { reject(new Error("Git source snapshot timed out")); return; }
-    const child = spawn("git", args, { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const ownedProcess = spawnOwned("git", args, { env });
+    const child = ownedProcess.child;
     let stdout = "", stderr = "", bytes = 0, failure, escalation;
-    const signalGroup = (name) => {
-      if (!Number.isSafeInteger(child.pid) || child.pid <= 1) return;
-      try { process.kill(-child.pid, name); }
-      catch (error) { if (error.code !== "ESRCH") failure ??= error; }
-    };
+    const signalGroup = (name) => { ownedProcess.request(name); };
     const stop = (error) => {
       failure ??= error;
       signalGroup("SIGTERM");
@@ -53,9 +50,8 @@ function gitRunner({ env, signal, deadline }) {
     child.stdout.setEncoding("utf8").on("data", (chunk) => consume(chunk, false));
     child.stderr.setEncoding("utf8").on("data", (chunk) => consume(chunk, true));
     child.once("error", (error) => { failure ??= error; });
-    child.once("close", (code, childSignal) => {
-      // Retire only this invocation's group, including a surviving pack child.
-      signalGroup("SIGKILL");
+    ownedProcess.done.then(({ code, signal: childSignal, error: supervisorError }) => {
+      if (supervisorError) failure ??= new Error(supervisorError);
       clearTimeout(timer);
       clearTimeout(escalation);
       signal?.removeEventListener("abort", aborted);

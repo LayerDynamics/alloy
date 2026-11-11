@@ -19,6 +19,9 @@ case "$OUT/" in "$ROOT/"*)
 esac
 PLUGIN_TESTS=(
   plugin_tool_hooks_order_veto_annotation plugin_protocol_timeout_and_sandbox
+  unsolicited_output_between_calls_fails_closed
+  raced_preconstructed_response_fails_closed
+  plugin_receives_canonical_payload_and_cannot_replace_result
   hardening::plugin_failures_reap_real_children_and_stop_later_hooks
   hardening::plugin_registration_is_atomic_and_drop_reaps
   hardening::plugin_cancellation_isolated_and_after_failure_is_warning_only
@@ -65,7 +68,7 @@ if [[ -f "$OUT/collector-files.txt" && ! -L "$OUT/collector-files.txt" ]]; then
 fi
 # Older collectors have no manifest. Include their pre-module and interim
 # colon-separated names as well as the current normalized names.
-for name in format compile clippy strict-json sandbox-alias sandbox sandboxed-host \
+for name in external-reaper linux-reaper owned-process format compile clippy strict-json sandbox-alias sandbox sandboxed-host artifact-sandbox fileport-failures fileport-concurrency fileport-stdio fileport-exhaustion fileport-malformed fileport-adversarial hardlink-integrity \
     all-targets doctests rustdoc "${PLUGIN_TESTS[@]}"; do
   for stem in "$name" "${name//::/_}" "${name#hardening::}"; do
     rm -f -- "$OUT/$stem.log" "$OUT/$stem.command.txt"
@@ -74,7 +77,7 @@ done
 rm -f -- "$OUT/collector-files.txt" "$OUT/candidate.txt" "$OUT/platform.txt" \
   "$OUT/source-before.sha256" "$OUT/source-after.sha256" \
   "$OUT/protocol-discovery.txt" "$OUT/unit-discovery.txt" \
-  "$OUT/sandbox-discovery.txt" "$OUT/sandbox-platform.txt"
+  "$OUT/sandbox-discovery.txt" "$OUT/sandbox-platform.txt" "$OUT/artifact-discovery.txt" "$OUT/owned-discovery.txt" "$OUT/linux-reaper-discovery.txt"
 : > "$OUT/collector-files.txt"
 # Clear old proof before prerequisite/candidate validation can fail.
 command -v python3 >/dev/null 2>&1 || {
@@ -135,6 +138,11 @@ gate strict-json cargo test --locked -p harness-core plugin_host::host::strict_j
 cargo test --locked -p harness-core --lib -- --list > "$OUT/unit-discovery.txt"
 grep -Fx 'plugin_host::host::strict_json::duplicate_escaped_nested_and_trailing_json_rejects: test' "$OUT/unit-discovery.txt"
 if [[ "$(uname -s)" == Darwin ]]; then
+  cargo test --locked -p harness-core --test owned_process -- --list > "$OUT/owned-discovery.txt"
+  grep -Fx 'macos_identity_signals_survive_exec_reaping_and_pid_mismatch: test' "$OUT/owned-discovery.txt"
+  gate owned-process cargo test --locked -p harness-core --test owned_process macos_identity_signals_survive_exec_reaping_and_pid_mismatch -- --exact --nocapture
+  grep -Fx 'hardening::plugin_external_reaper_owns_supervisor_statuses: test' "$OUT/protocol-discovery.txt"
+  gate external-reaper cargo test --locked -p harness-core --test plugin_hooks hardening::plugin_external_reaper_owns_supervisor_statuses -- --exact --nocapture
   cargo test --locked -p harness-core --test plugin_sandbox -- --list > "$OUT/sandbox-discovery.txt"
   grep -Fx 'plugin_protocol_timeout_and_sandbox: test' "$OUT/sandbox-discovery.txt"
   grep -Fx 'hardening::plugin_alias_read_works_but_symlink_cannot_escape: test' "$OUT/sandbox-discovery.txt"
@@ -142,8 +150,28 @@ if [[ "$(uname -s)" == Darwin ]]; then
   gate sandbox cargo test --locked -p harness-core --test plugin_sandbox plugin_protocol_timeout_and_sandbox -- --exact --nocapture
   grep -Fx 'hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork: test' "$OUT/protocol-discovery.txt"
   gate sandboxed-host cargo test --locked -p harness-core --test plugin_hooks hardening::plugin_actual_sandboxed_host_denies_undeclared_io_network_and_fork -- --exact --nocapture
+  grep -Fx 'hardening::fileport_helper_failure_and_cancellation_reap_exact_child: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::fileport_concurrent_unrelated_exec_inherits_no_endpoints: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::plugin_rejects_writable_hardlinks_and_helper_overlap_before_spawn: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::fileport_works_when_standard_descriptors_are_closed: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::fileport_descriptor_exhaustion_fails_closed_without_fd_leaks: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::fileport_rejects_malformed_helper_message: test' "$OUT/protocol-discovery.txt"
+  grep -Fx 'hardening::fileport_rejects_wrong_sender_and_complex_messages: test' "$OUT/protocol-discovery.txt"
+  gate fileport-failures cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_helper_failure_and_cancellation_reap_exact_child -- --exact --nocapture
+  gate fileport-concurrency cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_concurrent_unrelated_exec_inherits_no_endpoints -- --exact --nocapture
+  gate hardlink-integrity cargo test --locked -p harness-core --test plugin_hooks hardening::plugin_rejects_writable_hardlinks_and_helper_overlap_before_spawn -- --exact --nocapture
+  gate fileport-stdio cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_works_when_standard_descriptors_are_closed -- --exact --nocapture
+  gate fileport-exhaustion cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_descriptor_exhaustion_fails_closed_without_fd_leaks -- --exact --nocapture
+  gate fileport-malformed cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_malformed_helper_message -- --exact --nocapture
+  gate fileport-adversarial cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_wrong_sender_and_complex_messages -- --exact --nocapture
+  cargo test --locked -p harness-core --test tool_artifacts -- --list > "$OUT/artifact-discovery.txt"
+  grep -Fx 'plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes: test' "$OUT/artifact-discovery.txt"
+  gate artifact-sandbox cargo test --locked -p harness-core --test tool_artifacts plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes -- --exact --nocapture
 else
   printf '%s\n' 'NOT APPLICABLE: macOS Seatbelt lane required separately.' > "$OUT/sandbox-platform.txt"
+  cargo test --locked -p harness-core --test linux_reaper -- --list > "$OUT/linux-reaper-discovery.txt"
+  grep -Fx 'linux_plugin_reaping_survives_competing_reapers: test' "$OUT/linux-reaper-discovery.txt"
+  gate linux-reaper cargo test --locked -p harness-core --test linux_reaper linux_plugin_reaping_survives_competing_reapers -- --exact --nocapture
 fi
 gate all-targets cargo test --locked -p harness-core --all-targets
 gate doctests cargo test --locked -p harness-core --doc

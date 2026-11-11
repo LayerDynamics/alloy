@@ -326,5 +326,7 @@ fn supervisor_completes_two_turns_while_telemetry_transport_is_blocked() {
     drop(release);
 }
 
-include!("turn_boundary.inc");
-include!("tool_round.inc");
+#[path = "supervisor_turn/tool_loop_tool_round_tests.rs"]
+mod tool_loop_tool_round_tests;
+#[path = "supervisor_turn/turn_boundary.rs"]
+mod turn_boundary;

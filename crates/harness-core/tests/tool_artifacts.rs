@@ -173,6 +173,10 @@ fn oversized_tool_result_artifact_roundtrip() {
         1
     );
 }
+#[path = "tool_artifacts/plugin_artifact.rs"]
+#[cfg(target_os = "macos")]
+mod plugin_artifact;
+
 #[test]
 fn empty_and_exact_payloads_publish_but_one_over_never_registers() {
     let (_dir, mut store, artifacts) = fixture(ArtifactLimits {
