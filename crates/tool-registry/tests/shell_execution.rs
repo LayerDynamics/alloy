@@ -557,3 +557,62 @@ fn shell_survives_competing_waiter_without_stealing_statuses() {
         );
     }
 }
+
+#[test]
+fn shell_preserves_closed_host_standard_descriptors() {
+    const PROBE: &str = "ALLOY_SHELL_CLOSED_STDIO_PROBE";
+    if std::env::var_os(PROBE).is_none() {
+        let result = std::process::Command::new(executable())
+            .args([
+                "--exact",
+                "shell_preserves_closed_host_standard_descriptors",
+                "--test-threads=1",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    unsafe extern "C" {
+        fn close(fd: i32) -> i32;
+        fn fcntl(fd: i32, command: i32, ...) -> i32;
+    }
+    // SAFETY: this isolated fixture owns its standard descriptors and exits directly.
+    for fd in 0..3 {
+        // SAFETY: only this isolated probe owns these standard descriptors.
+        unsafe { close(fd) };
+    }
+    let d = Temp::new();
+    assert_eq!(execute(&d, "exit7").0.exit_code, Some(7));
+    for fd in 0..3 {
+        assert_eq!(
+            // SAFETY: F_GETFD inspects the numeric descriptor without variadic arguments.
+            unsafe { fcntl(fd, 1) },
+            -1,
+            "closed host descriptor was retained"
+        );
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn approved_large_argv_preserves_existing_byte_limit_contract() {
+    let d = Temp::new();
+    let executable = fs::canonicalize("/usr/bin/true").unwrap();
+    let scope = ShellScope::new(vec![executable.clone()], vec![d.0.clone()], 65536).unwrap();
+    let request = ShellRequest::new(
+        executable.to_str().unwrap(),
+        vec![String::new(); 5000],
+        d.0.to_str().unwrap(),
+    )
+    .unwrap();
+    let c = context(10000, 65536, CancellationToken::default());
+    let mut output = BoundedOutput::new(&c, 65536).unwrap();
+    assert!(scope.run(&request, &c, &mut output).unwrap().success);
+}

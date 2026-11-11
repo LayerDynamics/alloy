@@ -424,7 +424,11 @@ static int packet_receive(mach_port_t receiver,mach_port_t *reply,void *data,uin
     if(packet->header.msgh_id!=SHELL_MESSAGE || packet->header.msgh_size!=sizeof(*packet) || !(packet->header.msgh_bits&MACH_MSGH_BITS_COMPLEX) || packet->body.msgh_descriptor_count!=3 || packet->size>capacity)error=EPROTO;
     if(!error)for(int i=0;i<3;++i){
         if(packet->ports[i].type!=MACH_MSG_PORT_DESCRIPTOR || packet->ports[i].disposition!=MACH_MSG_TYPE_PORT_SEND){error=EPROTO;break;}
-        if(i<expected){int fd=fileport_makefd(packet->ports[i].name);if(fd<0){error=errno;break;}fds[received++]=fd;}
+        if(i<expected){
+            int fd=fileport_makefd(packet->ports[i].name);if(fd<0){error=errno;break;}
+            if(fd<3){int copy=fcntl(fd,F_DUPFD_CLOEXEC,3);int saved=errno;close(fd);if(copy<0){error=saved;break;}fd=copy;}
+            fds[received++]=fd;
+        }
     }
     if(!error){*size=packet->size;memcpy(data,packet->data,*size);if(reply){*reply=packet->header.msgh_remote_port;packet->header.msgh_remote_port=MACH_PORT_NULL;}}
     if(error)for(int i=0;i<received;++i){close(fds[i]);fds[i]=-1;}
@@ -457,8 +461,9 @@ static int shell_broker(int argc, char **argv) {
         if(error==EAGAIN)continue;
         if(error){connected=0;continue;}
         if(statefd<10){int copy=fcntl(statefd,F_DUPFD_CLOEXEC,10);close(statefd);statefd=copy;if(copy<0){mach_port_deallocate(mach_task_self(),reply_port);continue;}}
-        char *strings[4098];size_t count=0,offset=0;
-        while(offset<size && count<4098) {
+        char **strings=calloc((size_t)size+1,sizeof(char *));size_t count=0,offset=0;
+        if(!strings)error=ENOMEM;
+        while(!error && offset<size && count<size) {
             char *end=memchr(data+offset,0,size-offset);
             if(!end)break;
             strings[count++]=data+offset;offset=(size_t)(end-data)+1;
@@ -479,11 +484,14 @@ static int shell_broker(int argc, char **argv) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         if(!error) error=posix_spawn_file_actions_addchdir_np(&actions,strings[0]);
 #pragma clang diagnostic pop
-        char *arguments[4100]={argv[2],"--alloy-owned-exec-v1",NULL};
-        for(size_t i=1;i<count;++i) arguments[i+1]=strings[i];
+        char **arguments=calloc(count+3,sizeof(char *));
+        if(!arguments)error=ENOMEM;
+        if(arguments){arguments[0]=argv[2];arguments[1]="--alloy-owned-exec-v1";
+        for(size_t i=1;i<count;++i) arguments[i+1]=strings[i];}
         char *environment[]={NULL};
         if(!error) error=posix_spawn(&child,argv[2],&actions,&attr,arguments,environment);
         if(!error) ++children;
+        free(arguments);free(strings);
         if(actions)posix_spawn_file_actions_destroy(&actions);
         if(attr)posix_spawnattr_destroy(&attr);
         close(statefd);
@@ -527,7 +535,7 @@ static int connect_shell_broker(const char *launcher,alloy_stop_callback stop,vo
         for(;;){
             if(stop(context)){return ECANCELED;}
             kern_return_t result=mach_msg(&reply.header,MACH_RCV_MSG|MACH_RCV_TIMEOUT,0,sizeof(reply),receiver,25,MACH_PORT_NULL);
-            if(result==MACH_RCV_TIMED_OUT||result==MACH_RCV_INTERRUPTED){if(milliseconds()>=until){error=ETIMEDOUT;break;}continue;}
+            if(result==MACH_RCV_TIMED_OUT||result==MACH_RCV_INTERRUPTED){if(milliseconds()>=until){return ETIMEDOUT;}continue;}
             if(result!=KERN_SUCCESS){error=EPIPE;break;}
             struct ready_message {mach_msg_header_t header;mach_msg_body_t body;mach_msg_port_descriptor_t port;} *ready=(void *)&reply;
             if(ready->header.msgh_id!=SHELL_READY||ready->header.msgh_size!=sizeof(*ready)||!(ready->header.msgh_bits&MACH_MSGH_BITS_COMPLEX)||ready->body.msgh_descriptor_count!=1||ready->port.type!=MACH_MSG_PORT_DESCRIPTOR||ready->port.disposition!=MACH_MSG_TYPE_PORT_SEND){mach_msg_destroy(&reply.header);error=EPROTO;break;}
@@ -551,6 +559,7 @@ int alloy_shell_spawn(const char *launcher,const char *program,const char *cwd,
     int fd=-1;launch_state *state=MAP_FAILED;owned_control *control=NULL;char *data=NULL;
     if(error)goto done;
     fd=shm_open(name,O_CREAT|O_EXCL|O_RDWR,0600);if(fd<0){error=errno;goto done;}shm_unlink(name);
+    if(fd<3){int copy=fcntl(fd,F_DUPFD_CLOEXEC,3);int saved=errno;close(fd);fd=copy;if(fd<0){error=saved;goto done;}}
     if(ftruncate(fd,sizeof(*state))){error=errno;goto done;}
     state=mmap(NULL,sizeof(*state),PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     if(state==MAP_FAILED){error=errno;goto done;}
