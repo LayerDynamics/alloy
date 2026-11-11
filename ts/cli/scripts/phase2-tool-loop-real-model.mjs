@@ -85,11 +85,12 @@ async function main() {
     const marker = path.join(work, "marker");
     const fixture = path.join(work, "fixture.txt");
     fs.writeFileSync(fixture, "indigo-saffron-83\n");
+    fs.writeFileSync(path.join(work, "shell-result.txt"), "violet-signal-61\n");
     const executable = fs.realpathSync("/bin/sh");
     const python = fs.realpathSync("/usr/bin/python3");
     const hookLog = path.join(a.output, "plugin-hooks.ndjson");
     const readArgs = { path: "fixture.txt", offset: 0, length: 128 };
-    const shellArgs = { executable, args: ["-c", `printf violet-signal-61; /usr/bin/touch "${marker}"`], cwd: work };
+    const shellArgs = { executable, args: ["-c", `/bin/cat shell-result.txt; /usr/bin/touch "${marker}"`], cwd: work };
     const config = {
       read_root: work, write_root: work, shell_executables: [executable], shell_cwd_roots: [work],
       http_destinations: [{ origin: "http://fixture.invalid/", address: "127.0.0.1" }], policy: { rules: [
