@@ -40,7 +40,9 @@ async function sendTurn(a, session, prompt, allow, marker, label) {
             if (message.params?.event === "approval_requested") {
               approvalCount++;
               assert.equal(message.params.body.tool_id, "shell.run");
-              assert.equal(fs.existsSync(marker), false, "marker exists before decision");
+              const existsBeforeDecision = fs.existsSync(marker);
+              records.push({ direction: "observation", point: "before_decision", marker_exists: existsBeforeDecision, call_id: message.params.body.call_id });
+              assert.equal(existsBeforeDecision, false, "marker exists before decision");
               const decision = { session_id: session, call_id: message.params.body.call_id, allow };
               const result = await rpc(a.socket, "session.approve", decision);
               records.push({ direction: "control", method: "session.approve", params: decision, result });
@@ -55,7 +57,9 @@ async function sendTurn(a, session, prompt, allow, marker, label) {
       });
     });
     assert.equal(approvalCount, 1, "model must request one shell approval");
-    assert.equal(fs.existsSync(marker), allow, "marker state does not match explicit decision");
+    const existsAfterTurn = fs.existsSync(marker);
+    records.push({ direction: "observation", point: "after_turn", marker_exists: existsAfterTurn, decision: allow });
+    assert.equal(existsAfterTurn, allow, "marker state does not match explicit decision");
     const history = await rpc(a.socket, "sessions.resume", { session_id: session });
     save(path.join(a.output, `${label}-history.json`), history);
     save(path.join(a.output, `${label}-rpc.json`), records);
