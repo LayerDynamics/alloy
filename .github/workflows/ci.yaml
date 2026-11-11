@@ -93,6 +93,7 @@ jobs:
             -e CARGO_TERM_COLOR=never -w /work alloy-native-builder:phase0 \
             bash -euo pipefail -c '
               tar -C /src --exclude=target --exclude=.git -cf - . | tar -C /work -xf -
+              cargo test --locked -p alloy-process-owner --all-targets
               cargo test --locked -p tool-registry --all-targets
               cargo test --locked -p tool-registry --doc
               cargo test --locked -p mlx-ffi --all-targets -- --test-threads=1

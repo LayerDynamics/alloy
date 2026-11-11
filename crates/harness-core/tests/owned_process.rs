@@ -15,9 +15,9 @@ fn macos_identity_signals_survive_exec_reaping_and_pid_mismatch() {
             "-DALLOY_OWNED_PROCESS_TEST",
             "-I",
         ])
-        .arg(root.join("native"))
+        .arg(root.join("../process-owner/native"))
         .arg(root.join("tests/fixtures/owned_process.c"))
-        .arg(root.join("native/owned_process.c"))
+        .arg(root.join("../process-owner/native/owned_process.c"))
         .arg("-o")
         .arg(&driver)
         .output()
