@@ -66,6 +66,7 @@ async function sendTurn(a, session, prompt, allow, marker, label) {
     assert.equal(events.filter((e) => e.event === "tool_requested" && e.body.tool_id === "shell.run").length, 1);
     assert.equal(events.filter((e) => e.event === "tool_call_started" && e.body.tool_id === "shell.run").length, Number(allow));
     assert(final.assistant_text?.includes("indigo-saffron-83"), "final answer must consume the fixture result");
+    if (allow) assert(final.assistant_text.includes("violet-signal-61"), "final answer must consume the shell result");
     return { final, events, history };
   } finally {
     clearTimeout(timer);
@@ -84,11 +85,11 @@ async function main() {
     const marker = path.join(work, "marker");
     const fixture = path.join(work, "fixture.txt");
     fs.writeFileSync(fixture, "indigo-saffron-83\n");
-    const executable = fs.realpathSync("/usr/bin/touch");
+    const executable = fs.realpathSync("/bin/sh");
     const python = fs.realpathSync("/usr/bin/python3");
     const hookLog = path.join(a.output, "plugin-hooks.ndjson");
     const readArgs = { path: "fixture.txt", offset: 0, length: 128 };
-    const shellArgs = { executable, args: [marker], cwd: work };
+    const shellArgs = { executable, args: ["-c", `printf violet-signal-61; /usr/bin/touch "${marker}"`], cwd: work };
     const config = {
       read_root: work, write_root: work, shell_executables: [executable], shell_cwd_roots: [work],
       http_destinations: [{ origin: "http://fixture.invalid/", address: "127.0.0.1" }], policy: { rules: [
