@@ -270,6 +270,20 @@ impl<E: Engine> DaemonService<E> {
                 &cancellation,
                 on_started,
                 |event| {
+                    // A tool is admitted only after its generation has fully
+                    // completed. Keep cancellation scoped to a live generation:
+                    // the scheduler may evict the completed ID while a hook,
+                    // approval or subprocess remains in flight.
+                    if event.event == "tool_requested" {
+                        let mut guard = self
+                            .inflight
+                            .lock()
+                            .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
+                        let slot = guard
+                            .get_mut(&session_id)
+                            .ok_or_else(|| HarnessError::Engine("missing inflight slot".into()))?;
+                        slot.request_id = None;
+                    }
                     write_tool_notification(
                         writer,
                         &session_id,

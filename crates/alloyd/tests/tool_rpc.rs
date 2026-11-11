@@ -316,6 +316,15 @@ fn configured_tool_notifications_abort_before_approval_or_execution_on_overflow(
 
 #[test]
 fn pause_running_shell_reaps_process_without_affecting_another_session() {
+    pause_running_shell(false);
+}
+
+#[test]
+fn pause_running_shell_after_finished_request_eviction() {
+    pause_running_shell(true);
+}
+
+fn pause_running_shell(evicted: bool) {
     let dir = tempfile::tempdir().unwrap();
     let cwd = std::fs::canonicalize(dir.path()).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
@@ -329,6 +338,8 @@ fn pause_running_shell_reaps_process_without_affecting_another_session() {
             done(),
         ],
     ]);
+    let mut engine = engine;
+    engine.cancel_not_found = evicted;
     let service = DaemonService::open(
         dir.path().join("db"),
         engine,
@@ -404,6 +415,24 @@ fn pause_running_shell_reaps_process_without_affecting_another_session() {
         thread::sleep(Duration::from_millis(10));
     }
     let pid = std::fs::read_to_string(pidfile).unwrap().trim().to_owned();
+    struct Sentinel(std::process::Child);
+    impl Drop for Sentinel {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let mut sentinel = Sentinel(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    assert!(sentinel.0.try_wait().unwrap().is_none());
     send(
         &mut control,
         5,
@@ -446,16 +475,28 @@ fn pause_running_shell_reaps_process_without_affecting_another_session() {
         }
     }
     assert_eq!(terminals, 1);
+    assert!(
+        sentinel.0.try_wait().unwrap().is_none(),
+        "unrelated sentinel died during pause"
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let output = std::process::Command::new("/bin/ps")
             .args(["-p", &pid, "-o", "stat="])
             .output()
             .unwrap();
-        if !output.status.success()
-            || output.stdout.iter().all(u8::is_ascii_whitespace)
-            || output.stdout.first() == Some(&b'Z')
-        {
+        if !output.status.success() {
+            assert_eq!(output.status.code(), Some(1), "ps failed unexpectedly");
+            assert!(
+                output.stderr.is_empty(),
+                "ps inspection failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        let status = std::str::from_utf8(&output.stdout).unwrap().trim();
+        assert!(!status.is_empty(), "ps succeeded without process state");
+        if status.starts_with('Z') {
             break;
         }
         assert!(
