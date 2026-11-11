@@ -227,6 +227,7 @@ fn run() -> Result<(), String> {
         memory_guard,
         admission_budget_override_bytes: admission_budget_override,
         prefer_metal,
+        tools_enabled: tools_config.is_some(),
         tiered_kv,
     })
     .map_err(|error| error.message)?;

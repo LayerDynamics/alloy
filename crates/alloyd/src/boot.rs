@@ -10,6 +10,7 @@ use engine::memory_guard::{
     self, CeilingBreakdown, MemoryGuardConfig, should_apply_wired_limit,
     wired_limit_suggestion_bytes,
 };
+use engine::parser_allocation::ParserAllocationLimits;
 use engine::platform;
 use engine::registry::ModelProfile;
 use engine::runtime::{FamilyRuntime, RetentionPolicy};
@@ -61,6 +62,8 @@ pub struct BootRequest {
     pub admission_budget_override_bytes: Option<u64>,
     /// Prefer Metal when the platform supports it.
     pub prefer_metal: bool,
+    /// Enable bounded Qwen tool-call parsing only when the daemon has a tools configuration.
+    pub tools_enabled: bool,
     /// Bounded hot KV retention and optional persistent SSD snapshots.
     pub tiered_kv: TieredKvConfig,
 }
@@ -134,6 +137,24 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
 
     let backend = Qwen3Backend::new_with_execution(vec![specification], limits, execution)
         .map_err(|error| RpcError::internal(format!("construct Qwen3 backend: {error}")))?;
+    let backend = if request.tools_enabled {
+        // Match the daemon tool loop's 32-proposal and 1 MiB payload bounds.
+        // These allocations are included in the engine's admission plan.
+        backend
+            .with_parser_allocation_limits(ParserAllocationLimits {
+                carry_bytes: 64,
+                call_bytes: 1024 * 1024,
+                decoded_bytes: 1024 * 1024,
+                depth: 64,
+                keys: 8192,
+                nodes: 16384,
+                proposal_bytes: 1024 * 1024,
+                calls: 32,
+            })
+            .map_err(|error| RpcError::internal(format!("configure Qwen3 tool parser: {error}")))?
+    } else {
+        backend
+    };
 
     let profile = ModelProfile::new(
         ModelProfileId::new(request.profile_id.clone())
