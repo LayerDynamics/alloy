@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { spawnOwned } from "./group-supervisor.mjs";
+import { spawnOwned, SUPERVISOR_PYTHON } from "./group-supervisor.mjs";
 
 const script = fileURLToPath(new URL("./group_supervisor.py", import.meta.url));
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -68,7 +68,7 @@ test("process-table failure kills the still-owned group and reports failure", { 
   const root = temp(t), marker = path.join(root, "descendant");
   const command = `sleep 30 & echo $! > ${JSON.stringify(marker)}; exit 0`;
   const inject = `import runpy,subprocess,sys\ndef fail(*a,**k): raise OSError('injected process-table failure')\nsubprocess.run=fail\nsys.argv=[${JSON.stringify(script)},'/bin/sh','-c',${JSON.stringify(command)}]\nrunpy.run_path(sys.argv[0],run_name='__main__')`;
-  const child = spawn("python3", ["-c", inject], { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn(SUPERVISOR_PYTHON, ["-I", "-S", "-c", inject], { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
   child.stdio[3].on("data", () => {});
   child.stdio[4].end(JSON.stringify(process.env));
   const result = await new Promise(resolve => child.once("close", (code, signal) => resolve({ code, signal })));
@@ -84,7 +84,7 @@ test("broken control channel during ready publication cleans the target", { time
     `realpopen=subprocess.Popen\ndef start(*a,**k):\n p=realpopen(*a,**k)\n while not os.path.exists(${JSON.stringify(marker)}): time.sleep(.01)\n return p\n` +
     `subprocess.Popen=start\nrealwrite=os.write\ndef write(fd,data):\n if fd==3: raise BrokenPipeError('injected ready failure')\n return realwrite(fd,data)\nos.write=write\n` +
     `sys.argv=[${JSON.stringify(script)},${JSON.stringify(process.execPath)},'-e',${JSON.stringify(target)}]\nrunpy.run_path(sys.argv[0],run_name='__main__')`;
-  const child = spawn("python3", ["-c", inject], { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn(SUPERVISOR_PYTHON, ["-I", "-S", "-c", inject], { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
   child.stdio[3].on("data", () => {});
   child.stdio[4].end(JSON.stringify(process.env));
   const result = await new Promise(resolve => child.once("close", code => resolve(code)));
@@ -104,7 +104,7 @@ test("isolated target retains its exact PATH while supervisor uses a qualified i
 
 test("supervisor resets inherited SIGCHLD auto-reaping before owning its child", { timeout: 10000 }, async () => {
   const wrapper = `import os,signal,sys\nsignal.signal(signal.SIGCHLD,signal.SIG_IGN)\nos.execv(sys.executable,[sys.executable,${JSON.stringify(script)},'/usr/bin/true'])`;
-  const child = spawn("python3", ["-c", wrapper], { stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn(SUPERVISOR_PYTHON, ["-I", "-S", "-c", wrapper], { stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
   let protocol = "", stderr = "";
   child.stdio[3].setEncoding("utf8").on("data", text => { protocol += text; });
   child.stdio[4].end(JSON.stringify(process.env));

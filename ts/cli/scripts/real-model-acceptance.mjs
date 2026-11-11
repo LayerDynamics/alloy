@@ -258,6 +258,7 @@ export async function recordProxy(socketPath, daemonPath, evidenceFile) {
 
 export class Acceptance {
   owned = new Set();
+  ownerErrors = [];
   aborted = false;
   constructor(testName) {
     this.testName = testName;
@@ -310,6 +311,7 @@ export class Acceptance {
     owned.done = processOwner.done.then(({ code, signal, error }) => {
       owned.alive = false;
       this.owned.delete(owned);
+      if (error) this.ownerErrors.push(`${label}: ${error}`);
       return { code, signal, error: error ? new Error(error) : null };
     });
     return owned;
@@ -503,6 +505,7 @@ export class Acceptance {
     fs.rmSync(this.runtime, { recursive: true, force: true });
     const failure = results.find((result) => result.status === "rejected");
     if (failure) throw failure.reason;
+    if (this.ownerErrors.length) throw new Error(`owned process cleanup failed: ${this.ownerErrors.join("; ")}`);
   }
 }
 

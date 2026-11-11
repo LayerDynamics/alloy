@@ -11,7 +11,7 @@ const withoutLoaderInjection = env => Object.fromEntries(Object.entries(env)
 // Isolated startup without site initialization keeps Python customization from
 // starting competing waiters inside the supervisor.
 // Apple's /usr/bin/python3 3.9 can lack os.waitid even though WNOWAIT exists.
-const PYTHON = (() => {
+export const SUPERVISOR_PYTHON = (() => {
   for (const candidate of ["python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"]) {
     const probe = spawnSync(candidate, ["-I", "-S", "-c", "import os,sys; assert hasattr(os,'waitid') and hasattr(os,'WNOWAIT'); print(sys.executable)"],
       { env: withoutLoaderInjection(process.env), encoding: "utf8", timeout: 5000 });
@@ -23,10 +23,10 @@ const PYTHON = (() => {
 
 
 export function spawnOwned(command, args, { cwd, env }) {
-  if (!PYTHON) throw new Error("Python 3 with waitid(WNOWAIT) is required for safe process supervision");
+  if (!SUPERVISOR_PYTHON) throw new Error("Python 3 with waitid(WNOWAIT) is required for safe process supervision");
   const targetEnv = Object.fromEntries(Object.entries(env ?? process.env)
     .filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]));
-  const child = spawn(PYTHON, ["-I", "-S", SCRIPT, command, ...args], {
+  const child = spawn(SUPERVISOR_PYTHON, ["-I", "-S", SCRIPT, command, ...args], {
     cwd, env: withoutLoaderInjection(targetEnv), detached: true,
     stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"],
   });
