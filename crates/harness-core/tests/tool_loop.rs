@@ -649,6 +649,46 @@ fn projected_budget_reduces_inline_output_without_losing_artifact_bytes() {
     artifact.read_to_string(&mut actual).unwrap();
     assert_eq!(actual, payload);
 }
+
+#[test]
+fn pending_projected_admission_honors_deadline_before_any_tool_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SessionStore::open(dir.path().join("db")).unwrap();
+    store.create_session("s", "p").unwrap();
+    let runtime = setup(dir.path(), &mut store, false);
+    let store = Mutex::new(store);
+    let mut engine = ScriptedEngine::new(vec![vec![
+        proposal("fs.write", json!({"path":"marker.txt","content":"once"})),
+        done(),
+    ]]);
+    engine.projected_pending = true;
+    let supervisor = Supervisor::new(engine, telemetry());
+    let mut cfg = config();
+    cfg.round.deadline = Instant::now() + Duration::from_millis(100);
+    let start = Instant::now();
+    let result = supervisor.run_tool_turn(
+        &store,
+        &runtime,
+        "s",
+        "write",
+        cfg,
+        &CancellationToken::default(),
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(!dir.path().join("marker.txt").exists());
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == EventKind::ToolRequested)
+    );
+}
 #[test]
 fn subsequent_turn_after_reopen_does_not_reexecute_a_completed_effect() {
     let dir = tempfile::tempdir().unwrap();

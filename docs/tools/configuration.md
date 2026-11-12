@@ -44,6 +44,8 @@ The coordinator defaults are eight generation rounds, 32 calls per turn, 120 sec
 
 Artifacts are stored beside the session database at the database path with its extension replaced by `artifacts`. History carries opaque artifact references; subsequent rendering does not open artifact files or elevate result text into system instructions. Restart recovers existing W3 intent state and never automatically reexecutes an effect.
 
+Message-attached artifact references are rendered as quoted data alongside their message; they do not grant access to the underlying files. Until their owning reconstruction paths are implemented, sessions containing skill-loaded, context-compacted, or model-changed events are rejected with an explanation rather than reconstructed without those changes.
+
 Before executing a proposed batch, the daemon checks whether its bounded results can fit the selected profile. If necessary, it lowers the inline threshold for that batch; larger complete streaming results are stored as artifacts. If even the bounded results cannot fit, or the selected tokenizer has no verified projection bound, the batch is rejected before any tool intent or effect. The current native projection bound supports the pinned Qwen3-4B corpus tokenizer.
 
 Large error results remain intact in the append-only session history. When an error's serialized content exceeds 1,024 bytes, the model receives an explicitly marked short preview saying that the full result is retained in session history. `alloy sessions resume` exposes the original event; the preview does not replace it.

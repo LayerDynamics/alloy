@@ -20,6 +20,7 @@ pub struct ScriptedEngine {
     pub cancel_not_found: bool,
     pub cancel_not_found_id: Option<String>,
     pub projected_byte_limit: usize,
+    pub projected_pending: bool,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -36,6 +37,7 @@ impl ScriptedEngine {
             cancel_not_found: false,
             cancel_not_found_id: None,
             projected_byte_limit: usize::MAX,
+            projected_pending: false,
         }
     }
 }
@@ -63,6 +65,9 @@ impl Engine for ScriptedEngine {
     ) -> EngineFuture<'a, ()> {
         let limit = self.projected_byte_limit;
         let bytes = projection.input_bytes;
+        if self.projected_pending {
+            return Box::pin(std::future::pending());
+        }
         Box::pin(async move {
             if bytes > limit {
                 Err(engine::error::EngineError::ContextLimitExceeded {

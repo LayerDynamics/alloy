@@ -85,9 +85,9 @@ impl ContextBuilder {
                 .checked_add(1)
                 .ok_or_else(|| invalid("event sequence overflow"))?;
             match event.kind {
-                EventKind::SkillLoaded | EventKind::ContextCompacted => {
+                EventKind::SkillLoaded | EventKind::ContextCompacted | EventKind::ModelChanged => {
                     return Err(invalid(
-                        "skill or checkpoint context is not yet supported; cannot safely reconstruct this session",
+                        "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session",
                     ));
                 }
                 EventKind::UserMessage | EventKind::AssistantMessage => {
@@ -97,7 +97,7 @@ impl ContextBuilder {
                         } else {
                             MessageRole::Assistant
                         },
-                        content: string(&event.payload, "content")?.to_owned(),
+                        content: super::message_content(event)?,
                     };
                     if saw_call {
                         push(&mut tail, ToolHistoryBlock::Text(message), limits)?;
@@ -278,9 +278,8 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
 /// errors explicit bounded previews in model context. The preview is data,
 /// never authority, and callers can inspect the unmodified session event.
 fn bounded_error_context(content: String) -> HarnessResult<String> {
-    const MAX_ERROR_CONTEXT_BYTES: usize = 1024;
     const PREVIEW_SOURCE_BYTES: usize = 96;
-    if content.len() <= MAX_ERROR_CONTEXT_BYTES {
+    if content.len() <= super::MODEL_ERROR_CONTEXT_BYTES {
         return Ok(content);
     }
     let mut end = PREVIEW_SOURCE_BYTES.min(content.len());
@@ -293,7 +292,7 @@ fn bounded_error_context(content: String) -> HarnessResult<String> {
         "full_result": "retained_in_session_history",
     });
     let serialized = serde_json::to_string(&preview)?;
-    if serialized.len() > MAX_ERROR_CONTEXT_BYTES {
+    if serialized.len() > super::MODEL_ERROR_CONTEXT_BYTES {
         return Err(invalid("bounded error preview exceeds context ceiling"));
     }
     Ok(serialized)

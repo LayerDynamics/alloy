@@ -174,7 +174,11 @@ struct StaticStream {
 
 #[test]
 fn unsupported_skill_and_checkpoint_events_are_not_silently_dropped() {
-    for kind in [EventKind::SkillLoaded, EventKind::ContextCompacted] {
+    for kind in [
+        EventKind::SkillLoaded,
+        EventKind::ContextCompacted,
+        EventKind::ModelChanged,
+    ] {
         let dir = tempdir().expect("tempdir");
         let mut store = SessionStore::open(dir.path().join("s.sqlite")).expect("store");
         store
@@ -194,8 +198,27 @@ fn unsupported_skill_and_checkpoint_events_are_not_silently_dropped() {
         let history = store.list_events("session").expect("history");
         let error = ContextBuilder::build_snapshot("snapshot", "harness-profile", &history, None)
             .expect_err("must not ignore model-visible context");
-        assert!(error.to_string().contains("skill or checkpoint context"));
+        assert!(error.to_string().contains("model-change context"));
     }
+}
+
+#[test]
+fn text_snapshot_preserves_message_artifact_references() {
+    let dir = tempdir().unwrap();
+    let mut store = SessionStore::open(dir.path().join("s.sqlite")).unwrap();
+    store.create_session("session", "harness-profile").unwrap();
+    store
+        .append_event(
+            "session",
+            EventKind::UserMessage,
+            json!({"content":"hello"}),
+            json!(["artifact"]),
+        )
+        .unwrap();
+    let events = store.list_events("session").unwrap();
+    let snapshot =
+        ContextBuilder::build_snapshot("snapshot", "harness-profile", &events, None).unwrap();
+    assert!(snapshot.messages()[0].content.contains("[\"artifact\"]"));
 }
 
 impl GenerationEventStream for StaticStream {

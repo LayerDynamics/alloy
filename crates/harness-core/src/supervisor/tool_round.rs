@@ -280,7 +280,7 @@ fn check_live(store: &Mutex<SessionStore>, session: &str, deadline: Instant) -> 
     }
     ensure_session_active(store, session)
 }
-fn wait_checked<T>(
+pub(super) fn wait_checked<T>(
     future: impl Future<Output = T>,
     deadline: Instant,
     check: &impl Fn() -> HarnessResult<()>,

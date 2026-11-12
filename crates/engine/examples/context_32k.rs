@@ -125,6 +125,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             "actual tokens exceed projected bound"
         );
     }
+    // Exercise cumulative bounds for two projected results separated by an
+    // actual assistant call, including Unicode and JSON escaping.
+    let make_batch = |contents: [&str; 2]| -> Result<ContextSnapshot, Box<dyn Error>> {
+        let mut history = Vec::new();
+        for (index, content) in contents.into_iter().enumerate() {
+            let call_id = format!("batch-{index}");
+            history.push(ToolHistoryBlock::AssistantCall {
+                call_id: call_id.clone(),
+                tool_id: "fixture.read".into(),
+                arguments: serde_json::Map::new(),
+            });
+            history.push(ToolHistoryBlock::ToolResult {
+                call_id,
+                content: content.into(),
+                is_error: false,
+            });
+        }
+        Ok(ContextSnapshot::new(
+            ContextSnapshotId::new("batch-projection")?,
+            projection_profile.clone(),
+            vec![Message {
+                role: MessageRole::User,
+                content: "read both".into(),
+            }],
+        )?
+        .with_tool_context(ToolContext::new(vec![tool.clone()], history, tool_limits)?))
+    };
+    let batch_skeleton = tool_render(&make_batch(["", ""])?)?;
+    let first = serde_json::to_string(&serde_json::json!("Ǖ\u{344}\\\"".repeat(50)))?;
+    let second = serde_json::to_string(&serde_json::json!({"result":"x".repeat(1200)}))?;
+    let batch_actual = tool_render(&make_batch([&first, &second])?)?;
+    let batch_upper = qwen3_projected_tool_token_upper_bound(
+        &tokenizer,
+        &batch_skeleton,
+        2,
+        (first.len() + second.len()) * 2,
+    )?;
+    assert!(
+        batch_actual.token_count() <= batch_upper,
+        "multi-result tokens exceed projected bound"
+    );
     println!(
         "pinned_qwen_projected_tool_samples=3 status=passed skeleton_tokens={}",
         skeleton.token_count()

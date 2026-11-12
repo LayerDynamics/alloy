@@ -554,7 +554,7 @@ impl<E: Engine> Supervisor<E> {
             };
             // ContextBuilder bounds model-visible error projections to 1024
             // bytes while retaining the full result in the durable event.
-            let error_limit = 1024;
+            let error_limit = crate::context::MODEL_ERROR_CONTEXT_BYTES;
             result_limits.push((streaming, inline_limit, error_limit));
             blocks.push(ToolHistoryBlock::AssistantCall {
                 call_id: call_id.clone(),
@@ -575,8 +575,13 @@ impl<E: Engine> Supervisor<E> {
             .map_err(HarnessError::from)?;
         let base_json_bytes = projected.input_bytes();
         let snapshot = snapshot.with_tool_context(projected);
-        let rendered = block_on(self.engine.render_and_count(snapshot.clone()))?
-            .map_err(HarnessError::from)?;
+        let check = || live(store, session, cancel, config.round.deadline);
+        let rendered = super::tool_round::wait_checked(
+            self.engine.render_and_count(snapshot.clone()),
+            config.round.deadline,
+            &check,
+        )?
+        .map_err(HarnessError::from)?;
         let base_message_bytes = snapshot
             .messages()
             .iter()
@@ -609,14 +614,17 @@ impl<E: Engine> Supervisor<E> {
             let input_bytes = json_bytes
                 .checked_add(base_message_bytes)
                 .ok_or_else(|| HarnessError::Engine("projected input overflow".into()))?;
-            match block_on(self.engine.check_projected_tool_render(
-                engine::api::ProjectedToolRender {
-                    rendered: &rendered,
-                    result_count: proposed.len(),
-                    additional_rendered_bytes: extra,
-                    input_bytes: input_bytes.max(render_bytes),
-                },
-            ))? {
+            match super::tool_round::wait_checked(
+                self.engine
+                    .check_projected_tool_render(engine::api::ProjectedToolRender {
+                        rendered: &rendered,
+                        result_count: proposed.len(),
+                        additional_rendered_bytes: extra,
+                        input_bytes: input_bytes.max(render_bytes),
+                    }),
+                config.round.deadline,
+                &check,
+            )? {
                 Ok(()) => Ok(true),
                 Err(
                     engine::error::EngineError::ContextLimitExceeded { .. }
