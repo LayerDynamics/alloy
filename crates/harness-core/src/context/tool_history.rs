@@ -307,3 +307,21 @@ fn bounded_error_context(content: String) -> HarnessResult<String> {
     }
     Ok(serialized)
 }
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn error_preview_bounds_escaped_and_multibyte_inputs() {
+        for input in ["\0\u{1f}\\\"".repeat(512), "🦀é".repeat(512)] {
+            let encoded = serde_json::to_string(&input).unwrap();
+            let projected = bounded_error_context(encoded.clone()).unwrap();
+            assert!(projected.len() <= super::super::MODEL_ERROR_CONTEXT_BYTES);
+            let value: Value = serde_json::from_str(&projected).unwrap();
+            assert_eq!(value["context_projection"], "truncated_error_preview");
+            assert_eq!(value["full_result"], "retained_in_session_history");
+            assert!(encoded.starts_with(value["preview"].as_str().unwrap()));
+        }
+    }
+}

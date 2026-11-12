@@ -115,9 +115,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         serde_json::json!("simple"),
         serde_json::json!("quotes \" slashes \\\\ newline\nǕ\u{344}é中🦀"),
         serde_json::json!({"text":"x".repeat(4000)}),
+        serde_json::json!("\u{0}\u{1}\u{1f}\\\"".repeat(128)),
+        serde_json::json!({"call_id": format!("gen-{}-call-{}", "f".repeat(64), usize::MAX), "artifact_ref": format!("art1_{}", "f".repeat(32)), "is_error": false}),
     ] {
         let content = serde_json::to_string(&value)?;
         let actual = tool_render(&make_context(content.clone())?)?;
+        assert!(
+            actual.text().len() - skeleton.text().len() <= content.len() * 2,
+            "serialized result exceeds projected rendered byte bound"
+        );
         let upper =
             qwen3_projected_tool_token_upper_bound(&tokenizer, &skeleton, 1, content.len() * 2)?;
         assert!(
@@ -167,7 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "multi-result tokens exceed projected bound"
     );
     println!(
-        "pinned_qwen_projected_tool_samples=3 status=passed skeleton_tokens={}",
+        "pinned_qwen_projected_tool_samples=5 status=passed skeleton_tokens={}",
         skeleton.token_count()
     );
     let document = fs::read("bench/corpus/fixtures/documents/document-32k.txt")?;
