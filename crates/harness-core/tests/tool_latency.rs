@@ -1,11 +1,12 @@
 #[path = "support/scripted.rs"]
 mod scripted;
 use engine::types::{GenerationEvent, ToolContextLimits};
+use harness_core::telemetry::TelemetryTransport;
 use harness_core::{artifact::*, plugin_host::*, policy::*, supervisor::*, tool_execution::*, *};
 use scripted::*;
 use serde_json::json;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 use tool_registry::{
@@ -110,12 +111,26 @@ fn config() -> ToolLoopConfig {
         inline_bytes: 8192,
     }
 }
-fn telemetry() -> Arc<TelemetryClient> {
-    Arc::new(TelemetryClient::new(
+struct RecordingTransport(mpsc::Sender<TelemetryPayload>);
+
+impl TelemetryTransport for RecordingTransport {
+    fn post_json(&self, endpoint: &str, body: &str) -> Result<(), String> {
+        assert_eq!(endpoint, "https://telemetry.invalid");
+        let payload: TelemetryPayload = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        payload.assert_anonymous().map_err(|e| e.to_string())?;
+        self.0.send(payload).map_err(|e| e.to_string())
+    }
+}
+
+fn telemetry() -> (Arc<TelemetryClient>, mpsc::Receiver<TelemetryPayload>) {
+    let (sender, receiver) = mpsc::channel();
+    let client = Arc::new(TelemetryClient::with_transport(
         "test",
         HardwareTier::Unknown,
         "https://telemetry.invalid",
-    ))
+        Box::new(RecordingTransport(sender)),
+    ));
+    (client, receiver)
 }
 #[test]
 fn tool_roundtrip_overhead_under_50ms() {
@@ -145,7 +160,8 @@ fn tool_roundtrip_overhead_under_50ms() {
                 done(),
             ],
         ]);
-        let supervisor = Supervisor::new(engine, telemetry());
+        let (telemetry, delivered) = telemetry();
+        let supervisor = Supervisor::new(engine, telemetry);
         let start = Instant::now();
         let outcome = supervisor
             .run_tool_turn(
@@ -160,6 +176,12 @@ fn tool_roundtrip_overhead_under_50ms() {
             )
             .unwrap();
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        // Keep the real worker and turn-completion flush, but do not let DNS
+        // for a deliberately invalid endpoint perturb later timing samples.
+        // Delivery is verified outside the measured tool-roundtrip boundary.
+        let payload = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(payload.turn_count, 1);
+        assert_eq!(payload.session_count, 0);
         assert_eq!(outcome.assistant_text, "read complete");
         let contexts = supervisor.engine().contexts.lock().unwrap();
         assert!(format!("{:?}", contexts[1].tool_context()).contains("actual fixture bytes"));
