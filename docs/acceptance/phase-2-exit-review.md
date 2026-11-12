@@ -2,6 +2,15 @@
 
 **Decision: accepted for implementation candidate `9faba79f9ed27d11bcf1d8e7e7776826517587d0` on 2026-11-11.** All P2-01 through P2-16 requirements and the preserved Phase 1 regressions passed. Independent implementation, integration and acceptance reviews found no remaining blocker after the ownership and pause fixes. This sign-off is documentation-only; the final PR head must also have passing required checks before merge.
 
+PR #101 subsequently merged as `f4f9a3fa579ffcd618466d2bff344f98e5197042`.
+The Mac ownership and remaining-limit paragraphs below describe that accepted
+baseline. Follow-up [PR #102](https://github.com/LayerDynamics/alloy/pull/102)
+introduces launchd broker recovery and native descendant containment; its current
+contract, qualification boundary and failure handling are documented in
+[native ownership](../plugins/macos-broker-recovery.md). The follow-up requires
+passing checks on its own final head. The model, latency and workflow measurements
+in this review remain tied to the historical candidate identified below.
+
 ## Candidate and retained evidence
 
 - [Complete Linux/Mac CI run](https://github.com/LayerDynamics/alloy/actions/runs/43072447930): every job passed, including CLI, Linux foundation/core/engine/reproducibility, Mac core/Metal, approval/storage, real-model and installed Homebrew acceptance.
@@ -73,4 +82,4 @@ A later documentation sign-off run exposed a synthetic CLI startup-fixture publi
 
 A later parallel Linux W5 run also exceeded the mixed protocol fixture's 500 ms initialization deadline. That fixture now uses a two-second exchange budget while retaining its under-three-second veto assertion; production limits and separate 500 ms/short-deadline hardening tests are unchanged. Version rejection must explicitly report a handshake mismatch, and the hung-hook case must explicitly report a hook deadline, so unrelated startup errors cannot count as successful protocol evidence.
 
-Issues [#31](https://github.com/LayerDynamics/alloy/issues/31) and [#34](https://github.com/LayerDynamics/alloy/issues/34) may close when PR #101's final documentation sign-off head also passes its required checks and merges. The W5 tracking issue [#32](https://github.com/LayerDynamics/alloy/issues/32) retains the integration evidence and documented boundaries.
+Issues [#31](https://github.com/LayerDynamics/alloy/issues/31) and [#34](https://github.com/LayerDynamics/alloy/issues/34) closed with merged PR #101. The closed W5 tracking issue [#32](https://github.com/LayerDynamics/alloy/issues/32) retains the integration evidence and follow-up boundary updates. Its historical closure does not waive PR #102's independent acceptance gates.

@@ -164,6 +164,51 @@ if [[ "$(uname -s)" == Darwin ]]; then
   gate fileport-exhaustion cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_descriptor_exhaustion_fails_closed_without_fd_leaks -- --exact --nocapture
   gate fileport-malformed cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_malformed_helper_message -- --exact --nocapture
   gate fileport-adversarial cargo test --locked -p harness-core --test plugin_hooks hardening::fileport_rejects_wrong_sender_and_complex_messages -- --exact --nocapture
+  cargo test --locked -p alloy-process-owner --test macos_broker_recovery -- --list > "$OUT/broker-recovery-discovery.txt"
+  BROKER_TESTS=(
+    broker_loss_before_launch_recovers_without_replay
+    broker_loss_during_launch_releases_other_launches
+    broker_loss_during_execution_preserves_control
+    broker_loss_during_cancellation_preserves_cleanup
+    restart_budget_refuses_excess_reconnects_then_recovers
+    stale_generation_never_launches_or_replays_a_command
+    peer_audit_authentication_rejects_unrelated_code
+    live_supervisor_capacity_survives_broker_restart
+    unconfirmed_stopped_supervisor_stays_charged_until_proven_exit
+    repeated_confirmed_presend_cancellation_does_not_exhaust_capacity
+    inconclusive_host_identity_preserves_other_live_service
+    concurrent_host_retirement_does_not_break_registration
+    completion_published_before_supervisor_exit_keeps_real_status
+    malformed_message_does_not_retire_authenticated_service
+    native_framework_command_retains_bootstrap_access
+    registration_and_workloads_create_no_additional_host_children
+    private_verifier_rejects_unrelated_code_and_death_fails_closed
+    verifier_exits_on_inconclusive_parent_identity
+    stopped_verifier_exits_with_its_host_even_if_host_ignores_hup
+    containment::detached_descendants_are_cleaned_after_normal_exit
+    containment::detached_descendants_are_cleaned_after_cancellation
+    containment::trusted_plugin_detached_descendants_are_cleaned
+    containment::concurrent_fork_and_spawn_cannot_outlive_cancellation
+    containment::independent_revoker_cleans_after_gate_death
+    containment::gate_revokes_after_independent_revoker_death
+    containment::host_finishes_detached_cleanup_after_cleaner_death
+    containment::new_host_retires_crashed_cleaner_and_detached_workload
+    containment::try_wait_does_not_block_on_paused_revocation_after_cleaner_loss
+    containment::host_loss_between_record_and_submit_cannot_leave_untracked_job
+    containment::empty_cohort_without_revocation_marker_is_retired_after_setup_crash
+    containment::indeterminate_submission_stays_charged_until_positive_resolution
+    containment::recovery_retries_after_timed_out_revoker_resumes
+    containment::dropped_control_keeps_recovery_after_holder_timeout
+    containment::dropped_control_recovers_a_paused_cleaner_that_dies_later
+    containment::watcher_allocation_failure_prevents_workload_execution
+    containment::forced_close_retries_a_failed_cleaner_signal_without_another_caller
+    containment::workload_cannot_modify_or_hardlink_recovery_metadata
+    containment::recovery_retries_transient_failure_after_revocation_is_already_known
+  )
+  for name in "${BROKER_TESTS[@]}"; do
+    grep -Fx "$name: test" "$OUT/broker-recovery-discovery.txt"
+  done
+  gate broker-recovery cargo test --locked -p alloy-process-owner --test macos_broker_recovery -- --nocapture --test-threads=1
   cargo test --locked -p harness-core --test tool_artifacts -- --list > "$OUT/artifact-discovery.txt"
   grep -Fx 'plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes: test' "$OUT/artifact-discovery.txt"
   gate artifact-sandbox cargo test --locked -p harness-core --test tool_artifacts plugin_artifact::sandboxed_after_hook_cannot_replace_artifact_or_its_bytes -- --exact --nocapture

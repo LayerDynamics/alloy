@@ -366,6 +366,16 @@ fn fileport_concurrent_exec_scanner() {
     for fd in 3..1024 {
         // SAFETY: F_GETFD only observes the descriptor.
         let status = unsafe { fcntl(fd, 1) };
+        if status >= 0 {
+            let mut path = [0u8; 1024];
+            // SAFETY: Darwin F_GETPATH writes at most MAXPATHLEN bytes to this buffer.
+            let path_result = unsafe { fcntl(fd, 50, path.as_mut_ptr()) };
+            let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+            eprintln!(
+                "inherited fd={fd} flags={status} path_result={path_result} path={}",
+                String::from_utf8_lossy(&path[..end])
+            );
+        }
         assert!(
             status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(9),
             "unexpected inherited descriptor {fd}"
@@ -421,15 +431,22 @@ fn fileport_concurrent_unrelated_exec_inherits_no_endpoints() {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
     let scanner = || {
-        Command::new(std::env::current_exe().unwrap())
+        let result = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "hardening::fileport_concurrent_exec_scanner"])
             .env("ALLOY_FILEPORT_SCANNER", "1")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        if !result.status.success() {
+            eprintln!(
+                "concurrent scanner: stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        result.status.success()
     };
     assert!(scanner(), "scanner baseline was not clean");
     let file = std::fs::File::open("/dev/null").unwrap();
@@ -1117,6 +1134,7 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
             fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         }
         let mut statuses = 0;
+        let mut stopping_at = None;
         loop {
             // SAFETY: this isolated test owns the process-wide reaper; status
             // is deliberately ignored for supervisor children only.
@@ -1125,8 +1143,14 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
                 statuses += 1;
                 continue;
             }
-            if stop.load(std::sync::atomic::Ordering::Acquire) && pid < 0 {
-                break;
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                // The verifier deliberately remains a live host child. Drain
+                // the pipe supervisor's status without waiting for ECHILD.
+                let until =
+                    stopping_at.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if statuses >= 1 || Instant::now() >= *until {
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1145,8 +1169,28 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
     done.store(true, std::sync::atomic::Ordering::Release);
     assert_eq!(
         reaper.join().unwrap(),
-        2,
-        "external reaper must own both supervisor statuses"
+        1,
+        "external reaper owns the pipe supervisor; launchd owns the workload supervisor"
     );
+    unsafe extern "C" {
+        fn alloy_test_verifier_pid() -> i32;
+        fn proc_listchildpids(parent: i32, buffer: *mut i32, size: i32) -> i32;
+    }
+    let mut children = [0i32; 8];
+    // SAFETY: libproc fills this writable bounded buffer; this call never signals or reaps.
+    assert_eq!(
+        // SAFETY: the initialized PID array remains writable for the supplied size.
+        unsafe {
+            proc_listchildpids(
+                std::process::id() as i32,
+                children.as_mut_ptr(),
+                std::mem::size_of_val(&children) as i32,
+            )
+        },
+        1,
+        "unexpected additional host children: {children:?}"
+    );
+    // SAFETY: reads the test host's retained verifier PID, not a signalling capability.
+    assert_eq!(children[0], unsafe { alloy_test_verifier_pid() });
     assert_reaped(pid);
 }

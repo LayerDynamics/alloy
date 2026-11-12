@@ -155,16 +155,42 @@ export function assertOwnedDaemonPid(group, daemonPid, table) {
   assert(row && row.group === group && !row.state.startsWith("Z"), `Daemon PID ${daemonPid} is not a live descendant in owned process group ${group}`);
 }
 
-/** Verify the installed macOS ownership chain, including the isolated reaper. */
-export function assertOwnedPluginPid(daemonPid, pluginPid, table) {
+export function parseLaunchdJobs(stdout) {
+  return stdout.split("\n").flatMap(line => {
+    const match = /^\s*(\d+)\s+-?\d+\s+(com\.layerdynamics\.alloy\.cohort\.\d+\.\d+\.[1-9]\d*\.[0-9a-f]{32})\s*$/.exec(line);
+    return match ? [{ pid: Number(match[1]), label: match[2] }] : [];
+  });
+}
+
+/** Verify the installed launchd cleaner -> exclusive gate -> plugin chain. */
+export function assertOwnedPluginPid(daemonPid, pluginPid, table, jobs, uid = process.getuid()) {
   assert(Number.isSafeInteger(pluginPid) && pluginPid > 1 && pluginPid !== daemonPid, "Invalid installed plugin PID");
   const plugin = table.find(entry => entry.pid === pluginPid);
   assert(plugin && plugin.group === pluginPid && !plugin.state.startsWith("Z"), "Installed plugin is not a live private-group leader");
   const supervisor = table.find(entry => entry.pid === plugin.parent);
-  assert(supervisor && supervisor.pid !== daemonPid && supervisor.parent === daemonPid &&
+  assert(supervisor && supervisor.pid !== daemonPid &&
     supervisor.group === supervisor.pid && !supervisor.state.startsWith("Z"),
-  "Installed plugin is not owned by the daemon's live isolated supervisor");
-  return supervisor.pid;
+  "Installed plugin has no live isolated gate");
+  const cleaner = table.find(entry => entry.pid === supervisor.parent);
+  assert(cleaner && cleaner.pid !== daemonPid && cleaner.parent === 1 && cleaner.group === cleaner.pid && !cleaner.state.startsWith("Z"),
+    "Installed plugin has no live launchd cleaner");
+  const job = jobs.find(entry => entry.pid === cleaner.pid &&
+    entry.label.startsWith(`com.layerdynamics.alloy.cohort.${uid}.${daemonPid}.`) &&
+    /^com\.layerdynamics\.alloy\.cohort\.\d+\.\d+\.[1-9]\d*\.[0-9a-f]{32}$/.test(entry.label));
+  assert(job, "Installed cleaner has no launchd registration for this daemon");
+  const holders = table.filter(entry => entry.parent === supervisor.pid && entry.pid !== pluginPid);
+  assert(holders.length === 1 && holders[0].group === supervisor.pid && !holders[0].state.startsWith("Z"),
+    "Installed gate has no unique live independent revoker");
+  return { supervisor_pid: supervisor.pid, cleaner_pid: cleaner.pid, revoker_pid: holders[0].pid, cohort_job: job.label };
+}
+
+export async function waitForPluginCleanup(pluginPid, ownership, { read = processTable, timeoutMs = 5000 } = {}) {
+  const owned = [pluginPid, ownership.supervisor_pid, ownership.cleaner_pid, ownership.revoker_pid];
+  const until = Date.now() + timeoutMs;
+  while ((await read()).some(entry => owned.includes(entry.pid))) {
+    assert(Date.now() < until, "Installed plugin, gate, cleaner or revoker remained after daemon stop");
+    await sleep(50);
+  }
 }
 
 /** A fresh process group owns the complete child tree, even if its parent exits first. */
@@ -567,14 +593,11 @@ export async function runSmoke(options) {
       assert.equal(pluginObservation.method, "initialize");
       assert(Number.isInteger(pluginObservation.pid) && pluginObservation.pid > 1);
       await pluginOwner.ready;
-      const supervisorPid = assertOwnedPluginPid(pluginOwner.group, pluginObservation.pid, await processTable());
+      const { stdout: registeredJobs } = await execute("/bin/launchctl", ["list"], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
+      const ownership = assertOwnedPluginPid(pluginOwner.group, pluginObservation.pid, await processTable(), parseLaunchdJobs(registeredJobs));
       const pluginStop = await pluginOwner.stop();
-      const pluginExitDeadline = Date.now() + 5000;
-      while ((await processTable()).some(entry => [pluginObservation.pid, supervisorPid].includes(entry.pid) && !entry.state.startsWith("Z"))) {
-        assert(Date.now() < pluginExitDeadline, "Installed plugin or supervisor remained alive after daemon stop");
-        await sleep(50);
-      }
-      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, supervisor_pid: supervisorPid, cleanup: pluginStop };
+      await waitForPluginCleanup(pluginObservation.pid, ownership);
+      result.plugin_startup = { ...pluginObservation, daemon_pid: pluginOwner.group, ...ownership, cleanup: pluginStop };
       jsonFile(path.join(options.output, "installed-plugin.json"), result.plugin_startup);
     }
     check();

@@ -33,7 +33,11 @@ pub(super) fn spawn(
     external_reaper: bool,
 ) -> Result<Spawned, HostError> {
     let command = sandbox::command(config)?;
-    alloy_process_owner::spawn::spawn(
+    let launch = match config.sandbox {
+        sandbox::Sandbox::MacOs { .. } => alloy_process_owner::spawn::spawn_single_process_sandbox,
+        sandbox::Sandbox::Trusted => alloy_process_owner::spawn::spawn,
+    };
+    launch(
         command,
         helper,
         deadline,

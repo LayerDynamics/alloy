@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, assertOwnedPluginPid, installedPluginSource, parseArguments, processTable, runSmoke, verifyInstallation } from "./smoke.mjs";
+import { OwnedProcess, REQUIRED_FILES, assertNativeCheck, assertOwnedDaemonPid, assertOwnedPluginPid, installedPluginSource, parseArguments, parseLaunchdJobs, processTable, runSmoke, verifyInstallation, waitForPluginCleanup } from "./smoke.mjs";
 
 const COMMIT = "c".repeat(40);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -231,23 +231,43 @@ test("smoke cancellation interrupts its wait and removes TERM-ignoring groups wi
 });
 
 
-test("installed plugin ownership requires a live isolated supervisor and private groups", () => {
+test("installed plugin ownership requires its daemon's registered launchd cleaner and live private groups", () => {
   const rows = [
     { pid: 100, parent: 1, group: 100, state: "S" },
-    { pid: 101, parent: 100, group: 101, state: "S" },
+    { pid: 101, parent: 1, group: 101, state: "S" },
     { pid: 102, parent: 101, group: 102, state: "S" },
+    { pid: 103, parent: 102, group: 103, state: "S" },
+    { pid: 104, parent: 102, group: 102, state: "S" },
   ];
-  assert.equal(assertOwnedPluginPid(100, 102, rows), 101);
+  const label = `com.layerdynamics.alloy.cohort.501.100.9001.${"a".repeat(32)}`;
+  const jobs = parseLaunchdJobs(`PID Status Label\n101 0 ${label}\n- 0 ignored.inactive.job\n`);
+  assert.deepEqual(jobs, [{ pid: 101, label }]);
+  assert.deepEqual(assertOwnedPluginPid(100, 103, rows, jobs, 501), {
+    supervisor_pid: 102, cleaner_pid: 101, revoker_pid: 104, cohort_job: label,
+  });
   for (const change of [
-    { index: 2, parent: 100 }, { index: 1, parent: 99 },
-    { index: 1, state: "Z" }, { index: 2, state: "Z" },
-    { index: 1, group: 100 }, { index: 2, group: 101 },
+    { index: 3, parent: 100 }, { index: 2, parent: 100 }, { index: 1, parent: 99 },
+    { index: 1, state: "Z" }, { index: 2, state: "Z" }, { index: 3, state: "Z" },
+    { index: 1, group: 100 }, { index: 2, group: 101 }, { index: 3, group: 102 },
+    { index: 4, state: "Z" }, { index: 4, group: 999 },
   ]) {
     const altered = rows.map(row => ({ ...row }));
     Object.assign(altered[change.index], change);
-    assert.throws(() => assertOwnedPluginPid(100, 102, altered));
+    assert.throws(() => assertOwnedPluginPid(100, 103, altered, jobs, 501));
   }
-  assert.throws(() => assertOwnedPluginPid(100, 102, rows.filter(row => row.pid !== 101)));
+  for (const missing of [101, 102, 103, 104]) {
+    assert.throws(() => assertOwnedPluginPid(100, 103, rows.filter(row => row.pid !== missing), jobs, 501));
+  }
+  for (const wrong of [[], [{ pid: 102, label }], [{ pid: 101, label: label.replace(".100.", ".999.") }],
+    [{ pid: 101, label: label.replace(".501.", ".502.") }], [{ pid: 101, label: label.replace(".9001.", ".0.") }]]) {
+    assert.throws(() => assertOwnedPluginPid(100, 103, rows, wrong, 501));
+  }
+});
+
+test("installed cleanup rejects a leftover revoker after plugin, gate and cleaner exit", async () => {
+  const owner = { supervisor_pid: 102, cleaner_pid: 101, revoker_pid: 104 };
+  await assert.rejects(waitForPluginCleanup(103, owner, { read: async () => [{ pid: 104 }], timeoutMs: 1 }), /revoker remained/);
+  await waitForPluginCleanup(103, owner, { read: async () => [{ pid: 999 }], timeoutMs: 1 });
 });
 
 

@@ -2,6 +2,12 @@
 
 Implementation review checklist; this file is NOT a claim of independent approval.
 
+The process-group probes and lifecycle limitations below record the original W5
+implementation. The current native Mac broker and descendant-lifetime backend
+supersedes those Mac trusted-descendant/supervisor limits; see
+[native ownership and its qualification boundary](macos-broker-recovery.md).
+Historical negative evidence is retained here to explain the change.
+
 ## V1 restrictions
 
 Less-trusted macOS plugins use deny-default Seatbelt with no network grant.
@@ -98,8 +104,10 @@ process-wide child reaper or SIGCHLD auto-reaping must use
 PIDs and leaves those statuses to the registered reaper. Plugin completion and
 errors still come from shared memory. This explicit mode closes the separate
 numeric-wait/PID-reuse exit-status race; mixing an uncoordinated reaper with
-host-owned mode is unsupported. The isolated integration test requires the
-external reaper to collect exactly both supervisor statuses (pipe and plugin).
+host-owned mode is unsupported for the pipe-allocation helper. In the current
+native Mac integration test the external reaper collects exactly that one host
+child status. The trusted workload supervisor is owned by launchd, so counting
+it as a second embedding-host child would contradict the current ownership model.
 
 
 Research references: Apple's [process identity and audited signal implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c),

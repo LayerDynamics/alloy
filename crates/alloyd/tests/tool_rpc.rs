@@ -333,7 +333,9 @@ fn pause_running_operation(evicted: bool, hook: bool) {
     let dir = tempfile::tempdir().unwrap();
     let cwd = std::fs::canonicalize(dir.path()).unwrap();
     let shell = std::fs::canonicalize("/bin/sh").unwrap();
-    let args = json!({"executable":shell,"args":["-c","echo $$ > owned.pid; exec /bin/sleep 60"],"cwd":cwd});
+    // Creation alone is not publication: the reader must never observe the
+    // empty file between shell redirection and echo. Rename the complete PID.
+    let args = json!({"executable":shell,"args":["-c","echo $$ > owned.pid.tmp; /bin/mv owned.pid.tmp owned.pid; exec /bin/sleep 60"],"cwd":cwd});
     let engine = ScriptedEngine::new(vec![
         vec![proposal("shell.run", args.clone()), done()],
         vec![
@@ -479,6 +481,10 @@ fn pause_running_operation(evicted: bool, hook: bool) {
         }
         std::fs::read_to_string(pidfile).unwrap().trim().to_owned()
     };
+    let pid: i32 = pid
+        .parse()
+        .expect("fixture must publish a complete integer PID");
+    assert!(pid > 1 && pid != std::process::id() as i32);
     struct Sentinel(std::process::Child);
     impl Drop for Sentinel {
         fn drop(&mut self) {
@@ -598,22 +604,19 @@ fn pause_running_operation(evicted: bool, hook: bool) {
         "unrelated sentinel died during pause"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
     loop {
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-p", &pid, "-o", "stat="])
-            .output()
-            .unwrap();
-        if !output.status.success() {
-            assert_eq!(output.status.code(), Some(1), "ps failed unexpectedly");
-            assert!(
-                output.stderr.is_empty(),
-                "ps inspection failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+        // SAFETY: signal zero observes existence without delivering any signal.
+        if unsafe { kill(pid, 0) } != 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(3),
+                "PID inspection must establish ESRCH, not an observation failure"
             );
             break;
         }
-        let status = std::str::from_utf8(&output.stdout).unwrap().trim();
-        assert!(!status.is_empty(), "ps succeeded without process state");
         assert!(
             std::time::Instant::now() < deadline,
             "paused shell {pid} survived"

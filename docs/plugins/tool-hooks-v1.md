@@ -56,16 +56,21 @@ On macOS the host needs both `alloy-plugin-pipe-helper` and
 `cargo build --locked -p alloyd -p harness-core`; library embedders may instead
 provide its absolute path to `PluginHost::start_with_helper`. A missing or invalid
 helper fails registration. The exec helper must be beside the canonical pipe
-helper; it exclusively owns target reaping and group cleanup. The pipe helper creates pipe endpoints in a single-threaded
+helper; it provides the isolated target owner. Trusted workloads use the
+launchd/coalition backend described in [native ownership](macos-broker-recovery.md).
+The pipe helper creates pipe endpoints in a single-threaded
 process and transfers them through a private Mach port; the host checks the
 kernel-supplied sender identity and imports close-on-exec descriptors.
 
 Embedders with a process-wide child reaper must use the macOS
 `PluginHost::start_with_external_reaper` entry point and keep that reaper active
-through supervisor exit. It accepts an optional absolute pipe-helper path and
-never waits for supervisor PIDs. Default startup owns supervisor statuses and
-requires exclusive reaping. Both modes preserve trusted subprocesses in the
-plugin's original process group; neither contains malicious trusted descendants.
+through pipe-supervisor exit. It accepts an optional absolute pipe-helper path
+and never waits for host-child supervisor PIDs. Default startup exclusively reaps
+the pipe-allocation supervisor. In both modes launchd owns the trusted workload's
+supervisor; it is not an embedding-host child. Native Mac cleanup includes direct
+descendants that detach from the original process group. The declared-I/O sandbox
+continues to deny plugin subprocess creation; trusted mode does not supply that
+filesystem/network isolation.
 
 On Linux an isolated supervisor owns each plugin as its direct child. The host
 obtains the supervisor's pidfd atomically at creation, commits startup over a

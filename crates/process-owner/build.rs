@@ -2,6 +2,11 @@ fn main() {
     println!("cargo:rerun-if-changed=native/fileport.c");
     println!("cargo:rerun-if-changed=native/owned_process.c");
     println!("cargo:rerun-if-changed=native/owned_process.h");
+    println!("cargo:rerun-if-changed=native/macos_containment.c");
+    println!("cargo:rerun-if-changed=native/macos_cohort_records.c");
+    println!("cargo:rerun-if-changed=native/macos_containment.h");
+    println!("cargo:rerun-if-changed=native/macos_cohort_service.inc");
+    println!("cargo:rerun-if-changed=native/macos_verification_service.inc");
     println!("cargo:rerun-if-changed=native/linux_supervisor.c");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         cc::Build::new()
@@ -11,12 +16,18 @@ fn main() {
             .compile("alloy_linux_supervisor");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        cc::Build::new()
+        let mut native = cc::Build::new();
+        native
             .file("native/fileport.c")
             .file("native/owned_process.c")
+            .file("native/macos_containment.c")
+            .file("native/macos_cohort_records.c")
             .flag("-std=c11")
-            .warnings(true)
-            .compile("alloy_fileport");
+            .warnings(true);
+        if std::env::var("PROFILE").as_deref() == Ok("debug") {
+            native.define("ALLOY_OWNED_PROCESS_TEST", None);
+        }
+        native.compile("alloy_fileport");
         println!("cargo:rustc-link-lib=bsm");
         println!("cargo:rerun-if-changed=native/helper_main.c");
         if std::env::var("PROFILE").as_deref() == Ok("debug") {
@@ -30,9 +41,12 @@ fn main() {
                 command
                     .args([
                         "-std=c11",
+                        "-DALLOY_OWNED_PROCESS_TEST",
                         "native/helper_main.c",
                         "native/fileport.c",
                         "native/owned_process.c",
+                        "native/macos_containment.c",
+                        "native/macos_cohort_records.c",
                         "-lbsm",
                         "-o",
                     ])
