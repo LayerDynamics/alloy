@@ -5,10 +5,11 @@ use alloyd::{
     handle_connection,
 };
 use engine::api::{Engine, EngineFuture};
+use engine::registry::ModelProfile;
 use engine::types::{
     ArtifactId, CancelOutcome, Capabilities, ContextSnapshot, Generation, GenerationEvent,
-    GenerationEventStream, GenerationRequest, GenerationStream, MemoryEstimate, ModelProfileId,
-    ReleaseOutcome, RenderedContext, RequestId, SessionStateId,
+    GenerationEventStream, GenerationOptions, GenerationRequest, GenerationStream, MemoryEstimate,
+    ModelProfileId, ReleaseOutcome, RenderedContext, RequestId, SessionStateId,
 };
 use harness_core::{HardwareTier, TelemetryClient};
 use serde_json::{Value, json};
@@ -152,6 +153,47 @@ impl Engine for GatedFixtureEngine {
 
     fn capabilities(&self, artifact_id: ArtifactId) -> EngineFuture<'_, Capabilities> {
         self.inner.capabilities(artifact_id)
+    }
+}
+
+// Exercise RPC propagation using the same profile arithmetic as runtime admission.
+struct TurnBoundaryEngine {
+    inner: FixtureEngine,
+    profile: ModelProfile,
+}
+
+impl Engine for TurnBoundaryEngine {
+    fn api_version(&self) -> u32 {
+        self.inner.api_version()
+    }
+    fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {
+        self.inner.render_and_count(context)
+    }
+    fn estimate_memory(
+        &self,
+        profile: ModelProfileId,
+        input_tokens: usize,
+    ) -> EngineFuture<'_, MemoryEstimate> {
+        self.inner.estimate_memory(profile, input_tokens)
+    }
+    fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
+        let count = request
+            .expected_render()
+            .expect("supervisor binds counted render")
+            .token_count();
+        if let Err(error) = self.profile.check_context(count) {
+            return Box::pin(async move { Err(error) });
+        }
+        self.inner.generate(request)
+    }
+    fn cancel(&self, id: RequestId) -> EngineFuture<'_, CancelOutcome> {
+        self.inner.cancel(id)
+    }
+    fn release_session_state(&self, id: SessionStateId) -> EngineFuture<'_, ReleaseOutcome> {
+        self.inner.release_session_state(id)
+    }
+    fn capabilities(&self, id: ArtifactId) -> EngineFuture<'_, Capabilities> {
+        self.inner.capabilities(id)
     }
 }
 
@@ -318,6 +360,62 @@ fn call(socket: &std::path::Path, request: Value) -> Vec<Value> {
         }
     }
     out
+}
+
+#[test]
+fn rpc_turn_context_boundary_reserves_output_and_margin() {
+    let dir = tempdir().unwrap();
+    let profile = ModelProfile::new(
+        ModelProfileId::new("fixture-profile").unwrap(),
+        ArtifactId::new("alloyd-fixture").unwrap(),
+        5,
+        2,
+        1,
+        GenerationOptions::greedy(2).unwrap(),
+    )
+    .unwrap();
+    let (socket, _, server) = start_server_with_engine(
+        dir.path(),
+        "boundary.sock",
+        TurnBoundaryEngine {
+            inner: FixtureEngine::new("ok"),
+            profile,
+        },
+        0,
+        0,
+    );
+    for (id, content, fits) in [(1, "hello world", true), (2, "hello world test", false)] {
+        let created = call(
+            &socket,
+            json!({"jsonrpc":"2.0", "id":id, "api_version":API_VERSION,
+            "method":"session.create", "params":{"profile":"fixture-profile"}}),
+        );
+        let session = created[0]["result"]["session_id"].as_str().unwrap();
+        let response = call(
+            &socket,
+            json!({"jsonrpc":"2.0", "id":id, "api_version":API_VERSION,
+            "method":"session.send", "params":{"session_id":session,"content":content}}),
+        );
+        let final_response = response.last().unwrap();
+        if fits {
+            assert_eq!(final_response["result"]["ok"], true, "{response:?}");
+        } else {
+            assert!(
+                final_response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("start a new session or select a profile with a larger context"),
+                "{response:?}"
+            );
+            assert!(
+                !response
+                    .iter()
+                    .any(|line| line["params"]["event"] == "text_delta"),
+                "{response:?}"
+            );
+        }
+    }
+    server.stop();
 }
 
 #[test]
