@@ -14,3 +14,19 @@ Baseline: `4d158b9cd3cf67ceefdd836095167b9ddf60049d`. Phase 2 prerequisite #34 i
 ## Review and evidence
 
 Each focused change retains actual command exit status, candidate SHA, pinned dependencies and artifacts; report host fixtures separately from real-model and performance evidence. A plan, source review, mock, or successful build is not a runtime qualification. Fail closed on missing profile evidence. No later registry, scheduling or conversion milestone is a circular prerequisite for initial M3 native profiles.
+
+## Family work packages: planned files and named tests
+
+Each family uses `crates/families/<family>/Cargo.toml`, `src/{lib.rs,config.rs,model.rs,weights.rs,register.rs}`, `tests/{config.rs,numerical.rs,agent_conformance.rs}` and `fixture/` pin manifests; the exact `<family>` directories and special files follow. Shared changes are `Cargo.toml`, `Cargo.lock`, `crates/engine/src/{backends/mod.rs,registry.rs}`, `crates/alloyd/src/boot.rs`, and `bench/corpus/models.json`. These are planned paths, not claims that kernels, weights, or tests already exist. If architecture inspection shows a different decomposition, amend this list before implementing it.
+
+| Issue | Family paths in addition to common set | Named tests and explicit architectural questions |
+|---|---|---|
+| #52 Llama 3 | `crates/families/llama3/src/{attention.rs,rope.rs,template.rs}`; `tests/{cache.rs,quantized_loading.rs}` | `llama3_reference_logits`, `llama3_rope_positions`, `llama3_4bit_8bit_load`, `llama3_tool_stop_context_cache` |
+| #73 Gemma 3 | `crates/families/gemma3/src/{attention.rs,rope.rs,template.rs}`; `tests/{sliding_attention.rs,quantized_loading.rs}` | `gemma3_reference_logits`, `gemma3_sliding_full_attention`, `gemma3_template_stops`, `gemma3_agent_context_cache` |
+| #95 Ornith/Qwen3.5 | `crates/families/qwen35/src/{attention.rs,linear_attention.rs,recurrent_state.rs,template.rs}`; `tests/{recurrent_state.rs,quantized_loading.rs}` | `qwen35_reference_logits`, `ornith_pinned_native_agent`, `qwen35_recurrent_state_edit_restart`, `ornith_tool_context_compaction_cache` |
+| #96 Gemma 4 | `crates/families/gemma4/src/{attention.rs,shared_kv.rs,embeddings.rs,template.rs}`; `tests/{shared_kv.rs,quantized_loading.rs}` | `gemma4_reference_logits`, `gemma4_shared_kv_sliding_full`, `gemma4_embedding_logit_behavior`, `gemma4_agent_context_cache` |
+| #97 Phi | `crates/families/phi/src/{attention.rs,rope.rs,template.rs}`; `tests/{position_attention.rs,quantized_loading.rs}` | `phi4mini_reference_logits`, `phi4mini_position_attention`, `phi4mini_template_stop_tool`, `phi4mini_agent_context_cache` |
+| #98 SmolLM | `crates/families/smollm/src/{attention.rs,rope.rs,template.rs}`; `tests/{position_attention.rs,quantized_loading.rs}` | `smollm3_reference_logits`, `smollm3_attention_position`, `smollm3_reasoning_template_tools`, `smollm3_agent_context_cache` |
+| #99 Mistral/Ministral | `crates/families/mistral/src/{attention.rs,rope.rs,template.rs,text_checkpoint.rs}`; `tests/{sliding_attention.rs,quantized_loading.rs}` | `ministral3_reference_logits`, `ministral3_text_checkpoint_loading`, `ministral3_position_sliding_attention`, `ministral3_agent_context_cache` |
+
+The conformance owner #72 adds `crates/engine/tests/m3_profile_conformance.rs`, `crates/alloyd/tests/m3_agent_conformance.rs`, `scripts/m3-profile-conformance.sh`, and `docs/acceptance/phase-3-profile-conformance.md`; named gates are `m3_profile_numerical_reference`, `m3_profile_tool_schema_stop`, `m3_profile_long_context_compaction`, `m3_profile_cached_uncached`, `m3_profile_stream_cancel_restart`, `m3_profile_memory_tiers`, and `m3_profile_real_policy_gated_task`. Qwen3 text and Coder each need a pinned profile and the same applicable gates. Reference thresholds and artifact hashes are recorded with the test fixtures before qualification. Real execution evidence and candidate SHA are required; proposed names do not establish that a test or implementation exists.

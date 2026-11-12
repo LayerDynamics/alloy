@@ -85,6 +85,11 @@ impl ContextBuilder {
                 .checked_add(1)
                 .ok_or_else(|| invalid("event sequence overflow"))?;
             match event.kind {
+                EventKind::SkillLoaded | EventKind::ContextCompacted => {
+                    return Err(invalid(
+                        "skill or checkpoint context is not yet supported; cannot safely reconstruct this session",
+                    ));
+                }
                 EventKind::UserMessage | EventKind::AssistantMessage => {
                     let message = Message {
                         role: if event.kind == EventKind::UserMessage {

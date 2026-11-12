@@ -461,6 +461,7 @@ pub struct GenerationRequest {
     profile_id: ModelProfileId,
     context: ContextSnapshot,
     options: GenerationOptions,
+    expected_render: Option<RenderedContext>,
 }
 
 impl GenerationRequest {
@@ -483,7 +484,28 @@ impl GenerationRequest {
             profile_id,
             context,
             options,
+            expected_render: None,
         })
+    }
+
+    /// Require generation to use precisely the previously counted rendering.
+    /// The engine independently verifies this value against its current render.
+    pub fn with_expected_render(mut self, rendered: RenderedContext) -> Result<Self, EngineError> {
+        if rendered.snapshot_id() != self.context.snapshot_id()
+            || rendered.profile_id() != &self.profile_id
+        {
+            return Err(EngineError::invalid_request(
+                "expected_render",
+                "rendered context does not match the request snapshot and profile",
+            ));
+        }
+        self.expected_render = Some(rendered);
+        Ok(self)
+    }
+
+    /// Previously counted rendering, if exact render verification is required.
+    pub fn expected_render(&self) -> Option<&RenderedContext> {
+        self.expected_render.as_ref()
     }
 
     /// Return the request identifier.

@@ -32,6 +32,11 @@ impl ContextBuilder {
             let role = match event.kind {
                 EventKind::UserMessage => MessageRole::User,
                 EventKind::AssistantMessage => MessageRole::Assistant,
+                EventKind::SkillLoaded | EventKind::ContextCompacted => {
+                    return Err(HarnessError::Invalid(
+                        "skill or checkpoint context is not yet supported; cannot safely reconstruct this session".into(),
+                    ));
+                }
                 EventKind::ToolRequested
                 | EventKind::ToolApproved
                 | EventKind::ToolStarted

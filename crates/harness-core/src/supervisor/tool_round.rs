@@ -176,6 +176,7 @@ impl<E: Engine> Supervisor<E> {
             snapshot,
             options,
         )
+        .and_then(|request| request.with_expected_render(rendered.clone()))
         .map_err(HarnessError::from)?;
         // Re-check after registering the exact cancellation ID; no lock crosses the callback.
         let result = (|| {

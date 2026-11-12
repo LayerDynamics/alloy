@@ -219,6 +219,8 @@ pub trait Engine: Send + Sync {
     ///
     /// Startup failures return directly. After a handle is returned,
     /// execution failures are delivered through the generation stream.
+    /// If the request carries an expected rendering, implementations must
+    /// reject any difference before model execution and use that exact input.
     ///
     /// Dropping the returned stream requests cancellation; it does not
     /// release the worker's execution permit.
@@ -385,6 +387,16 @@ impl<R: EngineRuntime> Engine for EngineCore<R> {
             permit.check_cancelled()?;
 
             let rendered = self.render_and_count(request.context().clone()).await?;
+
+            if request
+                .expected_render()
+                .is_some_and(|expected| expected != &rendered)
+            {
+                return Err(EngineError::invalid_request(
+                    "expected_render",
+                    "context rendering changed after token counting; rebuild the snapshot and retry",
+                ));
+            }
 
             permit.check_cancelled()?;
 

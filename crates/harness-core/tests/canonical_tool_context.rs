@@ -126,6 +126,17 @@ fn snapshot(
         limits(),
     )
 }
+
+#[test]
+fn tool_snapshot_rejects_unhandled_skill_and_checkpoint_events() {
+    for kind in [EventKind::SkillLoaded, EventKind::ContextCompacted] {
+        let (_dir, mut store, registry, _count) = setup();
+        append(&mut store, kind, "unhandled model context");
+        let events = store.list_events(SESSION).unwrap();
+        let error = snapshot(&events, &registry).expect_err("must reject omitted context");
+        assert!(error.to_string().contains("skill or checkpoint context"));
+    }
+}
 fn finish(store: &mut SessionStore, registry: &ToolRegistry, result: ToolResult) {
     let policy = policy(false);
     store
