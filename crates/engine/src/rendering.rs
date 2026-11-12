@@ -336,6 +336,71 @@ pub fn qwen3_projected_token_upper_bound(
     })
 }
 
+/// Bound a Qwen tool-template skeleton after replacing its last result
+/// placeholders with bounded results. The pinned tokenizer recognizes each
+/// `<|im_start|>` as a non-normalized, non-stripping added token, so BPE and
+/// NFC processing cannot cross those message boundaries. Existing segments
+/// are charged at the exact skeleton count; each changing segment is charged
+/// again at the conservative byte bound. The deliberate double charge avoids
+/// subtracting tokens attributed to a segment.
+pub fn qwen3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const START: &str = "<|im_start|>";
+    const RESULT: &str = "<|im_start|>tool\n<tool_response>";
+    if result_count == 0 {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "a projected result is required",
+        ));
+    }
+    let text = rendered.text();
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (start, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let next = text[start + RESULT.len()..]
+            .find(START)
+            .map(|offset| start + RESULT.len() + offset)
+            .ok_or_else(|| {
+                EngineError::invalid_request(
+                    "projection",
+                    "result placeholder has no following message boundary",
+                )
+            })?;
+        let segment = &text[start..next];
+        if !segment.contains("\"content\":\"\"") || !segment.contains("</tool_response><|im_end|>")
+        {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "result placeholder is not empty",
+            ));
+        }
+        segment_bytes = segment_bytes.checked_add(segment.len()).ok_or_else(|| {
+            EngineError::invalid_request("projection", "result segment byte overflow")
+        })?;
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing result placeholders",
+        ));
+    }
+    let variable_bytes = segment_bytes
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "result byte bound overflow"))?;
+    rendered
+        .token_count()
+        .checked_add(qwen3_projected_token_upper_bound(
+            tokenizer,
+            variable_bytes,
+        )?)
+        .ok_or_else(|| EngineError::invalid_request("projection", "token bound overflow"))
+}
+
 /// Render exact model-visible text from a structured text snapshot.
 ///
 /// Uses the supplied pinned template. No fallback template is selected.

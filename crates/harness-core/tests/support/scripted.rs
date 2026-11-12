@@ -57,12 +57,12 @@ impl Engine for ScriptedEngine {
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
     }
-    fn check_projected_rendered_bytes(
-        &self,
-        _: ModelProfileId,
-        bytes: usize,
-    ) -> EngineFuture<'_, ()> {
+    fn check_projected_tool_render<'a>(
+        &'a self,
+        projection: engine::api::ProjectedToolRender<'a>,
+    ) -> EngineFuture<'a, ()> {
         let limit = self.projected_byte_limit;
+        let bytes = projection.input_bytes;
         Box::pin(async move {
             if bytes > limit {
                 Err(engine::error::EngineError::ContextLimitExceeded {

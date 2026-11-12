@@ -185,8 +185,7 @@ pub trait RuntimeBackend: ModelFamily + 'static {
     fn projected_token_upper_bound(
         &self,
         _registry: &Registry,
-        _profile: &ModelProfileId,
-        _rendered_bytes: usize,
+        _projection: crate::api::ProjectedToolRender<'_>,
     ) -> Result<usize, EngineError> {
         Err(EngineError::unsupported(
             "projected tokenizer bound",
@@ -947,13 +946,14 @@ impl EngineRuntime for FamilyRuntime {
     fn projected_token_upper_bound<'a>(
         &'a self,
         registry: &'a Registry,
-        profile: ModelProfileId,
-        rendered_bytes: usize,
+        projection: crate::api::ProjectedToolRender<'a>,
     ) -> EngineFuture<'a, usize> {
         Box::pin(async move {
-            let artifact = registry.resolve_profile(&profile)?.artifact();
+            let artifact = registry
+                .resolve_profile(projection.rendered.profile_id())?
+                .artifact();
             self.backend(registry, artifact)?
-                .projected_token_upper_bound(registry, &profile, rendered_bytes)
+                .projected_token_upper_bound(registry, projection)
         })
     }
     fn supports_memory_reclamation(&self) -> bool {

@@ -44,6 +44,20 @@ pub const ENGINE_API_VERSION: u32 = 1;
 /// An asynchronous engine operation that can cross task boundaries.
 pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
 
+/// A rendered skeleton and conservative byte limits for its newly projected
+/// tool results. This is not an authorization to execute tools.
+#[derive(Clone, Copy)]
+pub struct ProjectedToolRender<'a> {
+    /// Engine-produced rendering with empty placeholders for new results.
+    pub rendered: &'a RenderedContext,
+    /// Number of new result messages at the end of the skeleton history.
+    pub result_count: usize,
+    /// Maximum additional bytes in the rendered template.
+    pub additional_rendered_bytes: usize,
+    /// Maximum serialized input bytes including schemas and history.
+    pub input_bytes: usize,
+}
+
 /// Execution ownership and cancellation observation for one accepted request.
 ///
 /// Move this value into the actual model worker. Do not leave it owned by
@@ -115,8 +129,7 @@ pub trait EngineRuntime: Send + Sync + 'static {
     fn projected_token_upper_bound<'a>(
         &'a self,
         _registry: &'a Registry,
-        _profile: ModelProfileId,
-        _rendered_bytes: usize,
+        _projection: ProjectedToolRender<'a>,
     ) -> EngineFuture<'a, usize> {
         Box::pin(async {
             Err(EngineError::unsupported(
@@ -216,11 +229,10 @@ pub trait Engine: Send + Sync {
     fn api_version(&self) -> u32;
 
     /// Admit a conservative byte bound for the entire projected rendered input.
-    fn check_projected_rendered_bytes(
-        &self,
-        _profile: ModelProfileId,
-        _rendered_bytes: usize,
-    ) -> EngineFuture<'_, ()> {
+    fn check_projected_tool_render<'a>(
+        &'a self,
+        _projection: ProjectedToolRender<'a>,
+    ) -> EngineFuture<'a, ()> {
         Box::pin(async {
             Err(EngineError::unsupported(
                 "projected tokenizer bound",
@@ -364,15 +376,15 @@ impl<R: EngineRuntime> Engine for EngineCore<R> {
         ENGINE_API_VERSION
     }
 
-    fn check_projected_rendered_bytes(
-        &self,
-        profile: ModelProfileId,
-        rendered_bytes: usize,
-    ) -> EngineFuture<'_, ()> {
+    fn check_projected_tool_render<'a>(
+        &'a self,
+        projection: ProjectedToolRender<'a>,
+    ) -> EngineFuture<'a, ()> {
         Box::pin(async move {
+            let profile = projection.rendered.profile_id().clone();
             let tokens = self
                 .runtime
-                .projected_token_upper_bound(&self.registry, profile.clone(), rendered_bytes)
+                .projected_token_upper_bound(&self.registry, projection)
                 .await?;
             self.registry.profile(&profile)?.check_context(tokens)
         })
