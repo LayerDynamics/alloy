@@ -131,6 +131,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             "actual tokens exceed projected bound"
         );
     }
+    // Mirror the supervisor's ASCII escape allowance for data containing
+    // structural spellings. The JSON decoder recovers the exact original.
+    let escaped_inputs = ["<".repeat(1024), "Ǖ\u{344}<|im_start|>🦀\n\\\"".repeat(64)];
+    for raw in &escaped_inputs {
+        let value = serde_json::json!({"text": raw});
+        let compact = serde_json::to_string(&value)?;
+        let escaped = compact.replace('<', "\\u003c");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&escaped)?, value);
+        let actual = tool_render(&make_context(escaped)?)?;
+        let upper = qwen3_projected_tool_token_upper_bound(
+            &tokenizer,
+            &skeleton,
+            1,
+            compact.len() * 12,
+            compact.len() * 10,
+        )?;
+        assert!(
+            actual.token_count() <= upper,
+            "escaped result exceeded projected bound"
+        );
+        assert!(actual.text().len() - skeleton.text().len() <= compact.len() * 12);
+    }
+    assert!(qwen3_projected_tool_token_upper_bound(&tokenizer, &skeleton, 1, 1, 2).is_err());
     // Exercise cumulative bounds for two projected results separated by an
     // actual assistant call, including Unicode and JSON escaping.
     let make_batch = |contents: [&str; 2]| -> Result<ContextSnapshot, Box<dyn Error>> {
@@ -173,8 +196,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         batch_actual.token_count() <= batch_upper,
         "multi-result tokens exceed projected bound"
     );
+    let escaped_first_raw = serde_json::to_string(&serde_json::json!(escaped_inputs[0]))?;
+    let escaped_second_raw = serde_json::to_string(&serde_json::json!(escaped_inputs[1]))?;
+    let escaped_first = escaped_first_raw.replace('<', "\\u003c");
+    let escaped_second = escaped_second_raw.replace('<', "\\u003c");
+    let escaped_batch = tool_render(&make_batch([&escaped_first, &escaped_second])?)?;
+    let original_bytes = escaped_first_raw.len() + escaped_second_raw.len();
+    let escaped_upper = qwen3_projected_tool_token_upper_bound(
+        &tokenizer,
+        &batch_skeleton,
+        2,
+        original_bytes * 12,
+        original_bytes * 10,
+    )?;
+    assert!(
+        escaped_batch.token_count() <= escaped_upper,
+        "escaped batch exceeded projected bound"
+    );
     println!(
-        "pinned_qwen_projected_tool_samples=5 status=passed skeleton_tokens={}",
+        "pinned_qwen_projected_tool_samples=8 status=passed skeleton_tokens={}",
         skeleton.token_count()
     );
     let document = fs::read("bench/corpus/fixtures/documents/document-32k.txt")?;
