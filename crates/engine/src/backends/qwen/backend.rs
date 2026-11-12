@@ -667,6 +667,7 @@ impl RuntimeBackend for Qwen3Backend {
             rendered,
             projection.result_count,
             projection.additional_rendered_bytes,
+            projection.additional_ascii_escape_bytes,
         )
     }
     fn cache_manifest_digest(

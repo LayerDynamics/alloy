@@ -588,7 +588,7 @@ impl<E: Engine> Supervisor<E> {
             .try_fold(0usize, |n, message| n.checked_add(message.content.len()))
             .ok_or_else(|| HarnessError::Engine("projected input overflow".into()))?;
         let fits = |inline_bytes: usize| -> HarnessResult<bool> {
-            let extra = result_limits
+            let base = result_limits
                 .iter()
                 .try_fold(0usize, |total, (streaming, limit, error_limit)| {
                     let limit = if *streaming {
@@ -599,9 +599,15 @@ impl<E: Engine> Supervisor<E> {
                     // Escaping a literal `<` in compact JSON as `\u003c` can
                     // expand it sixfold. The enclosing JSON string can double
                     // every byte again; reserve both transformations.
-                    total.checked_add(limit.max(*error_limit).checked_mul(12)?)
+                    total.checked_add(limit.max(*error_limit).checked_mul(2)?)
                 })
                 .ok_or_else(|| HarnessError::Engine("projected tool batch overflow".into()))?;
+            let ascii_escape = base
+                .checked_mul(5)
+                .ok_or_else(|| HarnessError::Engine("projected escape overflow".into()))?;
+            let extra = base
+                .checked_add(ascii_escape)
+                .ok_or_else(|| HarnessError::Engine("projected result overflow".into()))?;
             let json_bytes = extra
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(base_json_bytes))
@@ -621,6 +627,7 @@ impl<E: Engine> Supervisor<E> {
                         rendered: &rendered,
                         result_count: proposed.len(),
                         additional_rendered_bytes: extra,
+                        additional_ascii_escape_bytes: ascii_escape,
                         input_bytes: input_bytes.max(render_bytes),
                     }),
                 config.round.deadline,

@@ -348,6 +348,7 @@ pub fn qwen3_projected_tool_token_upper_bound(
     rendered: &RenderedContext,
     result_count: usize,
     additional_bytes: usize,
+    ascii_escape_bytes: usize,
 ) -> Result<usize, EngineError> {
     const START: &str = "<|im_start|>";
     const RESULT: &str = "<|im_start|>tool\n<tool_response>";
@@ -390,7 +391,13 @@ pub fn qwen3_projected_tool_token_upper_bound(
         ));
     }
     let variable_bytes = segment_bytes
-        .checked_add(additional_bytes)
+        .checked_add(
+            additional_bytes
+                .checked_sub(ascii_escape_bytes)
+                .ok_or_else(|| {
+                    EngineError::invalid_request("projection", "ASCII escape bound exceeds total")
+                })?,
+        )
         .ok_or_else(|| EngineError::invalid_request("projection", "result byte bound overflow"))?;
     rendered
         .token_count()
@@ -398,6 +405,7 @@ pub fn qwen3_projected_tool_token_upper_bound(
             tokenizer,
             variable_bytes,
         )?)
+        .and_then(|n| n.checked_add(ascii_escape_bytes))
         .ok_or_else(|| EngineError::invalid_request("projection", "token bound overflow"))
 }
 

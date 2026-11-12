@@ -54,6 +54,8 @@ pub struct ProjectedToolRender<'a> {
     pub result_count: usize,
     /// Maximum additional bytes in the rendered template.
     pub additional_rendered_bytes: usize,
+    /// Portion of additional rendered bytes introduced solely as ASCII escapes.
+    pub additional_ascii_escape_bytes: usize,
     /// Maximum serialized input bytes including schemas and history.
     pub input_bytes: usize,
 }

@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "serialized result exceeds projected rendered byte bound"
         );
         let upper =
-            qwen3_projected_tool_token_upper_bound(&tokenizer, &skeleton, 1, content.len() * 2)?;
+            qwen3_projected_tool_token_upper_bound(&tokenizer, &skeleton, 1, content.len() * 2, 0)?;
         assert!(
             actual.token_count() <= upper,
             "actual tokens exceed projected bound"
@@ -167,6 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &batch_skeleton,
         2,
         (first.len() + second.len()) * 2,
+        0,
     )?;
     assert!(
         batch_actual.token_count() <= batch_upper,
