@@ -57,3 +57,20 @@ fn pinned_normalizer_canonical_decomposition_is_bounded_by_input_bytes() {
         );
     }
 }
+
+#[test]
+fn projected_unknown_tokenizer_rejects() {
+    use engine::rendering::{PinnedTokenizer, qwen3_projected_token_upper_bound};
+    use sha2::{Digest, Sha256};
+    let source = serde_json::to_vec(&serde_json::json!({
+        "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
+        "normalizer":null, "pre_tokenizer":{"type":"WhitespaceSplit"},
+        "post_processor":null, "decoder":null,
+        "model":{"type":"WordLevel", "vocab":{"[UNK]":0}, "unk_token":"[UNK]"}
+    }))
+    .unwrap();
+    let tokenizer =
+        PinnedTokenizer::from_pinned_json(&source, Sha256::digest(&source).into(), 16384).unwrap();
+    let error = qwen3_projected_token_upper_bound(&tokenizer, 1).unwrap_err();
+    assert!(matches!(error, EngineError::Unsupported { .. }), "{error}");
+}
