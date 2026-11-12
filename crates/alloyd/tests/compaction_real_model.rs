@@ -8,7 +8,6 @@ use harness_core::{
     ContextBuilder, EventKind, HardwareTier, SessionStore, Supervisor, TelemetryClient,
     telemetry::TelemetryTransport,
 };
-use serde_json::json;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -50,41 +49,6 @@ fn real_model_compaction_preserves_history_and_continues() {
         "Goal: refactor COBALT authentication. Constraint: keep the public API unchanged. Decision: use trait objects. Completed work: extracted the auth trait. Open task: migrate middleware. Artifact reference: art:12. Critical identifier: PR-42. Failure and lesson: bearer whitespace must be handled. Next action: migrate middleware. {}",
         "historic ".repeat(1000)
     );
-    db.append_event(
-        "real-compact",
-        EventKind::UserMessage,
-        json!({"content":old}),
-        json!([]),
-    )
-    .unwrap();
-    db.append_event(
-        "real-compact",
-        EventKind::AssistantMessage,
-        json!({"content":"Understood: COBALT, no public API changes, next migrate middleware."}),
-        json!([]),
-    )
-    .unwrap();
-    db.append_event(
-        "real-compact",
-        EventKind::RunCompleted,
-        json!({"status":"completed"}),
-        json!([]),
-    )
-    .unwrap();
-    let prior = db.list_events("real-compact").unwrap();
-    let prompt = format!(
-        "{} What is the project codename? Reply with the codename.",
-        "current ".repeat(500)
-    );
-    let snapshot =
-        ContextBuilder::build_snapshot("before", &boot.profile_id, &prior, Some(&prompt)).unwrap();
-    let tokens = ContextBuilder::render_and_count(&boot.engine, snapshot)
-        .unwrap()
-        .token_count();
-    assert!(
-        tokens + 512 + 64 > 2048,
-        "fixture must overflow, got {tokens}"
-    );
     let store = Mutex::new(db);
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
@@ -93,6 +57,29 @@ fn real_model_compaction_preserves_history_and_continues() {
         Box::new(Offline),
     ));
     let supervisor = Supervisor::new(boot.engine, telemetry);
+    let initial = supervisor
+        .run_turn(&store, "real-compact", &old, 64)
+        .expect("initial real-model turn");
+    assert!(!initial.assistant_text.is_empty());
+    let prior = store.lock().unwrap().list_events("real-compact").unwrap();
+    assert!(
+        prior
+            .iter()
+            .any(|event| event.kind == EventKind::AssistantMessage)
+    );
+    let prompt = format!(
+        "{} What is the project codename? Reply with the codename.",
+        "current ".repeat(500)
+    );
+    let snapshot =
+        ContextBuilder::build_snapshot("before", &boot.profile_id, &prior, Some(&prompt)).unwrap();
+    let tokens = ContextBuilder::render_and_count(supervisor.engine(), snapshot)
+        .unwrap()
+        .token_count();
+    assert!(
+        tokens + 512 + 64 > 2048,
+        "fixture must overflow, got {tokens}"
+    );
     let result = supervisor
         .run_turn(&store, "real-compact", &prompt, 128)
         .expect("compact and continue");
