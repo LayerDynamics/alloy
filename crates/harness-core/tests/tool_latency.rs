@@ -184,7 +184,10 @@ fn tool_roundtrip_overhead_under_50ms() {
         assert_eq!(payload.session_count, 0);
         assert_eq!(outcome.assistant_text, "read complete");
         let contexts = supervisor.engine().contexts.lock().unwrap();
-        assert!(format!("{:?}", contexts.last().unwrap().tool_context()).contains("actual fixture bytes"));
+        assert!(
+            format!("{:?}", contexts.last().unwrap().tool_context())
+                .contains("actual fixture bytes")
+        );
     }
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / SAMPLES as f64;
