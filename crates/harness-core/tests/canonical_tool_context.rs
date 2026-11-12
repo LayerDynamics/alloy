@@ -128,6 +128,43 @@ fn snapshot(
 }
 
 #[test]
+fn projected_tool_history_is_immutable_and_checks_call_result_linkage() {
+    let (_dir, store, registry, _count) = setup();
+    let base = snapshot(&store.list_events(SESSION).unwrap(), &registry).unwrap();
+    let tools = base.tool_context().unwrap();
+    let old_hash = *tools.schema_hash();
+    let blocks = vec![
+        ToolHistoryBlock::AssistantCall {
+            call_id: "projected-call".into(),
+            tool_id: "fixture.read".into(),
+            arguments: json!({"path":"fixture.txt"}).as_object().unwrap().clone(),
+        },
+        ToolHistoryBlock::ToolResult {
+            call_id: "projected-call".into(),
+            content: "projected result".into(),
+            is_error: false,
+        },
+    ];
+    let projected = tools.with_appended_history(blocks, limits()).unwrap();
+    assert_eq!(tools.history_len(), 0);
+    assert_eq!(projected.history_len(), 2);
+    assert_eq!(*projected.schema_hash(), old_hash);
+    assert!(
+        tools
+            .with_appended_history(
+                [ToolHistoryBlock::ToolResult {
+                    call_id: "missing".into(),
+                    content: "x".into(),
+                    is_error: false,
+                }],
+                limits()
+            )
+            .is_err()
+    );
+    assert_eq!(tools.history_len(), 0);
+}
+
+#[test]
 fn tool_snapshot_rejects_unhandled_skill_and_checkpoint_events() {
     for kind in [EventKind::SkillLoaded, EventKind::ContextCompacted] {
         let (_dir, mut store, registry, _count) = setup();

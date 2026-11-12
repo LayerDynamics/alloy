@@ -1185,6 +1185,29 @@ fn counted_render_is_used_for_generation_and_stale_identity_is_rejected() {
 }
 
 #[test]
+fn reused_snapshot_id_cannot_hide_changed_context_from_counted_render() {
+    let environment = TestEnvironment::prefix(discard_policy());
+    let original = environment.context.clone();
+    let counted = environment.render(original.clone());
+    let changed = context(
+        original.snapshot_id().as_str(),
+        original.profile_id().clone(),
+        "different content",
+    );
+    let request = environment
+        .request_with("changed-context", changed)
+        .with_expected_render(counted)
+        .expect("same tracing id is structurally valid");
+    let error = expect_failure(
+        block_on(environment.engine.generate(request)),
+        "changed context accepted",
+    );
+    assert!(error.to_string().contains("context rendering changed"));
+    assert_eq!(environment.work("changed-context").prefill_tokens.len(), 0);
+    environment.wait_unreserved();
+}
+
+#[test]
 fn real_generation_streams_exact_output_and_measured_usage() {
     let environment = TestEnvironment::new(4, 8, false);
     let generation = environment.start("real-output-limit");

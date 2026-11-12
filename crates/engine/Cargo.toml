@@ -23,3 +23,6 @@ workspace = true
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+unicode-normalization-alignments = "=0.1.12"

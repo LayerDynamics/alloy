@@ -625,6 +625,30 @@ impl Qwen3Backend {
 include!("loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
+    fn projected_token_upper_bound(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        rendered_bytes: usize,
+    ) -> Result<usize, EngineError> {
+        let artifact = registry.resolve_profile(profile)?.artifact();
+        let limit = self
+            .limits
+            .max_rendered_bytes
+            .min(self.limits.max_input_bytes);
+        if rendered_bytes > limit {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "projected tool context bytes",
+                required_bytes: u64::try_from(rendered_bytes).unwrap_or(u64::MAX),
+                available_bytes: u64::try_from(limit).unwrap_or(u64::MAX),
+                reason: MemoryLimitReason::BufferLimit,
+            });
+        }
+        rendering::qwen3_projected_token_upper_bound(
+            &self.data(artifact)?.tokenizer,
+            rendered_bytes,
+        )
+    }
     fn cache_manifest_digest(
         &self,
         artifact: &ArtifactRegistration,

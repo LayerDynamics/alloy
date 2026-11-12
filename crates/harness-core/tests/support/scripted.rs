@@ -19,6 +19,7 @@ pub struct ScriptedEngine {
     pub contexts: Mutex<Vec<ContextSnapshot>>,
     pub cancel_not_found: bool,
     pub cancel_not_found_id: Option<String>,
+    pub projected_byte_limit: usize,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -34,6 +35,7 @@ impl ScriptedEngine {
             contexts: Mutex::new(Vec::new()),
             cancel_not_found: false,
             cancel_not_found_id: None,
+            projected_byte_limit: usize::MAX,
         }
     }
 }
@@ -54,6 +56,25 @@ pub fn proposal(name: &str, args: serde_json::Value) -> GenerationEvent {
 impl Engine for ScriptedEngine {
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
+    }
+    fn check_projected_rendered_bytes(
+        &self,
+        _: ModelProfileId,
+        bytes: usize,
+    ) -> EngineFuture<'_, ()> {
+        let limit = self.projected_byte_limit;
+        Box::pin(async move {
+            if bytes > limit {
+                Err(engine::error::EngineError::ContextLimitExceeded {
+                    input_tokens: bytes,
+                    output_reserve_tokens: 0,
+                    safety_margin_tokens: 0,
+                    limit_tokens: limit,
+                })
+            } else {
+                Ok(())
+            }
+        })
     }
     fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {
         self.contexts.lock().unwrap().push(context.clone());

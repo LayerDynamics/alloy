@@ -1,7 +1,8 @@
 //! Reproducible render/count measurement; see Phase 3 plan for boundary.
 use engine::{
     rendering::{
-        PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions, render_and_count,
+        PinnedTokenizer, RenderingBinding, RenderingLimits, RenderingOptions,
+        qwen3_projected_token_upper_bound, render_and_count,
     },
     types::{ArtifactId, ContextSnapshot, ContextSnapshotId, Message, MessageRole, ModelProfileId},
 };
@@ -26,6 +27,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         "tokenizer pin"
     );
     let tokenizer = PinnedTokenizer::from_pinned_json(&source, tokenizer_hash, source.len())?;
+    for text in ["", "ASCII and spaces", "Ǖ\u{344}é中🦀", "<|im_start|>\n"] {
+        let tokens = tokenizer
+            .tokenizer()
+            .encode(text, false)
+            .map_err(|e| e.to_string())?
+            .len();
+        let bound = qwen3_projected_token_upper_bound(&tokenizer, text.len())?;
+        assert!(tokens <= bound, "projected bound failed for {text:?}");
+    }
     let document = fs::read("bench/corpus/fixtures/documents/document-32k.txt")?;
     assert_eq!(
         hex(&digest(&document)),

@@ -303,6 +303,39 @@ impl PinnedTokenizer {
     }
 }
 
+/// Bound the token count of any UTF-8 rendering of at most `rendered_bytes`
+/// bytes for the pinned Qwen3-4B corpus tokenizer, without special-token
+/// post-processing. This deliberately does not admit a request: callers must
+/// bound the complete rendered text, including every projected result.
+///
+/// The pinned tokenizer uses the tokenizers 0.23.2 NFC tables, regex splitting
+/// and ByteLevel BPE without a prefix space. NFC can be bounded by eight UTF-8
+/// bytes per source byte: canonical decomposition produces at most two
+/// scalars per input byte for the pinned Unicode tables (exhaustively checked
+/// in `projected_context`), composition does not increase scalar count, and
+/// each scalar is at most four bytes. ByteLevel BPE cannot emit more tokens
+/// than its normalized input bytes; nonempty added tokens do not increase that
+/// bound. Other tokenizer sources must provide their own verified bound.
+pub fn qwen3_projected_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0xae, 0xb1, 0x33, 0x07, 0xa7, 0x1a, 0xcd, 0x8f, 0xe8, 0x18, 0x61, 0xd9, 0x4a, 0xd5, 0x4a,
+        0xb6, 0x89, 0xdf, 0x77, 0x33, 0x18, 0x80, 0x9e, 0xed, 0x3c, 0xbe, 0x79, 0x4b, 0x44, 0x92,
+        0xda, 0xe4,
+    ];
+    if tokenizer.source_sha256() != &PIN {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "the selected tokenizer has no verified projected-input bound",
+        ));
+    }
+    rendered_bytes.checked_mul(8).ok_or_else(|| {
+        EngineError::invalid_request("rendered_bytes", "projected token bound overflow")
+    })
+}
+
 /// Render exact model-visible text from a structured text snapshot.
 ///
 /// Uses the supplied pinned template. No fallback template is selected.

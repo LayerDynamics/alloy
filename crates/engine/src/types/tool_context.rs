@@ -100,6 +100,25 @@ pub struct ToolContext {
     input_bytes: usize,
 }
 impl ToolContext {
+    /// Construct a new validated context with a projected historical tail.
+    ///
+    /// This does not mutate the original snapshot or authorize the projected
+    /// calls. Normal size, identity and call/result linkage checks apply to
+    /// the complete combined context.
+    pub fn with_appended_history(
+        &self,
+        blocks: impl IntoIterator<Item = ToolHistoryBlock>,
+        limits: ToolContextLimits,
+    ) -> Result<Self, EngineError> {
+        let mut history = self.history.clone();
+        for block in blocks {
+            if history.len() >= limits.max_history_blocks {
+                return Err(invalid("tool_context", "history count limit exceeded"));
+            }
+            history.push(block);
+        }
+        Self::new(self.tools.clone(), history, limits)
+    }
     /// Freeze schema order and validate historical call/result linkage.
     /// No registration, execution, policy, or approval is performed here.
     pub fn new(

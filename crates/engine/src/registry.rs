@@ -343,13 +343,25 @@ impl ModelProfile {
     ///
     /// This does not perform memory admission or acquire a reservation.
     pub fn check_context(&self, input_tokens: usize) -> Result<(), EngineError> {
-        let total = input_tokens
-            .checked_add(self.max_output_tokens)
+        self.check_context_with_growth(input_tokens, 0)
+    }
+
+    /// Check a current input together with a conservative upper bound on
+    /// additional model-visible tokens. Callers must establish that the
+    /// supplied bound covers their actual tokenizer and serialized inputs.
+    pub fn check_context_with_growth(
+        &self,
+        input_tokens: usize,
+        projected_growth_tokens: usize,
+    ) -> Result<(), EngineError> {
+        let projected_input = input_tokens.checked_add(projected_growth_tokens);
+        let total = projected_input
+            .and_then(|value| value.checked_add(self.max_output_tokens))
             .and_then(|value| value.checked_add(self.safety_margin_tokens));
 
         if total.is_none_or(|value| value > self.context_limit_tokens) {
             return Err(EngineError::ContextLimitExceeded {
-                input_tokens,
+                input_tokens: projected_input.unwrap_or(usize::MAX),
                 output_reserve_tokens: self.max_output_tokens,
                 safety_margin_tokens: self.safety_margin_tokens,
                 limit_tokens: self.context_limit_tokens,

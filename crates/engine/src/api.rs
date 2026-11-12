@@ -110,6 +110,21 @@ impl ExecutionContext {
 /// A runtime may dispatch to multiple registered model families. It must
 /// not hardcode a single family into the shared engine control path.
 pub trait EngineRuntime: Send + Sync + 'static {
+    /// Return a verified upper bound for tokenizing a rendered UTF-8 input of
+    /// the given maximum byte size, or reject unsupported tokenizers.
+    fn projected_token_upper_bound<'a>(
+        &'a self,
+        _registry: &'a Registry,
+        _profile: ModelProfileId,
+        _rendered_bytes: usize,
+    ) -> EngineFuture<'a, usize> {
+        Box::pin(async {
+            Err(EngineError::unsupported(
+                "projected tokenizer bound",
+                "backend has no verified bound",
+            ))
+        })
+    }
     /// Render and tokenize using the selected profile's real artifacts.
     ///
     /// The registry supplied here is the same registry used by EngineCore
@@ -200,10 +215,41 @@ pub trait Engine: Send + Sync {
     /// Return the engine API version implemented by this handle.
     fn api_version(&self) -> u32;
 
+    /// Admit a conservative byte bound for the entire projected rendered input.
+    fn check_projected_rendered_bytes(
+        &self,
+        _profile: ModelProfileId,
+        _rendered_bytes: usize,
+    ) -> EngineFuture<'_, ()> {
+        Box::pin(async {
+            Err(EngineError::unsupported(
+                "projected tokenizer bound",
+                "engine has no verified bound",
+            ))
+        })
+    }
+
     /// Render and tokenize the snapshot using its selected profile.
     ///
     /// Rendering does not reserve execution memory.
     fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext>;
+
+    /// Check an independently established upper bound on additional input
+    /// tokens against the selected profile's output reserve and margin.
+    /// Unknown implementations must fail closed rather than assume a limit.
+    fn check_projected_context(
+        &self,
+        _profile: ModelProfileId,
+        _input_tokens: usize,
+        _growth_tokens: usize,
+    ) -> EngineFuture<'_, ()> {
+        Box::pin(async {
+            Err(EngineError::unsupported(
+                "projected context admission",
+                "this engine cannot verify projected tool-result growth",
+            ))
+        })
+    }
 
     /// Estimate memory using the profile's maximum output allowance.
     ///
@@ -316,6 +362,33 @@ impl<R: EngineRuntime> Clone for EngineCore<R> {
 impl<R: EngineRuntime> Engine for EngineCore<R> {
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
+    }
+
+    fn check_projected_rendered_bytes(
+        &self,
+        profile: ModelProfileId,
+        rendered_bytes: usize,
+    ) -> EngineFuture<'_, ()> {
+        Box::pin(async move {
+            let tokens = self
+                .runtime
+                .projected_token_upper_bound(&self.registry, profile.clone(), rendered_bytes)
+                .await?;
+            self.registry.profile(&profile)?.check_context(tokens)
+        })
+    }
+
+    fn check_projected_context(
+        &self,
+        profile: ModelProfileId,
+        input_tokens: usize,
+        growth_tokens: usize,
+    ) -> EngineFuture<'_, ()> {
+        Box::pin(async move {
+            self.registry
+                .profile(&profile)?
+                .check_context_with_growth(input_tokens, growth_tokens)
+        })
     }
 
     fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {

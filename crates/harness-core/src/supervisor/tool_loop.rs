@@ -235,6 +235,20 @@ impl<E: Engine> Supervisor<E> {
                             values
                         }
                     };
+                // Check the complete proposed batch before persisting any tool
+                // intent or invoking a hook/implementation. The projected
+                // history is independent of authorization and cannot execute.
+                let admitted_inline_bytes = self.preflight_tool_batch(
+                    store,
+                    runtime,
+                    session,
+                    turn,
+                    &outcome.request_id,
+                    calls,
+                    &proposed,
+                    config,
+                    cancel,
+                )?;
                 for (name, arguments) in proposed {
                     live(store, session, cancel, config.round.deadline)?;
                     let call_id = format!("{}-call-{calls}", outcome.request_id.as_str());
@@ -369,7 +383,7 @@ impl<E: Engine> Supervisor<E> {
                         store,
                         receipt,
                         cancel.clone(),
-                        config.inline_bytes,
+                        admitted_inline_bytes,
                         config.round.deadline,
                     )?;
                     // After hooks annotate the persisted original result and can never retry it.
@@ -437,6 +451,196 @@ impl<E: Engine> Supervisor<E> {
             }
         }
         result
+    }
+}
+
+impl<E: Engine> Supervisor<E> {
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_tool_batch(
+        &self,
+        store: &Mutex<SessionStore>,
+        runtime: &ToolRuntime,
+        session: &str,
+        turn: i64,
+        request_id: &RequestId,
+        prior_calls: usize,
+        proposed: &[(String, serde_json::Map<String, Value>)],
+        config: ToolLoopConfig,
+        cancel: &CancellationToken,
+    ) -> HarnessResult<usize> {
+        use crate::policy::PolicyDecision;
+        use engine::types::ToolHistoryBlock;
+        live(store, session, cancel, config.round.deadline)?;
+        let (profile, history, epoch) = {
+            let guard = lock_store(store)?;
+            let profile = guard
+                .get_session(session)?
+                .ok_or_else(|| HarnessError::Invalid("unknown session".into()))?
+                .profile_id;
+            (
+                profile,
+                guard.list_events(session)?,
+                guard.daemon_epoch().to_owned(),
+            )
+        };
+        let snapshot = ContextBuilder::build_tool_snapshot(
+            request_id.as_str(),
+            &profile,
+            session,
+            &history,
+            runtime.executor.registry(),
+            config.round.context_limits,
+        )?;
+        let mut blocks = Vec::with_capacity(proposed.len().saturating_mul(2));
+        let mut result_limits = Vec::with_capacity(proposed.len());
+        for (index, (name, arguments)) in proposed.iter().enumerate() {
+            let number = prior_calls
+                .checked_add(index)
+                .ok_or_else(|| HarnessError::Engine("projected call count overflow".into()))?;
+            let call_id = format!("{}-call-{number}", request_id.as_str());
+            let invocation = ToolInvocation {
+                context: ToolCallContext {
+                    session_id: session.into(),
+                    turn_id: format!("turn-{turn}"),
+                    generation_id: request_id.as_str().into(),
+                },
+                call: ToolCall {
+                    call_id: call_id.clone(),
+                    tool_id: name.clone(),
+                    arguments: arguments.clone(),
+                },
+            };
+            // Error and artifact representations need space even for a denied
+            // call or a small policy output cap. Accepted inline JSON is bounded
+            // by the immutable policy binding's effective output limit.
+            let output_limit =
+                match runtime
+                    .policy
+                    .evaluate(runtime.executor.registry(), invocation, &epoch, 0)
+                {
+                    Ok(
+                        PolicyDecision::AllowWithoutPrompt(binding)
+                        | PolicyDecision::RequireApproval(binding),
+                    ) => binding.snapshot()["effective_max_output_bytes"]
+                        .as_u64()
+                        .ok_or_else(|| {
+                            HarnessError::Invalid("missing projected output limit".into())
+                        })?,
+                    _ => 0,
+                };
+            let output_limit = usize::try_from(output_limit).map_err(|_| {
+                HarnessError::Engine("projected tool output limit is too large".into())
+            })?;
+            // Streaming adapters move output larger than the inline threshold
+            // to the artifact store. fs.write returns bounded metadata based on
+            // its already-known path rather than its input content.
+            let streaming = matches!(
+                name.as_str(),
+                "fs.read" | "fs.list" | "http.fetch" | "shell.run"
+            );
+            let inline_limit = match name.as_str() {
+                "fs.read" | "fs.list" | "http.fetch" | "shell.run" => output_limit,
+                "fs.write" => {
+                    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+                    serde_json::to_vec(path)?
+                        .len()
+                        .checked_add(128)
+                        .ok_or_else(|| {
+                            HarnessError::Engine("projected write result overflow".into())
+                        })?
+                        .min(output_limit)
+                }
+                _ => output_limit,
+            };
+            // All current built-in control errors and durable terminal markers
+            // fit this allowance, including their bounded call identifier.
+            result_limits.push((streaming, inline_limit));
+            blocks.push(ToolHistoryBlock::AssistantCall {
+                call_id: call_id.clone(),
+                tool_id: name.clone(),
+                arguments: arguments.clone(),
+            });
+            blocks.push(ToolHistoryBlock::ToolResult {
+                call_id,
+                content: String::new(),
+                is_error: false,
+            });
+        }
+        let original = snapshot
+            .tool_context()
+            .ok_or_else(|| HarnessError::Invalid("missing tool context".into()))?;
+        let projected = original
+            .with_appended_history(blocks, config.round.context_limits)
+            .map_err(HarnessError::from)?;
+        let base_json_bytes = projected.input_bytes();
+        let snapshot = snapshot.with_tool_context(projected);
+        let rendered = block_on(self.engine.render_and_count(snapshot.clone()))?
+            .map_err(HarnessError::from)?;
+        let base_message_bytes = snapshot
+            .messages()
+            .iter()
+            .try_fold(0usize, |n, message| n.checked_add(message.content.len()))
+            .ok_or_else(|| HarnessError::Engine("projected input overflow".into()))?;
+        let fits = |inline_bytes: usize| -> HarnessResult<bool> {
+            let extra = result_limits
+                .iter()
+                .try_fold(0usize, |total, (streaming, limit)| {
+                    let limit = if *streaming {
+                        (*limit).min(inline_bytes)
+                    } else {
+                        *limit
+                    };
+                    // Results are compact JSON. Each additional quoting layer at
+                    // most doubles its bytes; control characters are already escaped.
+                    total.checked_add(limit.max(1024).checked_mul(2)?)
+                })
+                .ok_or_else(|| HarnessError::Engine("projected tool batch overflow".into()))?;
+            let json_bytes = extra
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(base_json_bytes))
+                .ok_or_else(|| HarnessError::Engine("projected tool context overflow".into()))?;
+            if json_bytes > config.round.context_limits.max_json_bytes {
+                return Ok(false);
+            }
+            let render_bytes = rendered.text().len().checked_add(extra).ok_or_else(|| {
+                HarnessError::Engine("projected rendered context overflow".into())
+            })?;
+            let input_bytes = json_bytes
+                .checked_add(base_message_bytes)
+                .ok_or_else(|| HarnessError::Engine("projected input overflow".into()))?;
+            match block_on(self.engine.check_projected_rendered_bytes(
+                snapshot.profile_id().clone(),
+                render_bytes.max(input_bytes),
+            ))? {
+                Ok(()) => Ok(true),
+                Err(
+                    engine::error::EngineError::ContextLimitExceeded { .. }
+                    | engine::error::EngineError::MemoryLimitExceeded {
+                        reason: engine::error::MemoryLimitReason::BufferLimit,
+                        ..
+                    },
+                ) => Ok(false),
+                Err(error) => Err(HarnessError::Engine(format!(
+                    "cannot verify projected tool results: {error}"
+                ))),
+            }
+        };
+        // Reduce only the inline threshold when necessary. The adapters retain
+        // larger successful outputs as artifacts, so no result bytes are lost.
+        if !fits(1)? {
+            return Err(HarnessError::Engine("projected tool results exceed the profile context; start a shorter session or reduce the batch".into()));
+        }
+        let (mut low, mut high) = (1usize, config.inline_bytes);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if fits(middle)? {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        live(store, session, cancel, config.round.deadline)?;
+        Ok(low)
     }
 }
 // Plugin processes are shared, but waiting for their host must not retain another

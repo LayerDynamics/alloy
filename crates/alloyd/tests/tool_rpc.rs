@@ -628,3 +628,101 @@ fn pause_running_operation(evicted: bool, hook: bool) {
     worker.join().unwrap();
     control_worker.join().unwrap();
 }
+
+#[test]
+fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
+    for fits in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = ScriptedEngine::new(vec![
+            vec![
+                proposal("fs.write", json!({"path":"marker.txt","content":"once"})),
+                done(),
+            ],
+            vec![
+                engine::types::GenerationEvent::TextDelta {
+                    text: "finished".into(),
+                },
+                done(),
+            ],
+        ]);
+        engine.projected_byte_limit = if fits { usize::MAX } else { 1 };
+        let service = DaemonService::open(
+            dir.path().join("db"),
+            engine,
+            Arc::new(TelemetryClient::new(
+                "test",
+                HardwareTier::Unknown,
+                "https://telemetry.invalid",
+            )),
+            128,
+            0,
+            0,
+        )
+        .unwrap();
+        let config = json!({"read_root":dir.path(),"write_root":dir.path(),"shell_executables":[std::fs::canonicalize("/bin/echo").unwrap()],"shell_cwd_roots":[dir.path()],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"fs.write","allowed_arguments":[{"path":"marker.txt","content":"once"}],"require_approval":false,"timeout_ms":1000,"max_output_bytes":65536}]},"plugins":[]});
+        let path = dir.path().join("tools.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+        let artifacts = service
+            .open_artifacts(&dir.path().join("artifacts"))
+            .unwrap();
+        let runtime = alloyd::tool_config::load(&path, artifacts).unwrap();
+        let service = Arc::new(service.with_tools(runtime));
+        let listener = bind_listener(&dir.path().join("rpc.sock")).unwrap();
+        let (mut stream, worker) = connect(&listener, service.clone());
+        let (mut control, control_worker) = connect(&listener, service.clone());
+        send(&mut control, 1, "session.create", json!({"profile":"p"}));
+        let session = receive(&mut control)["result"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        send(
+            &mut stream,
+            2,
+            "session.send",
+            json!({"session_id":session,"content":"write marker"}),
+        );
+        let mut saw_start = false;
+        loop {
+            let event = receive(&mut stream);
+            if event["params"]["event"] == "approval_requested" {
+                let call = event["params"]["body"]["call_id"].as_str().unwrap();
+                send(
+                    &mut control,
+                    3,
+                    "session.approve",
+                    json!({"session_id":session,"call_id":call,"allow":true}),
+                );
+                assert!(receive(&mut control).get("result").is_some());
+            }
+            saw_start |= event["params"]["event"] == "tool_call_started";
+            if event["id"] == 2 {
+                assert_eq!(event.get("error").is_none(), fits, "{event}");
+                break;
+            }
+        }
+        assert_eq!(saw_start, fits);
+        assert_eq!(dir.path().join("marker.txt").exists(), fits);
+        send(
+            &mut control,
+            4,
+            "sessions.resume",
+            json!({"session_id":session}),
+        );
+        let history = receive(&mut control);
+        let events = history["result"]["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["kind"] == "tool.started")
+                .count(),
+            usize::from(fits)
+        );
+        if !fits {
+            assert!(!events.iter().any(|e| e["kind"] == "tool.requested"));
+        }
+        drop(stream);
+        drop(control);
+        worker.join().unwrap();
+        control_worker.join().unwrap();
+    }
+}
