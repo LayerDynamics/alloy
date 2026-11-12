@@ -108,6 +108,17 @@ impl GatedFixtureEngine {
 }
 
 impl Engine for GatedFixtureEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }

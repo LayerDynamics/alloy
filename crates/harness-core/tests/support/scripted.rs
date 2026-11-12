@@ -19,6 +19,7 @@ pub struct ScriptedEngine {
     pub contexts: Mutex<Vec<ContextSnapshot>>,
     pub cancel_not_found: bool,
     pub cancel_not_found_id: Option<String>,
+    pub budget: Option<engine::api::ProfileContextBudget>,
     pub projected_byte_limit: usize,
     pub projected_pending: bool,
 }
@@ -36,6 +37,11 @@ impl ScriptedEngine {
             contexts: Mutex::new(Vec::new()),
             cancel_not_found: false,
             cancel_not_found_id: None,
+            budget: Some(engine::api::ProfileContextBudget {
+                limit: 1_000_000,
+                output_reserve: 512,
+                safety_margin: 64,
+            }),
             projected_byte_limit: usize::MAX,
             projected_pending: false,
         }
@@ -56,6 +62,12 @@ pub fn proposal(name: &str, args: serde_json::Value) -> GenerationEvent {
     }
 }
 impl Engine for ScriptedEngine {
+    fn profile_context_budget(
+        &self,
+        _: &ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(self.budget)
+    }
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
     }
@@ -85,7 +97,7 @@ impl Engine for ScriptedEngine {
         self.contexts.lock().unwrap().push(context.clone());
         let profile = context.profile_id().clone();
         let artifact = ArtifactId::new("scripted").unwrap();
-        let template = "{% for message in messages %}{{ message.role }} {% if message.kind == 'call' %}{{ message.call_json }}{% else %}{{ message.content }}{% endif %}{% endfor %} {{ tools_json }}";
+        let template = "{% for message in messages %}{{ message.role }} {% if message.kind is defined and message.kind == 'call' %}{{ message.call_json }}{% else %}{{ message.content }}{% endif %}{% endfor %} {{ tools_json | default('') }}";
         let binding = RenderingBinding {
             profile_id: &profile,
             artifact_id: &artifact,

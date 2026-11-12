@@ -1123,3 +1123,134 @@ fn cancelled_after_hook_host_wait_records_warning_without_changing_executed_resu
         "observer:initialize\nobserver:before\n"
     );
 }
+
+#[test]
+fn oversized_projected_batch_compacts_before_tool_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixture.txt"), "fixture").unwrap();
+    let mut db = SessionStore::open(dir.path().join("projection.db")).unwrap();
+    db.create_session("s", "p").unwrap();
+    db.append_event(
+        "s",
+        EventKind::UserMessage,
+        json!({"content":"old ".repeat(10_000)}),
+        json!([]),
+    )
+    .unwrap();
+    db.append_event("s", EventKind::RunCompleted, json!({}), json!([]))
+        .unwrap();
+    let runtime = setup(dir.path(), &mut db, false);
+    let store = Mutex::new(db);
+    let checkpoint = json!({"checkpoint_version":1,"goal":"read","constraints":[],"decisions":[],"completed_work":[],"open_tasks":[],"artifact_references":[],"critical_identifiers":[],"failures_and_lessons":[],"next_action":"read"}).to_string();
+    let mut engine = ScriptedEngine::new(vec![
+        vec![
+            proposal(
+                "fs.read",
+                json!({"path":"fixture.txt","offset":0,"length":4096}),
+            ),
+            done(),
+        ],
+        vec![GenerationEvent::TextDelta { text: checkpoint }, done()],
+        vec![
+            GenerationEvent::TextDelta {
+                text: "read done".into(),
+            },
+            done(),
+        ],
+    ]);
+    engine.projected_byte_limit = 20_000;
+    let supervisor = Supervisor::new(engine, telemetry());
+    let active = Arc::new(Mutex::new(None::<String>));
+    let started_active = Arc::clone(&active);
+    let finished_active = Arc::clone(&active);
+    let event_active = Arc::clone(&active);
+    let result = supervisor
+        .run_tool_turn_with_lifecycle(
+            &store,
+            &runtime,
+            "s",
+            "read fixture",
+            config(),
+            &CancellationToken::default(),
+            |id| {
+                *started_active.lock().unwrap() = Some(id.as_str().to_owned());
+                Ok(())
+            },
+            |id| {
+                let mut active = finished_active.lock().unwrap();
+                assert_eq!(active.as_deref(), Some(id.as_str()));
+                *active = None;
+                Ok(())
+            },
+            |event| {
+                if event.event == "tool_call_started" {
+                    assert!(
+                        event_active.lock().unwrap().is_none(),
+                        "summary request must be cleared before tool dispatch"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(result.assistant_text, "read done");
+    let events = store.lock().unwrap().list_events("s").unwrap();
+    let checkpoint_seq = events
+        .iter()
+        .find(|e| e.kind == EventKind::ContextCompacted)
+        .unwrap()
+        .seq;
+    let start_seq = events
+        .iter()
+        .find(|e| e.kind == EventKind::ToolStarted)
+        .unwrap()
+        .seq;
+    assert!(checkpoint_seq < start_seq);
+}
+
+#[test]
+fn oversized_batch_without_compactable_history_has_no_tool_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixture.txt"), "fixture").unwrap();
+    let mut db = SessionStore::open(dir.path().join("projection.db")).unwrap();
+    db.create_session("s", "p").unwrap();
+    let runtime = setup(dir.path(), &mut db, false);
+    let store = Mutex::new(db);
+    let mut engine = ScriptedEngine::new(vec![vec![
+        proposal(
+            "fs.read",
+            json!({"path":"fixture.txt","offset":0,"length":4096}),
+        ),
+        done(),
+    ]]);
+    engine.projected_byte_limit = 1;
+    let supervisor = Supervisor::new(engine, telemetry());
+    let error = supervisor
+        .run_tool_turn(
+            &store,
+            &runtime,
+            "s",
+            "read fixture",
+            config(),
+            &CancellationToken::default(),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no completed history"),
+        "{error}"
+    );
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e.kind,
+                EventKind::ToolRequested | EventKind::ToolStarted | EventKind::ContextCompacted
+            ))
+    );
+}

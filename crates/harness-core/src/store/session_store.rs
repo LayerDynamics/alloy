@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Schema version understood by this crate. Readers reject newer versions.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Spec version recorded in the meta row for forward-only migrations.
 pub const SPEC_VERSION: &str = "SPEC-1/B.4/v1";
@@ -355,6 +355,11 @@ impl SessionStore {
         payload: Value,
         artifact_refs: Value,
     ) -> HarnessResult<EventRecord> {
+        if kind == EventKind::ContextCompacted {
+            return Err(HarnessError::Invalid(
+                "checkpoint events must use the validated transaction".into(),
+            ));
+        }
         if !artifact_refs.is_array() {
             return Err(HarnessError::Invalid(
                 "artifact_refs must be a JSON array".into(),
@@ -381,6 +386,106 @@ impl SessionStore {
             params![ts, session_id],
         )?;
         tx.commit()?;
+        Ok(record)
+    }
+
+    /// Atomically commit a validated checkpoint against an unchanged session history.
+    /// `covered_through` is the final event replaced in model-visible context;
+    /// original rows remain intact. A changed history or inactive session aborts.
+    pub(crate) fn commit_checkpoint(
+        &mut self,
+        session_id: &str,
+        expected_last_seq: i64,
+        covered_through: i64,
+        checkpoint: &crate::context::Checkpoint,
+    ) -> HarnessResult<EventRecord> {
+        let checkpoint_json = serde_json::to_string(checkpoint)?;
+        crate::context::Checkpoint::parse_json(&checkpoint_json).map_err(HarnessError::Invalid)?;
+        if covered_through < 1 || covered_through > expected_last_seq {
+            return Err(HarnessError::Invalid(
+                "invalid checkpoint history boundary".into(),
+            ));
+        }
+        let ts = now_ms()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT status FROM sessions WHERE session_id=?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if state.as_deref() != Some("active") {
+            return Err(HarnessError::Invalid(
+                "checkpoint requires an active session".into(),
+            ));
+        }
+        let last: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM events WHERE session_id=?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if last != expected_last_seq {
+            return Err(HarnessError::Invalid(
+                "session history changed during compaction".into(),
+            ));
+        }
+        let boundary_kind: Option<String> = tx
+            .query_row(
+                "SELECT kind FROM events WHERE session_id=?1 AND seq=?2",
+                params![session_id, covered_through],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if boundary_kind.as_deref() != Some("run.completed") {
+            return Err(HarnessError::Invalid(
+                "checkpoint boundary must end a completed turn".into(),
+            ));
+        }
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tool_intents WHERE session_id=?1 AND state IN ('AwaitingApproval','Ready','Claimed','Started')",
+            [session_id], |r| r.get(0),
+        )?;
+        if pending != 0 {
+            return Err(HarnessError::Invalid(
+                "cannot compact with an unresolved tool call".into(),
+            ));
+        }
+        let prior: Option<String> = tx.query_row(
+            "SELECT payload_json FROM events WHERE session_id=?1 AND kind='context.compacted' ORDER BY seq DESC LIMIT 1",
+            [session_id], |r| r.get(0),
+        ).optional()?;
+        if let Some(prior) = prior {
+            let value: Value = serde_json::from_str(&prior)?;
+            let boundary = value
+                .get("covered_through")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| HarnessError::Invalid("invalid prior checkpoint boundary".into()))?;
+            if covered_through <= boundary {
+                return Err(HarnessError::Invalid(
+                    "checkpoint must advance its history boundary".into(),
+                ));
+            }
+        }
+        let record = append_event_in_tx(
+            &tx,
+            session_id,
+            ts,
+            EventKind::ContextCompacted,
+            serde_json::json!({"covered_through":covered_through,"checkpoint":checkpoint}),
+            serde_json::to_value(&checkpoint.artifact_references)?,
+        )?;
+        tx.execute(
+            "UPDATE sessions SET updated_ts=?1 WHERE session_id=?2",
+            params![ts, session_id],
+        )?;
+        #[cfg(test)]
+        checkpoint_crash_test::exit_at("before");
+        tx.commit()?;
+        #[cfg(test)]
+        checkpoint_crash_test::exit_at("after");
         Ok(record)
     }
 
@@ -513,4 +618,106 @@ pub(crate) fn commit_artifact(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_crash_test {
+    use super::*;
+    use crate::context::{Checkpoint, ContextBuilder};
+
+    pub(super) fn exit_at(stage: &str) {
+        if std::env::var("ALLOY_CHECKPOINT_CRASH_STAGE")
+            .ok()
+            .as_deref()
+            == Some(stage)
+        {
+            std::process::exit(86);
+        }
+    }
+    fn checkpoint() -> Checkpoint {
+        Checkpoint {
+            checkpoint_version: 1,
+            goal: "goal".into(),
+            constraints: vec!["retain".into()],
+            decisions: vec![],
+            completed_work: vec![],
+            open_tasks: vec![],
+            artifact_references: vec![],
+            critical_identifiers: vec![],
+            failures_and_lessons: vec![],
+            next_action: "next".into(),
+        }
+    }
+    #[test]
+    fn checkpoint_crash_child() {
+        let Ok(path) = std::env::var("ALLOY_CHECKPOINT_CRASH_DB") else {
+            return;
+        };
+        let mut db = SessionStore::open(path).unwrap();
+        db.commit_checkpoint("s", 4, 3, &checkpoint()).unwrap();
+        panic!("injected exit was not reached");
+    }
+    #[test]
+    fn checkpoint_process_exit_before_and_after_commit_recovers_once() {
+        for stage in ["before", "after"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db.sqlite");
+            let mut db = SessionStore::open(&path).unwrap();
+            db.create_session("s", "p").unwrap();
+            db.append_event(
+                "s",
+                EventKind::UserMessage,
+                serde_json::json!({"content":"old"}),
+                serde_json::json!([]),
+            )
+            .unwrap();
+            db.append_event(
+                "s",
+                EventKind::RunCompleted,
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )
+            .unwrap();
+            db.append_event(
+                "s",
+                EventKind::UserMessage,
+                serde_json::json!({"content":"new"}),
+                serde_json::json!([]),
+            )
+            .unwrap();
+            let original = db.list_events("s").unwrap();
+            drop(db);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::session_store::checkpoint_crash_test::checkpoint_crash_child",
+                ])
+                .env("ALLOY_CHECKPOINT_CRASH_STAGE", stage)
+                .env("ALLOY_CHECKPOINT_CRASH_DB", &path)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86));
+            let mut db = SessionStore::open(&path).unwrap();
+            let after = db.list_events("s").unwrap();
+            assert_eq!(&after[..original.len()], original.as_slice());
+            if stage == "before" {
+                assert_eq!(after.len(), original.len());
+                db.commit_checkpoint("s", 4, 3, &checkpoint()).unwrap();
+            } else {
+                assert_eq!(after.len(), original.len() + 1);
+                assert!(db.commit_checkpoint("s", 4, 3, &checkpoint()).is_err());
+            }
+            let events = db.list_events("s").unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.kind == EventKind::ContextCompacted)
+                    .count(),
+                1
+            );
+            let messages = ContextBuilder::messages_from_events(&events).unwrap();
+            assert!(messages[0].content.contains("retain"));
+            assert_eq!(messages[1].content, "new");
+        }
+    }
 }

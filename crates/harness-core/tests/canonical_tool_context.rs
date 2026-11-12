@@ -219,12 +219,8 @@ fn large_error_context_is_explicitly_bounded_without_changing_durable_result() {
 }
 
 #[test]
-fn tool_snapshot_rejects_unhandled_skill_and_checkpoint_events() {
-    for kind in [
-        EventKind::SkillLoaded,
-        EventKind::ContextCompacted,
-        EventKind::ModelChanged,
-    ] {
+fn tool_snapshot_rejects_unhandled_skill_and_model_change_events() {
+    for kind in [EventKind::SkillLoaded, EventKind::ModelChanged] {
         let (_dir, mut store, registry, _count) = setup();
         append(&mut store, kind, "unhandled model context");
         let events = store.list_events(SESSION).unwrap();

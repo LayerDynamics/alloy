@@ -16,6 +16,8 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "compaction.rs"]
+mod compaction;
 #[path = "tool_loop.rs"]
 mod tool_loop;
 #[path = "tool_round.rs"]
@@ -165,7 +167,7 @@ impl<E: Engine> Supervisor<E> {
             return Err(HarnessError::Invalid("user text must be non-empty".into()));
         }
 
-        let (profile_id, snapshot, request_id) = {
+        let (profile_id, mut snapshot, request_id, history) = {
             let mut guard = lock_store(store)?;
             let session = guard
                 .get_session(session_id)?
@@ -197,10 +199,51 @@ impl<E: Engine> Supervisor<E> {
                 &history,
                 None,
             )?;
-            (session.profile_id.clone(), snapshot, request_id)
+            (session.profile_id.clone(), snapshot, request_id, history)
         };
 
-        let rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
+        let mut rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
+        if let Some(limits) = self
+            .engine
+            .profile_context_budget(snapshot.profile_id())
+            .map_err(HarnessError::from)?
+        {
+            let budget = crate::context::ContextBudget {
+                limit: limits.limit,
+                output_reserve: limits.output_reserve,
+                safety_margin: limits.safety_margin,
+            };
+            if budget.headroom(rendered.token_count(), 0).is_none() {
+                compaction::compact(
+                    &self.engine,
+                    store,
+                    session_id,
+                    &history,
+                    &request_id,
+                    &compaction::Mode::Text,
+                    budget,
+                    0,
+                    Instant::now() + TURN_TIMEOUT,
+                    &|| ensure_session_active(store, session_id),
+                    &mut on_started,
+                    &mut |_| Ok(()),
+                )?;
+                let history = lock_store(store)?.list_events(session_id)?;
+                snapshot = ContextBuilder::build_snapshot(
+                    request_id.as_str(),
+                    &profile_id,
+                    &history,
+                    None,
+                )?;
+                rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
+            }
+        }
+        crate::context::admit_render(
+            &self.engine,
+            snapshot.profile_id(),
+            rendered.token_count(),
+            0,
+        )?;
         // Re-check Active after render so a concurrent pause aborts before generate.
         ensure_session_active(store, session_id)?;
         let profile = ModelProfileId::new(profile_id.clone())

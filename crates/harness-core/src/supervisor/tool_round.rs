@@ -147,7 +147,7 @@ impl<E: Engine> Supervisor<E> {
         validate_config(config, request)?;
         let (profile_id, history) = read_open_turn(store, request)?;
         let request_id = round_request_id(request.session_id, request.turn_seq, request.round)?;
-        let snapshot = ContextBuilder::build_tool_snapshot(
+        let mut snapshot = ContextBuilder::build_tool_snapshot(
             request_id.as_str(),
             &profile_id,
             request.session_id,
@@ -161,13 +161,61 @@ impl<E: Engine> Supervisor<E> {
             }
             check_live(store, request.session_id, config.deadline)
         };
-        let rendered = wait_checked(
+        let mut rendered = wait_checked(
             self.engine.render_and_count(snapshot.clone()),
             config.deadline,
             &check,
         )?
         .map_err(HarnessError::from)?;
         check()?;
+        if let Some(limits) = self
+            .engine
+            .profile_context_budget(snapshot.profile_id())
+            .map_err(HarnessError::from)?
+        {
+            let budget = crate::context::ContextBudget {
+                limit: limits.limit,
+                output_reserve: limits.output_reserve,
+                safety_margin: limits.safety_margin,
+            };
+            if budget.headroom(rendered.token_count(), 0).is_none() {
+                super::compaction::compact(
+                    &self.engine,
+                    store,
+                    request.session_id,
+                    &history,
+                    &request_id,
+                    &super::compaction::Mode::Tools(registry, config.context_limits),
+                    budget,
+                    0,
+                    config.deadline,
+                    &check,
+                    &mut on_started,
+                    &mut |_| Ok(()),
+                )?;
+                let (_, history) = read_open_turn(store, request)?;
+                snapshot = ContextBuilder::build_tool_snapshot(
+                    request_id.as_str(),
+                    &profile_id,
+                    request.session_id,
+                    &history,
+                    registry,
+                    config.context_limits,
+                )?;
+                rendered = wait_checked(
+                    self.engine.render_and_count(snapshot.clone()),
+                    config.deadline,
+                    &check,
+                )?
+                .map_err(HarnessError::from)?;
+            }
+        }
+        crate::context::admit_render(
+            &self.engine,
+            snapshot.profile_id(),
+            rendered.token_count(),
+            0,
+        )?;
         let options =
             GenerationOptions::greedy(config.max_output_tokens).map_err(HarnessError::from)?;
         let generation_request = GenerationRequest::new(

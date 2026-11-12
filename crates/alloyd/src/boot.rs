@@ -60,6 +60,8 @@ pub struct BootRequest {
     /// Optional absolute admission override for tests. When set, used as the
     /// custom ceiling path instead of live host math.
     pub admission_budget_override_bytes: Option<u64>,
+    /// Optional smaller validated profile context limit; cannot exceed the model limit.
+    pub profile_context_limit: Option<usize>,
     /// Prefer Metal when the platform supports it.
     pub prefer_metal: bool,
     /// Enable bounded Qwen tool-call parsing only when the daemon has a tools configuration.
@@ -109,6 +111,13 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         .get("max_position_embeddings")
         .and_then(Value::as_u64)
         .unwrap_or(40_960) as usize;
+
+    let profile_context_limit = request.profile_context_limit.unwrap_or(context_limit);
+    if profile_context_limit > context_limit {
+        return Err(RpcError::invalid_params(
+            "profile context limit exceeds model context",
+        ));
+    }
 
     let limits = Qwen3BackendLimits {
         max_files: 64,
@@ -162,7 +171,7 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         ModelProfileId::new(request.profile_id.clone())
             .map_err(|error| RpcError::internal(error.to_string()))?,
         artifact_id,
-        context_limit,
+        profile_context_limit,
         512,
         64,
         GenerationOptions::greedy(512).map_err(|error| RpcError::internal(error.to_string()))?,

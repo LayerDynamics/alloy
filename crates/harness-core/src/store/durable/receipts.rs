@@ -842,7 +842,8 @@ CREATE TABLE events(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,seq INTEGER 
 CREATE UNIQUE INDEX idx_events_session_seq ON events(session_id,seq);")?;
         tx.execute("INSERT INTO meta VALUES(1,?1)", [SPEC_VERSION])?;
     }
-    tx.execute_batch("CREATE TABLE tool_intents(
+    if version < 2 {
+        tx.execute_batch("CREATE TABLE tool_intents(
 session_id TEXT NOT NULL REFERENCES sessions(session_id),call_id TEXT NOT NULL,daemon_epoch TEXT NOT NULL,
 state TEXT NOT NULL CHECK(state IN ('AwaitingApproval','Ready','Claimed','Started','Denied','Expired','Withdrawn','Rejected','Completed','OutcomeUnknown')),
 binding_json TEXT NOT NULL,binding_digest TEXT,created_ts INTEGER NOT NULL,decision INTEGER CHECK(decision IN (0,1)),reason TEXT,result_json TEXT,
@@ -851,6 +852,7 @@ CREATE INDEX idx_tool_intents_state ON tool_intents(state,session_id);
 CREATE TABLE tool_artifacts(artifact_ref TEXT PRIMARY KEY,session_id TEXT NOT NULL,call_id TEXT NOT NULL,metadata_json TEXT NOT NULL);
 CREATE TABLE runtime_metadata(store_id TEXT NOT NULL,daemon_epoch TEXT NOT NULL);
 INSERT INTO runtime_metadata VALUES(lower(hex(randomblob(16))), '');")?;
+    }
     tx.execute("UPDATE meta SET schema_version=?1", [SCHEMA_VERSION])?;
     tx.commit()?;
     Ok(())
@@ -1203,7 +1205,7 @@ INSERT INTO events VALUES(17,'s',1,123,'user.message','{ \"old\": true }','[ \"l
             .conn
             .query_row("SELECT schema_version FROM meta", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, SCHEMA_VERSION);
     }
     #[test]
     fn newer_schema_rejected_before_ddl() {

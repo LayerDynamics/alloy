@@ -15,6 +15,17 @@ struct W6BoundaryEngine {
     seen: Arc<Mutex<Vec<String>>>,
 }
 impl Engine for W6BoundaryEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }

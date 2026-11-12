@@ -238,7 +238,7 @@ impl<E: Engine> Supervisor<E> {
                 // Check the complete proposed batch before persisting any tool
                 // intent or invoking a hook/implementation. The projected
                 // history is independent of authorization and cannot execute.
-                let admitted_inline_bytes = self.preflight_tool_batch(
+                let mut admitted_inline_bytes = self.preflight_tool_batch(
                     store,
                     runtime,
                     session,
@@ -249,6 +249,66 @@ impl<E: Engine> Supervisor<E> {
                     config,
                     cancel,
                 )?;
+                if admitted_inline_bytes.is_none() {
+                    let (profile, history) = {
+                        let db = lock_store(store)?;
+                        let row = db
+                            .get_session(session)?
+                            .ok_or_else(|| HarnessError::Invalid("unknown session".into()))?;
+                        (
+                            ModelProfileId::new(row.profile_id).map_err(HarnessError::from)?,
+                            db.list_events(session)?,
+                        )
+                    };
+                    let limits = self
+                        .engine
+                        .profile_context_budget(&profile)
+                        .map_err(HarnessError::from)?
+                        .ok_or_else(|| {
+                            HarnessError::Invalid(
+                                "engine does not expose a validated profile context budget".into(),
+                            )
+                        })?;
+                    let budget = crate::context::ContextBudget {
+                        limit: limits.limit,
+                        output_reserve: limits.output_reserve,
+                        safety_margin: limits.safety_margin,
+                    };
+                    let summary_id =
+                        RequestId::new(format!("{}:batch", outcome.request_id.as_str()))
+                            .map_err(HarnessError::from)?;
+                    super::compaction::compact(
+                        &self.engine,
+                        store,
+                        session,
+                        &history,
+                        &summary_id,
+                        &super::compaction::Mode::Tools(
+                            runtime.executor.registry(),
+                            config.round.context_limits,
+                        ),
+                        budget,
+                        0,
+                        config.round.deadline,
+                        &|| live(store, session, cancel, config.round.deadline),
+                        &mut started,
+                        &mut finished,
+                    )?;
+                    admitted_inline_bytes = self.preflight_tool_batch(
+                        store,
+                        runtime,
+                        session,
+                        turn,
+                        &outcome.request_id,
+                        calls,
+                        &proposed,
+                        config,
+                        cancel,
+                    )?;
+                }
+                let admitted_inline_bytes = admitted_inline_bytes.ok_or_else(|| HarnessError::Engine(
+                    "projected tool results exceed the profile context after compaction; start a shorter session or reduce the batch".into()
+                ))?;
                 for (name, arguments) in proposed {
                     live(store, session, cancel, config.round.deadline)?;
                     let call_id = format!("{}-call-{calls}", outcome.request_id.as_str());
@@ -467,7 +527,7 @@ impl<E: Engine> Supervisor<E> {
         proposed: &[(String, serde_json::Map<String, Value>)],
         config: ToolLoopConfig,
         cancel: &CancellationToken,
-    ) -> HarnessResult<usize> {
+    ) -> HarnessResult<Option<usize>> {
         use crate::policy::PolicyDecision;
         use engine::types::ToolHistoryBlock;
         live(store, session, cancel, config.round.deadline)?;
@@ -649,7 +709,7 @@ impl<E: Engine> Supervisor<E> {
         // Reduce only the inline threshold when necessary. The adapters retain
         // larger successful outputs as artifacts, so no result bytes are lost.
         if !fits(1)? {
-            return Err(HarnessError::Engine("projected tool results exceed the profile context; start a shorter session or reduce the batch".into()));
+            return Ok(None);
         }
         let (mut low, mut high) = (1usize, config.inline_bytes);
         while low < high {
@@ -661,7 +721,7 @@ impl<E: Engine> Supervisor<E> {
             }
         }
         live(store, session, cancel, config.round.deadline)?;
-        Ok(low)
+        Ok(Some(low))
     }
 }
 // Plugin processes are shared, but waiting for their host must not retain another

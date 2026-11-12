@@ -226,6 +226,7 @@ fn run() -> Result<(), String> {
         corpus_models_json: corpus_models.map(PathBuf::from),
         memory_guard,
         admission_budget_override_bytes: admission_budget_override,
+        profile_context_limit: None,
         prefer_metal,
         tools_enabled: tools_config.is_some(),
         tiered_kv,
