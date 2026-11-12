@@ -539,7 +539,7 @@ fn workload_cannot_modify_or_hardlink_recovery_metadata() {
             // SAFETY: the successful hook wrote a terminated path into this initialized buffer.
             let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) }.to_bytes();
             fs::write(root.join("descendants.bin.protected-path"), path).unwrap();
-            wait_records(&record, 4);
+            wait_records(&record, 5);
             let observations = records(&record);
             for kind in [7, 8] {
                 assert!(
@@ -549,6 +549,12 @@ fn workload_cannot_modify_or_hardlink_recovery_metadata() {
                     "metadata access was not denied: {observations:?}"
                 );
             }
+            assert!(
+                observations
+                    .iter()
+                    .any(|p| p[0] < 0 && p[1] == 0 && p[2] == 9),
+                "ordinary hard links were restricted: {observations:?}"
+            );
             stop(child);
             verify(&record);
         },

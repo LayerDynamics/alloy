@@ -68,6 +68,8 @@ int main(int argc, char **argv) {
         errno=0;int linked=link(path,alias);int link_error=linked<0?errno:0;if(!linked)unlink(alias);
         int32_t result[3]={-getpid(),write_error,7};if(write(records,result,sizeof(result))!=sizeof(result))return 22;
         result[1]=link_error;result[2]=8;if(write(records,result,sizeof(result))!=sizeof(result))return 23;
+        errno=0;linked=link(record_path,alias);int ordinary_error=linked<0?errno:0;if(!linked)unlink(alias);
+        result[1]=ordinary_error;result[2]=9;if(write(records,result,sizeof(result))!=sizeof(result))return 24;
     }
     int ready[2]; if (pipe(ready)) return 4;
     pid_t child = fork();

@@ -104,8 +104,8 @@ static int install_gate(issue_fn issue, consume_fn consume, int64_t *handle) {
         "(deny generic-issue-extension file-issue-extension mach-issue-extension (extension-class \"%s\"))"
         "(deny signal (require-not (require-any (target self)(target children))))"
         "(deny mach-task* (require-not (target self)))"
-        "(deny job-creation appleevent-send file-link)"
-        "(deny file-read* file-write* (subpath \"%s\"))", nonce, nonce, registry);
+        "(deny job-creation appleevent-send)"
+        "(deny file-link file-read* file-write* (subpath \"%s\"))", nonce, nonce, registry);
     char *diagnostic = NULL;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

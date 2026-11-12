@@ -49,7 +49,9 @@ releases it; process exit alone does not revoke inherited grants. Both trusted
 holders can release the same inherited lease, so the surviving holder can revoke
 after the other dies. The profile denies reminting that class, task-port access
 to other processes, signals except to self/children, launchd job creation,
-AppleEvents, hard-link creation, and reads/writes in Alloy's recovery registry. These controls protect the holders from workload interference.
+AppleEvents, and hard-link/read/write access in Alloy's recovery registry.
+Ordinary hard links outside that reserved registry remain available. These
+controls protect the holders from workload interference.
 The holders use a separate session so launchd's cleanup of a dead cleaner's
 process group does not kill both revocation authorities.
 
