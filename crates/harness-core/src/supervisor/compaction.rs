@@ -113,11 +113,10 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             engine.render_and_count(summary_snapshot.clone()),
             deadline,
             check,
-        ) {
-            if budget.headroom(rendered.token_count(), 0).is_some() {
-                selected = Some((boundary.seq, summary_snapshot));
-                break;
-            }
+        ) && budget.headroom(rendered.token_count(), 0).is_some()
+        {
+            selected = Some((boundary.seq, summary_snapshot));
+            break;
         }
     }
     let (boundary, base_summary) = selected.ok_or_else(|| HarnessError::Invalid("context overflow: no completed history fits a checkpoint request; reduce the request, start a new session or select a profile with a larger context".into()))?;
