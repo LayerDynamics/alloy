@@ -42,6 +42,8 @@ pub enum MemoryLimitReason {
     AdmissionsPaused,
     /// A bounded loader, cache, output, or other buffer allowance was exceeded.
     BufferLimit,
+    /// The message input or rendered-context output exceeded its bounded buffer.
+    ContextRenderingBufferLimit,
     /// A fresh host observation rejected planned startup before native loading.
     HostPreflight {
         /// Artifact whose startup plan was rejected.
@@ -60,6 +62,7 @@ impl MemoryLimitReason {
             Self::AllocatorCeiling { .. } => "allocator_ceiling",
             Self::AdmissionsPaused => "admissions_paused",
             Self::BufferLimit => "buffer_limit",
+            Self::ContextRenderingBufferLimit => "buffer_limit",
             Self::HostPreflight { .. } => "host_preflight",
         }
     }
@@ -395,7 +398,8 @@ impl EngineError {
                     }
                     MemoryLimitReason::AdmissionsPaused
                     | MemoryLimitReason::AdvisoryEstimate
-                    | MemoryLimitReason::BufferLimit => {}
+                    | MemoryLimitReason::BufferLimit
+                    | MemoryLimitReason::ContextRenderingBufferLimit => {}
                 }
             }
             _ => {}

@@ -22,6 +22,9 @@ pub struct ScriptedEngine {
     pub budget: Option<engine::api::ProfileContextBudget>,
     pub projected_byte_limit: usize,
     pub projected_pending: bool,
+    pub fail_summary_render: std::sync::atomic::AtomicBool,
+    pub summary_limit_failures: std::sync::atomic::AtomicUsize,
+    pub verification_results: Mutex<VecDeque<bool>>,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -44,6 +47,9 @@ impl ScriptedEngine {
             }),
             projected_byte_limit: usize::MAX,
             projected_pending: false,
+            fail_summary_render: std::sync::atomic::AtomicBool::new(false),
+            summary_limit_failures: std::sync::atomic::AtomicUsize::new(0),
+            verification_results: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -95,6 +101,43 @@ impl Engine for ScriptedEngine {
     }
     fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {
         self.contexts.lock().unwrap().push(context.clone());
+        if context
+            .messages()
+            .iter()
+            .any(|m| m.content.starts_with("Summarize the historical events"))
+            && self
+                .summary_limit_failures
+                .try_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Box::pin(async {
+                Err(engine::error::EngineError::MemoryLimitExceeded {
+                    reason: engine::error::MemoryLimitReason::ContextRenderingBufferLimit,
+                    operation: "fixture",
+                    required_bytes: 2,
+                    available_bytes: 1,
+                })
+            });
+        }
+        if self
+            .fail_summary_render
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && context
+                .messages()
+                .iter()
+                .any(|m| m.content.starts_with("Summarize the historical events"))
+        {
+            return Box::pin(async {
+                Err(engine::error::EngineError::InvalidRequest {
+                    field: "fixture",
+                    message: "summary renderer failed".into(),
+                })
+            });
+        }
         let profile = context.profile_id().clone();
         let artifact = ArtifactId::new("scripted").unwrap();
         let template = "{% for message in messages %}{{ message.role }} {% if message.kind is defined and message.kind == 'call' %}{{ message.call_json }}{% else %}{{ message.content }}{% endif %}{% endfor %} {{ tools_json | default('') }}";
@@ -139,12 +182,26 @@ impl Engine for ScriptedEngine {
         Box::pin(async move { result })
     }
     fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
-        let events = self
-            .batches
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("unexpected extra generation");
+        let events = if request.request_id().as_str().contains(":verify:") {
+            let valid = self
+                .verification_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(true);
+            vec![
+                GenerationEvent::TextDelta {
+                    text: format!("{{\"valid\":{valid}}}"),
+                },
+                done(),
+            ]
+        } else {
+            self.batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected extra generation")
+        };
         let id = request.request_id().clone();
         Box::pin(async move { Ok(Generation::from_stream(id, Box::pin(Events(events.into())))) })
     }

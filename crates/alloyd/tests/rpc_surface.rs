@@ -389,10 +389,10 @@ fn rpc_turn_context_boundary_reserves_output_and_margin() {
     let profile = ModelProfile::new(
         ModelProfileId::new("fixture-profile").unwrap(),
         ArtifactId::new("alloyd-fixture").unwrap(),
-        5,
-        2,
+        35,
+        32,
         1,
-        GenerationOptions::greedy(2).unwrap(),
+        GenerationOptions::greedy(32).unwrap(),
     )
     .unwrap();
     let (socket, _, server) = start_server_with_engine(

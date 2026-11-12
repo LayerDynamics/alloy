@@ -937,7 +937,7 @@ fn engine_output_bounds_use_shared_writer_errors() {
             assert_eq!(operation, "render chat template output");
             assert!(required_bytes > 1);
             assert_eq!(available_bytes, 1);
-            assert_eq!(reason, MemoryLimitReason::BufferLimit);
+            assert_eq!(reason, MemoryLimitReason::ContextRenderingBufferLimit);
         }
         other => panic!("expected shared writer error, got {other:?}"),
     }

@@ -197,8 +197,14 @@ fn tool_loop_truncated_failed_and_legacy_tool_streams_never_persist_success() {
         let events = store.lock().unwrap().list_events("boundary").unwrap();
         assert!(!events.iter().any(|e| matches!(
             e.kind,
-            EventKind::AssistantMessage | EventKind::RunCompleted | EventKind::ToolStarted
-        )));
+            EventKind::AssistantMessage | EventKind::ToolStarted
+        ) || (e.kind == EventKind::RunCompleted
+            && e.payload["status"] != "failed")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == EventKind::RunCompleted && e.payload["status"] == "failed")
+        );
     }
 }
 #[test]
@@ -224,8 +230,11 @@ fn tool_loop_callback_failure_cannot_persist_a_completed_turn() {
             .is_err()
     );
     let events = store.lock().unwrap().list_events("callback").unwrap();
-    assert!(!events.iter().any(|e| matches!(
-        e.kind,
-        EventKind::AssistantMessage | EventKind::RunCompleted
-    )));
+    assert!(!events.iter().any(|e| e.kind == EventKind::AssistantMessage
+        || (e.kind == EventKind::RunCompleted && e.payload["status"] != "failed")));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::RunCompleted && e.payload["status"] == "failed")
+    );
 }

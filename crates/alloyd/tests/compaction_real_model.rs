@@ -25,23 +25,25 @@ impl TelemetryTransport for Offline {
 fn real_model_compaction_preserves_history_and_continues() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let dir = tempfile::tempdir().unwrap();
-    let boot = boot_qwen3(BootRequest {
-        artifact_dir: artifact,
-        profile_id: "qwen3-4b-4bit".into(),
-        corpus_models_json: Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
-        ),
-        memory_guard: MemoryGuardConfig {
-            tier: MemoryGuardTier::Balanced,
-            custom_ceiling_bytes: 0,
-            enabled: true,
+    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+        BootRequest {
+            artifact_dir: artifact,
+            profile_id: "qwen3-4b-4bit".into(),
+            corpus_models_json: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
+            ),
+            memory_guard: MemoryGuardConfig {
+                tier: MemoryGuardTier::Balanced,
+                custom_ceiling_bytes: 0,
+                enabled: true,
+            },
+            admission_budget_override_bytes: None,
+            prefer_metal: true,
+            tools_enabled: true,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        admission_budget_override_bytes: None,
-        profile_context_limit: Some(2048),
-        prefer_metal: true,
-        tools_enabled: true,
-        tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
-    })
+        Some(2048),
+    )
     .expect("boot real Qwen");
     let mut db = SessionStore::open(dir.path().join("sessions.sqlite")).unwrap();
     db.create_session("real-compact", &boot.profile_id).unwrap();
@@ -164,7 +166,6 @@ fn real_model_render_32k_latency() {
             enabled: true,
         },
         admission_budget_override_bytes: None,
-        profile_context_limit: None,
         prefer_metal: true,
         tools_enabled: false,
         tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),

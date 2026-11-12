@@ -125,12 +125,48 @@ impl<E: Engine> Supervisor<E> {
         F: FnMut(&GenerationEvent) -> HarnessResult<()>,
     {
         self.generate_tool_round_cancellable(
-            store, registry, request, config, None, on_started, on_event,
+            store,
+            registry,
+            request,
+            config,
+            None,
+            on_started,
+            |_| Ok(()),
+            on_event,
+        )
+    }
+
+    /// Generate a tool round while tracking the start and completion of internal checkpoint requests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_tool_round_with_lifecycle<S, D, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        registry: &ToolRegistry,
+        request: ToolRoundRequest<'_>,
+        config: ToolRoundConfig,
+        on_started: S,
+        on_finished: D,
+        on_event: F,
+    ) -> HarnessResult<ToolRoundOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(&GenerationEvent) -> HarnessResult<()>,
+    {
+        self.generate_tool_round_cancellable(
+            store,
+            registry,
+            request,
+            config,
+            None,
+            on_started,
+            on_finished,
+            on_event,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_tool_round_cancellable<S, F>(
+    pub(super) fn generate_tool_round_cancellable<S, D, F>(
         &self,
         store: &Mutex<SessionStore>,
         registry: &ToolRegistry,
@@ -138,10 +174,12 @@ impl<E: Engine> Supervisor<E> {
         config: ToolRoundConfig,
         cancellation: Option<&tool_registry::execution::CancellationToken>,
         mut on_started: S,
+        mut on_finished: D,
         mut on_event: F,
     ) -> HarnessResult<ToolRoundOutcome>
     where
         S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
         F: FnMut(&GenerationEvent) -> HarnessResult<()>,
     {
         validate_config(config, request)?;
@@ -168,17 +206,30 @@ impl<E: Engine> Supervisor<E> {
         )?
         .map_err(HarnessError::from)?;
         check()?;
+        let mut additional_output = 0;
         if let Some(limits) = self
             .engine
             .profile_context_budget(snapshot.profile_id())
             .map_err(HarnessError::from)?
         {
+            if config.max_output_tokens > limits.output_reserve {
+                return Err(HarnessError::Invalid(format!(
+                    "tool output token limit {} exceeds validated profile reserve {}; reduce the requested limit",
+                    config.max_output_tokens, limits.output_reserve
+                )));
+            }
             let budget = crate::context::ContextBudget {
                 limit: limits.limit,
                 output_reserve: limits.output_reserve,
                 safety_margin: limits.safety_margin,
             };
-            if budget.headroom(rendered.token_count(), 0).is_none() {
+            additional_output = config
+                .max_output_tokens
+                .saturating_sub(limits.output_reserve);
+            if budget
+                .headroom(rendered.token_count(), additional_output)
+                .is_none()
+            {
                 super::compaction::compact(
                     &self.engine,
                     store,
@@ -187,11 +238,11 @@ impl<E: Engine> Supervisor<E> {
                     &request_id,
                     &super::compaction::Mode::Tools(registry, config.context_limits),
                     budget,
-                    0,
+                    additional_output,
                     config.deadline,
                     &check,
                     &mut on_started,
-                    &mut |_| Ok(()),
+                    &mut on_finished,
                 )?;
                 let (_, history) = read_open_turn(store, request)?;
                 snapshot = ContextBuilder::build_tool_snapshot(
@@ -214,7 +265,7 @@ impl<E: Engine> Supervisor<E> {
             &self.engine,
             snapshot.profile_id(),
             rendered.token_count(),
-            0,
+            additional_output,
         )?;
         let options =
             GenerationOptions::greedy(config.max_output_tokens).map_err(HarnessError::from)?;

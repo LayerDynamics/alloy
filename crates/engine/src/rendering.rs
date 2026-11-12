@@ -653,7 +653,7 @@ fn validate_render_input(
         .tool_context()
         .map_or(0, |tools| tools.input_bytes());
     if input_bytes > limits.max_input_bytes {
-        return Err(memory_limit(
+        return Err(context_memory_limit(
             "accept tool rendering input",
             input_bytes,
             limits.max_input_bytes,
@@ -669,7 +669,7 @@ fn validate_render_input(
             .ok_or_else(|| internal("message-content byte count overflow"))?;
 
         if input_bytes > limits.max_input_bytes {
-            return Err(memory_limit(
+            return Err(context_memory_limit(
                 "accept rendering input",
                 input_bytes,
                 limits.max_input_bytes,
@@ -779,6 +779,19 @@ fn memory_limit(
     })
 }
 
+fn context_memory_limit(
+    operation: &'static str,
+    required: usize,
+    available: usize,
+) -> Result<EngineError, EngineError> {
+    Ok(EngineError::MemoryLimitExceeded {
+        operation,
+        required_bytes: as_u64(required)?,
+        available_bytes: as_u64(available)?,
+        reason: MemoryLimitReason::ContextRenderingBufferLimit,
+    })
+}
+
 fn internal(message: &'static str) -> EngineError {
     EngineError::Internal {
         message: message.to_owned(),
@@ -799,7 +812,7 @@ impl WriterFailure {
     fn into_engine_error(self, limit: usize) -> EngineError {
         match self {
             Self::Limit { required } => {
-                match memory_limit("render chat template output", required, limit) {
+                match context_memory_limit("render chat template output", required, limit) {
                     Ok(error) | Err(error) => error,
                 }
             }

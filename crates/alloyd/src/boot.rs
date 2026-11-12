@@ -60,8 +60,6 @@ pub struct BootRequest {
     /// Optional absolute admission override for tests. When set, used as the
     /// custom ceiling path instead of live host math.
     pub admission_budget_override_bytes: Option<u64>,
-    /// Optional smaller validated profile context limit; cannot exceed the model limit.
-    pub profile_context_limit: Option<usize>,
     /// Prefer Metal when the platform supports it.
     pub prefer_metal: bool,
     /// Enable bounded Qwen tool-call parsing only when the daemon has a tools configuration.
@@ -85,6 +83,14 @@ impl BootRequest {
 
 /// Construct a real Qwen3 engine from a local corpus artifact directory.
 pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
+    boot_qwen3_with_context_limit(request, None)
+}
+
+/// Boot with an optional smaller validated context limit for constrained profiles.
+pub fn boot_qwen3_with_context_limit(
+    request: BootRequest,
+    context_override: Option<usize>,
+) -> Result<BootedEngine, RpcError> {
     request.validate_profile()?;
     if !request.artifact_dir.is_dir() {
         return Err(RpcError::internal(format!(
@@ -112,7 +118,7 @@ pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
         .and_then(Value::as_u64)
         .unwrap_or(40_960) as usize;
 
-    let profile_context_limit = request.profile_context_limit.unwrap_or(context_limit);
+    let profile_context_limit = context_override.unwrap_or(context_limit);
     if profile_context_limit > context_limit {
         return Err(RpcError::invalid_params(
             "profile context limit exceeds model context",

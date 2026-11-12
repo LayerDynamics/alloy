@@ -93,6 +93,16 @@ fn overflow_retries_bad_json_then_commits_and_continues() {
             .iter()
             .any(|m| m.content.contains("Strict retry"))
     }));
+    let continuation = contexts.last().unwrap();
+    assert!(continuation.messages().iter().any(
+        |m| m.content.contains("Previous session checkpoint") && m.content.contains("continue")
+    ));
+    assert!(
+        !continuation
+            .messages()
+            .iter()
+            .any(|m| m.content.contains(&"old ".repeat(200)))
+    );
 }
 #[test]
 fn two_invalid_outputs_reject_without_checkpoint() {
@@ -100,7 +110,18 @@ fn two_invalid_outputs_reject_without_checkpoint() {
     let error = supervisor
         .run_turn(&store, "s", &"new ".repeat(200), 20)
         .unwrap_err();
-    assert!(error.to_string().contains("invalid twice"), "{error}");
+    assert!(error.to_string().contains("failed twice"), "{error}");
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.kind == EventKind::RunCompleted && event.payload["status"] == "failed"
+            })
+    );
     assert!(
         !store
             .lock()
@@ -110,6 +131,162 @@ fn two_invalid_outputs_reject_without_checkpoint() {
             .iter()
             .any(|event| event.kind == EventKind::ContextCompacted)
     );
+}
+
+#[test]
+fn rejected_source_verification_retries_then_preserves_history() {
+    let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT), response(CHECKPOINT)]);
+    supervisor
+        .engine()
+        .verification_results
+        .lock()
+        .unwrap()
+        .extend([false, false]);
+    let before = store.lock().unwrap().list_events("s").unwrap();
+    let error = supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("source verification failed twice"),
+        "{error}"
+    );
+    let events = store.lock().unwrap().list_events("s").unwrap();
+    assert_eq!(&events[..before.len()], before.as_slice());
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextCompacted)
+    );
+    let contexts = supervisor.engine().contexts.lock().unwrap();
+    assert_eq!(
+        contexts
+            .iter()
+            .filter(|context| context.messages().iter().any(|message| message
+                .content
+                .contains("Candidate checkpoint:")
+                && message.content.contains("old ")
+                && message.content.contains("\"goal\":\"goal\"")))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn requested_output_above_reserve_is_rejected_before_generation() {
+    let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT), response("continued")]);
+    let error = supervisor
+        .run_turn(&store, "s", &"new ".repeat(130), 100)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds validated profile reserve"),
+        "{error}"
+    );
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == EventKind::ContextCompacted)
+    );
+}
+
+#[test]
+fn summary_registration_failure_clears_the_registered_request() {
+    let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT)]);
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&finished);
+    let error = supervisor
+        .run_turn_streaming_with_lifecycle(
+            &store,
+            "s",
+            &"new ".repeat(200),
+            20,
+            |_| {
+                Err(harness_core::HarnessError::Engine(
+                    "cancelled during registration".into(),
+                ))
+            },
+            move |id| {
+                captured.lock().unwrap().push(id.as_str().to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled during registration"));
+    let ids = finished.lock().unwrap();
+    assert_eq!(ids.len(), 1);
+    assert!(ids[0].ends_with(":compact:0"));
+}
+
+#[test]
+fn summary_render_failure_retains_the_original_cause() {
+    let (_dir, store, supervisor) = setup(vec![]);
+    supervisor
+        .engine()
+        .fail_summary_render
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let error = supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("summary renderer failed"),
+        "{error}"
+    );
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == EventKind::RunCompleted && e.payload["status"] == "failed")
+    );
+}
+
+#[test]
+fn summary_render_buffer_limit_tries_earlier_completed_boundary() {
+    let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT), response("continued")]);
+    let first = store
+        .lock()
+        .unwrap()
+        .list_events("s")
+        .unwrap()
+        .last()
+        .unwrap()
+        .seq;
+    {
+        let mut db = store.lock().unwrap();
+        db.append_event(
+            "s",
+            EventKind::UserMessage,
+            json!({"content":"small"}),
+            json!([]),
+        )
+        .unwrap();
+        db.append_event("s", EventKind::RunCompleted, json!({}), json!([]))
+            .unwrap();
+    }
+    supervisor
+        .engine()
+        .summary_limit_failures
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    let outcome = supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    assert_eq!(outcome.assistant_text, "continued");
+    let events = store.lock().unwrap().list_events("s").unwrap();
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == EventKind::ContextCompacted)
+        .unwrap();
+    assert_eq!(compacted.payload["covered_through"], first);
 }
 #[test]
 fn low_headroom_rejects_without_checkpoint() {
@@ -171,7 +348,9 @@ fn tool_round_compacts_then_generates_from_checkpoint() {
         deadline: Instant::now() + Duration::from_secs(5),
     };
     let registry = tool_registry::registry::ToolRegistry::default();
-    let outcome = supervisor
+    let mut oversized = config;
+    oversized.max_output_tokens = 21;
+    let error = supervisor
         .generate_tool_round(
             &store,
             &registry,
@@ -180,12 +359,57 @@ fn tool_round_compacts_then_generates_from_checkpoint() {
                 turn_seq: turn,
                 round: 0,
             },
-            config,
+            oversized,
+            |_| panic!("over-reserve tool request must not start"),
             |_| Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds validated profile reserve"),
+        "{error}"
+    );
+    let active = std::cell::RefCell::new(None::<String>);
+    let finished = std::cell::RefCell::new(Vec::new());
+    let outcome = supervisor
+        .generate_tool_round_with_lifecycle(
+            &store,
+            &registry,
+            ToolRoundRequest {
+                session_id: "s",
+                turn_seq: turn,
+                round: 0,
+            },
+            config,
+            |id| {
+                *active.borrow_mut() = Some(id.as_str().to_owned());
+                Ok(())
+            },
+            |id| {
+                assert_eq!(active.borrow().as_deref(), Some(id.as_str()));
+                *active.borrow_mut() = None;
+                finished.borrow_mut().push(id.as_str().to_owned());
+                Ok(())
+            },
             |_| Ok(()),
         )
         .unwrap();
     assert_eq!(outcome.assistant_text, "tool continuation");
+    assert_eq!(finished.borrow().len(), 2);
+    assert!(finished.borrow().iter().any(|id| id.contains(":compact:")));
+    assert!(finished.borrow().iter().any(|id| id.contains(":verify:")));
+    let contexts = supervisor.engine().contexts.lock().unwrap();
+    let continuation = contexts.last().unwrap();
+    assert!(continuation.messages().iter().any(
+        |m| m.content.contains("Previous session checkpoint") && m.content.contains("continue")
+    ));
+    assert!(
+        !continuation
+            .messages()
+            .iter()
+            .any(|m| m.content.contains(&"old ".repeat(200)))
+    );
     assert_eq!(
         store
             .lock()
@@ -222,7 +446,7 @@ fn second_invalid_checkpoint_attempt_preserves_committed_checkpoint() {
     let error = supervisor
         .run_turn(&store, "s", &"another ".repeat(200), 20)
         .unwrap_err();
-    assert!(error.to_string().contains("invalid twice"), "{error}");
+    assert!(error.to_string().contains("failed twice"), "{error}");
     let after: Vec<_> = store
         .lock()
         .unwrap()

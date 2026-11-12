@@ -306,11 +306,18 @@ fn assert_failure_survives(at: FailureAt) {
         let store = SessionStore::open(&db).unwrap();
         let events = store.list_events(session_id).unwrap();
         assert!(
-            !events.iter().any(|event| matches!(
-                event.kind,
-                EventKind::AssistantMessage | EventKind::RunCompleted
-            )),
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::AssistantMessage
+                    || (event.kind == EventKind::RunCompleted
+                        && event.payload["status"] != "failed")),
             "failed partial text cannot be committed as a successful turn"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::RunCompleted
+                    && event.payload["status"] == "failed")
         );
     }
 }

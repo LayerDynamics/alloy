@@ -293,7 +293,7 @@ impl<E: Engine> DaemonService<E> {
                 },
             )
         } else {
-            self.supervisor.run_turn_streaming(
+            self.supervisor.run_turn_streaming_with_lifecycle(
                 &self.store,
                 &session_id,
                 &content,
@@ -313,6 +313,19 @@ impl<E: Engine> DaemonService<E> {
                     drop(guard);
                     if let Some(id) = cancel_now {
                         self.supervisor.cancel(id)?;
+                    }
+                    Ok(())
+                },
+                |request_id| {
+                    let mut guard = self
+                        .inflight
+                        .lock()
+                        .map_err(|_| HarnessError::Store("inflight lock poisoned".into()))?;
+                    let slot = guard
+                        .get_mut(&session_id)
+                        .ok_or_else(|| HarnessError::Engine("missing inflight slot".into()))?;
+                    if slot.request_id.as_ref() == Some(request_id) {
+                        slot.request_id = None;
                     }
                     Ok(())
                 },

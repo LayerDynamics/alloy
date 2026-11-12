@@ -138,6 +138,7 @@ impl<E: Engine> Supervisor<E> {
                         live(store, session, cancel, config.round.deadline)?;
                         started(id)
                     },
+                    |id| finished(id),
                     |event| {
                         live(store, session, cancel, config.round.deadline)?;
                         let (name, body) = match event {
