@@ -1134,6 +1134,7 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
             fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         }
         let mut statuses = 0;
+        let mut stopping_at = None;
         loop {
             // SAFETY: this isolated test owns the process-wide reaper; status
             // is deliberately ignored for supervisor children only.
@@ -1142,8 +1143,14 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
                 statuses += 1;
                 continue;
             }
-            if stop.load(std::sync::atomic::Ordering::Acquire) && pid < 0 {
-                break;
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                // The verifier deliberately remains a live host child. Drain
+                // the pipe supervisor's status without waiting for ECHILD.
+                let until =
+                    stopping_at.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if statuses >= 1 || Instant::now() >= *until {
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1165,5 +1172,24 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
         1,
         "external reaper owns the pipe supervisor; launchd owns the workload supervisor"
     );
+    unsafe extern "C" {
+        fn alloy_test_verifier_pid() -> i32;
+        fn proc_listchildpids(parent: i32, buffer: *mut i32, size: i32) -> i32;
+    }
+    let mut children = [0i32; 8];
+    // SAFETY: libproc fills this writable bounded buffer; this call never signals or reaps.
+    assert_eq!(
+        unsafe {
+            proc_listchildpids(
+                std::process::id() as i32,
+                children.as_mut_ptr(),
+                std::mem::size_of_val(&children) as i32,
+            )
+        },
+        1,
+        "unexpected additional host children: {children:?}"
+    );
+    // SAFETY: reads the test host's retained verifier PID, not a signalling capability.
+    assert_eq!(children[0], unsafe { alloy_test_verifier_pid() });
     assert_reaped(pid);
 }
