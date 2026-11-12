@@ -303,6 +303,112 @@ impl PinnedTokenizer {
     }
 }
 
+/// Bound the token count of any UTF-8 rendering of at most `rendered_bytes`
+/// bytes for the pinned Qwen3-4B corpus tokenizer, without special-token
+/// post-processing. This deliberately does not admit a request: callers must
+/// bound the complete rendered text, including every projected result.
+///
+/// The pinned tokenizer uses the tokenizers 0.23.2 NFC tables, regex splitting
+/// and ByteLevel BPE without a prefix space. NFC can be bounded by eight UTF-8
+/// bytes per source byte: canonical decomposition produces at most two
+/// scalars per input byte for the pinned Unicode tables (exhaustively checked
+/// in `projected_context`), composition does not increase scalar count, and
+/// each scalar is at most four bytes. ByteLevel BPE cannot emit more tokens
+/// than its normalized input bytes; nonempty added tokens do not increase that
+/// bound. Other tokenizer sources must provide their own verified bound.
+pub fn qwen3_projected_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0xae, 0xb1, 0x33, 0x07, 0xa7, 0x1a, 0xcd, 0x8f, 0xe8, 0x18, 0x61, 0xd9, 0x4a, 0xd5, 0x4a,
+        0xb6, 0x89, 0xdf, 0x77, 0x33, 0x18, 0x80, 0x9e, 0xed, 0x3c, 0xbe, 0x79, 0x4b, 0x44, 0x92,
+        0xda, 0xe4,
+    ];
+    if tokenizer.source_sha256() != &PIN {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "the selected tokenizer has no verified projected-input bound",
+        ));
+    }
+    rendered_bytes.checked_mul(8).ok_or_else(|| {
+        EngineError::invalid_request("rendered_bytes", "projected token bound overflow")
+    })
+}
+
+/// Bound a Qwen tool-template skeleton after replacing its last result
+/// placeholders with bounded results. The pinned tokenizer recognizes each
+/// `<|im_start|>` as a non-normalized, non-stripping added token, so BPE and
+/// NFC processing cannot cross those message boundaries. Existing segments
+/// are charged at the exact skeleton count; each changing segment is charged
+/// again at the conservative byte bound. The deliberate double charge avoids
+/// subtracting tokens attributed to a segment.
+pub fn qwen3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+    ascii_escape_bytes: usize,
+) -> Result<usize, EngineError> {
+    const START: &str = "<|im_start|>";
+    const RESULT: &str = "<|im_start|>tool\n<tool_response>";
+    if result_count == 0 {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "a projected result is required",
+        ));
+    }
+    let text = rendered.text();
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (start, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let next = text[start + RESULT.len()..]
+            .find(START)
+            .map(|offset| start + RESULT.len() + offset)
+            .ok_or_else(|| {
+                EngineError::invalid_request(
+                    "projection",
+                    "result placeholder has no following message boundary",
+                )
+            })?;
+        let segment = &text[start..next];
+        if !segment.contains("\"content\":\"\"") || !segment.contains("</tool_response><|im_end|>")
+        {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "result placeholder is not empty",
+            ));
+        }
+        segment_bytes = segment_bytes.checked_add(segment.len()).ok_or_else(|| {
+            EngineError::invalid_request("projection", "result segment byte overflow")
+        })?;
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing result placeholders",
+        ));
+    }
+    let variable_bytes = segment_bytes
+        .checked_add(
+            additional_bytes
+                .checked_sub(ascii_escape_bytes)
+                .ok_or_else(|| {
+                    EngineError::invalid_request("projection", "ASCII escape bound exceeds total")
+                })?,
+        )
+        .ok_or_else(|| EngineError::invalid_request("projection", "result byte bound overflow"))?;
+    rendered
+        .token_count()
+        .checked_add(qwen3_projected_token_upper_bound(
+            tokenizer,
+            variable_bytes,
+        )?)
+        .and_then(|n| n.checked_add(ascii_escape_bytes))
+        .ok_or_else(|| EngineError::invalid_request("projection", "token bound overflow"))
+}
+
 /// Render exact model-visible text from a structured text snapshot.
 ///
 /// Uses the supplied pinned template. No fallback template is selected.

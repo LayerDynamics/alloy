@@ -15,6 +15,7 @@ pub struct RenderingTool {
     version: String,
     description: String,
     input_schema: Value,
+    registered_policy: Option<Value>,
 }
 impl RenderingTool {
     /// Copy exact metadata from a validated registration, not model output.
@@ -44,13 +45,31 @@ impl RenderingTool {
             version,
             description,
             input_schema: canonical(input_schema),
+            registered_policy: None,
         })
     }
+    /// Attach descriptive registered policy metadata. This is model-facing
+    /// information only; daemon policy and approvals remain authoritative.
+    pub fn with_registered_policy(mut self, policy: Value) -> Result<Self, EngineError> {
+        if !policy.is_object() {
+            return Err(invalid(
+                "tool.registered_policy",
+                "policy must be an object",
+            ));
+        }
+        self.registered_policy = Some(canonical(policy));
+        Ok(self)
+    }
     fn value(&self) -> Value {
-        json!({"type":"function", "function": {
+        let mut value = json!({"type":"function", "function": {
             "name": self.id, "version": self.version,
             "description": self.description, "parameters": self.input_schema,
-        }})
+        }});
+        if let Some(policy) = &self.registered_policy {
+            value["function"]["registered_policy"] = policy.clone();
+            value["function"]["local_policy_enforced_separately"] = Value::Bool(true);
+        }
+        value
     }
 }
 
@@ -100,6 +119,25 @@ pub struct ToolContext {
     input_bytes: usize,
 }
 impl ToolContext {
+    /// Construct a new validated context with a projected historical tail.
+    ///
+    /// This does not mutate the original snapshot or authorize the projected
+    /// calls. Normal size, identity and call/result linkage checks apply to
+    /// the complete combined context.
+    pub fn with_appended_history(
+        &self,
+        blocks: impl IntoIterator<Item = ToolHistoryBlock>,
+        limits: ToolContextLimits,
+    ) -> Result<Self, EngineError> {
+        let mut history = self.history.clone();
+        for block in blocks {
+            if history.len() >= limits.max_history_blocks {
+                return Err(invalid("tool_context", "history count limit exceeded"));
+            }
+            history.push(block);
+        }
+        Self::new(self.tools.clone(), history, limits)
+    }
     /// Freeze schema order and validate historical call/result linkage.
     /// No registration, execution, policy, or approval is performed here.
     pub fn new(

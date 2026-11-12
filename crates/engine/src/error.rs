@@ -539,7 +539,7 @@ impl fmt::Display for EngineError {
                     "context limit exceeded: input={input_tokens}, \
                      output reserve={output_reserve_tokens}, \
                      safety margin={safety_margin_tokens}, \
-                     limit={limit_tokens}"
+                     limit={limit_tokens}; start a new session or select a profile with a larger context"
                 )
             }
 

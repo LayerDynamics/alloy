@@ -210,6 +210,7 @@ impl<E: Engine> Supervisor<E> {
         // Pause may have raced between ensure and on_started; re-check once registered.
         ensure_session_active(store, session_id)?;
         let request = GenerationRequest::new(request_id.clone(), profile, snapshot, options)
+            .and_then(|request| request.with_expected_render(rendered.clone()))
             .map_err(HarnessError::from)?;
 
         let generation = block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;

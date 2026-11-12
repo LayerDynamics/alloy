@@ -17,6 +17,10 @@ mod tool_history;
 
 const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum serialized model-visible representation of a tool error. Full
+/// results remain in durable history; preflight uses this same bound.
+pub const MODEL_ERROR_CONTEXT_BYTES: usize = 256;
+
 /// Builds engine context snapshots from durable session events.
 #[derive(Debug, Default)]
 pub struct ContextBuilder;
@@ -32,6 +36,11 @@ impl ContextBuilder {
             let role = match event.kind {
                 EventKind::UserMessage => MessageRole::User,
                 EventKind::AssistantMessage => MessageRole::Assistant,
+                EventKind::SkillLoaded | EventKind::ContextCompacted | EventKind::ModelChanged => {
+                    return Err(HarnessError::Invalid(
+                        "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session".into(),
+                    ));
+                }
                 EventKind::ToolRequested
                 | EventKind::ToolApproved
                 | EventKind::ToolStarted
@@ -42,19 +51,9 @@ impl ContextBuilder {
                 }
                 _ => continue,
             };
-            let content = event
-                .payload
-                .get("content")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    HarnessError::Invalid(format!(
-                        "event seq {} missing string payload.content",
-                        event.seq
-                    ))
-                })?;
             messages.push(Message {
                 role,
-                content: content.to_owned(),
+                content: message_content(event)?,
             });
         }
         Ok(messages)
@@ -98,6 +97,39 @@ impl ContextBuilder {
     ) -> HarnessResult<RenderedContext> {
         block_on(engine.render_and_count(snapshot))?.map_err(HarnessError::from)
     }
+}
+
+/// Preserve message-attached opaque artifact references as quoted message data.
+/// This does not open an artifact or grant access to one.
+pub(super) fn message_content(event: &EventRecord) -> HarnessResult<String> {
+    let content = event
+        .payload
+        .get("content")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            HarnessError::Invalid(format!(
+                "event seq {} missing string payload.content",
+                event.seq
+            ))
+        })?;
+    let refs = event.artifact_refs.as_array().ok_or_else(|| {
+        HarnessError::Invalid("message artifact references must be an array".into())
+    })?;
+    if refs.is_empty() {
+        return Ok(content.to_owned());
+    }
+    if refs
+        .iter()
+        .any(|value| value.as_str().is_none_or(|s| s.is_empty() || s.len() > 128))
+    {
+        return Err(HarnessError::Invalid(
+            "message artifact reference must be a nonempty bounded string".into(),
+        ));
+    }
+    Ok(format!(
+        "{content}\n\nAttached artifact references (data): {}",
+        serde_json::to_string(refs)?
+    ))
 }
 
 struct Notify(std::sync::mpsc::Sender<()>);

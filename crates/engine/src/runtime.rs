@@ -181,6 +181,17 @@ pub trait TextDecoder {
 
 /// Required real backend services in addition to the actual family loader.
 pub trait RuntimeBackend: ModelFamily + 'static {
+    /// Bound tokens for a complete projected rendered byte sequence.
+    fn projected_token_upper_bound(
+        &self,
+        _registry: &Registry,
+        _projection: crate::api::ProjectedToolRender<'_>,
+    ) -> Result<usize, EngineError> {
+        Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "backend has no verified bound",
+        ))
+    }
     /// Trusted content-manifest digest for cross-process KV compatibility.
     ///
     /// Return None when this backend cannot bind persisted KV to verified
@@ -932,6 +943,19 @@ impl FamilyRuntime {
 }
 
 impl EngineRuntime for FamilyRuntime {
+    fn projected_token_upper_bound<'a>(
+        &'a self,
+        registry: &'a Registry,
+        projection: crate::api::ProjectedToolRender<'a>,
+    ) -> EngineFuture<'a, usize> {
+        Box::pin(async move {
+            let artifact = registry
+                .resolve_profile(projection.rendered.profile_id())?
+                .artifact();
+            self.backend(registry, artifact)?
+                .projected_token_upper_bound(registry, projection)
+        })
+    }
     fn supports_memory_reclamation(&self) -> bool {
         self.pressure_policy.is_some() || lock_metadata(&self.worker.summary).pool_enabled
     }

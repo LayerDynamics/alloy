@@ -172,6 +172,55 @@ struct StaticStream {
     events: VecDeque<GenerationEvent>,
 }
 
+#[test]
+fn unsupported_skill_and_checkpoint_events_are_not_silently_dropped() {
+    for kind in [
+        EventKind::SkillLoaded,
+        EventKind::ContextCompacted,
+        EventKind::ModelChanged,
+    ] {
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionStore::open(dir.path().join("s.sqlite")).expect("store");
+        store
+            .create_session("session", "harness-profile")
+            .expect("session");
+        store
+            .append_event(
+                "session",
+                EventKind::UserMessage,
+                json!({"content":"hello"}),
+                json!([]),
+            )
+            .expect("message");
+        store
+            .append_event("session", kind, json!({}), json!([]))
+            .expect("event");
+        let history = store.list_events("session").expect("history");
+        let error = ContextBuilder::build_snapshot("snapshot", "harness-profile", &history, None)
+            .expect_err("must not ignore model-visible context");
+        assert!(error.to_string().contains("model-change context"));
+    }
+}
+
+#[test]
+fn text_snapshot_preserves_message_artifact_references() {
+    let dir = tempdir().unwrap();
+    let mut store = SessionStore::open(dir.path().join("s.sqlite")).unwrap();
+    store.create_session("session", "harness-profile").unwrap();
+    store
+        .append_event(
+            "session",
+            EventKind::UserMessage,
+            json!({"content":"hello"}),
+            json!(["artifact"]),
+        )
+        .unwrap();
+    let events = store.list_events("session").unwrap();
+    let snapshot =
+        ContextBuilder::build_snapshot("snapshot", "harness-profile", &events, None).unwrap();
+    assert!(snapshot.messages()[0].content.contains("[\"artifact\"]"));
+}
+
 impl GenerationEventStream for StaticStream {
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<GenerationEvent>> {
         Poll::Ready(self.get_mut().events.pop_front())

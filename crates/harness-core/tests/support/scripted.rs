@@ -19,6 +19,8 @@ pub struct ScriptedEngine {
     pub contexts: Mutex<Vec<ContextSnapshot>>,
     pub cancel_not_found: bool,
     pub cancel_not_found_id: Option<String>,
+    pub projected_byte_limit: usize,
+    pub projected_pending: bool,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -34,6 +36,8 @@ impl ScriptedEngine {
             contexts: Mutex::new(Vec::new()),
             cancel_not_found: false,
             cancel_not_found_id: None,
+            projected_byte_limit: usize::MAX,
+            projected_pending: false,
         }
     }
 }
@@ -55,6 +59,28 @@ impl Engine for ScriptedEngine {
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
     }
+    fn check_projected_tool_render<'a>(
+        &'a self,
+        projection: engine::api::ProjectedToolRender<'a>,
+    ) -> EngineFuture<'a, ()> {
+        let limit = self.projected_byte_limit;
+        let bytes = projection.input_bytes;
+        if self.projected_pending {
+            return Box::pin(std::future::pending());
+        }
+        Box::pin(async move {
+            if bytes > limit {
+                Err(engine::error::EngineError::ContextLimitExceeded {
+                    input_tokens: bytes,
+                    output_reserve_tokens: 0,
+                    safety_margin_tokens: 0,
+                    limit_tokens: limit,
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
     fn render_and_count(&self, context: ContextSnapshot) -> EngineFuture<'_, RenderedContext> {
         self.contexts.lock().unwrap().push(context.clone());
         let profile = context.profile_id().clone();
@@ -74,7 +100,15 @@ impl Engine for ScriptedEngine {
             keep_trailing_newline: true,
             trim_blocks: false,
             lstrip_blocks: false,
-            reserved_spellings: &[],
+            reserved_spellings: &[
+                "<|",
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>",
+                "<tool_response>",
+                "</tool_response>",
+            ],
         };
         let result = render_and_count(
             &context,

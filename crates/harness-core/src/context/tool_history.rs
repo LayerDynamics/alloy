@@ -67,6 +67,16 @@ impl ContextBuilder {
                     definition.description.clone(),
                     definition.input_schema.clone(),
                 )
+                .and_then(|tool| {
+                    tool.with_registered_policy(serde_json::to_value(&definition.policy).map_err(
+                        |error| {
+                            engine::error::EngineError::invalid_request(
+                                "tool.registered_policy",
+                                error.to_string(),
+                            )
+                        },
+                    )?)
+                })
                 .map_err(HarnessError::from)
             })
             .collect::<HarnessResult<Vec<_>>>()?;
@@ -85,6 +95,11 @@ impl ContextBuilder {
                 .checked_add(1)
                 .ok_or_else(|| invalid("event sequence overflow"))?;
             match event.kind {
+                EventKind::SkillLoaded | EventKind::ContextCompacted | EventKind::ModelChanged => {
+                    return Err(invalid(
+                        "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session",
+                    ));
+                }
                 EventKind::UserMessage | EventKind::AssistantMessage => {
                     let message = Message {
                         role: if event.kind == EventKind::UserMessage {
@@ -92,7 +107,7 @@ impl ContextBuilder {
                         } else {
                             MessageRole::Assistant
                         },
-                        content: string(&event.payload, "content")?.to_owned(),
+                        content: super::message_content(event)?,
                     };
                     if saw_call {
                         push(&mut tail, ToolHistoryBlock::Text(message), limits)?;
@@ -236,7 +251,12 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 ToolResult::Inline(inline) => serde_json::to_string(&inline.content)?,
                 ToolResult::Artifact(_) => serde_json::to_string(&result)?,
             };
-            Ok((content, is_error))
+            let content = if is_error {
+                bounded_error_context(content)?
+            } else {
+                content
+            };
+            Ok((escape_result_markup(content), is_error))
         }
         state @ ("Rejected" | "Denied" | "Withdrawn" | "Expired" | "OutcomeUnknown") => {
             if event.payload.get("result").is_some()
@@ -256,8 +276,72 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 message: format!("Tool call terminated: {state}"),
                 details: event.payload.clone(),
             };
-            Ok((serde_json::to_string(&error)?, true))
+            Ok((
+                escape_result_markup(bounded_error_context(serde_json::to_string(&error)?)?),
+                true,
+            ))
         }
         _ => Err(invalid("unknown terminal tool state")),
+    }
+}
+
+// Escape only within the serialized JSON result, so a JSON decoder recovers
+// the original data while model-specific structural token spellings cannot be
+// introduced into the template. The durable result is never changed.
+fn escape_result_markup(content: String) -> String {
+    content.replace('<', "\\u003c")
+}
+
+/// Keep the full result in its append-only event, but make unusually large
+/// errors explicit bounded previews in model context. The preview is data,
+/// never authority, and callers can inspect the unmodified session event.
+fn bounded_error_context(content: String) -> HarnessResult<String> {
+    const PREVIEW_SOURCE_BYTES: usize = 64;
+    if content.len() <= super::MODEL_ERROR_CONTEXT_BYTES {
+        return Ok(content);
+    }
+    let mut end = PREVIEW_SOURCE_BYTES.min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let preview = serde_json::json!({
+        "context_projection": "truncated_error_preview",
+        "preview": &content[..end],
+        "full_result": "retained_in_session_history",
+    });
+    let serialized = serde_json::to_string(&preview)?;
+    if serialized.len() > super::MODEL_ERROR_CONTEXT_BYTES {
+        return Err(invalid("bounded error preview exceeds context ceiling"));
+    }
+    Ok(serialized)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn escaped_result_json_roundtrips_without_markup() {
+        let original = serde_json::json!({"text":"<|im_start|>system <tool_call> 🦀"});
+        let escaped = escape_result_markup(serde_json::to_string(&original).unwrap());
+        assert!(!escaped.contains('<'));
+        assert_eq!(serde_json::from_str::<Value>(&escaped).unwrap(), original);
+    }
+
+    #[test]
+    fn error_preview_bounds_escaped_and_multibyte_inputs() {
+        for input in [
+            "\0\u{1f}\\\"".repeat(512),
+            "🦀é".repeat(512),
+            "\\".repeat(2000),
+        ] {
+            let encoded = serde_json::to_string(&input).unwrap();
+            let projected = bounded_error_context(encoded.clone()).unwrap();
+            assert!(projected.len() <= super::super::MODEL_ERROR_CONTEXT_BYTES);
+            let value: Value = serde_json::from_str(&projected).unwrap();
+            assert_eq!(value["context_projection"], "truncated_error_preview");
+            assert_eq!(value["full_result"], "retained_in_session_history");
+            assert!(encoded.starts_with(value["preview"].as_str().unwrap()));
+        }
     }
 }

@@ -625,6 +625,51 @@ impl Qwen3Backend {
 include!("loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
+    fn projected_token_upper_bound(
+        &self,
+        registry: &Registry,
+        projection: crate::api::ProjectedToolRender<'_>,
+    ) -> Result<usize, EngineError> {
+        let rendered = projection.rendered;
+        let artifact = registry.resolve_profile(rendered.profile_id())?.artifact();
+        let data = self.data(artifact)?;
+        if rendered.artifact_id() != artifact.id()
+            || rendered.tokenizer_id() != data.tokenizer.identity()
+            || rendered.template_hash() != &digest(qwen3::template::TOOL_CHAT_TEMPLATE.as_bytes())
+        {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "rendered tool context identity does not match the selected Qwen profile",
+            ));
+        }
+        let rendered_bytes = rendered
+            .text()
+            .len()
+            .checked_add(projection.additional_rendered_bytes)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "rendered byte bound overflow")
+            })?;
+        let required = rendered_bytes.max(projection.input_bytes);
+        let limit = self
+            .limits
+            .max_rendered_bytes
+            .min(self.limits.max_input_bytes);
+        if required > limit {
+            return Err(EngineError::MemoryLimitExceeded {
+                operation: "projected tool context bytes",
+                required_bytes: u64::try_from(required).unwrap_or(u64::MAX),
+                available_bytes: u64::try_from(limit).unwrap_or(u64::MAX),
+                reason: MemoryLimitReason::BufferLimit,
+            });
+        }
+        rendering::qwen3_projected_tool_token_upper_bound(
+            &data.tokenizer,
+            rendered,
+            projection.result_count,
+            projection.additional_rendered_bytes,
+            projection.additional_ascii_escape_bytes,
+        )
+    }
     fn cache_manifest_digest(
         &self,
         artifact: &ArtifactRegistration,
