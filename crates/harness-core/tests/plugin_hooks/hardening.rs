@@ -1179,6 +1179,7 @@ fn plugin_external_reaper_owns_supervisor_statuses() {
     let mut children = [0i32; 8];
     // SAFETY: libproc fills this writable bounded buffer; this call never signals or reaps.
     assert_eq!(
+        // SAFETY: the initialized PID array remains writable for the supplied size.
         unsafe {
             proc_listchildpids(
                 std::process::id() as i32,
