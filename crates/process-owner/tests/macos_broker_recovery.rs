@@ -34,6 +34,10 @@ unsafe extern "C" {
     fn alloy_test_verifier_late_allow() -> i32;
     fn alloy_test_verifier_unknown_parent() -> i32;
     fn alloy_test_verifier_alive() -> i32;
+    fn alloy_test_verifier_pause() -> i32;
+    fn alloy_test_ignore_block_hup();
+    fn alloy_process_identity(pid: i32) -> u64;
+    fn alloy_owned_signal(pid: i32, identity: u64) -> i32;
 }
 
 fn start(program: &str, arguments: &[&str], root: &Path) -> std::io::Result<Child> {
@@ -699,6 +703,64 @@ fn verifier_exits_on_inconclusive_parent_identity() {
         assert!(start("/bin/sh", &["-c", "echo started >> unverified"], root).is_err());
         assert!(!root.join("unverified").exists());
     });
+}
+
+#[test]
+fn stopped_verifier_exits_with_its_host_even_if_host_ignores_hup() {
+    const MODE: &str = "ALLOY_STOPPED_VERIFIER_PARENT";
+    if let Some(root) = std::env::var_os(MODE) {
+        let root = Path::new(&root);
+        // SAFETY: this dedicated probe process changes only its own signal state.
+        unsafe {
+            alloy_test_ignore_block_hup();
+        }
+        stop(start("/bin/sleep", &["30"], root).unwrap());
+        // SAFETY: these reads capture this host's exact verifier identity.
+        let pid = unsafe { alloy_test_verifier_pid() };
+        // SAFETY: reads the live verifier's stable kernel identity.
+        let identity = unsafe { alloy_process_identity(pid) };
+        assert!(pid > 0 && identity > 0);
+        fs::write(root.join("verifier.pid"), format!("{pid} {identity}")).unwrap();
+        // SAFETY: stops only the exact verifier and waits for OS-confirmed SSTOP.
+        assert_eq!(unsafe { alloy_test_verifier_pause() }, 0);
+        return; // The entire probe host exits while its watchdog is stopped.
+    }
+    let root = std::env::temp_dir().join(format!("alloy-stopped-verifier-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "stopped_verifier_exits_with_its_host_even_if_host_ignores_hup",
+            "--nocapture",
+        ])
+        .env(MODE, &root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let record = fs::read_to_string(root.join("verifier.pid")).unwrap();
+    let values: Vec<_> = record.split_whitespace().collect();
+    let (pid, identity) = (
+        values[0].parse::<i32>().unwrap(),
+        values[1].parse::<u64>().unwrap(),
+    );
+    struct Cleanup(i32, u64);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            // SAFETY: fallback signals only the recorded kernel identity, after the assertion.
+            unsafe {
+                alloy_owned_signal(self.0, self.1);
+            }
+        }
+    }
+    let cleanup = Cleanup(pid, identity);
+    gone(pid as u32); // Independent OS absence must precede fallback cleanup.
+    drop(cleanup);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

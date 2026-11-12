@@ -184,6 +184,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
     registration_and_workloads_create_no_additional_host_children
     private_verifier_rejects_unrelated_code_and_death_fails_closed
     verifier_exits_on_inconclusive_parent_identity
+    stopped_verifier_exits_with_its_host_even_if_host_ignores_hup
     containment::detached_descendants_are_cleaned_after_normal_exit
     containment::detached_descendants_are_cleaned_after_cancellation
     containment::trusted_plugin_detached_descendants_are_cleaned

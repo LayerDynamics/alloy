@@ -82,7 +82,15 @@ static int authenticate_in_verifier(audit_token_t audit,const char *launcher,con
         int actions_ready=0,attr_ready=0,pid=0;
         int error=posix_spawn_file_actions_init(&actions);
         if(!error){actions_ready=1;error=posix_spawnattr_init(&attr);}
-        if(!error){attr_ready=1;error=posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT);}
+        if(!error){attr_ready=1;error=posix_spawnattr_setflags(&attr,
+            POSIX_SPAWN_CLOEXEC_DEFAULT|POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_SETSIGDEF|POSIX_SPAWN_SETSIGMASK);}
+        /* A stopped watchdog cannot observe parent death. Keep the verifier in
+         * its own group in the parent's session, with unblocked default HUP:
+         * Darwin then tears it down when that stopped group becomes orphaned. */
+        sigset_t defaults,mask;sigemptyset(&defaults);sigaddset(&defaults,SIGHUP);sigemptyset(&mask);
+        if(!error)error=posix_spawnattr_setpgroup(&attr,0);
+        if(!error)error=posix_spawnattr_setsigdefault(&attr,&defaults);
+        if(!error)error=posix_spawnattr_setsigmask(&attr,&mask);
         if(!error)error=posix_spawn_file_actions_adddup2(&actions,fd,3);
         for(int i=0;!error && i<3;++i)
             error=posix_spawn_file_actions_addopen(&actions,i,"/dev/null",i?O_WRONLY:O_RDONLY,0);
@@ -137,6 +145,22 @@ int alloy_test_verifier_unknown_parent(void){
 }
 int alloy_test_verifier_alive(void){
     return host_verifier?alloy_owned_alive(host_verifier->pid,host_verifier->identity):-ENOENT;
+}
+void alloy_test_ignore_block_hup(void){
+    signal(SIGHUP,SIG_IGN);sigset_t mask;sigemptyset(&mask);sigaddset(&mask,SIGHUP);
+    pthread_sigmask(SIG_BLOCK,&mask,NULL);
+}
+int alloy_test_verifier_pause(void){
+    if(!host_verifier)return ENOENT;
+    int error=identity_signal(host_verifier->pid,host_verifier->identity,SIGSTOP);
+    uint64_t until=milliseconds()+2000;
+    while(!error){
+        struct proc_bsdinfo state;
+        if(proc_pidinfo(host_verifier->pid,PROC_PIDTBSDINFO,0,&state,sizeof(state))==sizeof(state) && state.pbi_status==SSTOP)return 0;
+        if(milliseconds()>=until){(void)identity_signal(host_verifier->pid,host_verifier->identity,SIGCONT);return ETIMEDOUT;}
+        pause_briefly();
+    }
+    return error;
 }
 int alloy_test_verifier_kill(void){
     return host_verifier?alloy_owned_signal(host_verifier->pid,host_verifier->identity):ESRCH;

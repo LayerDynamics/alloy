@@ -45,6 +45,11 @@ failure disables new authentication until the host restarts, while existing
 command control remains independent. This bounds even an unreaped verifier
 status to one per host. Broker crashes do not kill that verifier and can still
 reconnect without restarting the host.
+The verifier also occupies its own process group in the parent's session, with
+default unblocked `SIGHUP`. If it is stopped when the host exits, Darwin's orphaned
+group handling sends `SIGHUP`/`SIGCONT`, so a stopped watchdog cannot leave it alive.
+This uses the kernel's own group lifecycle; the host does not signal a numeric
+group ID. The regression includes a host that ignores and blocks `SIGHUP`.
 
 No possibly-started command is automatically replayed. Losing a request or reply
 publishes `STOP` in the independent shared control channel. A late owner cannot
