@@ -552,7 +552,7 @@ impl<E: Engine> Supervisor<E> {
                 }
                 _ => output_limit,
             };
-            // ContextBuilder bounds model-visible error projections to 1024
+            // ContextBuilder bounds serialized error previews before markup escaping
             // bytes while retaining the full result in the durable event.
             let error_limit = crate::context::MODEL_ERROR_CONTEXT_BYTES;
             result_limits.push((streaming, inline_limit, error_limit));
@@ -596,9 +596,10 @@ impl<E: Engine> Supervisor<E> {
                     } else {
                         *limit
                     };
-                    // Results are compact JSON. Each additional quoting layer at
-                    // most doubles its bytes; control characters are already escaped.
-                    total.checked_add(limit.max(*error_limit).checked_mul(2)?)
+                    // Escaping a literal `<` in compact JSON as `\u003c` can
+                    // expand it sixfold. The enclosing JSON string can double
+                    // every byte again; reserve both transformations.
+                    total.checked_add(limit.max(*error_limit).checked_mul(12)?)
                 })
                 .ok_or_else(|| HarnessError::Engine("projected tool batch overflow".into()))?;
             let json_bytes = extra

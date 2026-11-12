@@ -100,7 +100,15 @@ impl Engine for ScriptedEngine {
             keep_trailing_newline: true,
             trim_blocks: false,
             lstrip_blocks: false,
-            reserved_spellings: &[],
+            reserved_spellings: &[
+                "<|",
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>",
+                "<tool_response>",
+                "</tool_response>",
+            ],
         };
         let result = render_and_count(
             &context,

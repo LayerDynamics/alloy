@@ -654,7 +654,7 @@ fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
             ],
         ]);
         // The same budget admits one call but rejects the combined pair.
-        engine.projected_byte_limit = if fits || batch_overflow { 8500 } else { 1 };
+        engine.projected_byte_limit = if fits || batch_overflow { 11000 } else { 1 };
         let service = DaemonService::open(
             dir.path().join("db"),
             engine,

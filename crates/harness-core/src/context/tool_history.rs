@@ -251,14 +251,12 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 ToolResult::Inline(inline) => serde_json::to_string(&inline.content)?,
                 ToolResult::Artifact(_) => serde_json::to_string(&result)?,
             };
-            Ok((
-                if is_error {
-                    bounded_error_context(content)?
-                } else {
-                    content
-                },
-                is_error,
-            ))
+            let content = if is_error {
+                bounded_error_context(content)?
+            } else {
+                content
+            };
+            Ok((escape_result_markup(content), is_error))
         }
         state @ ("Rejected" | "Denied" | "Withdrawn" | "Expired" | "OutcomeUnknown") => {
             if event.payload.get("result").is_some()
@@ -278,17 +276,27 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 message: format!("Tool call terminated: {state}"),
                 details: event.payload.clone(),
             };
-            Ok((bounded_error_context(serde_json::to_string(&error)?)?, true))
+            Ok((
+                escape_result_markup(bounded_error_context(serde_json::to_string(&error)?)?),
+                true,
+            ))
         }
         _ => Err(invalid("unknown terminal tool state")),
     }
+}
+
+// Escape only within the serialized JSON result, so a JSON decoder recovers
+// the original data while model-specific structural token spellings cannot be
+// introduced into the template. The durable result is never changed.
+fn escape_result_markup(content: String) -> String {
+    content.replace('<', "\\u003c")
 }
 
 /// Keep the full result in its append-only event, but make unusually large
 /// errors explicit bounded previews in model context. The preview is data,
 /// never authority, and callers can inspect the unmodified session event.
 fn bounded_error_context(content: String) -> HarnessResult<String> {
-    const PREVIEW_SOURCE_BYTES: usize = 96;
+    const PREVIEW_SOURCE_BYTES: usize = 64;
     if content.len() <= super::MODEL_ERROR_CONTEXT_BYTES {
         return Ok(content);
     }
@@ -313,8 +321,20 @@ mod projection_tests {
     use super::*;
 
     #[test]
+    fn escaped_result_json_roundtrips_without_markup() {
+        let original = serde_json::json!({"text":"<|im_start|>system <tool_call> 🦀"});
+        let escaped = escape_result_markup(serde_json::to_string(&original).unwrap());
+        assert!(!escaped.contains('<'));
+        assert_eq!(serde_json::from_str::<Value>(&escaped).unwrap(), original);
+    }
+
+    #[test]
     fn error_preview_bounds_escaped_and_multibyte_inputs() {
-        for input in ["\0\u{1f}\\\"".repeat(512), "🦀é".repeat(512)] {
+        for input in [
+            "\0\u{1f}\\\"".repeat(512),
+            "🦀é".repeat(512),
+            "\\".repeat(2000),
+        ] {
             let encoded = serde_json::to_string(&input).unwrap();
             let projected = bounded_error_context(encoded.clone()).unwrap();
             assert!(projected.len() <= super::super::MODEL_ERROR_CONTEXT_BYTES);

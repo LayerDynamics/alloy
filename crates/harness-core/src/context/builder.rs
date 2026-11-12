@@ -19,7 +19,7 @@ const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum serialized model-visible representation of a tool error. Full
 /// results remain in durable history; preflight uses this same bound.
-pub const MODEL_ERROR_CONTEXT_BYTES: usize = 1024;
+pub const MODEL_ERROR_CONTEXT_BYTES: usize = 256;
 
 /// Builds engine context snapshots from durable session events.
 #[derive(Debug, Default)]
