@@ -6,6 +6,7 @@ use harness_core::{artifact::*, plugin_host::*, policy::*, supervisor::*, tool_e
 use scripted::*;
 use serde_json::json;
 use std::{
+    io::Write,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -191,14 +192,17 @@ fn tool_roundtrip_overhead_under_50ms() {
     }
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / SAMPLES as f64;
-    println!(
+    // Direct stdout retains successful samples under the default test harness.
+    let mut output = std::io::stdout().lock();
+    writeln!(
+        output,
         "P2-16 samples={SAMPLES} boundary=run_tool_turn(mock_inference,fs.read,no_approval,no_client_transport) min_ms={:.3} median_ms={:.3} p95_ms={:.3} max_ms={:.3} mean_ms={mean:.3}",
         samples[0],
         samples[SAMPLES / 2],
         samples[(SAMPLES * 95).div_ceil(100) - 1],
         samples[SAMPLES - 1]
-    );
-    println!("P2-16 all_samples_ms={samples:?}");
+    ).unwrap();
+    writeln!(output, "P2-16 all_samples_ms={samples:?}").unwrap();
     assert!(
         samples[SAMPLES - 1] < 50.0,
         "a sampled round trip exceeded 50 ms"
