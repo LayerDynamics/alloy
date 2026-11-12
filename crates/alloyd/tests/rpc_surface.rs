@@ -174,6 +174,16 @@ struct TurnBoundaryEngine {
 }
 
 impl Engine for TurnBoundaryEngine {
+    fn profile_context_budget(
+        &self,
+        _: &ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: self.profile.context_limit_tokens(),
+            output_reserve: self.profile.max_output_tokens(),
+            safety_margin: self.profile.safety_margin_tokens(),
+        }))
+    }
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }

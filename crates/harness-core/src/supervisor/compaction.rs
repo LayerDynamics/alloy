@@ -120,7 +120,7 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             }
         }
     }
-    let (boundary, base_summary) = selected.ok_or_else(|| HarnessError::Invalid("context overflow: no completed history fits a checkpoint request; reduce the request or start a new session".into()))?;
+    let (boundary, base_summary) = selected.ok_or_else(|| HarnessError::Invalid("context overflow: no completed history fits a checkpoint request; reduce the request, start a new session or select a profile with a larger context".into()))?;
     let mut checkpoint = None;
     for attempt in 0..2 {
         check()?;
