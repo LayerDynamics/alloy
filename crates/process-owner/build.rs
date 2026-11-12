@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/macos_cohort_records.c");
     println!("cargo:rerun-if-changed=native/macos_containment.h");
     println!("cargo:rerun-if-changed=native/macos_cohort_service.inc");
+    println!("cargo:rerun-if-changed=native/macos_verification_service.inc");
     println!("cargo:rerun-if-changed=native/linux_supervisor.c");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         cc::Build::new()

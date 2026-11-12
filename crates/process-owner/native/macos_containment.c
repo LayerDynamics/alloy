@@ -367,7 +367,10 @@ int alloy_containment_recover(launch_state *state) {
     uint64_t until = now_ms() + 5000, count = 0;
     int error = 0;
     for (;;) {
-        if (atomic_load_explicit(&state->state, memory_order_acquire) == DONE) break;
+        if (atomic_load_explicit(&state->state, memory_order_acquire) == DONE) {
+            dlclose(system);
+            return 0; /* Preserve a real completion racing the recovery handoff. */
+        }
         error = count_tasks(usage, id, &count);
         if (error == ESRCH) { error = 0; break; }
         if (error) break;

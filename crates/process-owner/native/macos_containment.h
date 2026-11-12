@@ -16,9 +16,10 @@ typedef struct {
     _Atomic int fork_revoked;
     char cohort_record_path[1024];
     _Atomic int test_revoke_pause, test_revoke_paused;
-    _Atomic int recovery_started, recovery_done, recovery_error;
+    _Atomic int recovery_started, recovery_done, recovery_error, recovery_requested;
     _Atomic int test_submit_pause, test_submit_paused, test_setup_pause, test_setup_paused;
     _Atomic int test_recovery_fail;
+    _Atomic int test_cleaner_signal_fail;
 } launch_state;
 
 typedef struct {

@@ -33,6 +33,7 @@
 
 static int shell_broker(int argc, char **argv);
 static int cohort_service(int argc, char **argv);
+static int verification_service(int argc,char **argv);
 
 /* Stable Darwin libproc ABI, not exported by the public SDK header. */
 struct alloy_unique_info {
@@ -56,6 +57,8 @@ static void retire_shell_slot(int slot);
 
 static _Atomic int test_wait_for_owner_exit;
 static _Atomic int test_unknown_identity_pid;
+static _Atomic int test_watcher_start_failure;
+void alloy_test_watcher_start_failure(void){atomic_store(&test_watcher_start_failure,1);}
 void alloy_test_identity_unknown(int pid) {atomic_store(&test_unknown_identity_pid,pid);}
 void alloy_test_wait_owner_exit(void) {atomic_store(&test_wait_for_owner_exit,1);}
 static _Thread_local const char *test_shell_stage="before native shell spawn";
@@ -228,6 +231,7 @@ static int cleanup_group(pid_t target) {
 /* Only this single-threaded process reaps the target. No configured code runs
  * in the supervisor. It retains an exited child until group cleanup is done. */
 int alloy_exec_helper(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--alloy-verification-service-v1")) return verification_service(argc,argv);
     if (argc == 6 && !strcmp(argv[1], "--alloy-cohort-service-v1")) return cohort_service(argc, argv);
     if (argc == 7 && !strcmp(argv[1], "--alloy-shell-service-v2")) return shell_broker(argc, argv);
     if (argc < 3 || strcmp(argv[1], "--alloy-owned-exec-v1")) return 125;
@@ -336,6 +340,22 @@ int alloy_owned_stop(void *opaque) {
 }
 static void *recover_cohort_worker(void *opaque) {
     launch_state *state=opaque;
+    /* A watcher is mandatory before RUN, so dropping a control never needs to
+     * allocate a thread under resource pressure. Until handoff it only observes. */
+    while(!atomic_load_explicit(&state->recovery_requested,memory_order_acquire)) {
+        if(atomic_load_explicit(&state->state,memory_order_acquire)==DONE)goto done;
+        struct timespec idle={0,10000000};nanosleep(&idle,NULL);
+    }
+    while(atomic_load(&state->recovery_requested)==2 &&
+          atomic_load_explicit(&state->state,memory_order_acquire)!=DONE &&
+          alloy_owned_alive(state->pid,state->identity)!=0) {
+#ifdef ALLOY_OWNED_PROCESS_TEST
+        if(!atomic_exchange(&state->test_cleaner_signal_fail,0))
+#endif
+            (void)alloy_owned_signal(state->pid,state->identity);
+        /* Exact-identity signal errors never discard the cleanup obligation. */
+        pause_briefly();
+    }
     int error=alloy_containment_recover(state);
     state->recovery_error=error;
     /* A dropped caller cannot abandon the obligation. One bounded-resource
@@ -351,13 +371,19 @@ static void *recover_cohort_worker(void *opaque) {
             state->recovery_error=error;
         }
     }
+done:
     /* The retired-slot collector pins this mapping until this final store. */
     atomic_store_explicit(&state->recovery_done,1,memory_order_release);
     return NULL;
 }
-static int start_cohort_recovery(launch_state *state) {
+static int ensure_cohort_watcher(launch_state *state) {
     int expected=0;
     if(!atomic_compare_exchange_strong(&state->recovery_started,&expected,1))return 0;
+#ifdef ALLOY_OWNED_PROCESS_TEST
+    if(atomic_exchange(&test_watcher_start_failure,0)){
+        atomic_store(&state->recovery_started,0);return EAGAIN;
+    }
+#endif
     pthread_attr_t attributes;
     int error=pthread_attr_init(&attributes);
     if(!error){
@@ -366,6 +392,11 @@ static int start_cohort_recovery(launch_state *state) {
         pthread_attr_destroy(&attributes);
     }
     if(error)atomic_store(&state->recovery_started,0);
+    return error;
+}
+static int start_cohort_recovery(launch_state *state) {
+    int error=ensure_cohort_watcher(state);
+    if(!error)atomic_store_explicit(&state->recovery_requested,1,memory_order_release);
     return error;
 }
 int alloy_owned_wait(void *opaque, int *status, int nohang) {
@@ -415,10 +446,18 @@ void alloy_owned_close(void *opaque) {
         retire_shell_slot(control->shell_slot);free(control);return;
     }
     int status;
-    /* A delayed owner must retain its pinned leader and finish group cleanup.
-     * Killing it on a timeout would abandon descendants. wait reports failure
-     * to the caller; STOP remains set even after this mapping is released. */
+    /* Legacy owners retain their pinned group leader across delayed cleanup.
+     * Cohort owners additionally have an independent revoker and a kernel
+     * membership census, so a stalled cleaner can safely hand off to recovery. */
     (void)alloy_owned_wait(control, &status, 0);
+    if(control->state->cohort_identity &&
+       atomic_load_explicit(&control->state->state,memory_order_acquire)!=DONE) {
+        /* Establish the watcher before relinquishing the last caller. Killing
+         * only the exact cleaner closes its revocation channel even if it was
+         * paused. The independent holder then revokes forks before the sweep. */
+        if(!ensure_cohort_watcher(control->state))
+            atomic_store_explicit(&control->state->recovery_requested,2,memory_order_release);
+    }
     /* External-reaper mode never waits by PID. In host-owned mode the
      * embedding process promises exclusive supervisor reaping. */
     for (int attempt = 0; control->reap_owner && attempt < 100; ++attempt) {
@@ -603,8 +642,9 @@ static int authenticate_broker(audit_token_t audit,const char *launcher) {
     if(audit_token_to_euid(audit)!=geteuid())return EPERM;
     /* Pipe helpers run with a private bootstrap reply port. Loading CoreFoundation
      * at process startup deadlocks its launchd lookups before main. Load Security
-     * only here, in the host with its real bootstrap namespace, and retain one
-     * library reference for the host lifetime. */
+     * only in a verifier/service with its real bootstrap namespace, and retain
+     * one library reference for that process lifetime. The multithreaded host
+     * delegates this operation through its private anonymous verifier channel. */
     static void *library;
     if(!library)library=dlopen("/System/Library/Frameworks/Security.framework/Security",RTLD_LAZY|RTLD_LOCAL);
     if(!library)return ENOTSUP;
@@ -643,6 +683,7 @@ static int authenticate_host(audit_token_t audit,int parent,uint64_t identity) {
     return 0;
 }
 #include "macos_cohort_service.inc"
+#include "macos_verification_service.inc"
 static int shell_broker(int argc, char **argv) {
     (void)argc;
     int parent=(int)strtol(argv[3],NULL,10);
@@ -767,6 +808,12 @@ static void retire_shell_slot(int slot) {
     collect_shell_slots();pthread_mutex_unlock(&shell_slots_lock);
 }
 #ifdef ALLOY_OWNED_PROCESS_TEST
+int alloy_test_cleaner_signal_failure(int target) {
+    int error=ESRCH;pthread_mutex_lock(&shell_slots_lock);
+    for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
+        if(state && state->target_pid==target){atomic_store(&state->test_cleaner_signal_fail,1);error=0;break;}}
+    pthread_mutex_unlock(&shell_slots_lock);return error;
+}
 int alloy_test_cohort_fail_recovery(int target) {
     int error=ESRCH;
     pthread_mutex_lock(&shell_slots_lock);
@@ -982,7 +1029,7 @@ static int connect_shell_broker(const char *launcher,const char *service,alloy_s
     if(error && wait.lost)error=EPIPE;
     else if(error && wait.timed_out)error=ETIMEDOUT;
     if(!error && (kind!=SHELL_HELLO || size!=sizeof(identity) || (!generation[0]&&!generation[1]) || identity.pid!=audit_token_to_pid(audit)))error=EPROTO;
-    if(!error)error=authenticate_broker(audit,launcher);
+    if(!error)error=authenticate_in_verifier(audit,launcher,service,stop,context);
     if(!error && alloy_owned_alive(identity.pid,identity.identity)!=1)error=EPIPE;
     if(!error){shell_broker_port=endpoint;endpoint=MACH_PORT_NULL;memcpy(shell_broker_generation,generation,sizeof(generation));shell_broker_identity=identity;}
     if(endpoint)mach_port_deallocate(mach_task_self(),endpoint);
@@ -1051,6 +1098,8 @@ static int broker_spawn(const char *mode,const char *launcher,const char *servic
             unsigned expected=READY;atomic_compare_exchange_strong(&state->state,&expected,CREATE);
         } else if(phase==TARGET_READY) {
             if(stop(context)){error=ECANCELED;break;}
+            error=ensure_cohort_watcher(state);
+            if(error)break; /* Never execute a workload without its retained watcher. */
             unsigned expected=TARGET_READY;
             if(!atomic_compare_exchange_strong(&state->state,&expected,RUN))continue;
             *pid=state->target_pid;*out_control=control;control=NULL;state=MAP_FAILED;break;

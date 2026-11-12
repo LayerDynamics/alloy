@@ -6,6 +6,10 @@ fn isolated(name: &str, run: impl FnOnce(&Path)) {
 }
 
 unsafe extern "C" {
+    fn alloy_test_watcher_start_failure();
+    fn alloy_test_cleaner_signal_failure(target: i32) -> i32;
+    fn alloy_process_identity(pid: i32) -> u64;
+    fn alloy_owned_signal(pid: i32, identity: u64) -> i32;
     fn alloy_test_cohort_revoke_barrier(target: i32, operation: i32) -> i32;
     fn alloy_test_cohort_revoker_pause(target: i32, paused: i32) -> i32;
     fn alloy_test_cohort_gate_pause(target: i32, paused: i32) -> i32;
@@ -511,6 +515,90 @@ fn dropped_control_keeps_recovery_after_holder_timeout() {
             }
             drop(child); // The slot and its single watcher must outlive the control.
             drop(holders); // Publishes new evidence after no caller can poll/rearm it.
+            verify(&record);
+            stop(start("/bin/sleep", &["30"], root).unwrap());
+        },
+    );
+}
+
+#[test]
+fn dropped_control_recovers_a_paused_cleaner_that_dies_later() {
+    isolated(
+        "dropped_control_recovers_a_paused_cleaner_that_dies_later",
+        |root| {
+            struct Cleanup(Vec<(i32, u64)>);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    for &(pid, identity) in &self.0 {
+                        // SAFETY: signals require the captured kernel identity, never a reused PID.
+                        unsafe {
+                            alloy_owned_signal(pid, identity);
+                        }
+                    }
+                }
+            }
+            let (child, record) = begin(root, "detach-hold", false);
+            wait_records(&record, 2);
+            let cleanup = Cleanup(
+                records(&record)
+                    .into_iter()
+                    .filter(|p| p[0] > 0)
+                    // SAFETY: reads the kernel identity of each independently recorded live fixture task.
+                    .map(|p| (p[0], unsafe { alloy_process_identity(p[0]) }))
+                    .collect(),
+            );
+            assert!(cleanup.0.iter().all(|p| p.1 != 0));
+            let target = child.id() as i32;
+            // SAFETY: stops only the recorded cleaner and waits for its stopped state.
+            assert_eq!(unsafe { alloy_test_shell_owner_pause(target, 1) }, 0);
+            // SAFETY: injects one failed cleaner signal; the retained watcher must retry.
+            assert_eq!(unsafe { alloy_test_cleaner_signal_failure(target) }, 0);
+            drop(child);
+            // SAFETY: models supervisor loss after the final caller has gone. A completed
+            // failover may already have retired the slot, in which case ESRCH is expected.
+            let result = unsafe { alloy_test_cohort_kill(target, 2) };
+            assert!(result == 0 || result == 3, "late cleaner kill: {result}");
+            verify(&record); // Must pass before the fallback guard performs any cleanup.
+            drop(cleanup);
+            stop(start("/bin/sleep", &["30"], root).unwrap());
+        },
+    );
+}
+
+#[test]
+fn watcher_allocation_failure_prevents_workload_execution() {
+    isolated(
+        "watcher_allocation_failure_prevents_workload_execution",
+        |root| {
+            // SAFETY: the isolated process injects exactly one watcher creation failure.
+            unsafe {
+                alloy_test_watcher_start_failure();
+            }
+            let result = start("/bin/sh", &["-c", "echo started >> workload-started"], root);
+            assert!(
+                result.is_err(),
+                "workload started without a recovery watcher"
+            );
+            assert!(!root.join("workload-started").exists());
+            stop(start("/bin/sleep", &["30"], root).unwrap());
+        },
+    );
+}
+
+#[test]
+fn forced_close_retries_a_failed_cleaner_signal_without_another_caller() {
+    isolated(
+        "forced_close_retries_a_failed_cleaner_signal_without_another_caller",
+        |root| {
+            let (child, record) = begin(root, "detach-hold", false);
+            wait_records(&record, 2);
+            let target = child.id() as i32;
+            // SAFETY: both hooks address only the exact invocation's trusted cleaner.
+            assert_eq!(unsafe { alloy_test_shell_owner_pause(target, 1) }, 0);
+            // SAFETY: this isolated fault is consumed by the mandatory retained watcher.
+            assert_eq!(unsafe { alloy_test_cleaner_signal_failure(target) }, 0);
+            drop(child);
+            // No post-drop kill hook or poll can rescue this invocation.
             verify(&record);
             stop(start("/bin/sleep", &["30"], root).unwrap());
         },

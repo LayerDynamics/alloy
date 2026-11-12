@@ -30,6 +30,22 @@ Authentication checks the kernel audit token, effective UID, process identity an
 code-signing designated requirement against the expected helper. Requests use
 private reply ports; stale generations are rejected.
 
+The embedding host performs the Security framework check in one separately
+spawned verifier. Its anonymous shared-memory channel is unlinked before launch
+and passed only as an inherited descriptor; unrelated processes cannot submit
+verdicts through a registry file. This isolates framework-created executable
+descriptors from concurrent unrelated execs. Each request checks a fresh kernel
+audit token. Cancelled requests' late verdicts are discarded before another
+request is submitted.
+
+The verifier is the sole retained infrastructure child of the embedding host;
+the host never waits on its numeric PID and never replaces it after failure.
+Its watchdog exits on parent death or inconclusive parent identity. A verifier
+failure disables new authentication until the host restarts, while existing
+command control remains independent. This bounds even an unreaped verifier
+status to one per host. Broker crashes do not kill that verifier and can still
+reconnect without restarting the host.
+
 No possibly-started command is automatically replayed. Losing a request or reply
 publishes `STOP` in the independent shared control channel. A late owner cannot
 advance through `CREATE` or `RUN` after that cancellation. Already-running
@@ -81,6 +97,11 @@ one background recovery worker instead of blocking on that drain. If a holder is
 paused beyond an attempt's deadline, the charged slot and its single watcher
 remain alive even after the caller drops its control. New revocation or kernel
 absence evidence permits recovery to continue without replaying a command.
+The worker is reserved before the workload can execute. Allocation failure
+prevents execution. Dropping the last control after a bounded wait hands cleanup
+to that worker; it retries exact-identity cleaner signals even if the cleaner is
+paused or an initial signal fails. The independent holder then revokes the fork
+grant before the worker drains the coalition.
 
 This is descendant-process lifetime control, not isolation of a trusted program's
 entire user account, filesystem or network authority. The separate declared-I/O

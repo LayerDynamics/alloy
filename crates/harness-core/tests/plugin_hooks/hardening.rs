@@ -366,6 +366,16 @@ fn fileport_concurrent_exec_scanner() {
     for fd in 3..1024 {
         // SAFETY: F_GETFD only observes the descriptor.
         let status = unsafe { fcntl(fd, 1) };
+        if status >= 0 {
+            let mut path = [0u8; 1024];
+            // SAFETY: Darwin F_GETPATH writes at most MAXPATHLEN bytes to this buffer.
+            let path_result = unsafe { fcntl(fd, 50, path.as_mut_ptr()) };
+            let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+            eprintln!(
+                "inherited fd={fd} flags={status} path_result={path_result} path={}",
+                String::from_utf8_lossy(&path[..end])
+            );
+        }
         assert!(
             status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(9),
             "unexpected inherited descriptor {fd}"
@@ -421,15 +431,22 @@ fn fileport_concurrent_unrelated_exec_inherits_no_endpoints() {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
     let scanner = || {
-        Command::new(std::env::current_exe().unwrap())
+        let result = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "hardening::fileport_concurrent_exec_scanner"])
             .env("ALLOY_FILEPORT_SCANNER", "1")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        if !result.status.success() {
+            eprintln!(
+                "concurrent scanner: stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        result.status.success()
     };
     assert!(scanner(), "scanner baseline was not clean");
     let file = std::fs::File::open("/dev/null").unwrap();

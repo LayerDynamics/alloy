@@ -28,6 +28,12 @@ unsafe extern "C" {
     fn alloy_test_identity_unknown(pid: i32);
     fn alloy_test_shell_owner_pause(target: i32, paused: i32) -> i32;
     fn alloy_test_shell_cancellation_pending(target: i32) -> i32;
+    fn alloy_test_verifier_pid() -> i32;
+    fn alloy_test_verifier_kill() -> i32;
+    fn alloy_test_verifier_reject_self() -> i32;
+    fn alloy_test_verifier_late_allow() -> i32;
+    fn alloy_test_verifier_unknown_parent() -> i32;
+    fn alloy_test_verifier_alive() -> i32;
 }
 
 fn start(program: &str, arguments: &[&str], root: &Path) -> std::io::Result<Child> {
@@ -615,9 +621,9 @@ fn restart_budget_refuses_excess_reconnects_then_recovers() {
 }
 
 #[test]
-fn registration_and_workloads_create_no_embedding_host_children() {
+fn registration_and_workloads_create_no_additional_host_children() {
     isolated(
-        "registration_and_workloads_create_no_embedding_host_children",
+        "registration_and_workloads_create_no_additional_host_children",
         |root| {
             for _ in 0..5 {
                 let mut child = start("/usr/bin/true", &[], root).unwrap();
@@ -637,12 +643,62 @@ fn registration_and_workloads_create_no_embedding_host_children() {
                 };
                 assert_eq!(error, 0, "OS child enumeration failed");
                 assert_eq!(
-                    count, 0,
-                    "registration or ownership left direct host children: {pids:?}"
+                    count, 1,
+                    "registration or ownership added host children beyond its verifier: {pids:?}"
                 );
+                // SAFETY: reads this isolated host's retained verifier identity.
+                assert_eq!(pids[0], unsafe { alloy_test_verifier_pid() });
             }
         },
     );
+}
+
+#[test]
+fn private_verifier_rejects_unrelated_code_and_death_fails_closed() {
+    isolated(
+        "private_verifier_rejects_unrelated_code_and_death_fails_closed",
+        |root| {
+            let independent = start("/bin/sleep", &["30"], root).unwrap();
+            // SAFETY: sends this test executable's real kernel audit token through the private channel.
+            assert_eq!(unsafe { alloy_test_verifier_reject_self() }, 1);
+            // SAFETY: delays a real allow, cancels it, and submits this unrelated identity next.
+            assert_eq!(unsafe { alloy_test_verifier_late_allow() }, 0);
+            stop(start("/bin/sleep", &["30"], root).unwrap());
+            // SAFETY: kills only the retained verifier's exact kernel process identity.
+            assert_eq!(unsafe { alloy_test_verifier_kill() }, 0);
+            // A fresh broker requires fresh verification; no old success may be reused.
+            kill_broker();
+            for _ in 0..3 {
+                assert!(start("/bin/sh", &["-c", "echo started >> unverified"], root).is_err());
+            }
+            assert!(!root.join("unverified").exists());
+            stop(independent);
+        },
+    );
+}
+
+#[test]
+fn verifier_exits_on_inconclusive_parent_identity() {
+    isolated("verifier_exits_on_inconclusive_parent_identity", |root| {
+        stop(start("/bin/sleep", &["30"], root).unwrap());
+        // SAFETY: injects an inconclusive parent identity observation in this host's verifier.
+        assert_eq!(unsafe { alloy_test_verifier_unknown_parent() }, 0);
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: observes the retained stable identity, including exited zombie state.
+            if unsafe { alloy_test_verifier_alive() } == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "verifier retained an unverified parent"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        kill_broker();
+        assert!(start("/bin/sh", &["-c", "echo started >> unverified"], root).is_err());
+        assert!(!root.join("unverified").exists());
+    });
 }
 
 #[test]

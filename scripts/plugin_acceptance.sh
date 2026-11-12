@@ -181,7 +181,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
     completion_published_before_supervisor_exit_keeps_real_status
     malformed_message_does_not_retire_authenticated_service
     native_framework_command_retains_bootstrap_access
-    registration_and_workloads_create_no_embedding_host_children
+    registration_and_workloads_create_no_additional_host_children
+    private_verifier_rejects_unrelated_code_and_death_fails_closed
+    verifier_exits_on_inconclusive_parent_identity
     containment::detached_descendants_are_cleaned_after_normal_exit
     containment::detached_descendants_are_cleaned_after_cancellation
     containment::trusted_plugin_detached_descendants_are_cleaned
@@ -196,6 +198,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
     containment::indeterminate_submission_stays_charged_until_positive_resolution
     containment::recovery_retries_after_timed_out_revoker_resumes
     containment::dropped_control_keeps_recovery_after_holder_timeout
+    containment::dropped_control_recovers_a_paused_cleaner_that_dies_later
+    containment::watcher_allocation_failure_prevents_workload_execution
+    containment::forced_close_retries_a_failed_cleaner_signal_without_another_caller
     containment::workload_cannot_modify_or_hardlink_recovery_metadata
     containment::recovery_retries_transient_failure_after_revocation_is_already_known
   )
