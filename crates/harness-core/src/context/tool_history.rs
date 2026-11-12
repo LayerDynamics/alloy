@@ -241,7 +241,14 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 ToolResult::Inline(inline) => serde_json::to_string(&inline.content)?,
                 ToolResult::Artifact(_) => serde_json::to_string(&result)?,
             };
-            Ok((content, is_error))
+            Ok((
+                if is_error {
+                    bounded_error_context(content)?
+                } else {
+                    content
+                },
+                is_error,
+            ))
         }
         state @ ("Rejected" | "Denied" | "Withdrawn" | "Expired" | "OutcomeUnknown") => {
             if event.payload.get("result").is_some()
@@ -261,8 +268,33 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 message: format!("Tool call terminated: {state}"),
                 details: event.payload.clone(),
             };
-            Ok((serde_json::to_string(&error)?, true))
+            Ok((bounded_error_context(serde_json::to_string(&error)?)?, true))
         }
         _ => Err(invalid("unknown terminal tool state")),
     }
+}
+
+/// Keep the full result in its append-only event, but make unusually large
+/// errors explicit bounded previews in model context. The preview is data,
+/// never authority, and callers can inspect the unmodified session event.
+fn bounded_error_context(content: String) -> HarnessResult<String> {
+    const MAX_ERROR_CONTEXT_BYTES: usize = 1024;
+    const PREVIEW_SOURCE_BYTES: usize = 96;
+    if content.len() <= MAX_ERROR_CONTEXT_BYTES {
+        return Ok(content);
+    }
+    let mut end = PREVIEW_SOURCE_BYTES.min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let preview = serde_json::json!({
+        "context_projection": "truncated_error_preview",
+        "preview": &content[..end],
+        "full_result": "retained_in_session_history",
+    });
+    let serialized = serde_json::to_string(&preview)?;
+    if serialized.len() > MAX_ERROR_CONTEXT_BYTES {
+        return Err(invalid("bounded error preview exceeds context ceiling"));
+    }
+    Ok(serialized)
 }

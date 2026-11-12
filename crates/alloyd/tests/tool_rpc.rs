@@ -631,13 +631,21 @@ fn pause_running_operation(evicted: bool, hook: bool) {
 
 #[test]
 fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
-    for fits in [true, false] {
+    for (fits, batch_overflow) in [(true, false), (false, false), (false, true)] {
         let dir = tempfile::tempdir().unwrap();
+        let mut first_round = vec![proposal(
+            "fs.write",
+            json!({"path":"marker.txt","content":"once"}),
+        )];
+        if batch_overflow {
+            first_round.push(proposal(
+                "fs.write",
+                json!({"path":"second.txt","content":"twice"}),
+            ));
+        }
+        first_round.push(done());
         let mut engine = ScriptedEngine::new(vec![
-            vec![
-                proposal("fs.write", json!({"path":"marker.txt","content":"once"})),
-                done(),
-            ],
+            first_round,
             vec![
                 engine::types::GenerationEvent::TextDelta {
                     text: "finished".into(),
@@ -645,7 +653,8 @@ fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
                 done(),
             ],
         ]);
-        engine.projected_byte_limit = if fits { usize::MAX } else { 1 };
+        // The same budget admits one call but rejects the combined pair.
+        engine.projected_byte_limit = if fits || batch_overflow { 7000 } else { 1 };
         let service = DaemonService::open(
             dir.path().join("db"),
             engine,
@@ -659,7 +668,7 @@ fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
             0,
         )
         .unwrap();
-        let config = json!({"read_root":dir.path(),"write_root":dir.path(),"shell_executables":[std::fs::canonicalize("/bin/echo").unwrap()],"shell_cwd_roots":[dir.path()],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"fs.write","allowed_arguments":[{"path":"marker.txt","content":"once"}],"require_approval":false,"timeout_ms":1000,"max_output_bytes":65536}]},"plugins":[]});
+        let config = json!({"read_root":dir.path(),"write_root":dir.path(),"shell_executables":[std::fs::canonicalize("/bin/echo").unwrap()],"shell_cwd_roots":[dir.path()],"http_destinations":[{"origin":"http://fixture.invalid/","address":"127.0.0.1"}],"policy":{"rules":[{"tool_id":"fs.write","allowed_arguments":[{"path":"marker.txt","content":"once"},{"path":"second.txt","content":"twice"}],"require_approval":false,"timeout_ms":1000,"max_output_bytes":65536}]},"plugins":[]});
         let path = dir.path().join("tools.json");
         std::fs::write(&path, config.to_string()).unwrap();
         let artifacts = service
@@ -702,6 +711,7 @@ fn projected_batch_rpc_fit_executes_and_overflow_has_no_effect() {
         }
         assert_eq!(saw_start, fits);
         assert_eq!(dir.path().join("marker.txt").exists(), fits);
+        assert!(!dir.path().join("second.txt").exists());
         send(
             &mut control,
             4,

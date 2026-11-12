@@ -165,6 +165,32 @@ fn projected_tool_history_is_immutable_and_checks_call_result_linkage() {
 }
 
 #[test]
+fn large_error_context_is_explicitly_bounded_without_changing_durable_result() {
+    let (_dir, mut store, registry, _count) = setup();
+    let original =
+        json!({"kind":"execution", "details":{"cleanup_errors": ["\u{0001}🦀".repeat(2000)]}});
+    finish(
+        &mut store,
+        &registry,
+        inline("error-call", original.clone(), true),
+    );
+    let events = store.list_events(SESSION).unwrap();
+    let completion = events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCompleted)
+        .unwrap();
+    assert_eq!(completion.payload["result"]["content"], original);
+    let context = snapshot(&events, &registry).unwrap();
+    let display = format!("{:?}", context.tool_context());
+    assert!(display.contains("truncated_error_preview"));
+    assert!(display.contains("retained_in_session_history"));
+    assert!(!display.contains(&"🦀".repeat(100)));
+    // Context reconstruction is read-only and does not replace the event.
+    let after = store.list_events(SESSION).unwrap();
+    assert_eq!(events, after);
+}
+
+#[test]
 fn tool_snapshot_rejects_unhandled_skill_and_checkpoint_events() {
     for kind in [EventKind::SkillLoaded, EventKind::ContextCompacted] {
         let (_dir, mut store, registry, _count) = setup();

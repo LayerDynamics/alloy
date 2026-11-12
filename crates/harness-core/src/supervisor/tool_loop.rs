@@ -552,9 +552,10 @@ impl<E: Engine> Supervisor<E> {
                 }
                 _ => output_limit,
             };
-            // All current built-in control errors and durable terminal markers
-            // fit this allowance, including their bounded call identifier.
-            result_limits.push((streaming, inline_limit));
+            // ContextBuilder bounds model-visible error projections to 1024
+            // bytes while retaining the full result in the durable event.
+            let error_limit = 1024;
+            result_limits.push((streaming, inline_limit, error_limit));
             blocks.push(ToolHistoryBlock::AssistantCall {
                 call_id: call_id.clone(),
                 tool_id: name.clone(),
@@ -584,7 +585,7 @@ impl<E: Engine> Supervisor<E> {
         let fits = |inline_bytes: usize| -> HarnessResult<bool> {
             let extra = result_limits
                 .iter()
-                .try_fold(0usize, |total, (streaming, limit)| {
+                .try_fold(0usize, |total, (streaming, limit, error_limit)| {
                     let limit = if *streaming {
                         (*limit).min(inline_bytes)
                     } else {
@@ -592,7 +593,7 @@ impl<E: Engine> Supervisor<E> {
                     };
                     // Results are compact JSON. Each additional quoting layer at
                     // most doubles its bytes; control characters are already escaped.
-                    total.checked_add(limit.max(1024).checked_mul(2)?)
+                    total.checked_add(limit.max(*error_limit).checked_mul(2)?)
                 })
                 .ok_or_else(|| HarnessError::Engine("projected tool batch overflow".into()))?;
             let json_bytes = extra
