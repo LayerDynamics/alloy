@@ -825,7 +825,14 @@ int alloy_test_cohort_startup_stage(int setup) {
     int result=0;
     pthread_mutex_lock(&shell_slots_lock);
     for(int i=0;i<64;++i){launch_state *state=shell_slots[i].state;
-        if(state && atomic_load(setup?&state->test_setup_paused:&state->test_submit_paused)){result=1;break;}}
+        if(!state || !atomic_load(setup?&state->test_setup_paused:&state->test_submit_paused))continue;
+        /* The gate publishes its pause from the fork child. Its parent may
+         * still be publishing the identities used by the crash injection.
+         * Report the checkpoint only when both processes can be addressed
+         * by their exact identities, without weakening identity-safe signals. */
+        if(setup && (!atomic_load(&state->gate_pid) || !atomic_load(&state->gate_identity) ||
+                     !atomic_load(&state->pid) || !atomic_load(&state->identity)))continue;
+        result=1;break;}
     pthread_mutex_unlock(&shell_slots_lock);return result;
 }
 int alloy_test_cohort_recovery(int target,int revoked) {
