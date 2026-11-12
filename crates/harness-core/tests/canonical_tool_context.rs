@@ -165,6 +165,34 @@ fn projected_tool_history_is_immutable_and_checks_call_result_linkage() {
 }
 
 #[test]
+fn registered_policy_changes_model_visible_context_identity() {
+    let (_dir, store, original, count) = setup();
+    let events = store.list_events(SESSION).unwrap();
+    let first = snapshot(&events, &original).unwrap();
+    let mut changed_definition = definition("1.0.0", "string");
+    changed_definition.policy.max_output_bytes -= 1;
+    let mut changed = ToolRegistry::new();
+    changed
+        .register(changed_definition, Arc::new(NeverRun(Arc::clone(&count))))
+        .unwrap();
+    let second = snapshot(&events, &changed).unwrap();
+    assert_ne!(
+        first.tool_context().unwrap().schema_hash(),
+        second.tool_context().unwrap().schema_hash()
+    );
+    let first_render = render(&first, TEMPLATE, render_limits()).unwrap();
+    let second_render = render(&second, TEMPLATE, render_limits()).unwrap();
+    assert!(first_render.text().contains("registered_policy"));
+    assert!(
+        first_render
+            .text()
+            .contains("local_policy_enforced_separately")
+    );
+    assert_ne!(first_render.render_hash(), second_render.render_hash());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn large_error_context_is_explicitly_bounded_without_changing_durable_result() {
     let (_dir, mut store, registry, _count) = setup();
     let original =
@@ -305,6 +333,8 @@ fn tool_loop_context_projects_registry_and_durable_history_in_exact_order() {
                     def.description.clone(),
                     def.input_schema.clone(),
                 )
+                .unwrap()
+                .with_registered_policy(serde_json::to_value(&def.policy).unwrap())
                 .unwrap(),
             ],
             vec![

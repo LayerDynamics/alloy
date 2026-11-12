@@ -67,6 +67,16 @@ impl ContextBuilder {
                     definition.description.clone(),
                     definition.input_schema.clone(),
                 )
+                .and_then(|tool| {
+                    tool.with_registered_policy(serde_json::to_value(&definition.policy).map_err(
+                        |error| {
+                            engine::error::EngineError::invalid_request(
+                                "tool.registered_policy",
+                                error.to_string(),
+                            )
+                        },
+                    )?)
+                })
                 .map_err(HarnessError::from)
             })
             .collect::<HarnessResult<Vec<_>>>()?;
