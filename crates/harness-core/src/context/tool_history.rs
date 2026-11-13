@@ -40,6 +40,29 @@ impl ContextBuilder {
         registry: &ToolRegistry,
         limits: ToolContextLimits,
     ) -> HarnessResult<ContextSnapshot> {
+        Self::build_projected_tool_snapshot(
+            snapshot_id,
+            profile_id,
+            session_id,
+            history,
+            registry,
+            limits,
+            Vec::new(),
+        )
+    }
+
+    /// Project anticipated call/result blocks through the same placement and
+    /// serialization as durable history. This grants no execution authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_projected_tool_snapshot(
+        snapshot_id: impl AsRef<str>,
+        profile_id: impl AsRef<str>,
+        session_id: &str,
+        history: &[EventRecord],
+        registry: &ToolRegistry,
+        limits: ToolContextLimits,
+        appended: Vec<ToolHistoryBlock>,
+    ) -> HarnessResult<ContextSnapshot> {
         if session_id.is_empty()
             || limits.max_tools == 0
             || limits.max_history_blocks == 0
@@ -201,6 +224,15 @@ impl ContextBuilder {
             return Err(invalid(
                 "tool history has an unresolved call; do not regenerate",
             ));
+        }
+        // Apply anticipated calls before projecting skills: the first call
+        // moves skills from base messages into the counted/serialized tail.
+        // Appending to an already built ToolContext would miss that transition.
+        if !appended.is_empty() {
+            saw_call = true;
+            for block in appended {
+                push(&mut tail, block, limits)?;
+            }
         }
         if saw_call {
             let position = if matches!(

@@ -544,14 +544,6 @@ impl<E: Engine> Supervisor<E> {
                 guard.daemon_epoch().to_owned(),
             )
         };
-        let snapshot = ContextBuilder::build_tool_snapshot(
-            request_id.as_str(),
-            &profile,
-            session,
-            &history,
-            runtime.executor.registry(),
-            config.round.context_limits,
-        )?;
         let mut blocks = Vec::with_capacity(proposed.len().saturating_mul(2));
         let mut result_limits = Vec::with_capacity(proposed.len());
         for (index, (name, arguments)) in proposed.iter().enumerate() {
@@ -628,14 +620,19 @@ impl<E: Engine> Supervisor<E> {
                 is_error: false,
             });
         }
-        let original = snapshot
+        let snapshot = ContextBuilder::build_projected_tool_snapshot(
+            request_id.as_str(),
+            &profile,
+            session,
+            &history,
+            runtime.executor.registry(),
+            config.round.context_limits,
+            blocks,
+        )?;
+        let projected = snapshot
             .tool_context()
             .ok_or_else(|| HarnessError::Invalid("missing tool context".into()))?;
-        let projected = original
-            .with_appended_history(blocks, config.round.context_limits)
-            .map_err(HarnessError::from)?;
         let base_json_bytes = projected.input_bytes();
-        let snapshot = snapshot.with_tool_context(projected);
         let check = || live(store, session, cancel, config.round.deadline);
         let rendered = super::tool_round::wait_checked(
             self.engine.render_and_count(snapshot.clone()),

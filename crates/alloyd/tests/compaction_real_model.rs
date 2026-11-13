@@ -1,10 +1,12 @@
 //! Opt-in real Qwen compaction acceptance; run with ALLOY_REAL_MODEL pointing to the pinned artifact.
+#[path = "support/recording_engine.rs"]
+mod recording_engine;
 use alloyd::{BootRequest, boot_qwen3};
 use engine::{
     api::Engine,
     memory_guard::{MemoryGuardConfig, MemoryGuardTier},
     tiered_kv::{HotCacheLimit, TieredKvConfig},
-    types::ArtifactId,
+    types::{ArtifactId, GenerationEvent},
 };
 use harness_core::{
     ContextBuilder, EventKind, HardwareTier, SessionStore, Supervisor, TelemetryClient,
@@ -508,7 +510,10 @@ fn real_model_compaction_preserves_history_and_continues() {
         "https://127.0.0.1:1",
         Box::new(Offline),
     ));
-    let supervisor = Supervisor::new(boot.engine, telemetry);
+    let supervisor = Supervisor::new(
+        recording_engine::RecordingEngine::new(boot.engine),
+        telemetry,
+    );
     let initial = supervisor
         .run_turn(&store, "real-compact", &old, 64)
         .expect("initial real-model turn");
@@ -542,6 +547,41 @@ fn real_model_compaction_preserves_history_and_continues() {
             .contains("COBALT"),
         "{}",
         result.assistant_text
+    );
+    // The recorder captures the actual request BEFORE generation, including
+    // the committed checkpoint and identical decoding options. The cold oracle
+    // below consumes this request, never a history containing its warm answer.
+    let recorded = supervisor.engine().requests.lock().unwrap();
+    let (transition_request, before_transition) = recorded.last().unwrap().clone();
+    assert_eq!(transition_request.request_id(), &result.request_id);
+    let transition_render = transition_request.expected_render().unwrap();
+    assert_eq!(transition_render.token_count(), result.input_tokens);
+    let common_prefix = recorded[..recorded.len() - 1]
+        .iter()
+        .map(|(request, _)| {
+            let previous = request.expected_render().unwrap().token_ids();
+            let common = previous
+                .iter()
+                .zip(transition_render.token_ids())
+                .take_while(|(a, b)| a == b)
+                .count();
+            // Every earlier generated prompt diverges before its end. Thus
+            // generated suffix tokens cannot extend this common-prefix bound.
+            assert!(common < previous.len().min(transition_render.token_count()));
+            common
+        })
+        .max()
+        .unwrap();
+    drop(recorded);
+    let restored_at_transition = supervisor
+        .engine()
+        .runtime()
+        .tiered_kv_snapshot()
+        .restored_tokens
+        - before_transition.restored_tokens;
+    assert!(
+        restored_at_transition <= common_prefix as u64,
+        "compaction restored {restored_at_transition} beyond matching prefix {common_prefix}"
     );
     let events = store.lock().unwrap().list_events("real-compact").unwrap();
     assert_eq!(&events[..prior.len()], prior.as_slice());
@@ -630,6 +670,41 @@ fn real_model_compaction_preserves_history_and_continues() {
         Some(2048),
     )
     .expect("boot cold baseline");
+    let cold_render =
+        ContextBuilder::render_and_count(&cold_boot.engine, transition_request.context().clone())
+            .unwrap();
+    assert_eq!(cold_render, *transition_request.expected_render().unwrap());
+    let cold_generation = wait_future(cold_boot.engine.generate(transition_request)).unwrap();
+    let mut stream = cold_generation.into_events();
+    let mut cold_transition = String::new();
+    let mut completed = false;
+    while let Some(event) = wait_future(std::future::poll_fn(|cx| stream.as_mut().poll_next(cx))) {
+        match event {
+            GenerationEvent::TextDelta { text } => cold_transition.push_str(&text),
+            GenerationEvent::GenerationCompleted { usage, .. } => {
+                assert_eq!(usage.input_tokens, result.input_tokens);
+                completed = true;
+            }
+            GenerationEvent::RuntimeWarning { .. } => {}
+            other => panic!("unexpected cold transition event: {other:?}"),
+        }
+    }
+    assert!(completed, "cold transition did not complete");
+    assert_eq!(
+        result.assistant_text, cold_transition,
+        "first post-compaction continuation differs from the exact cold request"
+    );
+    assert_eq!(
+        cold_boot
+            .engine
+            .runtime()
+            .tiered_kv_snapshot()
+            .restored_tokens,
+        0
+    );
+    println!(
+        "real_compaction_transition: matching_prefix={common_prefix}, restored_tokens={restored_at_transition}, cold_output={cold_transition:?}"
+    );
     let cold_store = Mutex::new(SessionStore::open(dir.path().join("cold.sqlite")).unwrap());
     let cold_telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
