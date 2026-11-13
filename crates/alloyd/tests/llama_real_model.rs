@@ -279,10 +279,29 @@ fn llama3_long_context_stream_cancel_memory() {
         );
     }
     eprintln!("native_memory={:?}", mlx_ffi::memory::snapshot().unwrap());
+    check_cancellation_recovery(&supervisor, &store, &profile);
+}
+
+fn check_cancellation_recovery<E: engine::api::Engine>(
+    supervisor: &harness_core::Supervisor<E>,
+    store: &std::sync::Mutex<harness_core::SessionStore>,
+    profile: &str,
+) {
+    use engine::types::GenerationEvent;
+    store
+        .lock()
+        .unwrap()
+        .create_session("baseline", profile)
+        .unwrap();
+    let expected = supervisor
+        .run_turn(store, "baseline", "Reply with exactly COBALT.", 16)
+        .unwrap();
+    assert!(!expected.assistant_text.is_empty());
+    eprintln!("cancel_baseline={:?}", expected.assistant_text);
     let id = std::cell::RefCell::new(None);
     let mut cancelled = false;
     let result = supervisor.run_turn_streaming(
-        &store,
+        store,
         "cancel",
         "Count from 1 to 1000, one integer per line.",
         256,
@@ -303,8 +322,46 @@ fn llama3_long_context_stream_cancel_memory() {
     let error = result.err().unwrap().to_string();
     assert!(error.to_lowercase().contains("cancel"), "{error}");
     let resumed = supervisor
-        .run_turn(&store, "after_cancel", "Reply with exactly COBALT.", 16)
+        .run_turn(store, "after_cancel", "Reply with exactly COBALT.", 16)
         .unwrap();
-    assert!(resumed.assistant_text.contains("COBALT"));
+    eprintln!("cancel_following={:?}", resumed.assistant_text);
+    assert_eq!(
+        resumed.assistant_text, expected.assistant_text,
+        "cancellation changed a fresh session's response"
+    );
     eprintln!("stream_cancel={profile}: {error}; next request succeeded");
+}
+
+#[test]
+#[ignore = "requires pinned local Llama artifact and native Metal"]
+fn llama3_stream_cancel_recovery() {
+    use harness_core::{SessionStore, Supervisor};
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+        BootRequest {
+            artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
+            profile_id: profile.clone(),
+            corpus_models_json: None,
+            memory_guard: MemoryGuardConfig::balanced(),
+            admission_budget_override_bytes: None,
+            prefer_metal: true,
+            tools_enabled: false,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
+        },
+        Some(4096),
+    )
+    .unwrap();
+    let mut db = SessionStore::open(root.path().join("session.sqlite")).unwrap();
+    for session in ["cancel", "after_cancel"] {
+        db.create_session(session, &profile).unwrap();
+    }
+    let store = std::sync::Mutex::new(db);
+    let telemetry = Arc::new(TelemetryClient::with_transport(
+        "test",
+        HardwareTier::Unknown,
+        "https://127.0.0.1:1",
+        Box::new(Offline),
+    ));
+    check_cancellation_recovery(&Supervisor::new(boot.engine, telemetry), &store, &profile);
 }

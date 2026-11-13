@@ -26,7 +26,7 @@ class CiPartitionTest < Minitest::Test
     ["cargo test --locked -p tool-registry --all-targets", "cargo test --locked -p tool-registry --doc",
      "cargo test --locked -p mlx-ffi --all-targets -- --test-threads=1",
      "cargo test --locked -p inference-infra --all-targets", "cargo test --locked -p qwen3 --all-targets",
-     "cargo test --locked -p qwen3 --doc", "cargo check --locked -p engine --all-targets",
+     "cargo test --locked -p qwen3 --doc", "cargo test --locked -p llama3 --all-targets", "cargo test --locked -p llama3 --doc", "cargo check --locked -p engine --all-targets",
      "cargo test --locked -p engine --all-targets", "cargo test --locked -p engine --doc",
      'RUSTDOCFLAGS="-D warnings" cargo doc --locked -p engine --no-deps'].each { |gate| assert_includes engine, gate }
     core = commands("linux_core")
