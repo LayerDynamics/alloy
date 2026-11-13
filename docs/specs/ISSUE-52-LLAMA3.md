@@ -65,9 +65,12 @@ The frozen artifact revisions and file digests remain unchanged.
   dependency pins, artifact hashes, memory and validated context. Tiny fixtures
   and builds alone do not qualify a real profile. Any unmet gate remains open.
 
-## Current status
+## Qualification interface
 
-Implementation is present; profile qualification is in progress. This document is not a qualification report.
+This document defines the implementation and acceptance protocol. Qualification
+results must identify the tested source commit, frozen artifact hashes, dependency
+versions and complete terminal receipts; the implementation document alone is
+not evidence that a profile passed.
 
 ## Numerical protocol fixed before real-model comparison
 
