@@ -514,6 +514,18 @@ impl ModelFamily for PolicyBackend {
 }
 
 impl RuntimeBackend for PolicyBackend {
+    fn verify_retained_prefix_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        tokenizer: &engine::types::TokenizerId,
+        tokens: &[u32],
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        self.inner
+            .verify_retained_prefix_bytes(registry, profile, tokenizer, tokens, bytes)
+    }
+
     fn cache_manifest_digest(
         &self,
         artifact: &ArtifactRegistration,

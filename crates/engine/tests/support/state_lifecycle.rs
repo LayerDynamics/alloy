@@ -14,7 +14,7 @@
 //!
 //! That byte convention is specific to this lossless ByteLevel fixture.
 //! These tests do not establish a universal production-tokenizer prefix
-//! byte convention or add provenance validation to the runtime API.
+//! byte convention.
 
 use super::*;
 use engine::{
@@ -418,6 +418,17 @@ impl ModelFamily for LifecycleBackend {
 }
 
 impl RuntimeBackend for LifecycleBackend {
+    fn verify_retained_prefix_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        tokenizer: &engine::types::TokenizerId,
+        tokens: &[u32],
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        self.inner
+            .verify_retained_prefix_bytes(registry, profile, tokenizer, tokens, bytes)
+    }
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -830,6 +841,27 @@ fn repeated_publication_is_idempotent_without_additional_reservations() {
     assert_same_allocation(&before, &environment.lookup(second));
     assert_eq!(environment.snapshot(), accounting);
     assert_eq!(environment.tracker.counts(), counts);
+}
+
+#[test]
+fn canonical_publication_rejects_mismatched_prefix_bytes() {
+    let environment = StateEnvironment::new();
+    let completed = environment.complete("bad-first-prefix");
+    let accounting = environment.snapshot();
+    let mut wrong = completed.prefix_bytes.clone();
+    wrong.push(b'!');
+    let error = expect_failure(
+        block_on(
+            environment
+                .runtime
+                .retain_session_state(completed.request_id.clone(), wrong),
+        ),
+        "mismatched bytes published an unverified identity",
+    );
+    assert_eq!(error.kind(), ErrorKind::InvalidRequest);
+    assert_eq!(environment.snapshot(), accounting);
+    let id = environment.publish(&completed);
+    assert_eq!(environment.lookup(id).request_id, completed.request_id);
 }
 
 #[test]

@@ -81,6 +81,7 @@ impl ContextBuilder {
             })
             .collect::<HarnessResult<Vec<_>>>()?;
         let (checkpoint, boundary) = super::checkpoint_projection(history)?;
+        let skills = crate::context::project_skills(history)?;
         let mut base = Vec::new();
         if let Some(checkpoint) = checkpoint {
             base.push(super::checkpoint_message(&checkpoint)?);
@@ -98,7 +99,7 @@ impl ContextBuilder {
             next_seq = next_seq
                 .checked_add(1)
                 .ok_or_else(|| invalid("event sequence overflow"))?;
-            if matches!(event.kind, EventKind::SkillLoaded | EventKind::ModelChanged) {
+            if event.kind == EventKind::ModelChanged {
                 return Err(invalid(
                     "skill or model-change context is not yet supported",
                 ));
@@ -107,11 +108,12 @@ impl ContextBuilder {
                 continue;
             }
             match event.kind {
-                EventKind::SkillLoaded | EventKind::ModelChanged => {
+                EventKind::ModelChanged => {
                     return Err(invalid(
                         "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session",
                     ));
                 }
+                EventKind::SkillLoaded => {}
                 EventKind::UserMessage | EventKind::AssistantMessage => {
                     let message = Message {
                         role: if event.kind == EventKind::UserMessage {
@@ -199,6 +201,33 @@ impl ContextBuilder {
             return Err(invalid(
                 "tool history has an unresolved call; do not regenerate",
             ));
+        }
+        if saw_call {
+            let position = if matches!(
+                tail.last(),
+                Some(ToolHistoryBlock::Text(Message {
+                    role: MessageRole::User,
+                    ..
+                }))
+            ) {
+                tail.len() - 1
+            } else {
+                tail.len()
+            };
+            if tail.len().saturating_add(skills.len()) > limits.max_history_blocks {
+                return Err(invalid("historical block count exceeds context limit"));
+            }
+            tail.splice(
+                position..position,
+                skills.into_iter().map(ToolHistoryBlock::Text),
+            );
+        } else {
+            let position = if base.last().is_some_and(|m| m.role == MessageRole::User) {
+                base.len() - 1
+            } else {
+                base.len()
+            };
+            base.splice(position..position, skills);
         }
         // Empty bases are rejected by ContextSnapshot; do not invent a user turn.
         let snapshot_id =

@@ -148,25 +148,17 @@ impl<E: Engine> DaemonService<E> {
         match request.method.as_str() {
             "session.create" => self.session_create(&request.params),
             "session.send" => self.session_send(&request.params, writer),
+            "session.skill.load" => self.session_skill_load(&request.params),
+            "models.capabilities" => self.model_capabilities(&request.params),
             "session.pause" => self.session_pause(&request.params),
             "session.resume" => self.session_resume(&request.params),
             "sessions.resume" => self.sessions_resume(&request.params),
             "daemon.status" => self.daemon_status(),
             "daemon.metrics" => self.daemon_metrics(),
             "session.approve" => self.session_approve(&request.params),
-            "models.list"
-            | "models.pull"
-            | "models.verify"
-            | "models.capabilities"
-            | "skills.list"
-            | "skills.show"
-            | "mcp.add"
-            | "mcp.list"
-            | "automation.add"
-            | "automation.list"
-            | "automation.pause"
-            | "daemon.doctor"
-            | "daemon.stats" => Err(RpcError::application(
+            "models.list" | "models.pull" | "models.verify" | "skills.list" | "skills.show"
+            | "mcp.add" | "mcp.list" | "automation.add" | "automation.list"
+            | "automation.pause" | "daemon.doctor" | "daemon.stats" => Err(RpcError::application(
                 ErrorKind::UnsupportedInPhase1,
                 format!("{} is not implemented in Phase 1", request.method),
             )),
@@ -188,6 +180,98 @@ impl<E: Engine> DaemonService<E> {
             .create_session(&self.store, &session_id, profile)
             .map_err(map_harness)?;
         Ok(json!({ "session_id": session_id, "api_version": API_VERSION }))
+    }
+
+    fn session_skill_load(&self, params: &Value) -> Result<Value, RpcError> {
+        let session_id = require_session_id(params)?;
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("name string required"))?;
+        let instructions = params
+            .get("instructions")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("instructions string required"))?;
+        let payload =
+            harness_core::context::skill_event_payload(name, instructions).map_err(map_harness)?;
+        let inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| RpcError::internal("inflight lock poisoned"))?;
+        if inflight.contains_key(session_id) {
+            return Err(RpcError::application(
+                ErrorKind::SessionNotActive,
+                "session has an in-flight turn",
+            ));
+        }
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| RpcError::internal("store lock poisoned"))?;
+        let session = store
+            .get_session(session_id)
+            .map_err(map_harness)?
+            .ok_or_else(|| RpcError::application(ErrorKind::SessionNotFound, "unknown session"))?;
+        if session.status != SessionStatus::Active {
+            return Err(RpcError::application(
+                ErrorKind::SessionNotActive,
+                "session is not active",
+            ));
+        }
+        let event = store
+            .append_event(
+                session_id,
+                harness_core::EventKind::SkillLoaded,
+                payload,
+                json!([]),
+            )
+            .map_err(map_harness)?;
+        Ok(
+            json!({"session_id":session_id,"name":name,"sha256":event.payload["sha256"],"seq":event.seq}),
+        )
+    }
+
+    fn model_capabilities(&self, params: &Value) -> Result<Value, RpcError> {
+        let artifact = params
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("artifact_id string required"))?;
+        let artifact = ArtifactId::new(artifact).map_err(|error| RpcError::engine(&error))?;
+        let caps = wait_engine(self.supervisor.engine().capabilities(artifact.clone()))?
+            .map_err(|error| RpcError::engine(&error))?;
+        let backend = match caps.backend {
+            ExecutionBackend::HostCpu => json!({"kind":"host_cpu"}),
+            ExecutionBackend::MlxCpu => json!({"kind":"mlx_cpu"}),
+            ExecutionBackend::MlxMetal => json!({"kind":"mlx_metal"}),
+            ExecutionBackend::External { name } => json!({"kind":"external","name":name}),
+        };
+        let weights: Vec<_> = caps
+            .weight_representations
+            .iter()
+            .map(|value| match value {
+                WeightRepresentation::F32 => json!({"kind":"f32"}),
+                WeightRepresentation::F16 => json!({"kind":"f16"}),
+                WeightRepresentation::Bf16 => json!({"kind":"bf16"}),
+                WeightRepresentation::Affine4 { group_size } => {
+                    json!({"kind":"affine4","group_size":group_size.get()})
+                }
+            })
+            .collect();
+        let caches: Vec<_> = caps.cache_modes.iter().map(|cache| match cache.kind {
+            engine::types::CacheKind::Full => json!({"kind":"full","representation":cache.representation.as_str()}),
+            engine::types::CacheKind::Rotating { window_tokens } => json!({"kind":"rotating","representation":cache.representation.as_str(),"window_tokens":window_tokens.get()}),
+        }).collect();
+        let decoding: Vec<_> = caps
+            .decoding_modes
+            .iter()
+            .map(|mode| match mode {
+                DecodingCapability::Greedy => "greedy",
+                DecodingCapability::Sampling => "sampling",
+            })
+            .collect();
+        Ok(
+            json!({"artifact_id":artifact.as_str(),"task":caps.task,"family":caps.family,"backend":backend,"weight_representations":weights,"cache_modes":caches,"context_limit_tokens":caps.context_limit_tokens,"supports_streaming":caps.supports_streaming,"supports_incremental_kv":caps.supports_incremental_kv,"supports_prefix_reuse":caps.supports_prefix_reuse,"decoding_modes":decoding}),
+        )
     }
 
     fn session_send<W: Write>(&self, params: &Value, writer: &mut W) -> Result<Value, RpcError> {
@@ -512,6 +596,44 @@ fn require_session_id(params: &Value) -> Result<&str, RpcError> {
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid_params("session_id string required"))
+}
+
+struct EngineWake(std::sync::mpsc::Sender<()>);
+impl std::task::Wake for EngineWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.send(());
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.send(());
+    }
+}
+
+fn wait_engine<T>(future: impl std::future::Future<Output = T>) -> Result<T, RpcError> {
+    let mut future = Box::pin(future);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let waker = std::task::Waker::from(Arc::new(EngineWake(sender)));
+    let mut context = Context::from_waker(&waker);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return Ok(value),
+            Poll::Pending => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(RpcError::internal(
+                        "timed out waiting for engine capabilities",
+                    ));
+                }
+                if receiver.recv_timeout(remaining).is_err()
+                    && std::time::Instant::now() >= deadline
+                {
+                    return Err(RpcError::internal(
+                        "timed out waiting for engine capabilities",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn map_harness(error: HarnessError) -> RpcError {

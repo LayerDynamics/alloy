@@ -427,6 +427,135 @@ fn tiered_recreated_runtime_restores_partial_block_into_new_owner_and_matches_fr
 }
 
 #[test]
+fn tiered_process_restart_restores_prefix_and_matches_fresh() {
+    const PHASE: &str = "ALLOY_TEST_PREFIX_RESTART_PHASE";
+    const ROOT: &str = "ALLOY_TEST_PREFIX_RESTART_ROOT";
+    if let Ok(phase) = std::env::var(PHASE) {
+        let root = std::path::PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let fixtures = TieredFixtures::new();
+        let environment = fixtures.environment();
+        configure(
+            &environment,
+            configuration(&root.join("cache"), HotCacheLimit::Bytes(0)),
+        );
+        let (body, rendered) = prompt_with_partial_last_block(&environment);
+        let transcript = environment.run("process-restart", profile_a(), &body);
+        let work = environment.observations.work("process-restart");
+        let metrics = settled_metrics(&environment);
+        if phase == "seed" {
+            assert_eq!(work.prefill_tokens, rendered.token_ids());
+            assert_eq!(metrics.spill_count, 1);
+            assert_eq!(metrics.restore_count, 0);
+        } else {
+            assert_eq!(
+                work.prefill_tokens,
+                &rendered.token_ids()[rendered.token_count() - 1..]
+            );
+            assert_eq!(metrics.restore_count, 1);
+            assert_eq!(metrics.restored_tokens, (rendered.token_count() - 1) as u64);
+        }
+        fs::write(
+            root.join(format!("{phase}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "text": transcript.text,
+                "tokens": work.decode_tokens,
+                "logits": work.decode_logits,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        drop_runtime_and_assert_unreserved(environment);
+        return;
+    }
+
+    let directory = TestDirectory::new();
+    for phase in ["seed", "restore"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runtime_policies::tiered::tiered_process_restart_restores_prefix_and_matches_fresh", "--nocapture"])
+            .env(PHASE, phase)
+            .env(ROOT, directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child {phase} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let read = |phase: &str| -> Value {
+        serde_json::from_slice(&fs::read(directory.path().join(format!("{phase}.json"))).unwrap())
+            .unwrap()
+    };
+    let cold = read("seed");
+    let restored = read("restore");
+    assert_eq!(cold["text"], restored["text"]);
+    assert_eq!(cold["tokens"], restored["tokens"]);
+    let cold_logits: Vec<Vec<f32>> = serde_json::from_value(cold["logits"].clone()).unwrap();
+    let restored_logits: Vec<Vec<f32>> =
+        serde_json::from_value(restored["logits"].clone()).unwrap();
+    assert!(!cold_logits.is_empty());
+    assert_eq!(cold_logits.len(), restored_logits.len());
+    for (actual, expected) in restored_logits.iter().zip(&cold_logits) {
+        assert_close(actual, expected);
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(cache_property_config(8))]
+    #[test]
+    fn tiered_property_restart_edits_and_corruption_match_cold(change in 0u8..4, suffix in "[a-z]{1,3}") {
+        let fixtures = TieredFixtures::new();
+        let directory = TestDirectory::new();
+        let source = fixtures.environment();
+        configure(&source, configuration(directory.path(), HotCacheLimit::Bytes(0)));
+        let (body, original_rendered) = prompt_with_partial_last_block(&source);
+        let seeded = source.run("property-ssd-seed", profile_a(), &body);
+        completed_usage(&seeded, FinishReason::OutputLimit);
+        assert_eq!(settled_metrics(&source).spill_count, 1);
+        drop_runtime_and_assert_unreserved(source);
+
+        if change == 1 {
+            let block = entries(directory.path())[0].join("00000001.safetensors");
+            let mut bytes = fs::read(&block).unwrap();
+            *bytes.last_mut().unwrap() ^= 0x80;
+            fs::write(block, bytes).unwrap();
+        }
+        let input = match change {
+            2 => format!("{suffix}{}", &body[1..]),
+            3 => body[..body.len() / 2].to_owned(),
+            _ => body,
+        };
+        let cold_env = fixtures.environment();
+        let expected = cold_env.run("property-ssd-cold", profile_a(), &input);
+        let cold_work = cold_env.observations.work("property-ssd-cold");
+        drop_runtime_and_assert_unreserved(cold_env);
+
+        let restored = fixtures.environment();
+        configure(&restored, configuration(directory.path(), HotCacheLimit::Bytes(0)));
+        let rendered = render(&restored, profile_a(), &input);
+        let actual = restored.run("property-ssd-restore", profile_a(), &input);
+        let work = restored.observations.work("property-ssd-restore");
+        assert_matches_cold(&actual, &work, &expected, &cold_work);
+        let metrics = settled_metrics(&restored);
+        if change == 0 {
+            assert_eq!(metrics.restore_count, 1);
+            assert_eq!(work.prefill_tokens, &rendered.token_ids()[rendered.token_count() - 1..]);
+        } else if change == 1 {
+            assert_eq!(metrics.restore_count, 0);
+            assert!(metrics.last_error.is_some());
+            assert_eq!(work.prefill_tokens, rendered.token_ids());
+        } else {
+            let common = original_rendered.token_ids().iter().zip(rendered.token_ids())
+                .take_while(|(a, b)| a == b).count().min(rendered.token_count() - 1);
+            assert_eq!(metrics.restored_tokens, common as u64);
+            assert_eq!(metrics.restore_count, u64::from(common != 0));
+            assert_eq!(work.prefill_tokens, &rendered.token_ids()[common..]);
+        }
+        drop_runtime_and_assert_unreserved(restored);
+    }
+}
+
+#[test]
 fn tiered_artifact_and_profile_identity_mismatch_falls_back_to_full_real_prefill() {
     let fixtures = TieredFixtures::new();
     let directory = TestDirectory::new();
@@ -470,9 +599,9 @@ fn tiered_artifact_and_profile_identity_mismatch_falls_back_to_full_real_prefill
 }
 
 #[test]
-fn tiered_corrupt_or_truncated_second_block_rolls_back_partial_restore_and_prefills_safely() {
+fn tiered_corrupt_block_or_manifest_rolls_back_partial_restore_and_prefills_safely() {
     let fixtures = TieredFixtures::new();
-    for truncate in [false, true] {
+    for corruption in 0..6 {
         let directory = TestDirectory::new();
         let source = fixtures.environment();
         configure(
@@ -487,10 +616,10 @@ fn tiered_corrupt_or_truncated_second_block_rolls_back_partial_restore_and_prefi
         drop_runtime_and_assert_unreserved(source);
         let snapshots = entries(directory.path());
         assert_eq!(snapshots.len(), 1);
-        // The first block imports real native data before this later block
-        // fails validation, requiring complete logical rollback to zero.
+        // Block and block-hash corruption is found after the first block
+        // imports; identity, layout, and prefix changes must instead miss.
         let path = snapshots[0].join("00000001.safetensors");
-        if truncate {
+        if corruption == 0 {
             let length = fs::metadata(&path).unwrap().len();
             fs::OpenOptions::new()
                 .write(true)
@@ -498,10 +627,26 @@ fn tiered_corrupt_or_truncated_second_block_rolls_back_partial_restore_and_prefi
                 .unwrap()
                 .set_len(length / 2)
                 .unwrap();
-        } else {
+        } else if corruption == 1 {
             let mut bytes = fs::read(&path).unwrap();
             *bytes.last_mut().unwrap() ^= 0x80;
             fs::write(&path, bytes).unwrap();
+        } else {
+            let path = snapshots[0].join("manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match corruption {
+                2 => manifest["blocks"][1]["sha256"] = Value::String("0".repeat(64)),
+                3 => manifest["identity"] = Value::String("0".repeat(64)),
+                4 => {
+                    manifest["spec"]["head_dim"] =
+                        Value::from(manifest["spec"]["head_dim"].as_u64().unwrap() + 1)
+                }
+                5 => {
+                    manifest["tokens"][0] = Value::from(manifest["tokens"][0].as_u64().unwrap() ^ 1)
+                }
+                _ => unreachable!(),
+            }
+            fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         }
         let restored = fixtures.environment();
         configure(
@@ -522,10 +667,12 @@ fn tiered_corrupt_or_truncated_second_block_rolls_back_partial_restore_and_prefi
         let metrics = settled_metrics(&restored);
         assert_eq!(metrics.restore_count, 0);
         assert_eq!(metrics.restored_tokens, 0);
-        assert!(
-            metrics.last_error.is_some(),
-            "corruption must be observable as a cache miss"
-        );
+        if corruption < 3 {
+            assert!(
+                metrics.last_error.is_some(),
+                "block corruption must be observable"
+            );
+        }
         assert_eq!(
             restored
                 .observations

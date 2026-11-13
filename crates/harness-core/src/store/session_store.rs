@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Schema version understood by this crate. Readers reject newer versions.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Spec version recorded in the meta row for forward-only migrations.
 pub const SPEC_VERSION: &str = "SPEC-1/B.4/v1";
@@ -29,7 +29,7 @@ pub enum EventKind {
     ToolStarted,
     /// Tool execution completed (unused in Phase 1 supervisor).
     ToolCompleted,
-    /// Skill loaded (unused in Phase 1 supervisor).
+    /// Immutable, versioned skill instructions loaded for this session.
     SkillLoaded,
     /// Artifact created (unused in Phase 1 supervisor).
     ArtifactCreated,
@@ -360,13 +360,26 @@ impl SessionStore {
                 "checkpoint events must use the validated transaction".into(),
             ));
         }
+        if kind == EventKind::SkillLoaded {
+            crate::context::validate_skill_payload(&payload)?;
+            if artifact_refs != serde_json::json!([]) {
+                return Err(HarnessError::Invalid(
+                    "skill events cannot attach artifacts".into(),
+                ));
+            }
+        }
         if !artifact_refs.is_array() {
             return Err(HarnessError::Invalid(
                 "artifact_refs must be a JSON array".into(),
             ));
         }
         let ts = now_ms()?;
-        let tx = self.conn.transaction()?;
+        let behavior = if kind == EventKind::SkillLoaded {
+            rusqlite::TransactionBehavior::Immediate
+        } else {
+            rusqlite::TransactionBehavior::Deferred
+        };
+        let tx = self.conn.transaction_with_behavior(behavior)?;
         let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM sessions WHERE session_id = ?1",
@@ -379,6 +392,19 @@ impl SessionStore {
             return Err(HarnessError::Invalid(format!(
                 "unknown session_id: {session_id}"
             )));
+        }
+        if kind == EventKind::SkillLoaded {
+            let mut history = list_events_from(&tx, session_id)?;
+            history.push(EventRecord {
+                id: 0,
+                session_id: session_id.to_owned(),
+                seq: 0,
+                ts: 0,
+                kind,
+                payload: payload.clone(),
+                artifact_refs: artifact_refs.clone(),
+            });
+            crate::context::project_skills(&history)?;
         }
         let record = append_event_in_tx(&tx, session_id, ts, kind, payload, artifact_refs)?;
         tx.execute(
@@ -537,37 +563,44 @@ impl SessionStore {
 
     /// Return all events for a session ordered by `seq` ascending.
     pub fn list_events(&self, session_id: &str) -> HarnessResult<Vec<EventRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, seq, ts, kind, payload_json, artifact_refs
-             FROM events WHERE session_id = ?1 ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?;
-
-        let mut events = Vec::new();
-        for row in rows {
-            let (id, session_id, seq, ts, kind, payload_json, artifact_refs) = row?;
-            events.push(EventRecord {
-                id,
-                session_id,
-                seq,
-                ts,
-                kind: EventKind::parse(&kind)?,
-                payload: serde_json::from_str(&payload_json)?,
-                artifact_refs: serde_json::from_str(&artifact_refs)?,
-            });
-        }
-        Ok(events)
+        list_events_from(&self.conn, session_id)
     }
+}
+
+fn list_events_from(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> HarnessResult<Vec<EventRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, seq, ts, kind, payload_json, artifact_refs
+             FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (id, session_id, seq, ts, kind, payload_json, artifact_refs) = row?;
+        events.push(EventRecord {
+            id,
+            session_id,
+            seq,
+            ts,
+            kind: EventKind::parse(&kind)?,
+            payload: serde_json::from_str(&payload_json)?,
+            artifact_refs: serde_json::from_str(&artifact_refs)?,
+        });
+    }
+    Ok(events)
 }
 
 fn append_event_in_tx(

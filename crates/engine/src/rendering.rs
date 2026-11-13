@@ -303,6 +303,39 @@ impl PinnedTokenizer {
     }
 }
 
+/// Verify the byte representation of an exact executed token sequence.
+///
+/// Some token sequences do not have a lossless UTF-8 roundtrip. They cannot
+/// be used for canonical publication through this mapping.
+pub fn verify_token_prefix_bytes(
+    tokenizer: &PinnedTokenizer,
+    tokens: &[u32],
+    bytes: &[u8],
+) -> Result<(), EngineError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        EngineError::invalid_request("token_prefix_bytes", "prefix is not valid UTF-8")
+    })?;
+    let decoded = tokenizer.tokenizer().decode(tokens, false).map_err(|_| {
+        EngineError::invalid_request("token_prefix_bytes", "executed tokens cannot be decoded")
+    })?;
+    if decoded.as_bytes() != bytes {
+        return Err(EngineError::invalid_request(
+            "token_prefix_bytes",
+            "prefix differs from the executed token sequence",
+        ));
+    }
+    let encoded = tokenizer.tokenizer().encode(text, false).map_err(|_| {
+        EngineError::invalid_request("token_prefix_bytes", "prefix cannot be encoded")
+    })?;
+    if encoded.get_ids() != tokens {
+        return Err(EngineError::invalid_request(
+            "token_prefix_bytes",
+            "prefix does not roundtrip to the executed token sequence",
+        ));
+    }
+    Ok(())
+}
+
 /// Bound the token count of any UTF-8 rendering of at most `rendered_bytes`
 /// bytes for the pinned Qwen3-4B corpus tokenizer, without special-token
 /// post-processing. This deliberately does not admit a request: callers must
