@@ -171,6 +171,7 @@ impl Qwen3BackendLimits {
 /// Real Qwen3 backend. Normal metadata/factories may cross threads;
 /// actual model and cache instances are created by ModelFamily::load.
 pub struct Qwen3Backend {
+    family: inference_infra::decoder::config::DecoderFamily,
     registration: FamilyRegistration,
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
@@ -199,6 +200,34 @@ impl Qwen3Backend {
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
+        Self::new_family(
+            specifications,
+            limits,
+            execution,
+            inference_infra::decoder::config::DecoderFamily::Qwen3,
+        )
+    }
+
+    /// Explicit native Llama factory. Configs never fall back to Qwen.
+    pub fn new_llama3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(
+            specifications,
+            limits,
+            execution,
+            inference_infra::decoder::config::DecoderFamily::Llama3,
+        )
+    }
+
+    fn new_family(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+        family: inference_infra::decoder::config::DecoderFamily,
+    ) -> Result<Self, EngineError> {
         limits.validate()?;
         if specifications.is_empty() {
             return Err(EngineError::invalid_request(
@@ -206,7 +235,7 @@ impl Qwen3Backend {
                 "must not be empty",
             ));
         }
-        let registration = registration(limits.context_limit_tokens, execution)?;
+        let registration = registration_for(family, limits.context_limit_tokens, execution)?;
         let mut artifacts = BTreeMap::new();
         let inverse = Arc::new(byte_decoder_map());
         for mut specification in specifications {
@@ -235,7 +264,7 @@ impl Qwen3Backend {
                     "pinned file count is outside its limit",
                 ));
             }
-            if digest(CHAT_TEMPLATE.as_bytes()) != specification.template_sha256 {
+            if digest(family_template(family, false).as_bytes()) != specification.template_sha256 {
                 return Err(validation(
                     Some(&specification.id),
                     "trusted template digest does not match the compiled Qwen3 template",
@@ -262,7 +291,15 @@ impl Qwen3Backend {
                 read_metadata(&specification, "config.json", limits.max_config_bytes)?;
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
-            let config = parse_config(&config_value)?;
+            let config = match family {
+                inference_infra::decoder::config::DecoderFamily::Qwen3 => {
+                    parse_config(&config_value)?
+                }
+                inference_infra::decoder::config::DecoderFamily::Llama3 => {
+                    llama3::config::parse_config(&config_value)
+                        .map_err(|e| model_error(e, "validate Llama config"))?
+                }
+            };
             // Undeclared representation uses the conservative dense path.
             // Quantized declarations retain the existing packed estimates.
             let declares_quantization = ["quantization", "quantization_config"]
@@ -395,6 +432,7 @@ impl Qwen3Backend {
             artifacts.insert(data.specification.id.clone(), data);
         }
         Ok(Self {
+            family,
             registration,
             artifacts,
             limits,
@@ -653,7 +691,7 @@ impl RuntimeBackend for Qwen3Backend {
         let data = self.data(artifact)?;
         if rendered.artifact_id() != artifact.id()
             || rendered.tokenizer_id() != data.tokenizer.identity()
-            || rendered.template_hash() != &digest(qwen3::template::TOOL_CHAT_TEMPLATE.as_bytes())
+            || rendered.template_hash() != &digest(family_template(self.family, true).as_bytes())
         {
             return Err(EngineError::invalid_request(
                 "projection",
@@ -679,6 +717,14 @@ impl RuntimeBackend for Qwen3Backend {
                 available_bytes: u64::try_from(limit).unwrap_or(u64::MAX),
                 reason: MemoryLimitReason::BufferLimit,
             });
+        }
+        if self.family == inference_infra::decoder::config::DecoderFamily::Llama3 {
+            return rendering::llama3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
         }
         rendering::qwen3_projected_tool_token_upper_bound(
             &data.tokenizer,
@@ -710,11 +756,7 @@ impl RuntimeBackend for Qwen3Backend {
                     "enable tool-call parsing before rendering tool context",
                 ));
             }
-            let template = if tool_mode {
-                qwen3::template::TOOL_CHAT_TEMPLATE
-            } else {
-                CHAT_TEMPLATE
-            };
+            let template = family_template(self.family, tool_mode);
             let template_hash = if tool_mode {
                 digest(template.as_bytes())
             } else {
@@ -784,6 +826,15 @@ impl RuntimeBackend for Qwen3Backend {
                 .and_then(|v| v.checked_add(resolved.profile().safety_margin_tokens()))
                 .ok_or_else(|| internal("Qwen3 context arithmetic overflow"))?;
             let load_peak = loading_peak_bound(data, &self.limits)?;
+            // Full f32 KV overlap dominates long Llama requests. Bound the
+            // per-layer attention workspace further once capacity exceeds 16k.
+            let chunk_tokens = if !data.config.has_qk_norm() && capacity > 16_384 {
+                self.limits.prefill_chunk_tokens.get().min(32)
+            } else {
+                self.limits.prefill_chunk_tokens.get()
+            };
+            let prefill_chunk_tokens =
+                NonZeroUsize::new(chunk_tokens).expect("nonzero configured chunk");
             Ok(RuntimePlan {
                 load_limits: ModelLoadLimits::new(
                     data.source_bytes,
@@ -791,7 +842,7 @@ impl RuntimeBackend for Qwen3Backend {
                     load_peak,
                 )?,
                 cache: CacheAllocationRequest::new(
-                    cache_mode()?,
+                    family_cache_mode(self.family)?,
                     capacity,
                     sum(&[
                         cache_bound(&data.config, capacity)?,
@@ -803,15 +854,12 @@ impl RuntimeBackend for Qwen3Backend {
                 temporary_bytes: workspace_bound(
                     &data.config,
                     capacity,
-                    self.limits
-                        .prefill_chunk_tokens
-                        .get()
-                        .min(input_tokens.max(1)),
+                    chunk_tokens.min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
                 )?,
                 output_bytes: self.planned_output_bytes()?,
                 headroom_bytes: self.limits.execution_headroom_bytes,
-                prefill_chunk_tokens: self.limits.prefill_chunk_tokens,
+                prefill_chunk_tokens,
             })
         })
     }
@@ -1014,29 +1062,49 @@ impl RuntimeBackend for Qwen3Backend {
 
 include!("cache.rs");
 
-fn registration(
+fn registration_for(
+    family: inference_infra::decoder::config::DecoderFamily,
     context_limit: usize,
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
+    let llama = family == inference_infra::decoder::config::DecoderFamily::Llama3;
+    let mut representations = vec![
+        WeightRepresentation::F32,
+        WeightRepresentation::Affine4 {
+            group_size: NonZeroUsize::new(64).unwrap(),
+        },
+    ];
+    if llama {
+        representations.push(WeightRepresentation::Affine8 {
+            group_size: NonZeroUsize::new(64).unwrap(),
+        });
+    }
     FamilyRegistration::new(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
-        FamilyVersion::new(qwen3::register::IMPL_VERSION, 4, 0),
-        qwen3::register::ARCHITECTURES
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect(),
+        FamilyVersion::new(
+            if llama {
+                llama3::register::IMPL_VERSION
+            } else {
+                qwen3::register::IMPL_VERSION
+            },
+            5,
+            0,
+        ),
+        (if llama {
+            llama3::register::ARCHITECTURES
+        } else {
+            qwen3::register::ARCHITECTURES
+        })
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: "qwen3".to_owned(),
+            family: if llama { "llama3" } else { "qwen3" }.to_owned(),
             backend: execution.backend(),
-            weight_representations: vec![
-                WeightRepresentation::F32,
-                WeightRepresentation::Affine4 {
-                    group_size: NonZeroUsize::new(64).expect("64"),
-                },
-            ],
-            cache_modes: vec![cache_mode()?],
+            weight_representations: representations,
+            cache_modes: vec![family_cache_mode(family)?],
             context_limit_tokens: context_limit,
             supports_streaming: true,
             supports_incremental_kv: true,
@@ -1231,3 +1299,33 @@ mod shared_rendering_wiring_tests;
 #[cfg(test)]
 #[path = "../../../tests/unit/backends_qwen_dense_weight_planning_regressions.rs"]
 mod dense_weight_planning_regressions;
+
+fn family_template(
+    family: inference_infra::decoder::config::DecoderFamily,
+    tools: bool,
+) -> &'static str {
+    match (family, tools) {
+        (inference_infra::decoder::config::DecoderFamily::Qwen3, false) => CHAT_TEMPLATE,
+        (inference_infra::decoder::config::DecoderFamily::Qwen3, true) => {
+            qwen3::template::TOOL_CHAT_TEMPLATE
+        }
+        (inference_infra::decoder::config::DecoderFamily::Llama3, false) => {
+            llama3::template::CHAT_TEMPLATE
+        }
+        (inference_infra::decoder::config::DecoderFamily::Llama3, true) => {
+            llama3::template::TOOL_CHAT_TEMPLATE
+        }
+    }
+}
+fn family_cache_mode(
+    family: inference_infra::decoder::config::DecoderFamily,
+) -> Result<CacheMode, EngineError> {
+    if family == inference_infra::decoder::config::DecoderFamily::Llama3 {
+        Ok(CacheMode {
+            representation: CacheRepresentationId::new(llama3::register::CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        })
+    } else {
+        cache_mode()
+    }
+}

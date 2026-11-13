@@ -13,7 +13,7 @@
 # manifest (no [package] here), where cargo would otherwise default to
 # the legacy resolver.
 resolver = "3"
-members = ["crates/alloyd","crates/engine","crates/families/qwen3","crates/harness-core","crates/inference-infra","crates/mlx-ffi", "crates/tool-registry", "crates/process-owner"]
+members = ["crates/alloyd","crates/engine","crates/families/qwen3","crates/families/llama3","crates/harness-core","crates/inference-infra","crates/mlx-ffi", "crates/tool-registry", "crates/process-owner"]
 
 [workspace.package]
 # Shared metadata inherited by member crates via `workspace = true`.

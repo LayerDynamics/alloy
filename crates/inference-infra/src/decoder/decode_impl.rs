@@ -1,14 +1,14 @@
 /// Per-model, bounded K/V state.
 ///
 /// A cache cannot be reused with another loaded model instance.
-pub struct Qwen3Cache {
+pub struct DecoderCache {
     owner: std::sync::Arc<()>,
     capacity: usize,
     length: usize,
     layers: Vec<(Vec<f64>, Vec<f64>)>,
 }
 
-impl Qwen3Cache {
+impl DecoderCache {
     /// Return the number of logical token positions currently cached.
     pub fn len(&self) -> usize {
         self.length
@@ -44,7 +44,7 @@ impl Qwen3Cache {
     /// Occupied bytes use the corresponding vector lengths. Layer entries
     /// remain occupied even when logical K/V contents have been reset.
     ///
-    /// Excludes allocator overhead, the inline Qwen3Cache value, model
+    /// Excludes allocator overhead, the inline DecoderCache value, model
     /// weights, and the shared model-owner identity allocation.
     ///
     /// Resetting the cache retains allocated capacity, so allocated bytes
@@ -113,7 +113,7 @@ impl Qwen3Cache {
     }
 }
 
-impl Qwen3Model {
+impl DecoderModel {
     /// Reserve bounded K/V payload storage.
     ///
     /// The explicit limit excludes model weights and the outer
@@ -125,7 +125,7 @@ impl Qwen3Model {
         &self,
         capacity: usize,
         max_bytes: usize,
-    ) -> Result<Qwen3Cache, ModelError> {
+    ) -> Result<DecoderCache, ModelError> {
         let c = &self.config;
 
         if capacity == 0 || capacity > c.max_context {
@@ -177,7 +177,7 @@ impl Qwen3Model {
             layers.push((keys, values));
         }
 
-        Ok(Qwen3Cache {
+        Ok(DecoderCache {
             owner: self.cache_owner.clone(),
             capacity,
             length: 0,
@@ -193,7 +193,7 @@ impl Qwen3Model {
     pub fn prefill_cached(
         &self,
         tokens: &[u32],
-        cache: &mut Qwen3Cache,
+        cache: &mut DecoderCache,
     ) -> Result<Vec<f32>, ModelError> {
         if !std::sync::Arc::ptr_eq(
             &self.cache_owner,
@@ -245,7 +245,7 @@ impl Qwen3Model {
     pub fn decode_token(
         &self,
         token: u32,
-        cache: &mut Qwen3Cache,
+        cache: &mut DecoderCache,
     ) -> Result<Vec<f32>, ModelError> {
         let c = &self.config;
 
@@ -681,12 +681,12 @@ fn rope_at(
 mod prefill_hardening_unit_tests {
     use super::*;
 
-    fn loaded_model() -> Qwen3Model {
-        let config = Qwen3Config::tiny_fixture();
+    fn loaded_model() -> DecoderModel {
+        let config = DecoderConfig::tiny_fixture();
         let weights =
-            crate::fixture::generate_fixture(&config);
+            crate::decoder::fixture::generate_fixture(&config);
 
-        Qwen3Model::load(config, weights)
+        DecoderModel::load(config, weights)
             .expect("actual fixture-weight model")
     }
 

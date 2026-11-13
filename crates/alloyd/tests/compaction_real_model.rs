@@ -1,6 +1,9 @@
-//! Opt-in real Qwen compaction acceptance; run with ALLOY_REAL_MODEL pointing to the pinned artifact.
+//! Opt-in shared native-family conformance; set ALLOY_REAL_MODEL and ALLOY_REAL_PROFILE.
 #[path = "support/recording_engine.rs"]
 mod recording_engine;
+fn real_profile() -> String {
+    std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| "qwen3-4b-4bit".to_owned())
+}
 use alloyd::{BootRequest, boot_qwen3};
 use engine::{
     api::Engine,
@@ -43,13 +46,13 @@ fn wait_future<F: std::future::Future>(future: F) -> F::Output {
 }
 
 #[test]
-#[ignore = "requires local pinned Qwen3 model and native MLX"]
+#[ignore = "requires local pinned model and native MLX"]
 fn real_rpc_skill_load_changes_next_generation() {
     let root = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_qwen3_with_context_limit(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-            profile_id: "qwen3-4b-4bit".into(),
+            profile_id: real_profile().as_str().into(),
             corpus_models_json: Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
             ),
@@ -98,7 +101,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     };
     let created = rpc(
         "session.create",
-        serde_json::json!({"profile":"qwen3-4b-4bit"}),
+        serde_json::json!({"profile":real_profile().as_str()}),
     );
     let session = created[0]["result"]["session_id"].as_str().unwrap();
     let mut outputs = Vec::new();
@@ -128,7 +131,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     }
     let caps = rpc(
         "models.capabilities",
-        serde_json::json!({"artifact_id":"qwen3-4b-4bit"}),
+        serde_json::json!({"artifact_id":real_profile().as_str()}),
     );
     assert_eq!(
         caps[0]["result"]["supports_prefix_reuse"],
@@ -138,12 +141,12 @@ fn real_rpc_skill_load_changes_next_generation() {
 }
 
 #[test]
-#[ignore = "requires local pinned Qwen3 model and native MLX"]
+#[ignore = "requires local pinned model and native MLX"]
 fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let root = tempfile::tempdir().unwrap();
     let make_request = |disk: Option<PathBuf>| BootRequest {
         artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-        profile_id: "qwen3-4b-4bit".into(),
+        profile_id: real_profile().as_str().into(),
         corpus_models_json: Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
         ),
@@ -210,7 +213,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let db = store.into_inner().unwrap();
     let changed = ContextBuilder::build_snapshot(
         "changed",
-        "qwen3-4b-4bit",
+        real_profile().as_str(),
         &db.list_events("skill").unwrap(),
         Some("What color is specified now?"),
     )
@@ -249,7 +252,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let caps = wait_future(
         supervisor
             .engine()
-            .capabilities(ArtifactId::new("qwen3-4b-4bit").unwrap()),
+            .capabilities(ArtifactId::new(real_profile().as_str()).unwrap()),
     )
     .unwrap();
     assert!(caps.supports_prefix_reuse);
@@ -268,7 +271,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         0,
     )
     .unwrap();
-    let request: alloyd::RpcRequest = serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"api_version":alloyd::API_VERSION,"method":"models.capabilities","params":{"artifact_id":"qwen3-4b-4bit"}})).unwrap();
+    let request: alloyd::RpcRequest = serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"api_version":alloyd::API_VERSION,"method":"models.capabilities","params":{"artifact_id":real_profile().as_str()}})).unwrap();
     let mut response = Vec::new();
     service.handle(request, &mut response).unwrap();
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
@@ -295,7 +298,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     assert_eq!(warm.assistant_text, baseline.assistant_text);
     let caps = wait_future(
         cold.engine()
-            .capabilities(ArtifactId::new("qwen3-4b-4bit").unwrap()),
+            .capabilities(ArtifactId::new(real_profile().as_str()).unwrap()),
     )
     .unwrap();
     assert!(!caps.supports_prefix_reuse);
@@ -306,13 +309,13 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
 }
 
 #[test]
-#[ignore = "requires local pinned Qwen3 model and native MLX"]
+#[ignore = "requires local pinned model and native MLX"]
 fn real_model_generated_history_has_verified_canonical_bytes() {
     let root = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_qwen3_with_context_limit(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-            profile_id: "qwen3-4b-4bit".into(),
+            profile_id: real_profile().as_str().into(),
             corpus_models_json: Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
             ),
@@ -349,7 +352,14 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     assert!(!result.assistant_text.is_empty());
     let base = format!("{}{}", rendered.text(), result.assistant_text);
     let mut published = None;
-    for suffix in ["", "<|im_end|>", "<|endoftext|>"] {
+    for suffix in [
+        "",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "<|eom_id|>",
+        "<|end_of_text|>",
+    ] {
         let bytes = format!("{base}{suffix}").into_bytes();
         if let Ok(id) = wait_future(
             supervisor
@@ -373,7 +383,7 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
 }
 
 #[test]
-#[ignore = "requires local pinned Qwen3 model and native MLX"]
+#[ignore = "requires local pinned model and native MLX"]
 fn real_model_ssd_prefix_survives_process_restart() {
     const ROOT: &str = "ALLOY_TEST_REAL_SSD_ROOT";
     const PHASE: &str = "ALLOY_TEST_REAL_SSD_PHASE";
@@ -382,7 +392,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
         let boot = alloyd::boot::boot_qwen3_with_context_limit(
             BootRequest {
                 artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-                profile_id: "qwen3-4b-4bit".into(),
+                profile_id: real_profile().as_str().into(),
                 corpus_models_json: Some(
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("../../bench/corpus/models.json"),
@@ -470,14 +480,14 @@ fn real_model_ssd_prefix_survives_process_restart() {
 }
 
 #[test]
-#[ignore = "requires local pinned Qwen3 model and native MLX"]
+#[ignore = "requires local pinned model and native MLX"]
 fn real_model_compaction_preserves_history_and_continues() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let dir = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_qwen3_with_context_limit(
         BootRequest {
             artifact_dir: artifact,
-            profile_id: "qwen3-4b-4bit".into(),
+            profile_id: real_profile().as_str().into(),
             corpus_models_json: Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
             ),
@@ -653,7 +663,7 @@ fn real_model_compaction_preserves_history_and_continues() {
     let cold_boot = alloyd::boot::boot_qwen3_with_context_limit(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-            profile_id: "qwen3-4b-4bit".into(),
+            profile_id: real_profile().as_str().into(),
             corpus_models_json: Some(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
             ),
@@ -735,12 +745,12 @@ fn real_model_compaction_preserves_history_and_continues() {
 }
 
 #[test]
-#[ignore = "requires pinned Qwen artifact; timing must use an optimized build"]
+#[ignore = "requires pinned artifact; timing must use an optimized build"]
 fn real_model_render_32k_latency() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let boot = boot_qwen3(BootRequest {
         artifact_dir: artifact,
-        profile_id: "qwen3-4b-4bit".into(),
+        profile_id: real_profile().as_str().into(),
         corpus_models_json: Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
         ),

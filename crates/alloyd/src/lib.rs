@@ -12,7 +12,7 @@ pub mod server;
 pub mod service;
 pub mod tool_config;
 
-pub use boot::{BootRequest, BootedEngine, boot_qwen3};
+pub use boot::{BootRequest, BootedEngine, boot_native, boot_qwen3};
 pub use metrics::{LiveEngineMetrics, MetricsSource};
 pub use rpc::{API_VERSION, ErrorKind, RpcError, RpcRequest, RpcResponse};
 pub use server::{DaemonConfig, bind_listener, handle_connection, serve_listener};

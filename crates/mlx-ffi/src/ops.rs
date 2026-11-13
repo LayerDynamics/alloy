@@ -589,6 +589,24 @@ pub fn quantized_embedding_lookup(
     group_size: i32,
     stream: &Stream,
 ) -> OperationResult<Array> {
+    quantized_embedding_lookup_bits(weight, scales, biases, tokens, group_size, 4, stream)
+}
+
+/// Lookup packed affine 4-bit or 8-bit embedding rows without expanding the vocabulary.
+pub fn quantized_embedding_lookup_bits(
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    tokens: &[u32],
+    group_size: i32,
+    bits: i32,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if !matches!(bits, 4 | 8) {
+        return Err(OperationError::InvalidInput(
+            "embedding bits must be 4 or 8",
+        ));
+    }
     if weight.dtype() != DType::Uint32 {
         return Err(OperationError::InvalidInput(
             "quantized embedding weight must be uint32",
@@ -610,11 +628,12 @@ pub fn quantized_embedding_lookup(
     }
     require_positive_shape(&packed_shape)?;
     require_positive_shape(&parameter_shape)?;
-    let width = packed_shape[1]
-        .checked_mul(8)
-        .ok_or(OperationError::InvalidInput(
-            "quantized embedding width overflow",
-        ))?;
+    let width =
+        packed_shape[1]
+            .checked_mul(32 / bits as usize)
+            .ok_or(OperationError::InvalidInput(
+                "quantized embedding width overflow",
+            ))?;
     let group = group_size as usize;
     if width % group != 0 || parameter_shape[1] != width / group {
         return Err(OperationError::InvalidInput(
@@ -656,7 +675,7 @@ pub fn quantized_embedding_lookup(
         &selected_scales,
         &selected_biases,
         group_size,
-        4,
+        bits,
         stream,
     )
 }

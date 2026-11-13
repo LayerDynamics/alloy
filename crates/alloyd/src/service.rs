@@ -252,6 +252,9 @@ impl<E: Engine> DaemonService<E> {
                 WeightRepresentation::F32 => json!({"kind":"f32"}),
                 WeightRepresentation::F16 => json!({"kind":"f16"}),
                 WeightRepresentation::Bf16 => json!({"kind":"bf16"}),
+                WeightRepresentation::Affine8 { group_size } => {
+                    serde_json::json!({"kind": "affine8", "group_size": group_size.get()})
+                }
                 WeightRepresentation::Affine4 { group_size } => {
                     json!({"kind":"affine4","group_size":group_size.get()})
                 }

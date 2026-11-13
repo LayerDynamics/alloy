@@ -4,3 +4,5 @@
 pub mod qwen;
 
 pub use qwen::{FilePin, Qwen3Artifact, Qwen3Backend, Qwen3BackendLimits, Qwen3Execution};
+
+pub mod llama;

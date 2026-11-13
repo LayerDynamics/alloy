@@ -89,6 +89,10 @@ impl ModelFamily for Qwen3Backend {
         );
         control.check_cancelled()?;
         let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
+        let packed_bits = weights.embed_tokens.bits();
+        if !data.config.has_qk_norm() {
+            validate_llama_weight_layout(&weights)?;
+        }
         let decoded = weight_memory(&weights)?;
         if decoded.allocated_bytes() > weight_charge_limit {
             return Err(EngineError::MemoryLimitExceeded {
@@ -119,6 +123,13 @@ impl ModelFamily for Qwen3Backend {
             });
         }
         let mut capabilities = self.registration.capabilities().clone();
+        if !data.config.has_qk_norm() {
+            capabilities.weight_representations = vec![match packed_bits {
+                Some(8) => WeightRepresentation::Affine8 { group_size: NonZeroUsize::new(64).unwrap() },
+                Some(4) => WeightRepresentation::Affine4 { group_size: NonZeroUsize::new(64).unwrap() },
+                _ => WeightRepresentation::F32,
+            }];
+        }
         capabilities.context_limit_tokens = capabilities
             .context_limit_tokens
             .min(data.config.max_context);
@@ -132,7 +143,7 @@ impl ModelFamily for Qwen3Backend {
             memory: BufferMemoryUsage::new(measured, payload)?,
             vocabulary: data.config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: logits_payload_bound(&data.config)?,
+            logits_payload_bytes: product(logits_payload_bound(&data.config)?, if data.config.has_qk_norm() { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
         }))
     }
 }
@@ -185,7 +196,7 @@ impl Qwen3Loaded {
         &self,
         cache: &'a mut dyn FamilyCache,
     ) -> Result<&'a mut Qwen3NativeCache, EngineError> {
-        if cache.owner() != &self.instance || cache.mode() != &cache_mode()? {
+        if cache.owner() != &self.instance || cache.mode() != &family_cache_mode(self.model.config().family)? {
             return Err(EngineError::invalid_request(
                 "cache",
                 "cache belongs to another model or representation",
@@ -219,7 +230,7 @@ impl AutoregressiveModel for Qwen3Loaded {
         control: &ExecutionControl,
     ) -> Result<Box<dyn FamilyCache>, EngineError> {
         control.check_cancelled()?;
-        if request.mode() != &cache_mode()? {
+        if request.mode() != &family_cache_mode(self.model.config().family)? {
             return Err(EngineError::unsupported(
                 "cache mode",
                 "only full MLX float32 KV is implemented",
@@ -348,5 +359,34 @@ impl AutoregressiveModel for Qwen3Loaded {
             let _ = cache.inner.reset(&cache.mlx_owner);
         }
         result
+    }
+}
+
+
+fn validate_llama_weight_layout(weights: &qwen3::fixture::Qwen3Weights) -> Result<(), EngineError> {
+    let packed_bits = weights.embed_tokens.bits();
+    let matrices = std::iter::once(&weights.embed_tokens)
+        .chain(weights.lm_head.iter())
+        .chain(weights.layers.iter().flat_map(|l| [&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj]));
+    for matrix in matrices {
+        if matrix.bits() != packed_bits || matrix.affine4_group_size().is_some_and(|group| group != 64) {
+            return Err(EngineError::unsupported("Llama weight layout", "requires uniform dense weights or uniform affine group-size 64 matrices"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod llama_layout_tests {
+    use super::*;
+    use qwen3::fixture::{MatrixWeight, generate_fixture};
+    #[test]
+    fn llama_rejects_mixed_and_unqualified_groups_before_publication() {
+        let mut weights = generate_fixture(&Qwen3Config::tiny_fixture());
+        assert!(validate_llama_weight_layout(&weights).is_ok());
+        weights.layers[0].q_proj = MatrixWeight::Affine8 { packed: vec![], scales: vec![], biases: vec![], rows: 64, cols: 64, group_size: 64 };
+        assert!(validate_llama_weight_layout(&weights).is_err());
+        weights.embed_tokens = MatrixWeight::Affine4 { packed: vec![], scales: vec![], biases: vec![], rows: 64, cols: 64, group_size: 32 };
+        assert!(validate_llama_weight_layout(&weights).is_err());
     }
 }

@@ -45,6 +45,7 @@ dependencies = [
  "alloy-process-owner",
  "engine",
  "harness-core",
+ "llama3",
  "mlx-ffi",
  "qwen3",
  "serde",
@@ -489,6 +490,7 @@ dependencies = [
  "blake3",
  "cc",
  "inference-infra",
+ "llama3",
  "minijinja",
  "mlx-ffi",
  "proptest",
@@ -869,7 +871,11 @@ dependencies = [
 name = "inference-infra"
 version = "0.1.0"
 dependencies = [
+ "half",
  "mlx-ffi",
+ "safetensors",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -968,6 +974,16 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "llama3"
+version = "0.1.0"
+dependencies = [
+ "inference-infra",
+ "mlx-ffi",
+ "safetensors",
+ "serde_json",
+]
 
 [[package]]
 name = "lock_api"

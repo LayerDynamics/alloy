@@ -10,7 +10,6 @@ use engine::types::{
     ModelProfileId, RequestId,
 };
 use std::future::{Future, poll_fn};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread;
@@ -26,6 +25,9 @@ pub use tool_loop::{ToolLoopConfig, ToolLoopEvent, ToolRuntime};
 pub use tool_round::{RoundProposals, ToolRoundConfig, ToolRoundOutcome, ToolRoundRequest};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
+// Large native prefills can exceed the ordinary inter-event timeout. Keep a
+// bounded first-token deadline; control operations and decode retain 120s.
+const LONG_PREFILL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Result of one Phase-1 chat turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,13 +295,30 @@ impl<E: Engine> Supervisor<E> {
                 .and_then(|request| request.with_expected_render(rendered.clone()))
                 .map_err(HarnessError::from)?;
 
-            let generation =
-                block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;
+            let first_token_deadline = Instant::now()
+                + if rendered.token_count() > 8192 {
+                    LONG_PREFILL_TIMEOUT
+                } else {
+                    TURN_TIMEOUT
+                };
+            let generation = block_on_until(self.engine.generate(request), first_token_deadline)?
+                .map_err(HarnessError::from)?;
             let mut stream = generation.into_events();
             let mut assistant = String::new();
             let mut completed = false;
 
-            while let Some(event) = next_event(&mut stream)? {
+            let mut first_token_pending = true;
+            while let Some(event) = block_on_until(
+                poll_fn(|cx| stream.as_mut().poll_next(cx)),
+                if first_token_pending {
+                    first_token_deadline
+                } else {
+                    Instant::now() + TURN_TIMEOUT
+                },
+            )? {
+                if matches!(&event, GenerationEvent::TextDelta { .. }) {
+                    first_token_pending = false;
+                }
                 // The text-only supervisor must not forward tool proposals to
                 // callbacks or persist this turn as successfully completed.
                 if matches!(
@@ -434,14 +453,28 @@ impl Wake for Notify {
 }
 
 fn block_on<T>(future: impl Future<Output = T>) -> HarnessResult<T> {
+    block_on_until(future, Instant::now() + TURN_TIMEOUT)
+}
+
+fn block_on_until<T>(future: impl Future<Output = T>, deadline: Instant) -> HarnessResult<T> {
     let mut future = Box::pin(future);
     let (sender, receiver) = std::sync::mpsc::channel();
     let waker = Waker::from(Arc::new(Notify(sender)));
     let mut context = TaskContext::from_waker(&waker);
-    let deadline = Instant::now() + TURN_TIMEOUT;
 
     loop {
-        match future.as_mut().poll(&mut context) {
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Engine(
+                "timed out waiting for engine future".into(),
+            ));
+        }
+        let polled = future.as_mut().poll(&mut context);
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Engine(
+                "timed out waiting for engine future".into(),
+            ));
+        }
+        match polled {
             Poll::Ready(value) => return Ok(value),
             Poll::Pending => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -459,12 +492,6 @@ fn block_on<T>(future: impl Future<Output = T>) -> HarnessResult<T> {
             }
         }
     }
-}
-
-fn next_event(
-    stream: &mut Pin<Box<dyn engine::types::GenerationEventStream>>,
-) -> HarnessResult<Option<GenerationEvent>> {
-    block_on(poll_fn(|cx| stream.as_mut().poll_next(cx)))
 }
 
 // This is tracing/cancellation identity, never a KV cache identity or authority.
@@ -508,6 +535,37 @@ mod tool_loop_request_identity_tests {
                 .as_str()
                 .len(),
             68
+        );
+    }
+}
+
+#[cfg(test)]
+mod prefill_deadline_tests {
+    use super::*;
+    #[test]
+    fn first_token_wait_does_not_renew_deadline_on_wake() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let mut polls = 0;
+        let result: HarnessResult<()> = block_on_until(
+            poll_fn(|cx| {
+                polls += 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }),
+            deadline,
+        );
+        assert!(polls > 1);
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+    #[test]
+    fn ready_future_cannot_bypass_expired_deadline() {
+        assert!(block_on_until(std::future::ready(7), Instant::now()).is_err());
+    }
+    #[test]
+    fn completed_future_returns_within_explicit_prefill_deadline() {
+        assert_eq!(
+            block_on_until(std::future::ready(7), Instant::now() + LONG_PREFILL_TIMEOUT).unwrap(),
+            7
         );
     }
 }

@@ -71,9 +71,12 @@ pub struct BootRequest {
 impl BootRequest {
     /// Validate Phase-1 profile naming.
     pub fn validate_profile(&self) -> Result<(), RpcError> {
-        if self.profile_id != "qwen3-4b-4bit" {
+        if !matches!(
+            self.profile_id.as_str(),
+            "qwen3-4b-4bit" | "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit"
+        ) {
             return Err(RpcError::invalid_params(format!(
-                "Phase-1 production profile must be qwen3-4b-4bit (got {})",
+                "unsupported native profile {}",
                 self.profile_id
             )));
         }
@@ -83,6 +86,11 @@ impl BootRequest {
 
 /// Construct a real Qwen3 engine from a local corpus artifact directory.
 pub fn boot_qwen3(request: BootRequest) -> Result<BootedEngine, RpcError> {
+    boot_native(request)
+}
+
+/// Boot the explicitly requested native profile through the shared pipeline.
+pub fn boot_native(request: BootRequest) -> Result<BootedEngine, RpcError> {
     boot_qwen3_with_context_limit(request, None)
 }
 
@@ -99,14 +107,27 @@ pub fn boot_qwen3_with_context_limit(
         )));
     }
 
-    let files = pin_artifact_files(&request.artifact_dir, request.corpus_models_json.as_deref())?;
-    let artifact_id =
-        ArtifactId::new("qwen3-4b-4bit").map_err(|error| RpcError::internal(error.to_string()))?;
+    let llama = request.profile_id.starts_with("llama-");
+    let files = pin_artifact_files(
+        &request.artifact_dir,
+        request.corpus_models_json.as_deref(),
+        &request.profile_id,
+    )?;
+    let artifact_id = ArtifactId::new(request.profile_id.clone())
+        .map_err(|error| RpcError::internal(error.to_string()))?;
     let specification = Qwen3Artifact {
         id: artifact_id.clone(),
         directory: request.artifact_dir.clone(),
         files,
-        template_sha256: Sha256::digest(CHAT_TEMPLATE.as_bytes()).into(),
+        template_sha256: Sha256::digest(
+            if llama {
+                llama3::template::CHAT_TEMPLATE
+            } else {
+                CHAT_TEMPLATE
+            }
+            .as_bytes(),
+        )
+        .into(),
     };
 
     let config_bytes = fs::read(request.artifact_dir.join("config.json"))
@@ -138,8 +159,12 @@ pub fn boot_qwen3_with_context_limit(
         // Tool schemas increase prompt length; bound the actual prefill work
         // at 64 tokens for configured tools so the full workspace estimate can
         // fit without relaxing the admission guard. Text-only stays at 256.
-        prefill_chunk_tokens: NonZeroUsize::new(if request.tools_enabled { 64 } else { 256 })
-            .expect("chunk"),
+        prefill_chunk_tokens: NonZeroUsize::new(if request.tools_enabled || llama {
+            64
+        } else {
+            256
+        })
+        .expect("chunk"),
         loader_headroom_bytes: 64 * 1024 * 1024,
         execution_headroom_bytes: 64 * 1024 * 1024,
         generation: GenerationLimits::new(64, 64 * 1024, 16 * 1024)
@@ -152,8 +177,12 @@ pub fn boot_qwen3_with_context_limit(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = Qwen3Backend::new_with_execution(vec![specification], limits, execution)
-        .map_err(|error| RpcError::internal(format!("construct Qwen3 backend: {error}")))?;
+    let backend = (if llama {
+        Qwen3Backend::new_llama3(vec![specification], limits, execution)
+    } else {
+        Qwen3Backend::new_with_execution(vec![specification], limits, execution)
+    })
+    .map_err(|error| RpcError::internal(format!("construct Qwen3 backend: {error}")))?;
     let backend = if request.tools_enabled {
         // Match the daemon tool loop's 32-proposal and 1 MiB payload bounds.
         // These allocations are included in the engine's admission plan.
@@ -297,8 +326,9 @@ fn maybe_apply_wired_limit(
 fn pin_artifact_files(
     directory: &Path,
     corpus_models_json: Option<&Path>,
+    profile_id: &str,
 ) -> Result<BTreeMap<String, FilePin>, RpcError> {
-    let expected = load_expected_hashes(corpus_models_json)?;
+    let expected = load_expected_hashes(corpus_models_json, profile_id)?;
     let mut files = BTreeMap::new();
     for entry in fs::read_dir(directory)
         .map_err(|error| RpcError::internal(format!("read artifact dir: {error}")))?
@@ -315,6 +345,9 @@ fn pin_artifact_files(
         }
         let (byte_len, digest) = hash_file(&path)
             .map_err(|error| RpcError::internal(format!("hash {}: {error}", path.display())))?;
+        if profile_id.starts_with("llama-") && !expected.contains_key(&name) {
+            return Err(RpcError::internal(format!("unlisted Llama input: {name}")));
+        }
         if let Some(expected_hex) = expected.get(&name) {
             let actual_hex = hex_encode(&digest);
             if &actual_hex != expected_hex {
@@ -339,17 +372,35 @@ fn pin_artifact_files(
             "artifact directory missing config.json, tokenizer.json, or safetensors weights",
         ));
     }
+    if profile_id.starts_with("llama-") {
+        for name in expected
+            .keys()
+            .filter(|n| !n.starts_with('.') && n.as_str() != "README.md")
+        {
+            if !files.contains_key(name) {
+                return Err(RpcError::internal(format!(
+                    "missing frozen Llama input: {name}"
+                )));
+            }
+        }
+    }
     Ok(files)
 }
 
 fn load_expected_hashes(
     corpus_models_json: Option<&Path>,
+    profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
-    let Some(path) = corpus_models_json else {
+    // Llama runtime inputs must match the immutable corpus compiled into this
+    // source revision, even when an external corpus path is supplied.
+    let bytes = if profile_id.starts_with("llama-") {
+        include_bytes!("../../../bench/corpus/models.json").to_vec()
+    } else if let Some(path) = corpus_models_json {
+        fs::read(path)
+            .map_err(|error| RpcError::internal(format!("read corpus models.json: {error}")))?
+    } else {
         return Ok(BTreeMap::new());
     };
-    let bytes = fs::read(path)
-        .map_err(|error| RpcError::internal(format!("read corpus models.json: {error}")))?;
     let root: Value = serde_json::from_slice(&bytes)
         .map_err(|error| RpcError::internal(format!("parse models.json: {error}")))?;
     let profiles = root
@@ -357,7 +408,7 @@ fn load_expected_hashes(
         .and_then(Value::as_array)
         .ok_or_else(|| RpcError::internal("models.json missing profiles[]"))?;
     for profile in profiles {
-        if profile.get("id").and_then(Value::as_str) != Some("qwen3-4b-4bit") {
+        if profile.get("id").and_then(Value::as_str) != Some(profile_id) {
             continue;
         }
         let mut map = BTreeMap::new();
@@ -412,4 +463,29 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
         out.push(HEX[(byte & 0xf) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod llama_pins {
+    use super::*;
+    #[test]
+    fn llama_cannot_replace_frozen_hashes_with_external_manifest() {
+        let bogus = Path::new("/nonexistent/untrusted-corpus.json");
+        for profile in ["llama-3.1-8b-4bit", "llama-3.1-8b-8bit"] {
+            let pins = load_expected_hashes(Some(bogus), profile).unwrap();
+            assert!(!pins.is_empty());
+            assert_eq!(pins, load_expected_hashes(None, profile).unwrap());
+        }
+        let four = load_expected_hashes(None, "llama-3.1-8b-4bit").unwrap();
+        let eight = load_expected_hashes(None, "llama-3.1-8b-8bit").unwrap();
+        assert_ne!(four["config.json"], eight["config.json"]);
+        assert!(load_expected_hashes(None, "llama-unsupported").is_err());
+    }
+    #[test]
+    fn llama_missing_and_modified_inputs_fail_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(pin_artifact_files(dir.path(), None, "llama-3.1-8b-4bit").is_err());
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        assert!(pin_artifact_files(dir.path(), None, "llama-3.1-8b-4bit").is_err());
+    }
 }
