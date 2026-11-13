@@ -16,6 +16,8 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "compaction.rs"]
+mod compaction;
 #[path = "tool_loop.rs"]
 mod tool_loop;
 #[path = "tool_round.rs"]
@@ -154,18 +156,46 @@ impl<E: Engine> Supervisor<E> {
         session_id: &str,
         user_text: &str,
         max_output_tokens: usize,
+        on_started: S,
+        on_event: F,
+    ) -> HarnessResult<TurnOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(&GenerationEvent) -> HarnessResult<()>,
+    {
+        self.run_turn_streaming_with_lifecycle(
+            store,
+            session_id,
+            user_text,
+            max_output_tokens,
+            on_started,
+            |_| Ok(()),
+            on_event,
+        )
+    }
+
+    /// Run a text turn with callbacks for registering and clearing compaction requests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_turn_streaming_with_lifecycle<S, D, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        session_id: &str,
+        user_text: &str,
+        max_output_tokens: usize,
         mut on_started: S,
+        mut on_finished: D,
         mut on_event: F,
     ) -> HarnessResult<TurnOutcome>
     where
         S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
         F: FnMut(&GenerationEvent) -> HarnessResult<()>,
     {
         if user_text.is_empty() {
             return Err(HarnessError::Invalid("user text must be non-empty".into()));
         }
 
-        let (profile_id, snapshot, request_id) = {
+        let (profile_id, request_id, history, turn_seq) = {
             let mut guard = lock_store(store)?;
             let session = guard
                 .get_session(session_id)?
@@ -191,114 +221,182 @@ impl<E: Engine> Supervisor<E> {
 
             let history = guard.list_events(session_id)?;
             let request_id = round_request_id(session_id, turn_started.seq, 0)?;
-            let snapshot = ContextBuilder::build_snapshot(
-                request_id.as_str(),
-                &session.profile_id,
-                &history,
-                None,
-            )?;
-            (session.profile_id.clone(), snapshot, request_id)
+            (
+                session.profile_id.clone(),
+                request_id,
+                history,
+                turn_started.seq,
+            )
         };
 
-        let rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
-        // Re-check Active after render so a concurrent pause aborts before generate.
-        ensure_session_active(store, session_id)?;
-        let profile = ModelProfileId::new(profile_id.clone())
-            .map_err(|error| HarnessError::Invalid(format!("profile_id: {error}")))?;
-        let options = GenerationOptions::greedy(max_output_tokens).map_err(HarnessError::from)?;
-        on_started(&request_id)?;
-        // Pause may have raced between ensure and on_started; re-check once registered.
-        ensure_session_active(store, session_id)?;
-        let request = GenerationRequest::new(request_id.clone(), profile, snapshot, options)
-            .and_then(|request| request.with_expected_render(rendered.clone()))
-            .map_err(HarnessError::from)?;
-
-        let generation = block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;
-        let mut stream = generation.into_events();
-        let mut assistant = String::new();
-        let mut completed = false;
-
-        while let Some(event) = next_event(&mut stream)? {
-            // The text-only supervisor must not forward tool proposals to
-            // callbacks or persist this turn as successfully completed.
-            if matches!(
-                &event,
-                GenerationEvent::ToolCallProposed { .. }
-                    | GenerationEvent::ToolCallBatchProposed { .. }
-                    | GenerationEvent::ToolCallDelta { .. }
-            ) {
-                return Err(HarnessError::Engine(
-                    "tool-call proposals require a tool-aware supervisor".into(),
-                ));
+        let result = (|| {
+            let mut snapshot =
+                ContextBuilder::build_snapshot(request_id.as_str(), &profile_id, &history, None)?;
+            let mut rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
+            if let Some(limits) = self
+                .engine
+                .profile_context_budget(snapshot.profile_id())
+                .map_err(HarnessError::from)?
+            {
+                if max_output_tokens > limits.output_reserve {
+                    return Err(HarnessError::Invalid(format!(
+                        "output token limit {max_output_tokens} exceeds validated profile reserve {}; reduce the requested limit",
+                        limits.output_reserve
+                    )));
+                }
+                let budget = crate::context::ContextBudget {
+                    limit: limits.limit,
+                    output_reserve: limits.output_reserve,
+                    safety_margin: limits.safety_margin,
+                };
+                if budget.headroom(rendered.token_count(), 0).is_none() {
+                    compaction::compact(
+                        &self.engine,
+                        store,
+                        session_id,
+                        &history,
+                        &request_id,
+                        &compaction::Mode::Text,
+                        budget,
+                        0,
+                        Instant::now() + TURN_TIMEOUT,
+                        &|| ensure_session_active(store, session_id),
+                        &mut on_started,
+                        &mut on_finished,
+                    )?;
+                    let history = lock_store(store)?.list_events(session_id)?;
+                    snapshot = ContextBuilder::build_snapshot(
+                        request_id.as_str(),
+                        &profile_id,
+                        &history,
+                        None,
+                    )?;
+                    rendered = ContextBuilder::render_and_count(&self.engine, snapshot.clone())?;
+                }
             }
-            on_event(&event)?;
-            match event {
-                GenerationEvent::TextDelta { text } => assistant.push_str(&text),
-                GenerationEvent::GenerationCompleted { .. } => {
-                    completed = true;
-                    break;
-                }
-                GenerationEvent::RequestFailed { error, .. } => {
-                    return Err(error.into());
-                }
-                GenerationEvent::ToolCallProposed { .. }
-                | GenerationEvent::ToolCallBatchProposed { .. }
-                | GenerationEvent::ToolCallDelta { .. } => {
+            crate::context::admit_render(
+                &self.engine,
+                snapshot.profile_id(),
+                rendered.token_count(),
+                0,
+            )?;
+            // Re-check Active after render so a concurrent pause aborts before generate.
+            ensure_session_active(store, session_id)?;
+            let profile = ModelProfileId::new(profile_id.clone())
+                .map_err(|error| HarnessError::Invalid(format!("profile_id: {error}")))?;
+            let options =
+                GenerationOptions::greedy(max_output_tokens).map_err(HarnessError::from)?;
+            on_started(&request_id)?;
+            // Pause may have raced between ensure and on_started; re-check once registered.
+            ensure_session_active(store, session_id)?;
+            let request = GenerationRequest::new(request_id.clone(), profile, snapshot, options)
+                .and_then(|request| request.with_expected_render(rendered.clone()))
+                .map_err(HarnessError::from)?;
+
+            let generation =
+                block_on(self.engine.generate(request))?.map_err(HarnessError::from)?;
+            let mut stream = generation.into_events();
+            let mut assistant = String::new();
+            let mut completed = false;
+
+            while let Some(event) = next_event(&mut stream)? {
+                // The text-only supervisor must not forward tool proposals to
+                // callbacks or persist this turn as successfully completed.
+                if matches!(
+                    &event,
+                    GenerationEvent::ToolCallProposed { .. }
+                        | GenerationEvent::ToolCallBatchProposed { .. }
+                        | GenerationEvent::ToolCallDelta { .. }
+                ) {
                     return Err(HarnessError::Engine(
                         "tool-call proposals require a tool-aware supervisor".into(),
                     ));
                 }
-                GenerationEvent::RuntimeWarning { .. } => {}
+                on_event(&event)?;
+                match event {
+                    GenerationEvent::TextDelta { text } => assistant.push_str(&text),
+                    GenerationEvent::GenerationCompleted { .. } => {
+                        completed = true;
+                        break;
+                    }
+                    GenerationEvent::RequestFailed { error, .. } => {
+                        return Err(error.into());
+                    }
+                    GenerationEvent::ToolCallProposed { .. }
+                    | GenerationEvent::ToolCallBatchProposed { .. }
+                    | GenerationEvent::ToolCallDelta { .. } => {
+                        return Err(HarnessError::Engine(
+                            "tool-call proposals require a tool-aware supervisor".into(),
+                        ));
+                    }
+                    GenerationEvent::RuntimeWarning { .. } => {}
+                }
             }
-        }
 
-        if !completed {
-            return Err(HarnessError::Engine(
-                "generation stream ended before successful terminal event".into(),
-            ));
-        }
-        if assistant.is_empty() {
-            return Err(HarnessError::Engine(
-                "generation completed without assistant text".into(),
-            ));
-        }
+            if !completed {
+                return Err(HarnessError::Engine(
+                    "generation stream ended before successful terminal event".into(),
+                ));
+            }
+            if assistant.is_empty() {
+                return Err(HarnessError::Engine(
+                    "generation completed without assistant text".into(),
+                ));
+            }
 
-        {
+            {
+                let mut guard = lock_store(store)?;
+                let session = guard.get_session(session_id)?.ok_or_else(|| {
+                    HarnessError::Invalid(format!("unknown session: {session_id}"))
+                })?;
+                if session.status != SessionStatus::Active {
+                    return Err(HarnessError::Engine(format!(
+                        "generation cancelled: session is not active: {session_id}"
+                    )));
+                }
+                guard.append_event(
+                    session_id,
+                    EventKind::AssistantMessage,
+                    serde_json::json!({
+                        "content": assistant,
+                        "role": MessageRole::Assistant.as_str()
+                    }),
+                    serde_json::json!([]),
+                )?;
+                guard.append_event(
+                    session_id,
+                    EventKind::RunCompleted,
+                    serde_json::json!({ "input_tokens": rendered.token_count() }),
+                    serde_json::json!([]),
+                )?;
+            }
+
+            self.telemetry.record_turn();
+            self.telemetry.request_flush();
+
+            Ok(TurnOutcome {
+                session_id: session_id.to_owned(),
+                assistant_text: assistant,
+                input_tokens: rendered.token_count(),
+                request_id,
+            })
+        })();
+        if let Err(error) = &result {
             let mut guard = lock_store(store)?;
-            let session = guard
-                .get_session(session_id)?
-                .ok_or_else(|| HarnessError::Invalid(format!("unknown session: {session_id}")))?;
-            if session.status != SessionStatus::Active {
-                return Err(HarnessError::Engine(format!(
-                    "generation cancelled: session is not active: {session_id}"
-                )));
+            let events = guard.list_events(session_id)?;
+            if !events.iter().any(|event| {
+                event.seq > turn_seq
+                    && matches!(event.kind, EventKind::RunCompleted | EventKind::RunPaused)
+            }) {
+                guard.append_event(
+                    session_id,
+                    EventKind::RunCompleted,
+                    serde_json::json!({"status":"failed","error":error.to_string()}),
+                    serde_json::json!([]),
+                )?;
             }
-            guard.append_event(
-                session_id,
-                EventKind::AssistantMessage,
-                serde_json::json!({
-                    "content": assistant,
-                    "role": MessageRole::Assistant.as_str()
-                }),
-                serde_json::json!([]),
-            )?;
-            guard.append_event(
-                session_id,
-                EventKind::RunCompleted,
-                serde_json::json!({ "input_tokens": rendered.token_count() }),
-                serde_json::json!([]),
-            )?;
         }
-
-        self.telemetry.record_turn();
-        self.telemetry.request_flush();
-
-        Ok(TurnOutcome {
-            session_id: session_id.to_owned(),
-            assistant_text: assistant,
-            input_tokens: rendered.token_count(),
-            request_id,
-        })
+        result
     }
 }
 

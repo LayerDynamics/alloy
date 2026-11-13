@@ -44,6 +44,17 @@ impl DiagnosticEngine {
 }
 
 impl Engine for DiagnosticEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }
@@ -295,11 +306,18 @@ fn assert_failure_survives(at: FailureAt) {
         let store = SessionStore::open(&db).unwrap();
         let events = store.list_events(session_id).unwrap();
         assert!(
-            !events.iter().any(|event| matches!(
-                event.kind,
-                EventKind::AssistantMessage | EventKind::RunCompleted
-            )),
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::AssistantMessage
+                    || (event.kind == EventKind::RunCompleted
+                        && event.payload["status"] != "failed")),
             "failed partial text cannot be committed as a successful turn"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::RunCompleted
+                    && event.payload["status"] == "failed")
         );
     }
 }

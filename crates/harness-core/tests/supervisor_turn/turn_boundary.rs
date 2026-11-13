@@ -15,6 +15,17 @@ struct W6BoundaryEngine {
     seen: Arc<Mutex<Vec<String>>>,
 }
 impl Engine for W6BoundaryEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }
@@ -186,8 +197,14 @@ fn tool_loop_truncated_failed_and_legacy_tool_streams_never_persist_success() {
         let events = store.lock().unwrap().list_events("boundary").unwrap();
         assert!(!events.iter().any(|e| matches!(
             e.kind,
-            EventKind::AssistantMessage | EventKind::RunCompleted | EventKind::ToolStarted
-        )));
+            EventKind::AssistantMessage | EventKind::ToolStarted
+        ) || (e.kind == EventKind::RunCompleted
+            && e.payload["status"] != "failed")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == EventKind::RunCompleted && e.payload["status"] == "failed")
+        );
     }
 }
 #[test]
@@ -213,8 +230,11 @@ fn tool_loop_callback_failure_cannot_persist_a_completed_turn() {
             .is_err()
     );
     let events = store.lock().unwrap().list_events("callback").unwrap();
-    assert!(!events.iter().any(|e| matches!(
-        e.kind,
-        EventKind::AssistantMessage | EventKind::RunCompleted
-    )));
+    assert!(!events.iter().any(|e| e.kind == EventKind::AssistantMessage
+        || (e.kind == EventKind::RunCompleted && e.payload["status"] != "failed")));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::RunCompleted && e.payload["status"] == "failed")
+    );
 }

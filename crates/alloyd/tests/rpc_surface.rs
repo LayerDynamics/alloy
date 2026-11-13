@@ -108,6 +108,17 @@ impl GatedFixtureEngine {
 }
 
 impl Engine for GatedFixtureEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }
@@ -163,6 +174,16 @@ struct TurnBoundaryEngine {
 }
 
 impl Engine for TurnBoundaryEngine {
+    fn profile_context_budget(
+        &self,
+        _: &ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: self.profile.context_limit_tokens(),
+            output_reserve: self.profile.max_output_tokens(),
+            safety_margin: self.profile.safety_margin_tokens(),
+        }))
+    }
     fn api_version(&self) -> u32 {
         self.inner.api_version()
     }
@@ -368,10 +389,10 @@ fn rpc_turn_context_boundary_reserves_output_and_margin() {
     let profile = ModelProfile::new(
         ModelProfileId::new("fixture-profile").unwrap(),
         ArtifactId::new("alloyd-fixture").unwrap(),
-        5,
-        2,
+        35,
+        32,
         1,
-        GenerationOptions::greedy(2).unwrap(),
+        GenerationOptions::greedy(32).unwrap(),
     )
     .unwrap();
     let (socket, _, server) = start_server_with_engine(

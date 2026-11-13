@@ -68,6 +68,17 @@ impl ExactRenderEngine {
 }
 
 impl Engine for ExactRenderEngine {
+    fn profile_context_budget(
+        &self,
+        _: &engine::types::ModelProfileId,
+    ) -> Result<Option<engine::api::ProfileContextBudget>, engine::error::EngineError> {
+        Ok(Some(engine::api::ProfileContextBudget {
+            limit: 1_000_000,
+            output_reserve: 512,
+            safety_margin: 64,
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
     }
@@ -173,12 +184,8 @@ struct StaticStream {
 }
 
 #[test]
-fn unsupported_skill_and_checkpoint_events_are_not_silently_dropped() {
-    for kind in [
-        EventKind::SkillLoaded,
-        EventKind::ContextCompacted,
-        EventKind::ModelChanged,
-    ] {
+fn unsupported_skill_and_model_change_events_are_not_silently_dropped() {
+    for kind in [EventKind::SkillLoaded, EventKind::ModelChanged] {
         let dir = tempdir().expect("tempdir");
         let mut store = SessionStore::open(dir.path().join("s.sqlite")).expect("store");
         store

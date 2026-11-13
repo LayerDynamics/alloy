@@ -80,7 +80,11 @@ impl ContextBuilder {
                 .map_err(HarnessError::from)
             })
             .collect::<HarnessResult<Vec<_>>>()?;
+        let (checkpoint, boundary) = super::checkpoint_projection(history)?;
         let mut base = Vec::new();
+        if let Some(checkpoint) = checkpoint {
+            base.push(super::checkpoint_message(&checkpoint)?);
+        }
         let mut tail = Vec::new();
         let mut calls = BTreeMap::new();
         let mut next_seq = 1_i64;
@@ -94,8 +98,16 @@ impl ContextBuilder {
             next_seq = next_seq
                 .checked_add(1)
                 .ok_or_else(|| invalid("event sequence overflow"))?;
+            if matches!(event.kind, EventKind::SkillLoaded | EventKind::ModelChanged) {
+                return Err(invalid(
+                    "skill or model-change context is not yet supported",
+                ));
+            }
+            if event.seq <= boundary {
+                continue;
+            }
             match event.kind {
-                EventKind::SkillLoaded | EventKind::ContextCompacted | EventKind::ModelChanged => {
+                EventKind::SkillLoaded | EventKind::ModelChanged => {
                     return Err(invalid(
                         "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session",
                     ));

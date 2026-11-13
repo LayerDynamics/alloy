@@ -714,7 +714,7 @@ impl RuntimeBackend for Qwen3Backend {
                 self.limits.max_input_bytes,
                 template.len(),
                 self.limits.max_rendered_bytes,
-                profile.context_limit_tokens(),
+                self.limits.max_rendered_bytes,
             )?;
             let rendered = rendering::render_and_count(
                 &context,
@@ -735,7 +735,7 @@ impl RuntimeBackend for Qwen3Backend {
                 }
                 other => other,
             })?;
-            profile.check_context(rendered.token_count())?;
+            // Count overflow here; generation admission enforces profile limits.
             let vocabulary = as_u64(data.config.vocab_size)?;
             if rendered
                 .token_ids()

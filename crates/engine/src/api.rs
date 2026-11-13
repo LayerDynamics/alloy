@@ -225,10 +225,29 @@ pub trait EngineRuntime: Send + Sync + 'static {
     ) -> EngineFuture<'a, Capabilities>;
 }
 
+/// Validated token ceilings of a registered model profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileContextBudget {
+    /// Maximum context length.
+    pub limit: usize,
+    /// Reserved output tokens.
+    pub output_reserve: usize,
+    /// Additional safety margin.
+    pub safety_margin: usize,
+}
+
 /// Public, versioned interface used by the harness.
 pub trait Engine: Send + Sync {
     /// Return the engine API version implemented by this handle.
     fn api_version(&self) -> u32;
+
+    /// Expose the profile's validated token budget, or None if unavailable.
+    fn profile_context_budget(
+        &self,
+        _profile: &ModelProfileId,
+    ) -> Result<Option<ProfileContextBudget>, EngineError> {
+        Ok(None)
+    }
 
     /// Admit a conservative byte bound for the entire projected rendered input.
     fn check_projected_tool_render<'a>(
@@ -374,6 +393,18 @@ impl<R: EngineRuntime> Clone for EngineCore<R> {
 }
 
 impl<R: EngineRuntime> Engine for EngineCore<R> {
+    fn profile_context_budget(
+        &self,
+        id: &ModelProfileId,
+    ) -> Result<Option<ProfileContextBudget>, EngineError> {
+        let profile = self.registry.profile(id)?;
+        Ok(Some(ProfileContextBudget {
+            limit: profile.context_limit_tokens(),
+            output_reserve: profile.max_output_tokens(),
+            safety_margin: profile.safety_margin_tokens(),
+        }))
+    }
+
     fn api_version(&self) -> u32 {
         ENGINE_API_VERSION
     }
