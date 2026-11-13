@@ -133,7 +133,35 @@ fn shape4(array: &Array) -> OperationResult<[usize; 4]> {
 /// The returned array is lazy. The caller owns evaluation and stream
 /// synchronization.
 pub fn rope(input: &Array, theta: f32, offset: usize, stream: &Stream) -> OperationResult<Array> {
+    rope_impl(input, theta, None, offset, stream)
+}
+
+/// Split-half RoPE with explicit positive frequency divisors, one per head pair.
+pub fn rope_with_frequencies(
+    input: &Array,
+    frequencies: &Array,
+    offset: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    rope_impl(input, 1.0, Some(frequencies), offset, stream)
+}
+
+fn rope_impl(
+    input: &Array,
+    theta: f32,
+    frequencies: Option<&Array>,
+    offset: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
     let [_, _, tokens, head_dim] = shape4(input)?;
+    if let Some(freqs) = frequencies {
+        require_f32(freqs)?;
+        if freqs.shape() != [head_dim / 2] {
+            return Err(OperationError::InvalidInput(
+                "RoPE frequency shape mismatch",
+            ));
+        }
+    }
 
     if head_dim % 2 != 0 {
         return Err(OperationError::InvalidInput(
@@ -161,7 +189,7 @@ pub fn rope(input: &Array, theta: f32, offset: usize, stream: &Stream) -> Operat
 
     let base = sys::mlx_optional_float {
         value: theta,
-        has_value: true,
+        has_value: frequencies.is_none(),
     };
     let no_frequencies = sys::mlx_array {
         ctx: ptr::null_mut(),
@@ -180,7 +208,7 @@ pub fn rope(input: &Array, theta: f32, offset: usize, stream: &Stream) -> Operat
             base,
             1.0,
             native_offset,
-            no_frequencies,
+            frequencies.map_or(no_frequencies, Array::as_raw),
             stream.as_raw(),
         )
     };
@@ -359,6 +387,105 @@ fn causal_visibility(
         )
     };
     output.finish(status)
+}
+
+/// Construct Llama 3.1 frequency divisors using eager float32 MLX arithmetic.
+/// Keeping this calculation on the selected stream avoids host libm rounding
+/// differences becoming amplified by long rotary offsets.
+pub fn llama3_rope_frequencies(
+    dims: usize,
+    base: f32,
+    factor: f32,
+    low: f32,
+    high: f32,
+    original: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if dims == 0
+        || !dims.is_multiple_of(2)
+        || dims > i32::MAX as usize
+        || ![base, factor, low, high]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
+        || factor < 1.0
+        || high <= low
+        || original == 0
+    {
+        return Err(OperationError::InvalidInput("invalid Llama rotary scaling"));
+    }
+    type Binary = unsafe extern "C" fn(
+        *mut sys::mlx_array,
+        sys::mlx_array,
+        sys::mlx_array,
+        sys::mlx_stream,
+    ) -> c_int;
+    let binary = |op: Binary, a: &Array, b: &Array| -> OperationResult<Array> {
+        let mut out = PendingArray::new();
+        // SAFETY: valid live borrowed operands and stream; output exclusively owned.
+        let status = unsafe { op(&mut out.raw, a.as_raw(), b.as_raw(), stream.as_raw()) };
+        out.finish(status)
+    };
+    let constant = |x: f32| {
+        Array::from_f32_slice(&vec![x; dims / 2], &[(dims / 2) as i32])
+            .map_err(OperationError::from)
+    };
+    let select = |condition: &Array, yes: &Array, no: &Array| -> OperationResult<Array> {
+        let mut out = PendingArray::new();
+        // SAFETY: valid same-shape native operands, Boolean condition, owned output.
+        let status = unsafe {
+            sys::mlx_where(
+                &mut out.raw,
+                condition.as_raw(),
+                yes.as_raw(),
+                no.as_raw(),
+                stream.as_raw(),
+            )
+        };
+        out.finish(status)
+    };
+    let exponents = Array::from_f32_slice(
+        &(0..dims / 2)
+            .map(|i| (2 * i) as f32 / dims as f32)
+            .collect::<Vec<_>>(),
+        &[(dims / 2) as i32],
+    )?;
+    let frequencies = binary(sys::mlx_power, &constant(base)?, &exponents)?;
+    let wavelengths = binary(
+        sys::mlx_multiply,
+        &constant(std::f32::consts::TAU)?,
+        &frequencies,
+    )?;
+    let low_wave = constant(original as f32 / low)?;
+    let high_wave = constant(original as f32 / high)?;
+    let low_mask = binary(sys::mlx_greater, &wavelengths, &low_wave)?;
+    let scaled = select(
+        &low_mask,
+        &binary(sys::mlx_multiply, &frequencies, &constant(factor)?)?,
+        &frequencies,
+    )?;
+    let smooth = binary(
+        sys::mlx_divide,
+        &binary(
+            sys::mlx_subtract,
+            &binary(sys::mlx_divide, &constant(original as f32)?, &wavelengths)?,
+            &constant(low)?,
+        )?,
+        &constant(high - low)?,
+    )?;
+    let denominator = binary(
+        sys::mlx_add,
+        &binary(
+            sys::mlx_divide,
+            &binary(sys::mlx_subtract, &constant(1.0)?, &smooth)?,
+            &constant(factor)?,
+        )?,
+        &smooth,
+    )?;
+    let interpolated = binary(sys::mlx_divide, &scaled, &denominator)?;
+    let above_high = binary(sys::mlx_greater, &wavelengths, &high_wave)?;
+    let below_low = binary(sys::mlx_less, &wavelengths, &low_wave)?;
+    let within = select(&below_low, &interpolated, &scaled)?;
+    select(&above_high, &within, &scaled)
 }
 
 #[cfg(test)]

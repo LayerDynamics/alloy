@@ -849,6 +849,11 @@ pub enum WeightRepresentation {
     F16,
     /// Bfloat16 storage.
     Bf16,
+    /// Resident affine eight-bit storage.
+    Affine8 {
+        /// Number of weights sharing quantization parameters.
+        group_size: NonZeroUsize,
+    },
     /// Resident affine four-bit storage.
     Affine4 {
         /// Number of weights sharing quantization parameters.

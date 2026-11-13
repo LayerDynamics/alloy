@@ -44,6 +44,7 @@ fn config() -> Qwen3Config {
         rope_theta: 10000.0,
         max_context: 8,
         tie_embeddings: true,
+        ..Qwen3Config::tiny_fixture()
     }
 }
 fn tensors(c: &Qwen3Config) -> Tensors {
@@ -413,7 +414,9 @@ fn standalone_quantized_group_is_inferred() {
             assert_eq!(scales.len(), rows * 2);
             assert_eq!(biases.len(), rows * 2);
         }
-        qwen3::fixture::MatrixWeight::F32(_) => panic!("expected Affine4 embed"),
+        qwen3::fixture::MatrixWeight::F32(_) | qwen3::fixture::MatrixWeight::Affine8 { .. } => {
+            panic!("expected Affine4 embed")
+        }
     }
     assert!(
         Qwen3Model::from_weights(c.clone(), loaded).is_err(),

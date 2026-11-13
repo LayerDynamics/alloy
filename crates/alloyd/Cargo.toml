@@ -12,6 +12,7 @@ name = "alloyd"
 path = "src/main.rs"
 
 [dependencies]
+llama3 = { path = "../families/llama3" }
 engine = { path = "../engine" }
 harness-core = { path = "../harness-core" }
 tool-registry = { path = "../tool-registry" }

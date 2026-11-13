@@ -4,7 +4,7 @@ mod native_check;
 mod rpc_transport_config;
 
 use alloyd::{
-    BootRequest, DaemonConfig, DaemonService, LiveEngineMetrics, bind_listener, boot_qwen3,
+    BootRequest, DaemonConfig, DaemonService, LiveEngineMetrics, bind_listener, boot_native,
     serve_listener,
 };
 use engine::memory_enforcer::ACTIVE_POLL_INTERVAL;
@@ -180,7 +180,7 @@ fn run() -> Result<(), String> {
     let rpc_transport_limits = rpc_transport.finish()?;
 
     let artifact = artifact.ok_or_else(|| {
-        "--artifact PATH is required (local mlx-community Qwen3-4B-4bit directory for profile qwen3-4b-4bit)".to_owned()
+        "--artifact PATH is required (local artifact directory for the selected frozen native profile)".to_owned()
     })?;
 
     let defaults = DaemonConfig::default_paths().map_err(|error| error.message)?;
@@ -220,7 +220,7 @@ fn run() -> Result<(), String> {
     });
     let mut tiered_kv = TieredKvConfig::new(Some(cache_directory), hot_cache_limit);
     tiered_kv.hot_cache_only = hot_cache_only;
-    let booted = boot_qwen3(BootRequest {
+    let booted = boot_native(BootRequest {
         artifact_dir: PathBuf::from(artifact),
         profile_id: profile.clone(),
         corpus_models_json: corpus_models.map(PathBuf::from),
@@ -277,7 +277,7 @@ fn run() -> Result<(), String> {
 
     let listener = bind_listener(&config.socket_path).map_err(|error| error.message)?;
     eprintln!(
-        "alloyd listening on {} (db {}, profile {}, api_version 1, real Qwen3, \
+        "alloyd listening on {} (db {}, profile {}, api_version 1, native MLX, \
          memory-guard {} hard={} GiB binding={})",
         config.socket_path.display(),
         config.db_path.display(),
@@ -405,7 +405,7 @@ USAGE:
 
 OPTIONS:
   --artifact PATH              Required local Qwen3-4B-4bit mlx-community artifact directory
-  --profile NAME               Must be qwen3-4b-4bit in Phase 1 (default)
+  --profile NAME               qwen3-4b-4bit (default), llama-3.1-8b-4bit or llama-3.1-8b-8bit
   --corpus-models PATH         Optional bench/corpus/models.json for sha256 verification
   --socket PATH                UDS path (default: ~/.alloy/alloyd.sock)
   --db PATH                    SQLite session store (default: ~/.alloy/sessions.sqlite)

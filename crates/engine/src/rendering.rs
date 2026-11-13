@@ -927,3 +927,31 @@ impl Write for BoundedWriter {
 #[cfg(test)]
 #[path = "../tests/unit/rendering_tests.rs"]
 mod tests;
+
+/// The frozen Llama tokenizer has no normalizer and uses byte-level BPE.
+/// Each input byte contributes at most one token. Added special tokens replace
+/// nonempty byte spans. Charge the entire projected serialization, including
+/// unchanged text, so no assumption about BPE boundaries is needed.
+pub fn llama3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0xbb, 0xc1, 0x90, 0x4d, 0x35, 0x16, 0x9c, 0x54, 0x2d, 0xff, 0xbe, 0x1f, 0x75, 0x89, 0xa5,
+        0x99, 0x4e, 0xc7, 0x42, 0x6d, 0x9e, 0x5b, 0x60, 0x9d, 0x07, 0xba, 0xb8, 0x76, 0xf3, 0x2e,
+        0x97, 0xab,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Llama tokenizer or empty result projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Llama byte bound overflow"))
+}

@@ -211,6 +211,10 @@ fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
         return Err(validation(None, "rope_theta is not representable as f32"));
     }
     let config = Qwen3Config {
+        family: inference_infra::decoder::config::DecoderFamily::Qwen3,
+        rms_eps: 1e-6,
+        rope_scaling: None,
+        quantization_bits: 4,
         hidden_size: dimension("hidden_size")?,
         num_layers: dimension("num_hidden_layers")?,
         q_heads: dimension("num_attention_heads")?,

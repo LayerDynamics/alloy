@@ -6,7 +6,37 @@ use engine::{
     tiered_kv::TieredKvSnapshot,
     types::*,
 };
-use std::sync::Mutex;
+use std::{
+    pin::Pin,
+    sync::Mutex,
+    task::{Context, Poll},
+};
+
+struct CheckpointTrace {
+    inner: GenerationStream,
+    request_id: RequestId,
+    text: String,
+}
+
+impl GenerationEventStream for CheckpointTrace {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<GenerationEvent>> {
+        let result = self.inner.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(Some(GenerationEvent::TextDelta { text })) => self.text.push_str(text),
+            Poll::Ready(Some(
+                GenerationEvent::GenerationCompleted { .. } | GenerationEvent::RequestFailed { .. },
+            )) => {
+                eprintln!(
+                    "checkpoint_trace id={} output={:?} terminal={result:?}",
+                    self.request_id.as_str(),
+                    self.text
+                );
+            }
+            _ => {}
+        }
+        result
+    }
+}
 
 pub struct RecordingEngine {
     pub inner: EngineCore<FamilyRuntime>,
@@ -65,7 +95,22 @@ impl Engine for RecordingEngine {
             .lock()
             .unwrap()
             .push((request.clone(), self.runtime().tiered_kv_snapshot()));
-        self.inner.generate(request)
+        Box::pin(async move {
+            let generation = self.inner.generate(request).await?;
+            let id = generation.request_id().clone();
+            if id.as_str().contains(":compact:") || id.as_str().contains(":verify:") {
+                Ok(Generation::from_stream(
+                    id.clone(),
+                    Box::pin(CheckpointTrace {
+                        inner: generation.into_events(),
+                        request_id: id,
+                        text: String::new(),
+                    }),
+                ))
+            } else {
+                Ok(generation)
+            }
+        })
     }
     fn cancel(&self, request_id: RequestId) -> EngineFuture<'_, CancelOutcome> {
         self.inner.cancel(request_id)

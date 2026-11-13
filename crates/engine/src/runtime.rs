@@ -3065,16 +3065,20 @@ impl NativeState {
         setup: &Setup,
         artifact: &ArtifactRegistration,
     ) -> Result<(), EngineError> {
-        let resident = self.resident.as_ref();
-
-        let Some(resident) = resident else {
-            return Ok(());
-        };
-
         let incoming_is_mlx = matches!(
             &setup.backend.registration().capabilities().backend,
             crate::types::ExecutionBackend::MlxCpu | crate::types::ExecutionBackend::MlxMetal
         );
+        let Some(resident) = self.resident.as_ref() else {
+            if incoming_is_mlx {
+                // MLX's free-buffer pool outlives individual native workers.
+                // Drain it before a cold load overlaps decoded host weights
+                // with new native arrays, even when this worker has no model.
+                // Live arrays and admission reservations are unaffected.
+                let _report = self.reclaim_mlx_allocator_cache()?;
+            }
+            return Ok(());
+        };
         let resident_is_mlx = matches!(
             &resident.capabilities.backend,
             crate::types::ExecutionBackend::MlxCpu | crate::types::ExecutionBackend::MlxMetal

@@ -43,7 +43,7 @@ fn host_affine4_bound(config: &Qwen3Config) -> Result<u64, EngineError> {
             product(v, h)?
         },
     ])?;
-    let matrix_bytes = affine4_matrix_bytes(matrix_elements, AFFINE4_GROUP_SIZE)?;
+    let matrix_bytes = if config.quantization_bits == 8 { sum(&[matrix_elements, product(matrix_elements.div_ceil(AFFINE4_GROUP_SIZE), 8)?])? } else { affine4_matrix_bytes(matrix_elements, AFFINE4_GROUP_SIZE)? };
     let workspace = product(matrix_bytes / 32 + 1, 1)?;
     sum(&[norm_bytes(config)?, matrix_bytes, workspace])
 }
@@ -268,9 +268,9 @@ fn workspace_bound(
         product(4, product(s, kv)?)?,
     ])?;
     sum(&[
-        product(product(layers, per_layer_elements)?, 4)?,
+        product(product(if config.has_qk_norm() { layers } else { 1 }, per_layer_elements)?, 4)?,
         product(product(t, h)?, 16)?,
-        logits_payload_bound(config)?,
+        product(logits_payload_bound(config)?, if config.has_qk_norm() { 1 } else { t })?,
         product(as_u64(token_bytes)?, 8)?,
         product(sum(&[layers, 64])?, 256)?,
         32,

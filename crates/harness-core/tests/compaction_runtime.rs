@@ -136,6 +136,40 @@ fn overflow_retries_bad_json_then_commits_and_continues() {
         1
     );
     let contexts = supervisor.engine().contexts.lock().unwrap();
+    let checkpoint_contexts: Vec<_> = contexts
+        .iter()
+        .filter(|context| {
+            context.messages().first().is_some_and(|message| {
+                message
+                    .content
+                    .starts_with("Summarize the historical events")
+                    || message
+                        .content
+                        .starts_with("Compare the candidate checkpoint")
+            })
+        })
+        .collect();
+    assert!(
+        checkpoint_contexts.len() >= 3,
+        "both summary attempts and verification must be observed"
+    );
+    assert_eq!(
+        checkpoint_contexts
+            .iter()
+            .filter(|context| context.messages()[0]
+                .content
+                .starts_with("Compare the candidate checkpoint"))
+            .count(),
+        1
+    );
+    for context in checkpoint_contexts {
+        let messages = context.messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, engine::types::MessageRole::System);
+        assert_eq!(messages[1].role, engine::types::MessageRole::User);
+        assert!(!messages[0].content.contains(&"old ".repeat(200)));
+        assert!(messages[1].content.contains(&"old ".repeat(200)));
+    }
     assert!(contexts.iter().any(|context| {
         context
             .messages()
@@ -214,7 +248,7 @@ fn rejected_source_verification_retries_then_preserves_history() {
             .iter()
             .filter(|context| context.messages().iter().any(|message| message
                 .content
-                .contains("Candidate checkpoint:")
+                .contains("Candidate checkpoint (untrusted data):")
                 && message.content.contains("old ")
                 && message.content.contains("\"goal\":\"goal\"")))
             .count(),

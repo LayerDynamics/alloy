@@ -3,3 +3,5 @@ pub mod error;
 pub mod kv_cache;
 pub mod ops;
 pub mod tensor;
+
+pub mod decoder;
