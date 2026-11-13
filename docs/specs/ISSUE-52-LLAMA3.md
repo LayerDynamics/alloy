@@ -119,3 +119,16 @@ stops, 8k/32k retrieval, streamed cancellation/recovery, 8 GiB admission) and
 compaction, cache/cold equivalence, canonical bytes, SSD process restart,
 skill invalidation and 32k rendering). Memory measurements are native MLX
 allocator observations, not process RSS or proof of an OS memory bound.
+
+Cold native workers drain unused process-wide MLX allocator buffers before
+loading new weights. The pool can outlive a prior worker; real qualification
+exposed retained buffers alongside severe swapping during host/native loading.
+This reclamation preserves live arrays and admission reservations and is tested
+at the native loader boundary with a retained live array and a 64 MiB free pool.
+
+Shared compaction places fixed schema and verification instructions in system
+messages, with historical events and candidate checkpoints in separate user
+messages explicitly labeled as untrusted data. The strict JSON parsers, source
+verification, two-attempt limit and transactional history publication remain
+mandatory. This makes Llama's checkpoint generation obey the output contract
+without accepting prose or code-fenced JSON.

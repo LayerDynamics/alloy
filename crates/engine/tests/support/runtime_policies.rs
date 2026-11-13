@@ -1967,6 +1967,69 @@ fn pool_state_only_pressure_reports_the_lease_without_blaming_its_model_pin() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn cold_worker_reclaims_previous_native_pool_before_loading() {
+    const CHILD: &str = "ALLOY_COLD_WORKER_POOL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime_policies::cold_worker_reclaims_previous_native_pool_before_loading",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let environment = PolicyEnvironment::new(retained_policy(), false);
+    mlx_ffi::memory::clear_cache().unwrap();
+    let previous_limit = mlx_ffi::memory::set_cache_limit_bytes(128 * 1024 * 1024).unwrap();
+    let live = mlx_ffi::Array::from_f32_slice(&[1.0, 2.0, 3.0], &[3]).unwrap();
+    live.eval().unwrap();
+    let old =
+        mlx_ffi::Array::from_f32_slice(&vec![0.5; 16 * 1024 * 1024], &[16 * 1024 * 1024]).unwrap();
+    old.eval().unwrap();
+    drop(old);
+    let before = mlx_ffi::memory::snapshot().unwrap();
+    assert!(before.cache_bytes >= 64 * 1024 * 1024, "{before:?}");
+    environment
+        .control
+        .startup_gate_stage
+        .store(1, Ordering::Release);
+    let release = environment.control.startup_gate.arm();
+    let generation = block_on(environment.engine.generate(environment.request(
+        "cold-pool",
+        profile_a(),
+        "hello",
+    )))
+    .unwrap();
+    environment.control.startup_gate.wait_entered();
+    let after = mlx_ffi::memory::snapshot().unwrap();
+    assert!(
+        after.cache_bytes < 4 * 1024 * 1024,
+        "cold load retained previous free pool: before={before:?}, after={after:?}"
+    );
+    assert_eq!(live.data_f32().unwrap(), &[1.0, 2.0, 3.0]);
+    assert_eq!(
+        environment.snapshot().reserved_bytes(),
+        pending_startup_reservation(&environment.plan_a)
+    );
+    release.release();
+    drop(generation);
+    environment.wait_idle();
+    mlx_ffi::memory::set_cache_limit_bytes(previous_limit).unwrap();
+    environment.drop_and_assert_unreserved();
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn pool_startup_pressure_reclaims_pinned_pool_kv_under_native_pressure() {
     // MLX allocator counters are process-wide. Isolate this required Metal
     // regression from other concurrently executing native test fixtures.
