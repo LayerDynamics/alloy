@@ -21,7 +21,7 @@
 //! are not implemented by this adapter.
 //!
 //! Affine4 residency and greedy decoding are advertised. Rotating caches,
-//! stochastic sampling, thinking mode, and public prefix reuse are not.
+//! stochastic sampling and thinking mode are not.
 
 #[path = "output.rs"]
 mod output;
@@ -44,7 +44,7 @@ use crate::{
     scheduler::Scheduler,
     types::{
         ArtifactId, CacheKind, CacheMode, CacheRepresentationId, Capabilities, ContextSnapshot,
-        DecodingCapability, ExecutionBackend, ModelProfileId, RenderedContext,
+        DecodingCapability, ExecutionBackend, ModelProfileId, RenderedContext, TokenizerId,
         WeightRepresentation,
     },
 };
@@ -625,6 +625,24 @@ impl Qwen3Backend {
 include!("loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
+    fn verify_retained_prefix_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        tokenizer: &TokenizerId,
+        tokens: &[u32],
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
+        if data.tokenizer.identity() != tokenizer {
+            return Err(EngineError::invalid_request(
+                "token_prefix_bytes",
+                "retained state uses a different tokenizer",
+            ));
+        }
+        rendering::verify_token_prefix_bytes(&data.tokenizer, tokens, bytes)
+    }
     fn projected_token_upper_bound(
         &self,
         registry: &Registry,
@@ -1022,7 +1040,7 @@ fn registration(
             context_limit_tokens: context_limit,
             supports_streaming: true,
             supports_incremental_kv: true,
-            supports_prefix_reuse: false,
+            supports_prefix_reuse: true,
             decoding_modes: vec![DecodingCapability::Greedy],
         },
     )

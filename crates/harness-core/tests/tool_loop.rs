@@ -1330,3 +1330,83 @@ fn oversized_batch_without_compactable_history_has_no_tool_effect() {
             ))
     );
 }
+
+#[test]
+fn first_tool_batch_accounts_for_loaded_skills_before_execution() {
+    for (block_limit, json_limit, instructions, fits) in [
+        (2, 1_048_576, "Check the result".to_owned(), false),
+        (3, 1_048_576, "Check the result".to_owned(), true),
+        (128, 80_000, "\"".repeat(20_000), false),
+        (128, 1_048_576, "\"".repeat(20_000), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture.txt"), "fixture").unwrap();
+        let mut db = SessionStore::open(dir.path().join("skills.db")).unwrap();
+        db.create_session("s", "p").unwrap();
+        db.append_event(
+            "s",
+            EventKind::SkillLoaded,
+            harness_core::context::skill_event_payload("audit", &instructions).unwrap(),
+            json!([]),
+        )
+        .unwrap();
+        let runtime = setup(dir.path(), &mut db, false);
+        let store = Mutex::new(db);
+        let engine = ScriptedEngine::new(vec![
+            vec![
+                proposal(
+                    "fs.read",
+                    json!({"path":"fixture.txt","offset":0,"length":4096}),
+                ),
+                done(),
+            ],
+            vec![
+                GenerationEvent::TextDelta {
+                    text: "done".into(),
+                },
+                done(),
+            ],
+        ]);
+        let supervisor = Supervisor::new(engine, telemetry());
+        let mut limits = config();
+        limits.round.context_limits.max_history_blocks = block_limit;
+        limits.round.context_limits.max_json_bytes = json_limit;
+        let result = supervisor.run_tool_turn(
+            &store,
+            &runtime,
+            "s",
+            "read fixture",
+            limits,
+            &CancellationToken::default(),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        let history = store.lock().unwrap().list_events("s").unwrap();
+        if fits {
+            assert_eq!(result.unwrap().assistant_text, "done");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|e| e.kind == EventKind::ToolStarted)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|e| e.kind == EventKind::ToolCompleted)
+                    .count(),
+                1
+            );
+        } else {
+            assert!(result.is_err(), "over-budget skill context was accepted");
+            assert!(
+                !history.iter().any(|e| matches!(
+                    e.kind,
+                    EventKind::ToolRequested | EventKind::ToolStarted | EventKind::ToolCompleted
+                )),
+                "tool executed before skill budget rejection (blocks={block_limit}, bytes={json_limit}): {history:?}"
+            );
+        }
+    }
+}

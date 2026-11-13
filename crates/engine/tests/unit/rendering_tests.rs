@@ -86,6 +86,39 @@ fn pinned_tokenizer() -> PinnedTokenizer {
 }
 
 #[test]
+fn canonical_prefix_requires_matching_lossless_tokenizer_roundtrip() {
+    let tokenizer = pinned_tokenizer();
+    verify_token_prefix_bytes(&tokenizer, &[1, 2], b"hello world").expect("matching prefix");
+    assert!(verify_token_prefix_bytes(&tokenizer, &[1, 2], b"hello hello").is_err());
+    assert!(verify_token_prefix_bytes(&tokenizer, &[1, 2], &[0xff]).is_err());
+    // Hugging Face decode skips an unknown ID, so even equal decoded bytes
+    // must be rejected when encoding cannot recover the executed sequence.
+    assert!(verify_token_prefix_bytes(&tokenizer, &[999], b"").is_err());
+}
+
+#[test]
+#[ignore = "requires the pinned local Qwen3-4B tokenizer"]
+fn canonical_prefix_real_qwen_prompt_and_special_tokens_roundtrip() {
+    let directory = std::env::var_os("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL");
+    let source = std::fs::read(std::path::Path::new(&directory).join("tokenizer.json"))
+        .expect("read Qwen tokenizer");
+    let expected = [
+        0xae, 0xb1, 0x33, 0x07, 0xa7, 0x1a, 0xcd, 0x8f, 0xe8, 0x18, 0x61, 0xd9, 0x4a, 0xd5, 0x4a,
+        0xb6, 0x89, 0xdf, 0x77, 0x33, 0x18, 0x80, 0x9e, 0xed, 0x3c, 0xbe, 0x79, 0x4b, 0x44, 0x92,
+        0xda, 0xe4,
+    ];
+    let tokenizer = PinnedTokenizer::from_pinned_json(&source, expected, 16 * 1024 * 1024)
+        .expect("verified Qwen tokenizer");
+    let text = "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>";
+    let encoding = tokenizer
+        .tokenizer()
+        .encode(text, false)
+        .expect("encode prompt");
+    verify_token_prefix_bytes(&tokenizer, encoding.get_ids(), text.as_bytes())
+        .expect("prompt and special tokens roundtrip");
+}
+
+#[test]
 fn exact_token_ids_and_count_come_from_tokenizer() {
     let profile = profile();
     let artifact = artifact();

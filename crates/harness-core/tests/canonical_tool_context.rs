@@ -219,14 +219,37 @@ fn large_error_context_is_explicitly_bounded_without_changing_durable_result() {
 }
 
 #[test]
-fn tool_snapshot_rejects_unhandled_skill_and_model_change_events() {
-    for kind in [EventKind::SkillLoaded, EventKind::ModelChanged] {
+fn tool_snapshot_rejects_unhandled_model_change_events() {
+    {
+        let kind = EventKind::ModelChanged;
         let (_dir, mut store, registry, _count) = setup();
         append(&mut store, kind, "unhandled model context");
         let events = store.list_events(SESSION).unwrap();
         let error = snapshot(&events, &registry).expect_err("must reject omitted context");
         assert!(error.to_string().contains("model-change context"));
     }
+}
+
+#[test]
+fn tool_snapshot_projects_latest_loaded_skill_without_executing_it() {
+    let (_dir, mut store, registry, count) = setup();
+    for text in ["previous instructions", "current instructions"] {
+        store
+            .append_event(
+                SESSION,
+                EventKind::SkillLoaded,
+                harness_core::context::skill_event_payload("audit", text).unwrap(),
+                json!([]),
+            )
+            .unwrap();
+    }
+    let events = store.list_events(SESSION).unwrap();
+    let context = snapshot(&events, &registry).unwrap();
+    let messages = format!("{:?}", context.messages());
+    assert!(messages.contains("current instructions"));
+    assert!(!messages.contains("previous instructions"));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(events, store.list_events(SESSION).unwrap());
 }
 
 #[test]

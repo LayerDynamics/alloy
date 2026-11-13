@@ -908,7 +908,9 @@ pub struct Capabilities {
     pub supports_streaming: bool,
     /// Whether token-by-token execution retains KV state.
     pub supports_incremental_kv: bool,
-    /// Whether compatible prefixes can be reused across requests.
+    /// Whether this implementation can reuse compatible prefixes with an enabled
+    /// retention path. This does not guarantee a hit or sufficient capacity;
+    /// quotas, memory pressure, eviction, and the actual prompt still apply.
     pub supports_prefix_reuse: bool,
     /// Implemented decoding modes.
     pub decoding_modes: Vec<DecodingCapability>,

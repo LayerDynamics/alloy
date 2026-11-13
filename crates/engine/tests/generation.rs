@@ -441,6 +441,7 @@ fn tokenizer_bytes(eos_is_zero: bool) -> Vec<u8> {
 struct RequestWork {
     prefill_tokens: Vec<u32>,
     prefill_calls: usize,
+    final_prefill_logits: Vec<f32>,
     decode_tokens: Vec<u32>,
     decode_logits: Vec<Vec<f32>>,
 }
@@ -462,11 +463,12 @@ impl Observations {
             .unwrap_or_default()
     }
 
-    fn record_prefill(&self, request: &RequestId, tokens: &[u32]) {
+    fn record_prefill(&self, request: &RequestId, tokens: &[u32], logits: &TokenLogits) {
         let mut requests = self.requests.lock().expect("observation mutex");
         let work = requests.entry(request.clone()).or_default();
         work.prefill_calls += 1;
         work.prefill_tokens.extend_from_slice(tokens);
+        work.final_prefill_logits = logits.values().to_vec();
     }
 
     fn record_decode(&self, request: &RequestId, token: u32, logits: &TokenLogits) {
@@ -547,7 +549,7 @@ impl AutoregressiveModel for ObservedModel {
     ) -> Result<PrefillOutput, EngineError> {
         let output = self.executable()?.prefill(tokens, cache, control)?;
         self.observations
-            .record_prefill(control.request_id(), tokens);
+            .record_prefill(control.request_id(), tokens, output.logits());
         Ok(output)
     }
 
@@ -597,6 +599,29 @@ impl ModelFamily for ObservedBackend {
 }
 
 impl RuntimeBackend for ObservedBackend {
+    fn cache_manifest_digest(
+        &self,
+        artifact: &ArtifactRegistration,
+    ) -> Result<Option<[u8; 32]>, EngineError> {
+        self.inner.cache_manifest_digest(artifact)
+    }
+    fn verify_retained_prefix_bytes(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        tokenizer: &engine::types::TokenizerId,
+        tokens: &[u32],
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        if self.tokenizer_a.identity() == tokenizer {
+            return rendering::verify_token_prefix_bytes(&self.tokenizer_a, tokens, bytes);
+        }
+        if self.tokenizer_b.identity() == tokenizer {
+            return rendering::verify_token_prefix_bytes(&self.tokenizer_b, tokens, bytes);
+        }
+        self.inner
+            .verify_retained_prefix_bytes(registry, profile, tokenizer, tokens, bytes)
+    }
     fn render_and_count<'a>(
         &'a self,
         registry: &'a Registry,
@@ -1388,6 +1413,47 @@ fn completed_request_cannot_emit_a_second_terminal_after_cancel() {
 }
 
 #[test]
+fn prefix_capability_requires_qualified_backend_and_retention() {
+    let retained = TestEnvironment::prefix(retained_policy());
+    let next = completed_context(&retained, "capability-seed", "capability-next");
+    let caps = block_on(retained.engine.capabilities(artifact_id())).expect("loaded capabilities");
+    assert!(caps.supports_prefix_reuse);
+    retained.run("capability-hit", next);
+    assert!(retained.work("capability-hit").prefill_tokens.is_empty());
+    let no_storage =
+        engine::tiered_kv::TieredKvConfig::new(None, engine::tiered_kv::HotCacheLimit::Bytes(0));
+    retained
+        .engine
+        .runtime()
+        .configure_tiered_kv(no_storage)
+        .unwrap();
+    assert!(
+        !block_on(retained.engine.capabilities(artifact_id()))
+            .unwrap()
+            .supports_prefix_reuse
+    );
+    let ram = engine::tiered_kv::TieredKvConfig::new(
+        None,
+        engine::tiered_kv::HotCacheLimit::Bytes(BUDGET_BYTES),
+    );
+    retained.engine.runtime().configure_tiered_kv(ram).unwrap();
+    assert!(
+        block_on(retained.engine.capabilities(artifact_id()))
+            .unwrap()
+            .supports_prefix_reuse
+    );
+
+    let model_only = TestEnvironment::prefix(RetentionPolicy {
+        retain_model: true,
+        retain_cache_buffers: false,
+    });
+    model_only.run("capability-model-only", model_only.context.clone());
+    let caps =
+        block_on(model_only.engine.capabilities(artifact_id())).expect("loaded capabilities");
+    assert!(!caps.supports_prefix_reuse);
+}
+
+#[test]
 fn retained_identical_executed_context_skips_prefill_and_matches_cold() {
     let warm = TestEnvironment::prefix(retained_policy());
     let next = completed_context(&warm, "identical-seed", "identical-next");
@@ -1444,6 +1510,108 @@ fn retained_extension_executes_only_missing_suffix_and_matches_cold() {
     assert_eq!(cold_work.prefill_tokens, rendered.token_ids());
     assert_matches_cold(&actual, &actual_work, &reference, &cold_work);
     cold.wait_unreserved();
+}
+
+fn cache_property_config(cases: u32) -> proptest::test_runner::Config {
+    let mut config = proptest::test_runner::Config::with_cases(cases);
+    if matches!(config.rng_seed, proptest::test_runner::RngSeed::Random) {
+        config.rng_seed = proptest::test_runner::RngSeed::Fixed(0x51ca_c4e5);
+    }
+    eprintln!("prefix property seed: {}", config.rng_seed);
+    let path = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+        .join(".codex/generation-proptest-regressions");
+    let path = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+    config.failure_persistence = Some(Box::new(
+        proptest::test_runner::FileFailurePersistence::Direct(path),
+    ));
+    config
+}
+
+proptest::proptest! {
+    #![proptest_config(cache_property_config(12))]
+    #[test]
+    fn prefix_property_cached_equals_fresh(suffix in "[a-z]{1,4}", change in 0u8..5) {
+        let warm = TestEnvironment::prefix(retained_policy());
+        let completed = completed_context(&warm, "property-seed", "property-base");
+        let old_ids = warm.render(completed.clone()).token_ids().to_vec();
+        let original = &completed.messages()[0].content;
+        let body = match change {
+            0 => format!("{original}{suffix}"),
+            1 => format!("j{}", &original[1..]),
+            2 => "hel".to_owned(),
+            _ => original.clone(),
+        };
+        if change == 3 {
+            warm.select_rendering(RENDER_TEST_B);
+        } else if change == 4 {
+            warm.select_rendering(RENDER_TEST_TOKENIZER_B);
+        }
+        let next = context("property-next", profile_id(), &body);
+        let rendered = warm.render(next.clone());
+        let actual = warm.run("property-warm", next.clone());
+        let warm_work = warm.work("property-warm");
+        if change == 0 {
+            assert!(rendered.token_ids().starts_with(&old_ids));
+            assert_eq!(warm_work.prefill_tokens, rendered.token_ids()[old_ids.len()..]);
+        } else {
+            assert_eq!(warm_work.prefill_tokens, rendered.token_ids());
+        }
+        let cold = TestEnvironment::prefix(discard_policy());
+        if change == 3 {
+            cold.select_rendering(RENDER_TEST_B);
+        } else if change == 4 {
+            cold.select_rendering(RENDER_TEST_TOKENIZER_B);
+        }
+        let reference = cold.run("property-cold", next);
+        let cold_work = cold.work("property-cold");
+        assert_eq!(cold_work.prefill_tokens, rendered.token_ids());
+        assert_matches_cold(&actual, &warm_work, &reference, &cold_work);
+        cold.wait_unreserved();
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(cache_property_config(8))]
+    #[test]
+    fn schema_property_cached_equals_fresh(description in "[a-z]{1,5}", changed in proptest::bool::ANY) {
+        fn tools(description: &str) -> engine::types::ToolContext {
+            let tool = engine::types::RenderingTool::new(
+                "test.probe".into(), "1.0.0".into(), description.into(),
+                serde_json::json!({"type": "object"}),
+            ).unwrap();
+            engine::types::ToolContext::new(
+                vec![tool], vec![], engine::types::ToolContextLimits {
+                    max_tools: 2, max_history_blocks: 2, max_json_bytes: 4096,
+                },
+            ).unwrap()
+        }
+        let warm = TestEnvironment::prefix(retained_policy());
+        let seed_context = context("schema-seed-context", profile_id(), "hello")
+            .with_tool_context(tools("original"));
+        let seed_rendered = warm.render(seed_context.clone());
+        let seed = warm.run("schema-property-seed", seed_context);
+        let seed_work = warm.work("schema-property-seed");
+        let body = format!("{}{}", seed_rendered.text(), seed.text);
+        let tool_description = if changed { description.as_str() } else { "original" };
+        let next = context("schema-property-next", profile_id(), &body)
+            .with_tool_context(tools(tool_description));
+        let rendered = warm.render(next.clone());
+        let mut executed = seed_rendered.token_ids().to_vec();
+        executed.extend_from_slice(&seed_work.decode_tokens);
+        assert_eq!(rendered.token_ids(), executed);
+        let actual = warm.run("schema-property-warm", next.clone());
+        let work = warm.work("schema-property-warm");
+        if changed {
+            assert_ne!(seed_rendered.tool_schema_hash(), rendered.tool_schema_hash());
+            assert_eq!(work.prefill_tokens, rendered.token_ids());
+        } else {
+            assert!(work.prefill_tokens.is_empty());
+        }
+        let cold = TestEnvironment::prefix(discard_policy());
+        let reference = cold.run("schema-property-cold", next);
+        assert_matches_cold(&actual, &work, &reference, &cold.work("schema-property-cold"));
+        cold.wait_unreserved();
+    }
 }
 
 #[test]
@@ -1666,3 +1834,6 @@ mod runtime_policies;
 
 #[path = "support/state_lifecycle.rs"]
 mod state_lifecycle;
+
+#[path = "support/real_prefix_numerical.rs"]
+mod real_prefix_numerical;

@@ -31,13 +31,21 @@ impl ContextBuilder {
     /// Text-only reconstruction rejects tool lifecycle history; use
     /// `build_tool_snapshot` to preserve linked tool context instead.
     pub fn messages_from_events(events: &[EventRecord]) -> HarnessResult<Vec<Message>> {
+        Self::messages_with_new_user(events, None)
+    }
+
+    fn messages_with_new_user(
+        events: &[EventRecord],
+        new_user_message: Option<&str>,
+    ) -> HarnessResult<Vec<Message>> {
         let (checkpoint, boundary) = checkpoint_projection(events)?;
+        let skills = super::project_skills(events)?;
         let mut messages = Vec::new();
         if let Some(checkpoint) = checkpoint {
             messages.push(checkpoint_message(&checkpoint)?);
         }
         for event in events {
-            if matches!(event.kind, EventKind::SkillLoaded | EventKind::ModelChanged) {
+            if event.kind == EventKind::ModelChanged {
                 return Err(HarnessError::Invalid(
                     "skill or model-change context is not yet supported".into(),
                 ));
@@ -48,11 +56,12 @@ impl ContextBuilder {
             let role = match event.kind {
                 EventKind::UserMessage => MessageRole::User,
                 EventKind::AssistantMessage => MessageRole::Assistant,
-                EventKind::SkillLoaded | EventKind::ModelChanged => {
+                EventKind::ModelChanged => {
                     return Err(HarnessError::Invalid(
                         "skill, checkpoint, or model-change context is not yet supported; cannot safely reconstruct this session".into(),
                     ));
                 }
+                EventKind::SkillLoaded => continue,
                 EventKind::ToolRequested
                 | EventKind::ToolApproved
                 | EventKind::ToolStarted
@@ -68,17 +77,6 @@ impl ContextBuilder {
                 content: message_content(event)?,
             });
         }
-        Ok(messages)
-    }
-
-    /// Build a nonempty snapshot for `profile_id`, optionally appending a new user turn.
-    pub fn build_snapshot(
-        snapshot_id: impl AsRef<str>,
-        profile_id: impl AsRef<str>,
-        history: &[EventRecord],
-        new_user_message: Option<&str>,
-    ) -> HarnessResult<ContextSnapshot> {
-        let mut messages = Self::messages_from_events(history)?;
         if let Some(content) = new_user_message {
             if content.is_empty() {
                 return Err(HarnessError::Invalid(
@@ -90,6 +88,23 @@ impl ContextBuilder {
                 content: content.to_owned(),
             });
         }
+        let position = if messages.last().is_some_and(|m| m.role == MessageRole::User) {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.splice(position..position, skills);
+        Ok(messages)
+    }
+
+    /// Build a nonempty snapshot for `profile_id`, optionally appending a new user turn.
+    pub fn build_snapshot(
+        snapshot_id: impl AsRef<str>,
+        profile_id: impl AsRef<str>,
+        history: &[EventRecord],
+        new_user_message: Option<&str>,
+    ) -> HarnessResult<ContextSnapshot> {
+        let messages = Self::messages_with_new_user(history, new_user_message)?;
         if messages.is_empty() {
             return Err(HarnessError::Invalid(
                 "context snapshot requires at least one message".into(),

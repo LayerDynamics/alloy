@@ -384,6 +384,49 @@ fn call(socket: &std::path::Path, request: Value) -> Vec<Value> {
 }
 
 #[test]
+fn rpc_skill_load_updates_session_and_persists_exact_content() {
+    let dir = tempdir().unwrap();
+    let (socket, _, server) = start_server(dir.path());
+    let created = call(
+        &socket,
+        json!({"jsonrpc":"2.0","id":1,"api_version":API_VERSION,"method":"session.create","params":{"profile":"fixture-profile"}}),
+    );
+    let session = created[0]["result"]["session_id"].as_str().unwrap();
+    for (id, text) in [(2, "first instructions"), (3, "updated instructions")] {
+        let result = call(
+            &socket,
+            json!({"jsonrpc":"2.0","id":id,"api_version":API_VERSION,"method":"session.skill.load","params":{"session_id":session,"name":"audit","instructions":text}}),
+        );
+        assert_eq!(result[0]["result"]["name"], "audit", "{result:?}");
+    }
+    let sent = call(
+        &socket,
+        json!({"jsonrpc":"2.0","id":4,"api_version":API_VERSION,"method":"session.send","params":{"session_id":session,"content":"hello"}}),
+    );
+    assert_eq!(sent.last().unwrap()["result"]["ok"], true, "{sent:?}");
+    let capabilities = call(
+        &socket,
+        json!({"jsonrpc":"2.0","id":6,"api_version":API_VERSION,"method":"models.capabilities","params":{"artifact_id":"alloyd-fixture"}}),
+    );
+    assert_eq!(
+        capabilities[0]["result"]["supports_prefix_reuse"], false,
+        "{capabilities:?}"
+    );
+    let history = call(
+        &socket,
+        json!({"jsonrpc":"2.0","id":5,"api_version":API_VERSION,"method":"sessions.resume","params":{"session_id":session}}),
+    );
+    let events = history[0]["result"]["events"].as_array().unwrap();
+    let skills: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "skill.loaded")
+        .collect();
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[1]["payload"]["instructions"], "updated instructions");
+    server.stop();
+}
+
+#[test]
 fn rpc_turn_context_boundary_reserves_output_and_margin() {
     let dir = tempdir().unwrap();
     let profile = ModelProfile::new(

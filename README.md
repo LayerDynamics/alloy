@@ -45,6 +45,23 @@ The daemon supports bounded hot RAM and persistent safetensors KV. See
 [the M10 storage contract](docs/designs/tiered-kv.md) for configuration,
 reservation ownership, corruption handling, and restart semantics.
 
+Clients using the local JSON-RPC API can load or replace explicitly supplied
+skill instructions for a session with `session.skill.load`:
+
+```json
+{"jsonrpc":"2.0","id":1,"api_version":1,"method":"session.skill.load","params":{"session_id":"SESSION_ID","name":"review","instructions":"Summarize the changes before reviewing them."}}
+```
+
+Loading the same name replaces its active instructions on subsequent turns;
+the recorded versions remain in session history. Skills survive restart and
+compaction, and tool authorization remains governed by tool policy. This
+method accepts instruction text; filesystem skill discovery is not yet
+available. A client can query the capabilities of a loaded model with
+`models.capabilities` and an `artifact_id` parameter; `supports_prefix_reuse`
+means that the loaded model supports exact prefix reuse and a retention path is
+enabled. It does not guarantee a hit: quotas, available memory, eviction, and
+the particular prompt determine whether reusable state can actually be kept.
+
 ## Repo map
 
 | Path | Contents |

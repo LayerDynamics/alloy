@@ -31,8 +31,7 @@
 //! acknowledgements.
 //! A configured hot limit may spill and reclaim only unleased idle KV.
 //!
-//! Prefix-reuse capability reporting intentionally remains false until
-//! production-path verification has passed.
+//! Prefix-reuse capability reflects the qualified backend and retention policy.
 
 use crate::parser_allocation::{
     FrozenParserAllocation, ParserAllocation, ParserAllocationError, ParserAllocationLimits,
@@ -181,6 +180,22 @@ pub trait TextDecoder {
 
 /// Required real backend services in addition to the actual family loader.
 pub trait RuntimeBackend: ModelFamily + 'static {
+    /// Verify that bytes represent the exact executed token history under the
+    /// tokenizer that rendered the request. Backends without a proven mapping
+    /// must reject publication rather than trust caller-supplied bytes.
+    fn verify_retained_prefix_bytes(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+        _tokenizer: &TokenizerId,
+        _tokens: &[u32],
+        _bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        Err(EngineError::unsupported(
+            "canonical prefix bytes",
+            "backend cannot verify tokenizer byte provenance",
+        ))
+    }
     /// Bound tokens for a complete projected rendered byte sequence.
     fn projected_token_upper_bound(
         &self,
@@ -769,7 +784,8 @@ impl FamilyRuntime {
     ///
     /// token_prefix_bytes must be the exact tokenizer-produced bytes for
     /// the full executed sequence, including generated EOS when processed.
-    /// This API trusts provenance; it does not synthesize these bytes.
+    /// The originating backend verifies the supplied bytes against the exact
+    /// executed token history before either new or idempotent publication.
     ///
     /// Publication is idempotent for the same request and identity.
     /// Dropping the future does not undo an already-completed publication.
@@ -2023,6 +2039,8 @@ impl Compatibility {
 }
 
 struct StateCandidate {
+    backend: Arc<dyn RuntimeBackend>,
+    registry: Arc<Registry>,
     disk_identity: Option<String>,
     persisted: bool,
     request_id: RequestId,
@@ -2746,6 +2764,16 @@ impl NativeState {
                         .ok_or_else(|| EngineError::NotFound {
                             resource: "verified loaded artifact",
                             id: artifact.into_string(),
+                        })
+                        .and_then(|mut capabilities| {
+                            if let Some(store) = &self.tiered
+                                && !store.metrics.disk_enabled
+                            {
+                                let budget = self.admission.snapshot()?.budget_bytes();
+                                capabilities.supports_prefix_reuse &=
+                                    store.config.hot_limit.bytes(budget) > 0;
+                            }
+                            Ok(capabilities)
                         });
                     let _ = reply.send(Reply {
                         result,
@@ -3806,8 +3834,10 @@ impl NativeState {
                 ));
             }
 
-            // Keep this conservative until production-path verification.
-            capabilities.supports_prefix_reuse = false;
+            // Reuse requires both a qualified backend and retained full KV.
+            capabilities.supports_prefix_reuse = capabilities.supports_prefix_reuse
+                && retains_contents(self.retention)
+                && matches!(setup.plan.cache.mode().kind, CacheKind::Full);
             capabilities.supports_streaming = true;
             capabilities.decoding_modes = vec![DecodingCapability::Greedy];
 
@@ -4022,6 +4052,8 @@ impl NativeState {
             };
 
             Some(StateCandidate {
+                backend: Arc::clone(&setup.backend),
+                registry: Arc::clone(&setup.registry),
                 disk_identity,
                 persisted: false,
                 request_id: control.request_id().clone(),
@@ -4338,6 +4370,12 @@ impl NativeState {
             .find(|entry| &entry.metadata.request_id == request_id)
         {
             validate_entry(entry)?;
+            let candidate = entry
+                .resident
+                .candidate
+                .as_ref()
+                .ok_or_else(|| internal("published state has no retained candidate"))?;
+            verify_candidate_prefix(candidate, token_prefix_bytes)?;
             let state_id = canonical_identity(&entry.resident, token_prefix_bytes)?;
             if state_id != entry.metadata.state_id {
                 return Err(EngineError::invalid_request(
@@ -4365,6 +4403,7 @@ impl NativeState {
             })?;
 
         validate_candidate(resident, candidate)?;
+        verify_candidate_prefix(candidate, token_prefix_bytes)?;
         let state_id = canonical_identity(resident, token_prefix_bytes)?;
 
         if self.states.contains_key(&state_id) {
@@ -4665,6 +4704,16 @@ fn exact_reusable_prefix(retained: &[u32], input: &[u32], has_logits: bool) -> u
         return 0;
     }
     retained.len()
+}
+
+fn verify_candidate_prefix(candidate: &StateCandidate, bytes: &[u8]) -> Result<(), EngineError> {
+    candidate.backend.verify_retained_prefix_bytes(
+        &candidate.registry,
+        &candidate.compatibility.profile_id,
+        &candidate.compatibility.tokenizer_id,
+        &candidate.history.tokens,
+        bytes,
+    )
 }
 
 fn canonical_identity(

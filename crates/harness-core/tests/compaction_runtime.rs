@@ -66,6 +66,55 @@ fn setup(
     (dir, Mutex::new(store), Supervisor::new(engine, telemetry))
 }
 #[test]
+fn loaded_skill_remains_exact_after_compaction() {
+    let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT), response("continued")]);
+    {
+        let mut db = store.lock().unwrap();
+        db.append_event(
+            "s",
+            EventKind::SkillLoaded,
+            harness_core::context::skill_event_payload(
+                "review",
+                "Preserve the exact audit marker X32.",
+            )
+            .unwrap(),
+            json!([]),
+        )
+        .unwrap();
+        db.append_event(
+            "s",
+            EventKind::UserMessage,
+            json!({"content":"earlier work"}),
+            json!([]),
+        )
+        .unwrap();
+        db.append_event(
+            "s",
+            EventKind::AssistantMessage,
+            json!({"content":"done"}),
+            json!([]),
+        )
+        .unwrap();
+        db.append_event("s", EventKind::RunCompleted, json!({}), json!([]))
+            .unwrap();
+    }
+    let result = supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    assert_eq!(result.assistant_text, "continued");
+    let events = store.lock().unwrap().list_events("s").unwrap();
+    assert!(events.iter().any(|e| e.kind == EventKind::ContextCompacted));
+    let snapshot =
+        harness_core::ContextBuilder::build_snapshot("after", "p", &events, None).unwrap();
+    assert!(
+        snapshot
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("Preserve the exact audit marker X32."))
+    );
+}
+
+#[test]
 fn overflow_retries_bad_json_then_commits_and_continues() {
     let (_dir, store, supervisor) = setup(vec![
         response("bad"),
