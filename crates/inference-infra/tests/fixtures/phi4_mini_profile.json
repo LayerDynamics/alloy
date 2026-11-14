@@ -1,0 +1,88 @@
+{
+  "id": "phi4-mini-instruct-4bit",
+  "source": {
+    "repository": "microsoft/Phi-4-mini-instruct",
+    "revision": "cfbefacb99257ffa30c83adab238a50856ac3083",
+    "declared_card_license": "MIT",
+    "standalone_license_verified": true,
+    "license_sha256": "fa8235e5b48faca34e3ca98cf4f694ef08bd216d28b58071a1f85b1d50cb814d"
+  },
+  "artifact": {
+    "repository": "mlx-community/Phi-4-mini-instruct-4bit",
+    "revision": "ac1c269cb4222a4e136a3d09edad301056c1f36a",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 3298,
+        "sha256": "431eafdf55dc6d4a76dc3e9f22b0d06eac42d9ac6dc7cbd7ff8ca1e38f18cdb1"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 32554,
+        "sha256": "958e2e0939857e9fb398e9e3d5344a84e345b00da2e4e7c396024d6a91bc1ab7"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 15524095,
+        "sha256": "382cc235b56c725945e149cc25f191da667c836655efd0857b004320e90e91ea"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 2962,
+        "sha256": "76c79ba1828e98a574123dd5de047587219ed8c1ab20702d340bc10a7a32b6bd"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 587,
+        "sha256": "aff38493227d813e29fcf8406e8e90062f1f031aa47d589325e9c31d89ac7cc3"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 2158100796,
+        "sha256": "9dcfcdc0a579494283f2d2317ad686123782ce461d1111690ede7c904ff3f87b"
+      }
+    ]
+  },
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "compile_enabled": false,
+    "sha256": "bf2d5d13e92610c08391c814b45c71505fbd5ebfdedd372f82079393ef6a4729"
+  },
+  "position_regime": "mlx-su-long-fixed-v1",
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "prompt_tokens": [
+    [
+      65570,
+      220,
+      17,
+      659,
+      220,
+      17,
+      13,
+      30985,
+      51088,
+      13
+    ],
+    [
+      176289,
+      4436,
+      290,
+      17307,
+      382,
+      9861,
+      13
+    ]
+  ],
+  "decode_tokens": [
+    19,
+    13
+  ],
+  "qualification_status": "unqualified"
+}

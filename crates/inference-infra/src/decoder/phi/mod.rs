@@ -1,5 +1,8 @@
 //! Phi native position operations; complete model qualification is separate.
 pub mod config;
+pub mod model;
+pub mod planning;
+pub mod weights;
 use crate::decoder::mlx_model::{MlxDecoderError, MlxDecoderResult};
 pub use config::{PhiConfig, PhiRopeRegime};
 use mlx_ffi::{Array, Stream, attention, ops};
@@ -33,10 +36,12 @@ pub fn partial_longrope(
     leading[3] = config.rotary_dim;
     let prefix = ops::slice(input, &[0, 0, 0, 0], &leading, stream)?;
     let prefix = ops::scale(&prefix, config.rotary_amplitude(), stream)?;
-    let frequencies = Array::from_f32_slice(
-        &config.frequency_denominators(regime),
-        &[(config.rotary_dim / 2) as i32],
-    )?;
+    let factors = match regime {
+        PhiRopeRegime::Short => &config.short_factors,
+        PhiRopeRegime::Long => &config.long_factors,
+    };
+    let frequencies =
+        attention::longrope_frequencies(config.rotary_dim, config.theta, factors, stream)?;
     let rotated = attention::rope_with_frequencies(&prefix, &frequencies, offset, stream)?;
     if config.rotary_dim == config.head_dim {
         return Ok(rotated);

@@ -389,6 +389,57 @@ fn causal_visibility(
     output.finish(status)
 }
 
+/// Native LongRoPE frequency denominators, preserving the upstream float32
+/// exponentiation and multiplication graph on the caller's stream.
+pub fn longrope_frequencies(
+    dims: usize,
+    base: f32,
+    factors: &[f32],
+    stream: &Stream,
+) -> OperationResult<Array> {
+    if dims == 0
+        || !dims.is_multiple_of(2)
+        || dims > 4096
+        || factors.len() != dims / 2
+        || !base.is_finite()
+        || base <= 0.0
+        || factors.iter().any(|n| !n.is_finite() || *n <= 0.0)
+    {
+        return Err(OperationError::InvalidInput("invalid LongRoPE frequencies"));
+    }
+    let shape = &[(dims / 2) as i32];
+    let bases = Array::from_f32_slice(&vec![base; dims / 2], shape)?;
+    let exponents = Array::from_f32_slice(
+        &(0..dims / 2)
+            .map(|i| (2 * i) as f32 / dims as f32)
+            .collect::<Vec<_>>(),
+        shape,
+    )?;
+    let factors = Array::from_f32_slice(factors, shape)?;
+    let mut output = PendingArray::new();
+    // SAFETY: live equal-shaped float32 arrays and explicit stream; owned output.
+    let status = unsafe {
+        sys::mlx_power(
+            &mut output.raw,
+            bases.as_raw(),
+            exponents.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    let frequencies = output.finish(status)?;
+    let mut output = PendingArray::new();
+    // SAFETY: live equal-shaped float32 arrays and explicit stream; owned output.
+    let status = unsafe {
+        sys::mlx_multiply(
+            &mut output.raw,
+            frequencies.as_raw(),
+            factors.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
 /// Construct Llama 3.1 frequency divisors using eager float32 MLX arithmetic.
 /// Keeping this calculation on the selected stream avoids host libm rounding
 /// differences becoming amplified by long rotary offsets.
