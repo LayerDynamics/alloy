@@ -562,3 +562,25 @@ stream events and capability assertions for both hybrid profiles. Preserve
 failed model observations; do not normalize answers or grant production support
 from engine-only proposals. Run mandatory actual Ornith first. This batch does
 not claim compaction, restart, long-context or broad family qualification.
+
+### #95 complete hybrid state rebuild and retention reporting (2026-11-14)
+
+Update `crates/engine/src/runtime.rs` to retain whether the actual allocated
+cache supports complete disk snapshots. Report prefix reuse only when the
+configured hot retention or an actually supported disk path can retain state;
+a disk directory alone must not advertise hybrid reuse with a zero hot limit.
+Add `crates/engine/tests/qwen35_engine.rs::qwen35_engine_retention_capabilities`
+covering hot-only, disk-only and no-retention configurations after native work.
+
+Extend `crates/alloyd/tests/compaction_real_model.rs` shared real tests for the
+explicit hybrid reset/rebuild contract. Existing homogeneous profiles must
+still restore nonzero SSD state. Hybrid runs must show zero spills/restores,
+unchanged actual outputs after process restart, exact changed-skill and
+post-compaction cold equivalence, preserved append-only events and every B.3
+checkpoint field. Update named tests `real_rpc_skill_load_changes_next_generation`,
+`real_skill_change_invalidates_stale_cache_and_matches_cold`,
+`real_model_ssd_prefix_survives_process_restart`, and
+`real_model_compaction_preserves_history_and_continues`. Retain independent
+`real_model_generated_history_has_verified_canonical_bytes` and long-context,
+streaming/cancellation/memory tests. Rebuilding is an explicit architecture
+strategy, not evidence of unsupported recurrent-state SSD restoration.
