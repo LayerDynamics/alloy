@@ -225,3 +225,23 @@ owners, shape/nonfinite weights and payload overflow without changing prior
 state. Native CPU and Metal runs qualify this block, not the whole Ornith model.
 The complete hybrid model, bounded real-artifact loader, engine integration,
 real agent fixtures and persistent state/rebuild qualification remain required.
+
+### #95 shared verified hybrid tensor loader (2026-11-14)
+
+Extend `crates/inference-infra/src/decoder/loader.rs` only for this batch,
+including its existing `hardening_unit_tests` module. Extract the existing
+bounded shard/index inventory opening into a shared helper without changing
+Qwen/Llama/Smol loading policy. Add a verified tensor-set API whose family
+callback receives hash-verified configuration bytes and declares exact logical
+matrix and floating tensor shapes. Support rank-three convolution weights and
+rank-one decay/norm vectors alongside resident affine 4/8-bit matrices. Reuse
+all existing header, source, decoded-payload, cancellation, same-descriptor and
+whole-shard hashing rules; reject extras and missing/duplicate tensor requests.
+The API returns nothing until every pinned component has verified. It does not
+infer trust from a freshly computed artifact hash.
+
+Named tests: `verified_tensor_set_preserves_hybrid_shapes_and_packed_weights`,
+`verified_tensor_set_rejects_wrong_shapes_extras_and_limits`, and
+`verified_tensor_set_rejects_digest_or_configuration_failure`. Preserve all
+existing loader and native model tests. Full Ornith configuration/model/engine
+integration and the small upstream profile remain subsequent required work.
