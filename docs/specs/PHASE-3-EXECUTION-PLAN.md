@@ -276,3 +276,22 @@ All logits require strict FR8 maximum absolute <0.02 and maximum pointwise
 relative <0.01, with the zero-reference rule unchanged. Tiny-model qualification
 does not replace real Ornith/upstream artifact tests, engine integration,
 policy-gated tool tasks, memory tiers or persistent cache conformance.
+
+The full-model diagnosis found two numerical contracts to preserve: compare
+CPU/Metal against their corresponding pinned upstream device and compare each
+chunk geometry with the same upstream geometry. The generator retains the
+original GPU vectors unchanged and adds CPU/per-split vectors. FR8 thresholds
+are unchanged; #51 cached/full equivalence additionally keeps its existing
+0.02 + 0.01*abs(reference) bound, and cancellation recovery must equal a fresh
+execution with identical chunking exactly.
+
+One Metal chunk still fails strict FR8 because vendored `fast.gated_delta_update`
+uses an ops fallback for small head counts and chunked kernels for some larger
+sequences, whereas pinned mlx-lm uses a sequential SIMD recurrence. Extend
+`crates/mlx-ffi/src/ops.rs`, `src/ops/hybrid.rs`, and add
+`src/ops/sequential_delta.rs` for a native explicit-stream Metal implementation
+of that recurrence with owned kernel/config/vector handles. Keep the existing
+CPU native path. Preserve scalar-oracle, chunk/state and invalid-shape tests
+in `crates/mlx-ffi/tests/hybrid.rs`; the unchanged complete Qwen3.5 fixed-vector
+tests must pass before this numerical fix is considered verified. No Python
+runtime or vendored MLX source mutation is part of this implementation.
