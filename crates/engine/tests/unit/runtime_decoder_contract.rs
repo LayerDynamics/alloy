@@ -32,11 +32,13 @@ fn text_decoder_defaults_preserve_text_and_skip_empty_deltas() {
         finishes: 0,
     };
     assert!(decoder.push_blocks(0).expect("empty delta").is_empty());
+    assert!(!decoder.is_sequence_complete());
     assert_eq!(
         decoder.push_blocks(1).expect("text delta"),
         vec![GenerationOutputBlock::Text("résumé 雪".to_owned())],
     );
     assert_eq!(decoder.pushes, 2);
+    assert!(!decoder.is_sequence_complete());
     assert_eq!(decoder.finishes, 0);
 }
 

@@ -132,6 +132,13 @@ pub struct RuntimeResidency {
 /// Output is untrusted: decoding cannot assign invocation identities or
 /// authorize effects. The runtime separately enforces delivery budgets.
 pub trait TextDecoder {
+    /// Observe a profile-defined structural end after a successfully decoded
+    /// token. The default waits for the configured EOS token or output limit.
+    /// This must neither execute model work nor publish tentative proposals.
+    fn is_sequence_complete(&self) -> bool {
+        false
+    }
+
     /// Decode one generated token without corrupting incremental state.
     fn push(&mut self, token: u32) -> Result<String, EngineError>;
 
@@ -4245,6 +4252,10 @@ impl NativeState {
         } else {
             active.decoder.push_blocks(token)?
         };
+        // A structural protocol boundary is a profile EOS condition. The
+        // selected closing token has already executed and is counted above;
+        // do not generate a speculative answer or invent an extra EOS token.
+        let end_of_sequence = end_of_sequence || active.decoder.is_sequence_complete();
 
         Ok(BlockStep {
             token_id: token,

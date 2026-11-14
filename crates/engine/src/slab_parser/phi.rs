@@ -26,6 +26,7 @@ enum Mode {
     Next,
     Object,
     AfterObject,
+    Complete,
 }
 
 /// Incremental function-list parser. Only a successfully finished generation
@@ -42,6 +43,7 @@ pub struct PhiToolParser {
     received: usize,
     max_output: usize,
     failed: bool,
+    terminal_list: bool,
 }
 impl PhiToolParser {
     /// Take ownership of a fixed, already-admitted slab and total output bound.
@@ -67,7 +69,21 @@ impl PhiToolParser {
             received: 0,
             max_output,
             failed: false,
+            terminal_list: false,
         })
+    }
+    /// End this profile turn at the first complete nonempty function list.
+    /// Select before supplying output. A non-whitespace suffix within the same
+    /// token is an error, never silently discarded or published as an answer.
+    pub fn with_terminal_list(mut self) -> Self {
+        self.terminal_list = true;
+        self
+    }
+
+    /// Whether the configured protocol end condition has completed successfully.
+    /// Proposals remain private until `finish`, even at this boundary.
+    pub fn is_sequence_complete(&self) -> bool {
+        self.terminal_list && !self.failed && self.mode == Mode::Complete
     }
     /// Consume a valid UTF-8 fragment and stream only ordinary assistant text.
     /// Any parsing or sink failure permanently prevents batch publication.
@@ -111,6 +127,12 @@ impl PhiToolParser {
         while i < bytes.len() {
             let byte = bytes[i];
             match self.mode {
+                Mode::Complete => {
+                    if !matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                        return Err(bad("non-whitespace after terminal function list"));
+                    }
+                    i += 1;
+                }
                 Mode::First | Mode::Next => {
                     if matches!(byte, b' ' | b'\n' | b'\r' | b'\t') {
                         i += 1;
@@ -164,7 +186,13 @@ impl PhiToolParser {
                 Mode::AfterObject => {
                     match byte {
                         b',' => self.mode = Mode::Next,
-                        b']' => self.mode = Mode::Text,
+                        b']' => {
+                            self.mode = if self.terminal_list {
+                                Mode::Complete
+                            } else {
+                                Mode::Text
+                            };
+                        }
                         b' ' | b'\t' | b'\n' | b'\r' => {}
                         _ => return Err(bad("expected function-list comma or closing bracket")),
                     }
@@ -224,7 +252,7 @@ impl PhiToolParser {
         mut self,
         mut emit: impl FnMut(&str) -> Result<(), EngineError>,
     ) -> Result<FrozenParserAllocation, EngineError> {
-        if self.failed || self.mode != Mode::Text {
+        if self.failed || !matches!(self.mode, Mode::Text | Mode::Complete) {
             return Err(bad("failed or incomplete function list"));
         }
         if self.carry > 0 {

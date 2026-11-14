@@ -495,6 +495,12 @@ fn real_engine(tool_mode: bool) {
                 } => {
                     assert_eq!(usage.input_tokens, expected_input);
                     assert_eq!(finish_reason, engine::types::FinishReason::EndOfSequence);
+                    if tool_mode {
+                        // Frozen artifact selects 22 actual tokens through the
+                        // closing list; its otherwise-next token is EOS. The
+                        // structural boundary must not execute that extra token.
+                        assert_eq!(usage.output_tokens, 22);
+                    }
                     eprintln!("Phi {name}: {finish_reason:?} {usage:?}");
                     completed = true;
                 }
@@ -516,6 +522,7 @@ fn real_engine(tool_mode: bool) {
         assert!(completed);
         if tool_mode {
             assert_eq!(proposals, 1, "Phi tool output {text:?}");
+            assert!(text.is_empty(), "tool turn included an answer: {text:?}");
         } else {
             assert_eq!(text.trim(), "4", "Phi streamed output {text:?}");
         }
@@ -686,7 +693,7 @@ fn phi_engine_trained_tool_template_and_admitted_decoder() {
     drop(grant);
     let tokenizer = tokenizers::Tokenizer::from_file(fixture.root.join("tokenizer.json")).unwrap();
     for raw in [
-        r#"functools[{"name":"fs.read","arguments":{"path":"README.md","nested":[1,true]}}] fun"#,
+        r#"functools[{"name":"fs.read","arguments":{"path":"README.md","nested":[1,true]}}]"#,
         r#"functools[{"name":"fs.read","arguments":{}},{"name":"bad","arguments":false}]"#,
     ] {
         let mut grant = admission.reserve_grant("Phi slab", &[required]).unwrap();
@@ -695,6 +702,7 @@ fn phi_engine_trained_tool_template_and_admitted_decoder() {
             .decoder_with_parser_allocation(&registry, &profile_id(), Some(allocation))
             .unwrap();
         let mut text = String::new();
+        assert!(!decoder.is_sequence_complete());
         let mut failed = false;
         let ids = tokenizer.encode(raw, false).unwrap();
         assert_eq!(tokenizer.decode(ids.get_ids(), false).unwrap(), raw);
@@ -716,16 +724,18 @@ fn phi_engine_trained_tool_template_and_admitted_decoder() {
             }
         }
         if raw.contains("false") {
+            assert!(!decoder.is_sequence_complete());
             assert!(failed || decoder.finish_blocks().is_err());
             assert!(decoder.take_parser_proposals().is_none());
         } else {
             assert!(!failed);
+            assert!(decoder.is_sequence_complete());
             for block in decoder.finish_blocks().unwrap() {
                 if let engine::types::GenerationOutputBlock::Text(t) = block {
                     text.push_str(&t)
                 }
             }
-            assert_eq!(text, " fun");
+            assert_eq!(text, "");
             let batch = decoder.take_parser_proposals().unwrap();
             assert_eq!(batch.proposal_count(), 1);
             let call = batch.proposal(0).unwrap();

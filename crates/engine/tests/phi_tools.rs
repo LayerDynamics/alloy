@@ -156,6 +156,72 @@ fn phi_tools_reject_malformed_or_ambiguous_lists_atomically() {
             .is_err()
     );
 }
+
+#[test]
+fn phi_tools_terminal_list_boundary_is_atomic() {
+    let input = r#"functools[{"name":"a","arguments":{"nested":[1,{"text":"] 雪"}]}},{"name":"b","arguments":{}}]"#;
+    for split in (0..=input.len()).filter(|&n| input.is_char_boundary(n)) {
+        let (admission, allocation) = storage(limits());
+        let mut parser = PhiToolParser::new(allocation, 8192)
+            .unwrap()
+            .with_terminal_list();
+        assert!(!parser.is_sequence_complete());
+        parser
+            .push(&input[..split], |_| panic!("tool text leaked"))
+            .unwrap();
+        assert_eq!(parser.is_sequence_complete(), split == input.len());
+        parser
+            .push(&input[split..], |_| panic!("tool text leaked"))
+            .unwrap();
+        assert!(parser.is_sequence_complete());
+        parser
+            .push(" \r\n\t", |_| panic!("boundary whitespace leaked"))
+            .unwrap();
+        let batch = parser.finish(|_| panic!("finish text leaked")).unwrap();
+        assert_eq!(batch.proposal_count(), 2);
+        drop(batch);
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    }
+    for suffix in ["DONE", "\nDONE", "functools[", "<|end|>"] {
+        let (_, allocation) = storage(limits());
+        let mut parser = PhiToolParser::new(allocation, 8192)
+            .unwrap()
+            .with_terminal_list();
+        assert!(
+            parser
+                .push(&format!("{input}{suffix}"), |_| Ok(()))
+                .is_err()
+        );
+        assert!(!parser.is_sequence_complete());
+        assert!(parser.finish(|_| Ok(())).is_err());
+    }
+    for incomplete in [
+        r#"functools[{"name":"a","arguments":{}}"#,
+        r#"functools[{"name":"a","arguments":{}},{"name":"b","arguments":false}]"#,
+    ] {
+        let (_, allocation) = storage(limits());
+        let mut parser = PhiToolParser::new(allocation, 8192)
+            .unwrap()
+            .with_terminal_list();
+        let _ = parser.push(incomplete, |_| Ok(()));
+        assert!(!parser.is_sequence_complete());
+        assert!(parser.finish(|_| Ok(())).is_err());
+    }
+    let (_, allocation) = storage(limits());
+    let mut parser = PhiToolParser::new(allocation, 8192)
+        .unwrap()
+        .with_terminal_list();
+    let mut text = String::new();
+    parser
+        .push("ordinary answer", |part| {
+            text.push_str(part);
+            Ok(())
+        })
+        .unwrap();
+    assert!(!parser.is_sequence_complete());
+    assert_eq!(parser.finish(|_| Ok(())).unwrap().proposal_count(), 0);
+    assert_eq!(text, "ordinary answer");
+}
 #[test]
 fn phi_tools_enforce_every_storage_bound() {
     let input = r#"functools[{"name":"fs.test","arguments":{"nested":[{"x":1}]}}]"#;
@@ -195,17 +261,24 @@ fn phi_tools_enforce_every_storage_bound() {
 }
 #[test]
 fn phi_tools_success_uses_only_admitted_storage() {
-    let (admission, allocation) = storage(limits());
-    let mut parser = PhiToolParser::new(allocation, 8192).unwrap();
-    ALLOCATIONS.with(|n| n.set(0));
-    TRACK.with(|t| t.set(true));
-    let pushed=parser.push(r#"functools[{"name":"a","arguments":{"a":[1,"é",true,null,18446744073709551615,1.234567890123456789e30]}},{"name":"b","parameters":{}}] fun"#, |_| Ok(()));
-    let frozen = parser.finish(|_| Ok(()));
-    TRACK.with(|t| t.set(false));
-    assert!(pushed.is_ok());
-    let frozen = frozen.unwrap();
-    assert_eq!(ALLOCATIONS.with(Cell::get), 0);
-    assert_eq!(frozen.proposal_count(), 2);
-    drop(frozen);
-    assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    for terminal in [false, true] {
+        let (admission, allocation) = storage(limits());
+        let mut parser = PhiToolParser::new(allocation, 8192).unwrap();
+        if terminal {
+            parser = parser.with_terminal_list();
+        }
+        ALLOCATIONS.with(|n| n.set(0));
+        TRACK.with(|t| t.set(true));
+        let pushed=parser.push(r#"functools[{"name":"a","arguments":{"a":[1,"é",true,null,18446744073709551615,1.234567890123456789e30]}},{"name":"b","parameters":{}}]"#, |_| Ok(()));
+        let complete = parser.is_sequence_complete();
+        let frozen = parser.finish(|_| Ok(()));
+        TRACK.with(|t| t.set(false));
+        assert_eq!(complete, terminal);
+        assert!(pushed.is_ok());
+        let frozen = frozen.unwrap();
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+        assert_eq!(frozen.proposal_count(), 2);
+        drop(frozen);
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    }
 }

@@ -1153,10 +1153,13 @@ impl RuntimeBackend for Qwen3Backend {
                 let (slab, phi) = if self.family == BackendFamily::Phi {
                     (
                         None,
-                        Some(crate::slab_parser::PhiToolParser::new(
-                            allocation,
-                            self.tool_parser_limits().max_output_bytes,
-                        )?),
+                        Some(
+                            crate::slab_parser::PhiToolParser::new(
+                                allocation,
+                                self.tool_parser_limits().max_output_bytes,
+                            )?
+                            .with_terminal_list(),
+                        ),
                     )
                 } else {
                     (
