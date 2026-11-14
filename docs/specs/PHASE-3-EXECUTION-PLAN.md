@@ -584,3 +584,6 @@ checkpoint field. Update named tests `real_rpc_skill_load_changes_next_generatio
 `real_model_generated_history_has_verified_canonical_bytes` and long-context,
 streaming/cancellation/memory tests. Rebuilding is an explicit architecture
 strategy, not evidence of unsupported recurrent-state SSD restoration.
+The new resident metadata also requires updating the existing private fixture
+initializer in `crates/engine/tests/unit/runtime_model_pool_runtime.rs`; retain
+its current model-pool tests and declare its actual cache persistence support.
