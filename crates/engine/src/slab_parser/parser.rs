@@ -195,41 +195,7 @@ impl SlabParser {
         Ok(())
     }
     fn complete_call(&mut self) -> Result<(), EngineError> {
-        let (decoded, name, args) = {
-            let w = self.allocation.workspaces();
-            let body = &w.call[..self.call];
-            str::from_utf8(body).map_err(|_| bad("invalid UTF-8 in tool envelope"))?;
-            if body.windows(OPEN.len()).any(|x| x == OPEN) {
-                return Err(bad("nested tool delimiter"));
-            }
-            let mut json = JsonCheck {
-                input: body,
-                pos: 0,
-                decoded: w.decoded,
-                used: 0,
-                stack: w.stack,
-                keys: w.keys,
-                key_count: 0,
-                nodes: w.nodes,
-                node_count: 0,
-                name: None,
-                args: None,
-            };
-            json.value(0, usize::MAX, true)?;
-            json.ws();
-            if json.pos != body.len() {
-                return Err(bad("trailing tool-envelope data"));
-            }
-            (
-                json.used,
-                json.name.ok_or_else(|| bad("missing tool name"))?,
-                json.args.ok_or_else(|| bad("missing object arguments"))?,
-            )
-        };
-        self.allocation
-            .commit_validated_call(decoded, name, self.call, args)
-            .map_err(|e| execution_error("commit slab proposal", e.to_string()))?;
-        Ok(())
+        commit_json_call(&mut self.allocation, self.call)
     }
     pub(crate) fn finish(self) -> Result<FrozenParserAllocation, EngineError> {
         if self.failed {
@@ -243,6 +209,78 @@ impl SlabParser {
         }
         Ok(self.allocation.freeze())
     }
+}
+
+pub(super) fn commit_json_call(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+) -> Result<(), EngineError> {
+    let (decoded, name, args) = {
+        let w = allocation.workspaces();
+        let body = &w.call[..call_bytes];
+        str::from_utf8(body).map_err(|_| bad("invalid UTF-8 in tool envelope"))?;
+        if body.windows(OPEN.len()).any(|x| x == OPEN) {
+            return Err(bad("nested tool delimiter"));
+        }
+        let mut json = JsonCheck {
+            input: body,
+            pos: 0,
+            decoded: w.decoded,
+            used: 0,
+            stack: w.stack,
+            keys: w.keys,
+            key_count: 0,
+            nodes: w.nodes,
+            node_count: 0,
+            name: None,
+            args: None,
+        };
+        json.value(0, usize::MAX, true)?;
+        json.ws();
+        if json.pos != body.len() {
+            return Err(bad("trailing tool-envelope data"));
+        }
+        (
+            json.used,
+            json.name.ok_or_else(|| bad("missing tool name"))?,
+            json.args.ok_or_else(|| bad("missing object arguments"))?,
+        )
+    };
+    allocation
+        .commit_validated_call(decoded, name, call_bytes, args)
+        .map_err(|e| execution_error("commit slab proposal", e.to_string()))?;
+    Ok(())
+}
+
+pub(super) fn validate_json_parameter(
+    input: &[u8],
+    decoded: &mut [u8],
+    stack: &mut [JsonFrame],
+    keys: &mut [JsonKey],
+    nodes: &mut [JsonNode],
+    expected_kind: usize,
+) -> Result<(), EngineError> {
+    let mut json = JsonCheck {
+        input,
+        pos: 0,
+        decoded,
+        used: 0,
+        stack,
+        keys,
+        key_count: 0,
+        nodes,
+        node_count: 0,
+        name: None,
+        args: None,
+    };
+    let value = json.value(0, usize::MAX, false)?;
+    json.ws();
+    if value.kind != expected_kind || json.pos != input.len() {
+        return Err(bad(
+            "parameter must contain exactly one declared JSON value",
+        ));
+    }
+    Ok(())
 }
 
 struct Val {

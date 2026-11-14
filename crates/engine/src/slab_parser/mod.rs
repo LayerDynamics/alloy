@@ -4,5 +4,8 @@
 //! keys, nodes, pending bytes, and retained proposals reside in the slab.
 
 mod parser;
+mod xml;
+
+pub use xml::{XmlParameterType, XmlToolSchema, commit_xml_tool_call};
 
 pub(crate) use parser::*;
