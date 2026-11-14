@@ -295,3 +295,27 @@ CPU native path. Preserve scalar-oracle, chunk/state and invalid-shape tests
 in `crates/mlx-ffi/tests/hybrid.rs`; the unchanged complete Qwen3.5 fixed-vector
 tests must pass before this numerical fix is considered verified. No Python
 runtime or vendored MLX source mutation is part of this implementation.
+
+### #95 pinned Ornith 9B numerical execution (2026-11-14)
+
+Add `crates/inference-infra/tests/qwen35_quantized.rs` and
+`tests/fixtures/ornith_1_5_9b_profile.json`; add `--artifact` / `--output` offline
+capture mode to `tests/fixtures/qwen35_model/generate.py` without changing the
+tiny fixture's fixed weights or numerical vectors. Pin publisher
+`ornith-ai/Ornith-1.5-9B` revision
+`489cb97981b8654bcfcf30ce1f94ed1b62e07b53` and converted artifact
+`ornith-ai/Ornith-1.5-9B-MLX-4bit` revision
+`a48173b246ac705be75c05bedf1a0666db522d53`, with actual config/index/weight and
+tokenizer/template checksums. Record the publisher card's MIT declaration
+precisely; a standalone license file has not been found in that artifact.
+
+Capture two fixed token prompts plus two fixed continuation tokens through
+pinned eager MLX 0.32.4 / mlx-lm 0.31.2, with all floating weights promoted to
+float32 and packed weights kept resident. Freeze the reference digest before
+running `ornith_9b_quantized_native_reference` (explicit ignored real-artifact
+test). Verify actual model layers, packed matrix residency, cache length, finite
+complete vocabulary logits and strict unchanged FR8. Store large reference
+output under the authorized Codex artifact directory, not in the checkout.
+This numerical gate does not qualify tools, templates, long-context agent
+behavior, memory tiers, persistent state or the separately required upstream
+Qwen3.5 profile; all remain mandatory subsequent work.
