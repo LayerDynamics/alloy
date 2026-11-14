@@ -88,7 +88,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     ));
     let service = alloyd::DaemonService::open(
         root.path().join("sessions.sqlite"),
-        boot.engine,
+        recording_engine::RecordingEngine::new(boot.engine),
         telemetry,
         16,
         1,
@@ -112,8 +112,8 @@ fn real_rpc_skill_load_changes_next_generation() {
     let session = created[0]["result"]["session_id"].as_str().unwrap();
     let mut outputs = Vec::new();
     for (value, word) in [
-        ("The secret color is COBALT.", "COBALT"),
-        ("The secret color is AMBER.", "AMBER"),
+        ("The display color is COBALT.", "COBALT"),
+        ("The display color is AMBER.", "AMBER"),
     ] {
         let loaded = rpc(
             "session.skill.load",
@@ -122,7 +122,7 @@ fn real_rpc_skill_load_changes_next_generation() {
         assert!(loaded[0].get("error").is_none(), "{loaded:?}");
         let sent = rpc(
             "session.send",
-            serde_json::json!({"session_id":session,"content":"What color is specified?"}),
+            serde_json::json!({"session_id":session,"content":"What color is specified? Reply with only the color."}),
         );
         assert_eq!(sent.last().unwrap()["result"]["ok"], true, "{sent:?}");
         let text = sent
@@ -133,7 +133,7 @@ fn real_rpc_skill_load_changes_next_generation() {
         outputs.push((word, text));
     }
     for (word, text) in outputs {
-        assert!(text.to_ascii_uppercase().contains(word), "{word}: {text}");
+        assert_eq!(text, word, "skill must return the current color exactly");
     }
     let caps = rpc(
         "models.capabilities",
@@ -176,7 +176,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     db.append_event(
         "skill",
         EventKind::SkillLoaded,
-        harness_core::context::skill_event_payload("answer", "The secret color is COBALT.")
+        harness_core::context::skill_event_payload("answer", "The display color is COBALT.")
             .unwrap(),
         serde_json::json!([]),
     )
@@ -185,7 +185,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "initial",
         &boot.profile_id,
         &db.list_events("skill").unwrap(),
-        Some("What color is specified?"),
+        Some("What color is specified? Reply with only the color."),
     )
     .unwrap();
     let initial = ContextBuilder::render_and_count(&boot.engine, initial).unwrap();
@@ -195,22 +195,26 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "https://127.0.0.1:1",
         Box::new(Offline),
     ));
-    let supervisor = Supervisor::new(boot.engine, telemetry);
+    let supervisor = Supervisor::new(
+        recording_engine::RecordingEngine::new(boot.engine),
+        telemetry,
+    );
     let store = Mutex::new(db);
     let first = supervisor
-        .run_turn(&store, "skill", "What color is specified?", 16)
+        .run_turn(
+            &store,
+            "skill",
+            "What color is specified? Reply with only the color.",
+            16,
+        )
         .unwrap();
-    assert!(
-        first.assistant_text.to_ascii_uppercase().contains("COBALT"),
-        "{}",
-        first.assistant_text
-    );
+    assert_eq!(first.assistant_text, "COBALT");
     {
         let mut db = store.lock().unwrap();
         db.append_event(
             "skill",
             EventKind::SkillLoaded,
-            harness_core::context::skill_event_payload("answer", "The secret color is AMBER.")
+            harness_core::context::skill_event_payload("answer", "The display color is AMBER.")
                 .unwrap(),
             serde_json::json!([]),
         )
@@ -221,7 +225,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "changed",
         real_profile().as_str(),
         &db.list_events("skill").unwrap(),
-        Some("What color is specified now?"),
+        Some("What color is specified now? Reply with only the color."),
     )
     .unwrap();
     let changed = ContextBuilder::render_and_count(supervisor.engine(), changed).unwrap();
@@ -242,7 +246,12 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let warm_store = Mutex::new(SessionStore::open(root.path().join("warm.sqlite")).unwrap());
     let before = supervisor.engine().runtime().tiered_kv_snapshot();
     let warm = supervisor
-        .run_turn(&warm_store, "skill", "What color is specified now?", 16)
+        .run_turn(
+            &warm_store,
+            "skill",
+            "What color is specified now? Reply with only the color.",
+            16,
+        )
         .unwrap();
     let after = supervisor.engine().runtime().tiered_kv_snapshot();
     let restored = after.restored_tokens - before.restored_tokens;
@@ -250,11 +259,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         restored <= common as u64,
         "restored {restored} exceeds unchanged prefix {common}"
     );
-    assert!(
-        warm.assistant_text.to_ascii_uppercase().contains("AMBER"),
-        "{}",
-        warm.assistant_text
-    );
+    assert_eq!(warm.assistant_text, "AMBER");
     let caps = wait_future(
         supervisor
             .engine()
@@ -270,7 +275,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     ));
     let service = alloyd::DaemonService::open(
         root.path().join("rpc.sqlite"),
-        supervisor.engine().clone(),
+        supervisor.engine().inner.clone(),
         rpc_telemetry,
         16,
         1,
@@ -296,10 +301,18 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "https://127.0.0.1:1",
         Box::new(Offline),
     ));
-    let cold = Supervisor::new(cold_boot.engine, telemetry);
+    let cold = Supervisor::new(
+        recording_engine::RecordingEngine::new(cold_boot.engine),
+        telemetry,
+    );
     let cold_store = Mutex::new(SessionStore::open(root.path().join("cold.sqlite")).unwrap());
     let baseline = cold
-        .run_turn(&cold_store, "skill", "What color is specified now?", 16)
+        .run_turn(
+            &cold_store,
+            "skill",
+            "What color is specified now? Reply with only the color.",
+            16,
+        )
         .unwrap();
     assert_eq!(warm.input_tokens, baseline.input_tokens);
     assert_eq!(warm.assistant_text, baseline.assistant_text);
@@ -552,9 +565,16 @@ fn real_model_compaction_preserves_history_and_continues() {
             .iter()
             .any(|event| event.kind == EventKind::AssistantMessage)
     );
+    // Ordinary document content exercises the same measured overflow without
+    // a repeated-word flood that trained models may correctly treat as injection.
+    let sample: String = include_str!("../../../bench/corpus/fixtures/documents/document-8k.txt")
+        .chars()
+        .skip(2000)
+        .take(2000)
+        .collect();
+    assert_eq!(sample.chars().count(), 2000);
     let prompt = format!(
-        "{} What is the project codename? Reply with the codename.",
-        "current ".repeat(500)
+        "Here is a sample document for later tests. Keep our earlier refactor notes in context.\n<sample_document>\n{sample}\n</sample_document>\nWhat is the project name from our earlier refactor notes? Reply with only the name."
     );
     let snapshot =
         ContextBuilder::build_snapshot("before", &boot.profile_id, &prior, Some(&prompt)).unwrap();
@@ -568,13 +588,9 @@ fn real_model_compaction_preserves_history_and_continues() {
     let result = supervisor
         .run_turn(&store, "real-compact", &prompt, 128)
         .expect("compact and continue");
-    assert!(
-        result
-            .assistant_text
-            .to_ascii_uppercase()
-            .contains("COBALT"),
-        "{}",
-        result.assistant_text
+    assert_eq!(
+        result.assistant_text, "COBALT",
+        "compaction must retrieve the name, not merely mention it in a refusal"
     );
     // The recorder captures the actual request BEFORE generation, including
     // the committed checkpoint and identical decoding options. The cold oracle
@@ -660,18 +676,11 @@ fn real_model_compaction_preserves_history_and_continues() {
         .run_turn(
             &resumed,
             "real-compact",
-            "What is the project codename? Answer briefly.",
+            "What is the project name from our refactor notes? Reply with only the name.",
             32,
         )
         .expect("continue after reopen");
-    assert!(
-        followup
-            .assistant_text
-            .to_ascii_uppercase()
-            .contains("COBALT"),
-        "{}",
-        followup.assistant_text
-    );
+    assert_eq!(followup.assistant_text, "COBALT");
     let after_restore = supervisor.engine().runtime().tiered_kv_snapshot();
     if hybrid_rebuild_profile() {
         assert_eq!(after_restore.restore_count, 0, "{after_restore:?}");
@@ -752,7 +761,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         .run_turn(
             &cold_store,
             "real-compact",
-            "What is the project codename? Answer briefly.",
+            "What is the project name from our refactor notes? Reply with only the name.",
             32,
         )
         .expect("cold compacted continuation");
