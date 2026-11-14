@@ -197,7 +197,7 @@ impl MlxLogits {
 }
 
 /// Dense float32 or resident Affine4 projection.
-enum MlxLinear {
+pub(crate) enum MlxLinear {
     Dense(Array),
     Affine4 {
         bits: i32,
@@ -209,7 +209,7 @@ enum MlxLinear {
 }
 
 impl MlxLinear {
-    fn upload(matrix: MatrixWeight, rows: usize, cols: usize) -> MlxDecoderResult<Self> {
+    pub(crate) fn upload(matrix: MatrixWeight, rows: usize, cols: usize) -> MlxDecoderResult<Self> {
         let bits = i32::from(matrix.bits().unwrap_or(4));
         let pack = 32 / bits as usize;
         match matrix {
@@ -283,7 +283,7 @@ impl MlxLinear {
         }
     }
 
-    fn apply(&self, input: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
+    pub(crate) fn apply(&self, input: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
         match self {
             Self::Dense(weight) => Ok(ops::linear(input, weight, stream)?),
             Self::Affine4 {
@@ -305,7 +305,7 @@ impl MlxLinear {
         }
     }
 
-    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+    pub(crate) fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
         match self {
             Self::Dense(weight) => visitor(weight),
             Self::Affine4 {
@@ -1016,7 +1016,7 @@ fn shape_i32(shape: &[usize]) -> MlxDecoderResult<(usize, Vec<i32>)> {
     Ok((expected, dimensions))
 }
 
-fn upload_f32(values: Vec<f32>, shape: &[usize]) -> MlxDecoderResult<Array> {
+pub(crate) fn upload_f32(values: Vec<f32>, shape: &[usize]) -> MlxDecoderResult<Array> {
     let (expected, dimensions) = shape_i32(shape)?;
     if expected != values.len() {
         return Err(ModelError::ShapeMismatch {
@@ -1046,7 +1046,7 @@ fn upload_u32(values: Vec<u32>, shape: &[usize]) -> MlxDecoderResult<Array> {
     Ok(array)
 }
 
-fn check_weight(
+pub(crate) fn check_weight(
     name: &'static str,
     expected: usize,
     values: &[f32],
@@ -1072,7 +1072,7 @@ fn check_weight(
     Ok(())
 }
 
-fn check_matrix(
+pub(crate) fn check_matrix(
     name: &'static str,
     expected_elements: usize,
     matrix: &MatrixWeight,

@@ -22,7 +22,10 @@
 
 use crate::{Array, DType, Error, Stream, bindings as sys};
 mod hybrid;
-pub use hybrid::{depthwise_conv1d, exp, gated_delta_update, sigmoid, softplus};
+pub use hybrid::{
+    broadcast_to, concatenate_axis, depthwise_conv1d, exp, gated_delta_update, rms_norm_unweighted,
+    scale, sigmoid, softplus,
+};
 use std::{
     ffi::CString,
     fmt,

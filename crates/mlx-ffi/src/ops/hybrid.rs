@@ -3,6 +3,135 @@
 use super::*;
 use crate::VectorArray;
 
+/// Explicit right-aligned float32 broadcasting. A source axis must equal its
+/// destination or be one; this never silently changes a non-singleton axis.
+pub fn broadcast_to(input: &Array, shape: &[usize], stream: &Stream) -> OperationResult<Array> {
+    require_f32(input)?;
+    require_positive_shape(shape)?;
+    shape
+        .iter()
+        .try_fold(1_usize, |total, &n| total.checked_mul(n))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(OperationError::InvalidInput("broadcast payload overflow"))?;
+    let source = input.shape();
+    if source.len() > shape.len()
+        || source
+            .iter()
+            .rev()
+            .zip(shape.iter().rev())
+            .any(|(&a, &b)| a != 1 && a != b)
+    {
+        return Err(OperationError::InvalidInput(
+            "incompatible broadcast dimensions",
+        ));
+    }
+    let dimensions: Vec<_> = shape
+        .iter()
+        .copied()
+        .map(native_dimension)
+        .collect::<OperationResult<_>>()?;
+    let mut output = PendingArray::new();
+    // SAFETY: rank, dimensions and broadcast compatibility checked above.
+    let status = unsafe {
+        sys::mlx_broadcast_to(
+            &mut output.raw,
+            input.as_raw(),
+            dimensions.as_ptr(),
+            dimensions.len(),
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
+/// Concatenate two nonempty float32 tensors along one explicit axis.
+pub fn concatenate_axis(
+    left: &Array,
+    right: &Array,
+    axis: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    require_f32(left)?;
+    require_f32(right)?;
+    let a = left.shape();
+    let b = right.shape();
+    require_positive_shape(&a)?;
+    require_positive_shape(&b)?;
+    if axis >= a.len()
+        || a.len() != b.len()
+        || a.iter()
+            .zip(&b)
+            .enumerate()
+            .any(|(i, (x, y))| i != axis && x != y)
+        || a[axis]
+            .checked_add(b[axis])
+            .is_none_or(|n| native_dimension(n).is_err())
+    {
+        return Err(OperationError::InvalidInput(
+            "incompatible concatenation dimensions",
+        ));
+    }
+    let arrays = VectorArray::from_arrays(&[left.clone(), right.clone()])?;
+    let mut output = PendingArray::new();
+    // SAFETY: owned vector keeps both valid inputs alive; axis is in range.
+    let status = unsafe {
+        sys::mlx_concatenate_axis(
+            &mut output.raw,
+            arrays.raw,
+            native_dimension(axis)?,
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
+/// Multiply by a finite scalar, retaining the input shape.
+pub fn scale(input: &Array, factor: f32, stream: &Stream) -> OperationResult<Array> {
+    require_f32(input)?;
+    if !factor.is_finite() {
+        return Err(OperationError::InvalidInput("nonfinite scale"));
+    }
+    let scalar = Array::from_f32_slice(&[factor], &[])?;
+    let mut output = PendingArray::new();
+    // SAFETY: a scalar broadcasts to every valid input shape.
+    let status = unsafe {
+        sys::mlx_multiply(
+            &mut output.raw,
+            input.as_raw(),
+            scalar.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
+/// RMS normalization without a learned weight, matching the trained Q/K
+/// normalization in Qwen3.5 recurrent attention.
+pub fn rms_norm_unweighted(input: &Array, epsilon: f32, stream: &Stream) -> OperationResult<Array> {
+    require_f32(input)?;
+    let shape = input.shape();
+    if shape.is_empty() || !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(OperationError::InvalidInput(
+            "invalid unweighted RMS normalization",
+        ));
+    }
+    require_positive_shape(&shape)?;
+    let mut output = PendingArray::new();
+    // SAFETY: null optional weight is the MLX unweighted normalization API.
+    let status = unsafe {
+        sys::mlx_fast_rms_norm(
+            &mut output.raw,
+            input.as_raw(),
+            sys::mlx_array {
+                ctx: ptr::null_mut(),
+            },
+            epsilon,
+            stream.as_raw(),
+        )
+    };
+    output.finish(status)
+}
+
 /// Elementwise sigmoid on float32 model tensors.
 pub fn sigmoid(input: &Array, stream: &Stream) -> OperationResult<Array> {
     require_f32(input)?;
