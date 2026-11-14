@@ -445,3 +445,25 @@ reservation refusal before native load, then run Ornith streaming at the
 36 GiB host tier. Keep upstream 0.8B streaming at 8 GiB. This preserves the
 required incompatible-tier rejection; it does not qualify host peak memory
 or long-context performance from a reservation calculation alone.
+
+### #95 bounded trained XML call conversion (2026-11-14)
+
+Add `crates/engine/src/slab_parser/xml.rs`, export its bounded conversion API
+from `slab_parser/mod.rs`, and factor the existing complete JSON call validator
+in `slab_parser/parser.rs` for reuse. Convert complete trained
+`<function=...><parameter=...>...</parameter></function>` bodies using only
+the caller-admitted call/decoded scratch regions and existing JSON bookkeeping.
+Resolve each parameter's declared JSON type through a caller-supplied schema
+lookup; never infer numeric/boolean types from string content. Preserve one
+template-added leading/trailing newline, escaping and Unicode correctly.
+Reject unknown schema/type, malformed structure, duplicate parameters or
+nested JSON keys, invalid/non-finite numbers, and capacity overflow before
+publishing the proposal. No Python literal evaluation or growing JSON tree.
+
+Add `tests/unit/qwen35_xml_tools.rs` with `xml_schema_types_preserve_values`,
+`xml_structure_and_duplicate_keys_fail_closed`,
+`xml_fixed_capacity_boundaries_release_reservations`, and
+`xml_conversion_success_allocates_no_heap`. This is the bounded call grammar
+building block; runtime schema transport, incremental reasoning separation,
+trained tool templates and real agent validation remain required before the
+hybrid tool-mode rejection is removed.
