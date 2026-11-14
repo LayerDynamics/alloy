@@ -319,3 +319,13 @@ output under the authorized Codex artifact directory, not in the checkout.
 This numerical gate does not qualify tools, templates, long-context agent
 behavior, memory tiers, persistent state or the separately required upstream
 Qwen3.5 profile; all remain mandatory subsequent work.
+
+The first real Ornith run passed all decode rows but failed prefill strict
+pointwise relative error at a near-zero value. The fixed upstream capture
+projects all prompt positions before selecting its final row, while the native
+test requested last-position-only projection. In `tests/qwen35_quantized.rs`,
+compare the frozen reference using the same all-position projection geometry,
+selecting the last returned vocabulary row. Retain a separate last-only versus
+all-position cache/output equivalence check using the existing #51 bound.
+Neither fixed reference values nor FR8 thresholds may change. Both projection
+paths must advance identical cache lengths and preserve continuation behavior.
