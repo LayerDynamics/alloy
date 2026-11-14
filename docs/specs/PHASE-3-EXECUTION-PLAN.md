@@ -47,6 +47,44 @@ not qualify any real model. Production daemon adoption, native runner/report
 issuance and family implementations remain required follow-on batches; neither
 #72 nor #53 closes on this batch alone.
 
+### #53 / #98 SmolLM3 native batch (2026-11-14)
+
+Pin source `HuggingFaceTB/SmolLM3-3B` at
+`a07cc9a04f16550a088caea529712d1d335b0ac1` and the Apache-2.0 MLX affine
+4-bit/group-64 artifact `mlx-community/SmolLM3-3B-4bit` at
+`d3a7e0594d6642dbcfb7d149bed8b0bdf49f95ce`. Record file hashes in the new
+`crates/families/smollm/fixture/profile.json`; do not modify the frozen benchmark
+corpus. The converted configuration omits `tie_word_embeddings`; the source
+declares true, the converted weight index contains no `lm_head`, and the pinned
+MLX implementation defaults to tied embeddings. Validate this explicit default
+and the actual index/weight layout. The artifact tokenizer exceeds 16 MiB, so
+increase the bounded metadata allowance for this profile only.
+
+Add `crates/families/smollm/Cargo.toml`, `src/{lib.rs,config.rs,register.rs,template.rs}`,
+`fixture/{profile.json,chat_template.jinja,tool_chat_template.jinja,gen_reference.py,reference_logits.json}`,
+and `tests/{config.rs,numerical.rs,cache.rs,quantized_loading.rs}`. Extend
+`Cargo.toml`, `Cargo.lock`, `crates/inference-infra/src/decoder/{config.rs,model.rs,mlx_model.rs,loader.rs}`,
+`crates/families/llama3/src/config.rs`,
+`crates/engine/{Cargo.toml,src/backends/qwen/artifact.rs,src/backends/qwen/backend.rs,src/backends/qwen/memory.rs,src/rendering.rs}`,
+`crates/alloyd/{Cargo.toml,src/boot.rs,tests/llama_real_model.rs,tests/compaction_real_model.rs}`,
+and configuration literals in existing decoder/engine tests if required by the
+shared configuration field. Native attention retains full KV and causal masks;
+only layers selected by the validated NoPE schedule omit RoPE. Explicit schedule
+overrides interval derivation; entries must be exactly zero or one. The family
+has its own version/cache identity and uses native packed weight loading. Pin
+the deterministic non-thinking/XML-tool profile templates; do not claim Python
+tools or arbitrary reasoning modes. Reference code is the installed pinned
+`mlx-lm==0.31.2` `models/smollm3.py` and its Llama dependency, plus the publisher
+configuration above.
+
+Named checks: `smollm3_nope_schedule_override`,
+`smollm3_invalid_config_rejected`, `smollm3_reference_logits`,
+`smollm3_cached_matches_full_across_nope_layers`,
+`smollm3_quantized_native_reference`, and actual shared daemon
+tool/context/compaction/cache/stream/cancellation/restart checks. Record native
+reference vectors independently before accepting logits. This batch implements
+one required family; it does not waive the remaining families or Ornith.
+
 ## Family work packages: planned files and named tests
 
 Each family uses `crates/families/<family>/Cargo.toml`, `src/{lib.rs,config.rs,model.rs,weights.rs,register.rs}`, `tests/{config.rs,numerical.rs,agent_conformance.rs}` and `fixture/` pin manifests; the exact `<family>` directories and special files follow. Shared changes are `Cargo.toml`, `Cargo.lock`, `crates/engine/src/{backends/mod.rs,registry.rs}`, `crates/alloyd/src/boot.rs`, and `bench/corpus/models.json`. These are planned paths, not claims that kernels, weights, or tests already exist. If architecture inspection shows a different decomposition, amend this list before implementing it.
