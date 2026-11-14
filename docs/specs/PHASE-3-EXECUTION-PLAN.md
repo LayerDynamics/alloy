@@ -374,3 +374,12 @@ Extend `tests/qwen35_model.rs` with `qwen35_admission_matches_execution` to
 check exact logical cache formula, one-byte-below output/work refusal without
 state publication, and successful execution at calculated step bounds on
 CPU/Metal. Preserve frozen strict numerical vectors and existing tests.
+
+Extend the same shared planning batch in `qwen35/planning.rs` with declared
+weight payload and largest-upload-vector bounds, computed from the exact
+validated tensor layout and quantization groups. Enforce those declared matrix
+representations during `qwen35/model.rs` construction, so a dense/mixed
+checkpoint cannot silently exceed a packed load estimate. Extend
+`qwen35_model.rs` admission test and `qwen35_quantized.rs` real tests to assert
+planned weight payload equals retained payload, and reject representation
+mismatch before publication. Numerical refs remain unchanged.
