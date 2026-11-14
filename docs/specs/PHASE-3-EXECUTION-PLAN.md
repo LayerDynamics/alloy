@@ -437,3 +437,11 @@ public engine interfaces, exact rebuilt cache versus cold execution, template
 history differences, cancellation and missing-tool support rejection. Preserve
 Qwen3/Llama/SmolLM regression behavior. Production boot and agent qualification
 remain subsequent gates; constructors do not declare either profile qualified.
+
+Real adapter admission observation: the pinned Ornith startup plan requires
+9,430,037,496 bytes at the bounded 512-token test context, exceeding simulated
+8 GiB. Extend `qwen35_real_engine_streaming` to assert its structured 8 GiB
+reservation refusal before native load, then run Ornith streaming at the
+36 GiB host tier. Keep upstream 0.8B streaming at 8 GiB. This preserves the
+required incompatible-tier rejection; it does not qualify host peak memory
+or long-context performance from a reservation calculation alone.
