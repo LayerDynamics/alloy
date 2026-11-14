@@ -219,6 +219,9 @@ fn terminal_policy_reason_survives_context_without_changing_history() {
     assert!(content.len() <= harness_core::context::MODEL_ERROR_CONTEXT_BYTES);
     let projected: Value = serde_json::from_str(content).unwrap();
     assert_eq!(projected["kind"], "policy");
+    let message = projected["message"].as_str().unwrap();
+    assert!(message.contains("was not executed"));
+    assert!(message.contains("Do not retry or bypass"));
     assert_eq!(projected["details"]["state"], "Rejected");
     assert_eq!(projected["details"]["reason"], "policy:ArgumentsNotAllowed");
     assert_eq!(events, store.list_events(SESSION).unwrap());

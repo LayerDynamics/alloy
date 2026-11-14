@@ -163,6 +163,21 @@ fn llama3_tool_stop_context_cache() {
             .iter()
             .any(|e| e["params"]["event"] == "generation_completed")
     );
+    let rejected_answer = denied.last().unwrap()["result"]["assistant_text"]
+        .as_str()
+        .unwrap();
+    let lower = rejected_answer.to_ascii_lowercase();
+    assert!(
+        ["reject", "denied", "not allowed", "not permitted", "policy"]
+            .iter()
+            .any(|word| lower.contains(word)),
+        "missing rejection explanation: {rejected_answer:?}"
+    );
+    assert_ne!(
+        rejected_answer.trim(),
+        "DONE",
+        "rejection cannot be reported as success"
+    );
     assert!(
         denied
             .iter()

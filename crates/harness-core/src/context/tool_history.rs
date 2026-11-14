@@ -357,6 +357,21 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
 // envelope. Preserve their state/reason before any optional metadata. All data
 // stays in the original event; this compact projection grants no authority.
 fn terminal_error_context(kind: ToolErrorKind, state: &str, reason: &str) -> HarnessResult<String> {
+    let message = match state {
+        "Rejected" | "Denied" => {
+            "This operation was not executed because local policy rejected it. Do not retry or bypass it. Tell the user it was rejected."
+        }
+        "Expired" => {
+            "This operation was not executed because its approval expired. Ask the user before attempting it again."
+        }
+        "Withdrawn" => {
+            "This operation was withdrawn before execution. Do not automatically retry it."
+        }
+        "OutcomeUnknown" => {
+            "Execution may have occurred, but its outcome is unknown. Do not retry it; verify the effect first."
+        }
+        _ => return Err(invalid("unknown terminal tool state")),
+    };
     let mut end = reason.len().min(super::MODEL_ERROR_CONTEXT_BYTES);
     while !reason.is_char_boundary(end) {
         end -= 1;
@@ -369,7 +384,7 @@ fn terminal_error_context(kind: ToolErrorKind, state: &str, reason: &str) -> Har
             details["reason_truncated"] = Value::Bool(true);
         }
         let content = escape_result_markup(serde_json::to_string(&serde_json::json!({
-            "kind": kind, "details": details, "full_result": "retained_in_session_history",
+            "kind": kind, "message": message, "details": details,
         }))?);
         if content.len() <= super::MODEL_ERROR_CONTEXT_BYTES {
             return Ok(content);
@@ -448,7 +463,19 @@ mod projection_tests {
                 assert_eq!(value["details"]["state"], state);
                 assert_eq!(value["details"]["outcome_known"], state != "OutcomeUnknown");
                 let projected = value["details"]["reason"].as_str().unwrap();
-                assert!(projected.starts_with("policy:ArgumentsNotAllowed"));
+                assert!(!projected.is_empty());
+                if reason == "policy:ArgumentsNotAllowed" {
+                    assert_eq!(projected, reason);
+                }
+                let message = value["message"].as_str().unwrap();
+                assert!(message.contains("Do not") || message.contains("Ask the user"));
+                if state == "OutcomeUnknown" {
+                    assert!(message.contains("may have occurred"));
+                    assert!(!message.contains("was not executed"));
+                } else if matches!(state, "Rejected" | "Denied") {
+                    assert!(message.contains("was not executed"));
+                    assert!(message.contains("Tell the user it was rejected"));
+                }
                 assert!(reason.starts_with(projected));
                 assert_eq!(
                     value["details"].get("reason_truncated").is_some(),
