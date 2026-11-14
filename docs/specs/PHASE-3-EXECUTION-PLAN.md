@@ -803,3 +803,37 @@ allocation after construction, then run strict Clippy and existing bounded
 JSON/XML parser regressions. Native rendering/decoder/daemon wiring is a
 separate next batch and must use the actual Phi protocol; parser fixtures do
 not qualify a model's tool behavior.
+
+### #97 Phi trained tool rendering and native decoder wiring (2026-11-14)
+
+Literal-format upstream probe 71cbd0a8416042c9949cc2d7644fcd32 produced a valid
+`functools` fs.read call with README.md and EOS; its weather output remained
+nonconforming. Earlier minimal and prose-format failures remain evidence.
+This authorizes implementation of the documented grammar, not a claim of
+general instruction-following or native agent qualification.
+
+Extend `crates/engine/src/backends/qwen/{architecture.rs,backend.rs,output.rs}`,
+add `phi_tools.jinja`, and extend `crates/engine/src/rendering.rs`. Wire the
+admitted Phi parser into the existing incremental ByteLevel output owner and
+successful terminal proposal transfer. Remove the explicit intermediate Phi
+tool rejection only when this path is wired. Keep other family parsers intact;
+update owner literals in
+`crates/engine/tests/unit/{backends_qwen_output_protocol_token.rs,backends_qwen_output_structured_output.rs}`.
+The compiled profile supplies the literal function-list instruction, all
+advertised JSON schemas, publisher role/end framing and deterministic typed
+call/result history. Preserve all source messages and tool result linkage.
+Bind the distinct tool template digest and existing schema identity to counting
+and generation. Add a pinned Phi tokenizer byte-bound projection with actual
+normalizer/pretokenizer/postprocessor evidence and overflow checks.
+
+Extend `crates/engine/tests/phi_engine.rs` with
+`phi_engine_trained_tool_template_and_admitted_decoder`,
+`phi_engine_tool_projection_bounds`, and ignored
+`phi_real_engine_tool_proposals`. Add
+`crates/engine/tests/fixtures/phi_tool_render/{input.json,expected.txt,generate.py}`
+with independently serialized Python/publisher-template expected bytes. Check
+typed nested schemas/history, all decoder splits, missing/wrong slabs, malformed
+later calls and successful atomic proposal transfer; compare pinned actual
+token counts and Unicode/control-result growth bounds. Run real Phi cold/repeat
+fs.read proposals, strict Clippy and affected output/rendering/parser tests.
+The daemon policy-gated file task and full conformance remain subsequent work.
