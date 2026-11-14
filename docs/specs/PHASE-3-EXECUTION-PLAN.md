@@ -245,3 +245,34 @@ Named tests: `verified_tensor_set_preserves_hybrid_shapes_and_packed_weights`,
 `verified_tensor_set_rejects_digest_or_configuration_failure`. Preserve all
 existing loader and native model tests. Full Ornith configuration/model/engine
 integration and the small upstream profile remain subsequent required work.
+
+### #95 complete native hybrid decoder core (2026-11-14)
+
+Add `crates/inference-infra/src/decoder/qwen35/{mod.rs,config.rs,weights.rs,model.rs}`
+and export it from `decoder/mod.rs`. Extend only the crate-visible reusable
+projection/logit helpers in `decoder/mlx_model.rs` and validation/array visitation
+in `decoder/hybrid.rs`. Parse the verified nested Qwen3.5 text configuration,
+validate its explicit linear/full schedule, gated Q projection, partial RoPE,
+norm/MLP geometry and quantization declarations. Reject unsupported MoE,
+activation, bias or RoPE scaling. Use the shared verified tensor loader for the
+exact `language_model` checkpoint names and already-sanitized convolution/norm
+layout; never silently shift normalized converted weights a second time.
+
+Execute embedding, alternating GatedDeltaNet and gated full attention, residual
+RMS/SwiGLU layers and tied/untied logits in native MLX. Apply RoPE only to the
+configured leading rotary channels and retain unrotated tails. Publish all
+full-KV layers and recurrent/convolution states only after evaluated finite
+logits and cancellation checks. Check model ownership, context/output/weight
+payload bounds and measured native buffers. Edits reset/rebuild recurrent state;
+no arbitrary recurrent truncation is claimed.
+
+Add `crates/inference-infra/tests/qwen35_model.rs` and
+`tests/fixtures/qwen35_model/{generate.py,config.json,model.safetensors,reference.json,manifest.json}`.
+The tiny deterministic mixed-layer model is generated offline by pinned MLX
+0.32.4 / mlx-lm 0.31.2, with all-position logits and fixed prompt/decode tokens.
+Named tests: `qwen35_reference_logits`, `qwen35_partial_rope_cached_continuation`,
+`qwen35_model_state_transaction_and_reset`, `qwen35_config_and_tensor_inventory`.
+All logits require strict FR8 maximum absolute <0.02 and maximum pointwise
+relative <0.01, with the zero-reference rule unchanged. Tiny-model qualification
+does not replace real Ornith/upstream artifact tests, engine integration,
+policy-gated tool tasks, memory tiers or persistent cache conformance.
