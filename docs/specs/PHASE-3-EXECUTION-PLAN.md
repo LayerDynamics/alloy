@@ -68,7 +68,10 @@ and `tests/{config.rs,numerical.rs,cache.rs,quantized_loading.rs}`. Extend
 `crates/engine/{Cargo.toml,src/backends/qwen/artifact.rs,src/backends/qwen/backend.rs,src/backends/qwen/memory.rs,src/rendering.rs}`,
 `crates/alloyd/{Cargo.toml,src/boot.rs,tests/llama_real_model.rs,tests/compaction_real_model.rs}`,
 and configuration literals in existing decoder/engine tests if required by the
-shared configuration field. Native attention retains full KV and causal masks;
+shared configuration field. Add the family to `.github/workflows/ci.yaml`'s
+native verification and extend `crates/engine/tests/unit/rendering_tests.rs`
+with pinned-tokenizer projected-result bounds and deterministic template tests.
+Native attention retains full KV and causal masks;
 only layers selected by the validated NoPE schedule omit RoPE. Explicit schedule
 overrides interval derivation; entries must be exactly zero or one. The family
 has its own version/cache identity and uses native packed weight loading. Pin
@@ -84,6 +87,15 @@ Named checks: `smollm3_nope_schedule_override`,
 tool/context/compaction/cache/stream/cancellation/restart checks. Record native
 reference vectors independently before accepting logits. This batch implements
 one required family; it does not waive the remaining families or Ornith.
+
+The tiny reference retains the independent NumPy float64 oracle for an absolute
+semantic check (maximum error below 0.00002) and captures the specified pinned
+upstream eager float32 oracle for FR8's unchanged strict maximum absolute and
+pointwise-relative thresholds. The initial float64 comparison had maximum
+absolute error 0.00000687762 but relative error 0.07705 near zero; native versus
+upstream eager float32 passed both limits on the same fixed inputs. The real
+quantized reference remains independently captured, hash-bound and subject to
+both strict FR8 thresholds.
 
 ## Family work packages: planned files and named tests
 
