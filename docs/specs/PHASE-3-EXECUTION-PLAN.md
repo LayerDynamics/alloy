@@ -773,3 +773,33 @@ frozen artifact test checks exact counted input, streaming completion and equal
 cold/repeated output through the runtime at the 8 GiB simulated budget. Run
 strict Clippy and affected engine regressions. Daemon selection, trained tools,
 long-context/compaction/restart and report issuance remain required next work.
+
+### #97 bounded Phi function-list parser (2026-11-14)
+
+Pinned vLLM v0.18.0 `vllm/tool_parsers/phi4mini_tool_parser.py` documents Phi's
+`functools[...]` JSON list, with `name` and either `arguments` or `parameters`.
+The publisher example alone produced ordinary code/refusal in upstream probe
+b9c0b6f9c9ef4d25a11e9a71220f5ce7; preserve that observation. An explicit grammar
+instruction control is queued, not a native tool qualification. Do not treat
+the tokenizer's reserved tool tokens as proof of output grammar or promote
+ordinary example code to executable calls.
+
+Extend `crates/engine/src/slab_parser/{mod.rs,parser.rs}` and add `phi.rs` plus
+`crates/engine/tests/phi_tools.rs`. Implement streaming Phi function lists in
+the exact caller-admitted parser slab. Track JSON strings/escapes and balanced
+containers so nested arrays and brackets inside strings cannot terminate the
+list. Validate each complete object through the existing bounded JSON checker;
+permit `parameters` only on this Phi path, with exactly one name and one object
+argument member. Preserve duplicate-key, finite-number, UTF-8, depth/key/node,
+call/proposal/count and total-output limits. A malformed later call, truncated
+list, cancellation/drop or failing text sink must publish no executable batch.
+Keep text streaming and proposal access restricted to successful finish.
+
+Named tests: `phi_tools_all_utf8_splits_preserve_nested_arguments`,
+`phi_tools_reject_malformed_or_ambiguous_lists_atomically`,
+`phi_tools_enforce_every_storage_bound`, and
+`phi_tools_success_uses_only_admitted_storage`. Verify no success-path heap
+allocation after construction, then run strict Clippy and existing bounded
+JSON/XML parser regressions. Native rendering/decoder/daemon wiring is a
+separate next batch and must use the actual Phi protocol; parser fixtures do
+not qualify a model's tool behavior.
