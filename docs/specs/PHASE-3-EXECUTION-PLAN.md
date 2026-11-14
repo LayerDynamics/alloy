@@ -837,3 +837,28 @@ later calls and successful atomic proposal transfer; compare pinned actual
 token counts and Unicode/control-result growth bounds. Run real Phi cold/repeat
 fs.read proposals, strict Clippy and affected output/rendering/parser tests.
 The daemon policy-gated file task and full conformance remain subsequent work.
+
+### #97 Phi daemon qualification and actual agent lifecycle (2026-11-14)
+
+The actual frozen Phi artifact passed bounded tool projection, repeated text
+generation and cold/repeated fs.read proposals (f4f721ad590e4d6488fa9e2677adf0f9,
+three tests, exit zero). This does not establish daemon tool execution or full
+profile qualification. Preserve prior upstream format failures.
+
+Extend `crates/alloyd/src/boot.rs` to recognize `phi4-mini-instruct-4bit`, pin
+the compiled Phi manifest regardless of external overrides, select its own text
+template/native backend, and bound prefill at 64. Refuse Phi in all normal boot
+routes while full qualification remains incomplete. Add named tests
+`phi_profile_ignores_external_pin_overrides` and
+`unqualified_phi_cannot_boot_production_or_override_context` covering immutable
+pins, missing/modified files, and every normal boot route with/without tools.
+
+Extend `crates/alloyd/tests/llama_real_model.rs` shared profile/capability
+expectations for Phi's distinct family and fixed-long cache identity; retain
+the unchanged policy-gated file task, exact DONE answer, denied-write behavior,
+8k/32k stream/memory checks and cancellation recovery. Run its real tool task,
+then the existing `compaction_real_model` actual overflow, skill changes,
+canonical history and process-restart tests with Phi. Full-KV Phi must retain
+SSD restore requirements; it is not a hybrid rebuild profile. Run strict
+Clippy and focused boot regressions before real artifact tests. Retain failures
+and diagnose exact inputs against the pinned oracle before speculative edits.
