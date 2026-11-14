@@ -506,3 +506,29 @@ and extend the observing native backend in `tests/generation.rs` with
 `decoder_receives_the_rendered_schema_owner_on_each_generation` to verify exact
 owner/hash transport across changed schemas and removal while actual model
 generation still executes. This does not yet remove hybrid tool-mode rejection.
+
+### #95 hybrid tool rendering and decoder integration (2026-11-14)
+
+Update `crates/engine/src/backends/qwen/{architecture.rs,backend.rs,output.rs}`
+and add `hybrid_tools.jinja`. Pin separate Ornith/upstream template constants
+around their actual assistant-history difference. Preserve the publisher's
+function/parameter instructions and grouped tool responses. Extend shared
+`rendering.rs` with opt-in Hugging Face JSON/value formatting filters and supply
+structured `tools` values; extend `types/tool_context.rs` rendering projections
+with structured historical calls without changing canonical input serialization
+or schema hashes. Existing templates and JSON protocols keep their formatting.
+
+Connect `XmlToolParser<Arc<ToolContext>>` through the admitted decoder hook;
+preserve think markers only for that grammar, route reasoning away from visible
+answer/tool proposals, and require the exact schema owner. Count the enlarged
+decoder owner through the existing exact Layout plan. Remove hybrid tool-mode
+rejection only with this wiring; retain missing slab/schema refusal. Adapt
+decoder literals in `tests/unit/backends_qwen_output_{protocol_token,structured_output}.rs`.
+Extend `tests/qwen35_engine.rs` with `qwen35_engine_tool_template_contract`,
+`qwen35_engine_xml_decoder_uses_advertised_schema`, and ignored
+`qwen35_real_engine_tool_proposals`. Compare rendered tools/history against the
+pinned publisher templates using the pinned Transformers Jinja environment;
+verify schema-typed proposals through real tokenizer IDs and real native
+generation. Actual daemon policy-gated tool execution remains the next gate.
+Check projected tool-result growth through the same grouped response delimiters
+and conservative existing Qwen byte/token calculation before real agent use.
