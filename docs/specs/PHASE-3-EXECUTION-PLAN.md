@@ -543,3 +543,22 @@ The existing Qwen projection helper has a Qwen3-only tokenizer pin and different
 response-role framing, so add a separate verified hybrid projection bound in
 `rendering.rs` and cover its pins/placeholder validation in the hybrid tests;
 do not route hybrid projections through the incompatible Qwen3-only helper.
+
+### #95 qualification daemon boot and actual tool authority (2026-11-14)
+
+Update `crates/alloyd/src/boot.rs` to admit the frozen Ornith/Qwen3.5 profiles
+only through `boot_native_for_qualification`. Normal boot must reject both
+before artifact access until their agent qualification is complete. Use their
+actual constructors, text templates, positive nested model context, tokenizer
+bounds and immutable compiled artifact hashes; external manifests cannot
+replace these pins. Keep hybrid prefill bounded to 32 tokens. Add named tests
+`unqualified_hybrids_cannot_boot_production`,
+`hybrid_profiles_ignore_external_pin_overrides`, and
+`hybrid_context_requires_positive_consistent_metadata`.
+
+Extend `crates/alloyd/tests/llama_real_model.rs::llama3_tool_stop_context_cache`
+to run the same actual fs.write effect, exact terminal answer, rejected write,
+stream events and capability assertions for both hybrid profiles. Preserve
+failed model observations; do not normalize answers or grant production support
+from engine-only proposals. Run mandatory actual Ornith first. This batch does
+not claim compaction, restart, long-context or broad family qualification.
