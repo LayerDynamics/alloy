@@ -1,0 +1,112 @@
+{
+  "base_messages": [
+    {
+      "content": " Be precise. ",
+      "role": "system"
+    },
+    {
+      "content": " Previous request. ",
+      "role": "user"
+    },
+    {
+      "content": " Prior answer. ",
+      "role": "assistant"
+    },
+    {
+      "content": " Run the tools. ",
+      "role": "user"
+    }
+  ],
+  "history": [
+    {
+      "arguments": {
+        "a": [
+          1,
+          "é",
+          1e-07,
+          1e-05,
+          0.0001,
+          1e+16,
+          1.0,
+          -0.0
+        ],
+        "b": true,
+        "i": 7,
+        "n": 0.5,
+        "o": {
+          "punctuation": "a,b:c"
+        },
+        "s": " line one\n雪, résumé \\\"quoted\\\" ",
+        "z": null
+      },
+      "call_id": "c1",
+      "kind": "call",
+      "tool_id": "fs.test"
+    },
+    {
+      "arguments": {
+        "s": "second"
+      },
+      "call_id": "c2",
+      "kind": "call",
+      "tool_id": "fs.test"
+    },
+    {
+      "call_id": "c1",
+      "content": "雪 result",
+      "is_error": false,
+      "kind": "result"
+    },
+    {
+      "call_id": "c2",
+      "content": "second result",
+      "is_error": true,
+      "kind": "result"
+    },
+    {
+      "content": " Summary. ",
+      "kind": "text",
+      "role": "assistant"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Test \"quotes\", commas: and 雪.",
+        "name": "fs.test",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "a": {
+              "type": "array"
+            },
+            "b": {
+              "type": "boolean"
+            },
+            "i": {
+              "type": "integer"
+            },
+            "n": {
+              "type": "number"
+            },
+            "o": {
+              "type": "object"
+            },
+            "s": {
+              "type": "string"
+            },
+            "z": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "s"
+          ],
+          "type": "object"
+        },
+        "version": "1.0.0"
+      },
+      "type": "function"
+    }
+  ]
+}

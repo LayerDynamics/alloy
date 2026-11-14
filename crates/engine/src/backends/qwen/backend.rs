@@ -555,12 +555,6 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
-        if self.family == BackendFamily::Phi {
-            return Err(EngineError::unsupported(
-                "Phi tool protocol",
-                "native Phi tool parsing is not implemented",
-            ));
-        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -574,12 +568,6 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
-        if self.family == BackendFamily::Phi && self.tool_call_parsing {
-            return Err(EngineError::unsupported(
-                "Phi tool protocol",
-                "native Phi tool parsing is not implemented",
-            ));
-        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -814,6 +802,14 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family == BackendFamily::Phi {
+            return rendering::phi_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
         if self.family.hybrid() {
             return rendering::qwen35_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -863,12 +859,6 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
-            if tool_mode && self.family == BackendFamily::Phi {
-                return Err(EngineError::unsupported(
-                    "Phi tool protocol",
-                    "native Phi tool rendering is not implemented",
-                ));
-            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -1071,6 +1061,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser,
             slab: None,
             xml: None,
+            phi: None,
             completed_slab: None,
         }))
     }
@@ -1128,6 +1119,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser: None,
             slab: None,
             xml: Some(xml),
+            phi: None,
             completed_slab: None,
         })
     }
@@ -1158,10 +1150,23 @@ impl RuntimeBackend for Qwen3Backend {
                     ));
                 }
                 let data = self.data(resolved.artifact())?;
-                let slab = crate::slab_parser::SlabParser::new(
-                    allocation,
-                    self.tool_parser_limits().max_output_bytes,
-                )?;
+                let (slab, phi) = if self.family == BackendFamily::Phi {
+                    (
+                        None,
+                        Some(crate::slab_parser::PhiToolParser::new(
+                            allocation,
+                            self.tool_parser_limits().max_output_bytes,
+                        )?),
+                    )
+                } else {
+                    (
+                        Some(crate::slab_parser::SlabParser::new(
+                            allocation,
+                            self.tool_parser_limits().max_output_bytes,
+                        )?),
+                        None,
+                    )
+                };
                 output::box_slab_decoder(Qwen3TextDecoder {
                     tokenizer: Arc::clone(&data.tokenizer),
                     special_tokens: Arc::clone(&data.special_tokens),
@@ -1170,8 +1175,9 @@ impl RuntimeBackend for Qwen3Backend {
                     max_token_bytes: self.limits.max_token_bytes,
                     finished: false,
                     parser: None,
-                    slab: Some(slab),
+                    slab,
                     xml: None,
+                    phi,
                     completed_slab: None,
                 })
             }
@@ -1497,7 +1503,8 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        (BackendFamily::Phi, _) => PHI_TEXT_TEMPLATE,
+        (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
+        (BackendFamily::Phi, true) => PHI_TOOL_TEMPLATE,
         (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
         (BackendFamily::Ornith, true) => ORNITH_TOOL_TEMPLATE,
         (BackendFamily::Qwen35, false) => QWEN35_TEXT_TEMPLATE,

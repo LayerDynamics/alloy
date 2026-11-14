@@ -1159,3 +1159,30 @@ pub fn qwen35_projected_tool_token_upper_bound(
         .checked_add(variable)
         .ok_or_else(|| EngineError::invalid_request("projection", "hybrid token bound overflow"))
 }
+
+/// Bound the complete Phi prompt plus already-escaped tool-result growth.
+/// The pinned tokenizer has no normalizer/postprocessor, splits existing bytes,
+/// and applies ByteLevel BPE without prefix-space insertion. BPE only merges.
+pub fn phi_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x38, 0x2c, 0xc2, 0x35, 0xb5, 0x6c, 0x72, 0x59, 0x45, 0xe1, 0x49, 0xcc, 0x25, 0xf1, 0x91,
+        0xda, 0x66, 0x7c, 0x83, 0x66, 0x55, 0xef, 0xd0, 0x85, 0x7b, 0x00, 0x43, 0x20, 0xe9, 0x0e,
+        0x91, 0xea,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Phi tokenizer or empty result projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Phi byte bound overflow"))
+}

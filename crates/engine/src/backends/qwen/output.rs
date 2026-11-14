@@ -31,6 +31,7 @@ pub(super) struct Qwen3TextDecoder {
     pub(super) parser: Option<ToolCallParser>,
     pub(super) slab: Option<SlabParser>,
     pub(super) xml: Option<XmlToolParser<HybridToolSchema>>,
+    pub(super) phi: Option<crate::slab_parser::PhiToolParser>,
     pub(super) completed_slab: Option<FrozenParserAllocation>,
 }
 
@@ -176,6 +177,14 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn push_blocks(&mut self, token: u32) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let text = self.push(token)?;
+        if let Some(parser) = self.phi.as_mut() {
+            let mut emitted = String::new();
+            parser.push(&text, |part| {
+                emitted.push_str(part);
+                Ok(())
+            })?;
+            return Ok(text_blocks(emitted));
+        }
         if let Some(parser) = self.xml.as_mut() {
             let mut emitted = String::new();
             parser.push(
@@ -207,6 +216,18 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn finish_blocks(&mut self) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let tail = self.finish()?;
+        if let Some(mut parser) = self.phi.take() {
+            let mut emitted = String::new();
+            parser.push(&tail, |part| {
+                emitted.push_str(part);
+                Ok(())
+            })?;
+            self.completed_slab = Some(parser.finish(|part| {
+                emitted.push_str(part);
+                Ok(())
+            })?);
+            return Ok(text_blocks(emitted));
+        }
         if let Some(mut parser) = self.xml.take() {
             let mut emitted = String::new();
             parser.push(
