@@ -358,3 +358,19 @@ against the source before freezing the derived artifact. The pinned eager
 reference from the original artifact must also match the derived artifact
 capture exactly. No vision runtime support or relaxed production loader is
 implied.
+
+### #95 shared hybrid admission calculations (2026-11-14)
+
+Before wiring the engine adapter, expose the native hybrid decoder's checked
+cache and step payload calculations so runtime admission cannot drift from
+execution. Add `decoder/qwen35/planning.rs`, export it from `qwen35/mod.rs`,
+and update `qwen35/model.rs` and `decoder/hybrid.rs` to consume the same
+calculations. Expose recurrent state/step payload on LinearAttentionConfig;
+Qwen35Config supplies full-KV plus recurrent overlap, output payload and
+conservative layer work payload. Reject zero/out-of-context/overflowing inputs
+before native allocation. These are named buffer payloads, not process RSS;
+engine allocator/loading/output overhead remains separately admitted.
+Extend `tests/qwen35_model.rs` with `qwen35_admission_matches_execution` to
+check exact logical cache formula, one-byte-below output/work refusal without
+state publication, and successful execution at calculated step bounds on
+CPU/Metal. Preserve frozen strict numerical vectors and existing tests.
