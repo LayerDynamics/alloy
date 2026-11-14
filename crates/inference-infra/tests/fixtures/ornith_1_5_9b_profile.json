@@ -1,0 +1,92 @@
+{
+  "id": "ornith-1.5-9b-4bit",
+  "source": {
+    "repository": "ornith-ai/Ornith-1.5-9B",
+    "revision": "489cb97981b8654bcfcf30ce1f94ed1b62e07b53",
+    "declared_card_license": "MIT",
+    "standalone_license_verified": false
+  },
+  "artifact": {
+    "repository": "ornith-ai/Ornith-1.5-9B-MLX-4bit",
+    "revision": "a48173b246ac705be75c05bedf1a0666db522d53",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 26719,
+        "sha256": "ea2ce3b33ade0490769f14d8e3c847ec6df482d3c192c9063b4b6dae25241383"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7593,
+        "sha256": "9dd2fbd270feaa1fbef2d4f634d7887c9c506e3bde140f8e7351c8944e8fd235"
+      },
+      {
+        "path": "config.json",
+        "bytes": 3084,
+        "sha256": "7ddc5bb8c3057edaa0a3337c1721312a8f3d28ad587b77dd6ac075876929d95d"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 5038161163,
+        "sha256": "c022a4c4b8de62c75306e2442fd78161ff49bce85fe7abb308c5ad5d04454a26"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 81194,
+        "sha256": "215f9abadc1cea4d465b01c036dffcac5a84c2fb2386777863eff6928b91ed0b"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 19989325,
+        "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 1160,
+        "sha256": "386ba246ba3dfa4d3a21d8bc8712eba38de558e5ac94c2c90436d8f94d519d5e"
+      }
+    ]
+  },
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "compile_enabled": false,
+    "sha256": "a53048571aa7b4f1eaad3c0cb35cd29bb9ef9ce6a3802032c9511be84019b95c"
+  },
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "decode_tokens": [
+    19,
+    13
+  ],
+  "qualification_status": "unqualified",
+  "prompt_tokens": [
+    [
+      46270,
+      220,
+      17,
+      478,
+      220,
+      17,
+      13,
+      21134,
+      25899,
+      13
+    ],
+    [
+      814,
+      20139,
+      3069,
+      279,
+      12515,
+      369,
+      6105,
+      13
+    ]
+  ]
+}
