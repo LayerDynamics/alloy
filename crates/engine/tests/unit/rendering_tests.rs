@@ -448,3 +448,43 @@ fn smollm3_pinned_tokenizer_projected_bounds() {
     assert!(smollm3_projected_tool_token_upper_bound(&tokenizer, &empty, 0, 0).is_err());
     assert!(smollm3_projected_tool_token_upper_bound(&tokenizer, &empty, 1, usize::MAX).is_err());
 }
+
+#[test]
+fn smollm3_text_uses_trained_system_and_assistant_framing() {
+    let profile = profile();
+    let artifact = artifact();
+    let context = ContextSnapshot::new(
+        ContextSnapshotId::new("system-template").unwrap(),
+        profile.clone(),
+        vec![
+            Message {
+                role: MessageRole::System,
+                content: "Return valid checkpoint JSON only.".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Preserve the project facts.".into(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "Acknowledged.".into(),
+            },
+        ],
+    )
+    .unwrap();
+    let binding = binding(&profile, &artifact, smollm::template::CHAT_TEMPLATE);
+    let text = render_chat(&context, &binding, &options(), limits()).unwrap();
+    assert_eq!(text.matches("<|im_start|>system").count(), 1);
+    assert!(
+        text.contains("## Metadata\n\nKnowledge Cutoff Date: June 2025\nReasoning Mode: /no_think")
+    );
+    assert!(
+        text.contains("## Custom Instructions\n\nReturn valid checkpoint JSON only.\n\n<|im_end|>")
+    );
+    assert!(text.contains("<|im_start|>assistant\n<think>\n\n</think>\nAcknowledged.<|im_end|>"));
+    assert!(text.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n"));
+    assert_eq!(
+        text,
+        render_chat(&context, &binding, &options(), limits()).unwrap()
+    );
+}
