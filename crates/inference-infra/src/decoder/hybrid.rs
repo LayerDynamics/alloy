@@ -71,6 +71,29 @@ fn limit(operation: &'static str, required_bytes: u64, limit_bytes: u64) -> MlxD
     Ok(())
 }
 impl LinearAttentionConfig {
+    /// Logical convolution and recurrent state payload for one layer.
+    pub fn state_payload_bytes(self) -> MlxDecoderResult<u64> {
+        let g = self.geometry()?;
+        bytes(sum(g.history_elements, g.recurrent_elements)?)
+    }
+
+    /// Named step buffers, including previous/new state. Native allocator
+    /// caches and kernel workspace require separate caller headroom.
+    pub fn step_payload_bytes(self, tokens: usize) -> MlxDecoderResult<u64> {
+        let g = self.geometry()?;
+        if tokens == 0 || i32::try_from(sum(tokens, self.convolution_kernel - 1)?).is_err() {
+            return Err(invalid("invalid hybrid step token count"));
+        }
+        let per_token = sum(
+            sum(product(5, g.convolution_width)?, product(6, g.value_width)?)?,
+            sum(product(8, self.value_heads)?, self.hidden_size)?,
+        )?;
+        bytes(sum(
+            product(tokens, per_token)?,
+            product(3, sum(g.history_elements, g.recurrent_elements)?)?,
+        )?)
+    }
+
     fn geometry(self) -> MlxDecoderResult<Geometry> {
         for n in [
             self.hidden_size,
@@ -287,10 +310,7 @@ impl MlxLinearAttention {
 
     /// Fixed two-component state payload for batch one.
     pub fn state_bytes(&self) -> MlxDecoderResult<u64> {
-        bytes(sum(
-            self.geometry.history_elements,
-            self.geometry.recurrent_elements,
-        )?)
+        self.config.state_payload_bytes()
     }
 
     /// Step with [1,T,hidden] float32 input, returning evaluated output and new
@@ -330,14 +350,7 @@ impl MlxLinearAttention {
         }
         // Conservative named-tensor payload, including prior and next state,
         // QKV/conv, normalized Q/K, gates, gated values and projected output.
-        let per_token = sum(
-            sum(product(5, g.convolution_width)?, product(6, g.value_width)?)?,
-            sum(product(8, c.value_heads)?, c.hidden_size)?,
-        )?;
-        let required = bytes(sum(
-            product(t, per_token)?,
-            product(3, sum(g.history_elements, g.recurrent_elements)?)?,
-        )?)?;
+        let required = c.step_payload_bytes(t)?;
         limit("hybrid step tensor payload", required, payload_limit)?;
         if cancelled() {
             return Err(MlxDecoderError::Cancelled);

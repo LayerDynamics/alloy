@@ -11,7 +11,7 @@ use crate::{
             upload_f32,
         },
     },
-    kv_cache::{KvCacheError, KvCacheSpec, MlxKvCache, MlxModelId},
+    kv_cache::{KvCacheError, MlxKvCache, MlxModelId},
 };
 use mlx_ffi::{
     Array, Stream,
@@ -27,12 +27,6 @@ fn add(a: u64, b: u64) -> MlxDecoderResult<u64> {
 fn mul(a: usize, b: usize) -> MlxDecoderResult<usize> {
     a.checked_mul(b)
         .ok_or_else(|| invalid("hybrid dimension overflow").into())
-}
-fn bytes(n: usize) -> MlxDecoderResult<u64> {
-    u64::try_from(n)
-        .ok()
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| invalid("hybrid payload overflow").into())
 }
 fn limit(operation: &'static str, required_bytes: u64, limit_bytes: u64) -> MlxDecoderResult<()> {
     if required_bytes > limit_bytes {
@@ -304,25 +298,10 @@ impl MlxQwen35Model {
         if !self.healthy.get() {
             return Err(MlxDecoderError::Invalidated);
         }
-        if capacity == 0 || capacity > self.config.context {
-            return Err(invalid("invalid Qwen3.5 cache capacity").into());
-        }
-        let mut recurrent = 0;
-        for l in &self.layers {
-            if let NativeAttention::Linear(a) = &l.attention {
-                recurrent = add(recurrent, a.state_bytes()?)?;
-            }
-        }
-        let recurrent_overlap = add(recurrent, recurrent)?;
-        let spec = KvCacheSpec {
-            layers: self.config.linear_layers.iter().filter(|&&v| !v).count(),
-            batch: 1,
-            kv_heads: self.config.kv_heads,
-            head_dim: self.config.head_dim,
-            capacity_tokens: capacity,
-        };
-        let full_minimum = spec.payload_plan()?.update_overlap_bytes;
-        let minimum = add(full_minimum, recurrent_overlap)?;
+        let plan = self.config.cache_payload_plan(capacity)?;
+        let spec = plan.full;
+        let full_minimum = plan.full_overlap_bytes;
+        let minimum = plan.total_overlap_bytes;
         limit("Qwen3.5 cache overlap", minimum, payload_limit)?;
         // Logical payload excludes allocator padding and reusable backing
         // buffers. Split the caller's remaining allowance between components;
@@ -424,20 +403,12 @@ impl MlxQwen35Model {
         {
             return Err(invalid("Qwen3.5 cache components disagree").into());
         }
+        let plan = c.step_payload_plan(t, end, all_logits)?;
         let rows = if all_logits { t } else { 1 };
-        limit(
-            "Qwen3.5 logits",
-            bytes(mul(rows, c.vocabulary)?)?,
-            output_limit,
-        )?;
-        let dense_width = mul(8, c.hidden)?
-            .checked_add(mul(3, c.intermediate)?)
-            .and_then(|n| n.checked_add(8 * c.query_heads * c.head_dim))
-            .ok_or_else(|| invalid("Qwen3.5 workspace overflow"))?;
-        let scores = mul(mul(t, end)?, c.query_heads)?;
+        limit("Qwen3.5 logits", plan.output_bytes, output_limit)?;
         limit(
             "Qwen3.5 layer workspace payload",
-            add(bytes(mul(t, dense_width)?)?, bytes(scores)?)?,
+            plan.work_bytes,
             work_limit,
         )?;
         if cancelled() {

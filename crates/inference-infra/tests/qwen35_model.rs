@@ -12,6 +12,82 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{cell::Cell, collections::BTreeMap, path::PathBuf};
 const TOKENS: &[u32] = &[3, 41, 7, 200, 128, 95, 12, 250];
+
+#[test]
+fn qwen35_admission_matches_execution() {
+    for stream in streams() {
+        let model = model(&stream);
+        let c = model.config();
+        let cache_plan = c.cache_payload_plan(TOKENS.len()).unwrap();
+        let linear = c.linear_layers.iter().filter(|&&v| v).count() as u64;
+        let full = c.linear_layers.len() as u64 - linear;
+        let history = (c.linear.convolution_kernel - 1)
+            * (2 * c.linear.key_heads * c.linear.key_dim
+                + c.linear.value_heads * c.linear.value_dim);
+        let recurrent = c.linear.value_heads * c.linear.key_dim * c.linear.value_dim;
+        assert_eq!(
+            cache_plan.recurrent_overlap_bytes,
+            linear * (history + recurrent) as u64 * 8
+        );
+        assert_eq!(
+            cache_plan.full_overlap_bytes,
+            full * c.kv_heads as u64 * c.head_dim as u64 * TOKENS.len() as u64 * 16
+        );
+        assert_eq!(
+            cache_plan.total_overlap_bytes,
+            cache_plan.full_overlap_bytes + cache_plan.recurrent_overlap_bytes
+        );
+        assert!(
+            model
+                .new_cache(TOKENS.len(), cache_plan.total_overlap_bytes - 1, &stream)
+                .is_err()
+        );
+        for (tokens, end) in [(0, 1), (2, 1), (1, c.context + 1), (usize::MAX, usize::MAX)] {
+            assert!(c.step_payload_plan(tokens, end, true).is_err());
+        }
+        assert!(c.cache_payload_plan(0).is_err());
+        assert!(c.cache_payload_plan(c.context + 1).is_err());
+        let step = c
+            .step_payload_plan(TOKENS.len(), TOKENS.len(), true)
+            .unwrap();
+        assert_eq!(step.output_bytes, (TOKENS.len() * c.vocabulary * 4) as u64);
+        let exact = ForwardOptions {
+            all_logits: true,
+            output_limit: step.output_bytes,
+            work_limit: step.work_bytes,
+        };
+        let mut cache = model
+            .new_cache(
+                TOKENS.len(),
+                cache_plan.total_overlap_bytes + (1 << 20),
+                &stream,
+            )
+            .unwrap();
+        for options in [
+            ForwardOptions {
+                output_limit: step.output_bytes - 1,
+                ..exact
+            },
+            ForwardOptions {
+                work_limit: step.work_bytes - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                model.forward(TOKENS, &mut cache, options, &stream, &|| false),
+                Err(MlxDecoderError::PayloadLimit { .. })
+            ));
+            assert!(cache.is_empty());
+            assert!(model.is_healthy());
+        }
+        let actual = model
+            .forward(TOKENS, &mut cache, exact, &stream, &|| false)
+            .unwrap()
+            .into_values();
+        assert_eq!(actual.len(), TOKENS.len() * c.vocabulary);
+        assert_eq!(cache.len(), TOKENS.len());
+    }
+}
 const OPTIONS: ForwardOptions = ForwardOptions {
     all_logits: true,
     output_limit: 1 << 20,

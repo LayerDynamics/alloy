@@ -2,4 +2,5 @@
 //! profile production support or implement image/audio inference.
 pub mod config;
 pub mod model;
+pub mod planning;
 pub mod weights;
