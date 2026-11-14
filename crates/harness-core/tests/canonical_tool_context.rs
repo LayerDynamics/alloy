@@ -193,6 +193,39 @@ fn registered_policy_changes_model_visible_context_identity() {
 }
 
 #[test]
+fn terminal_policy_reason_survives_context_without_changing_history() {
+    let (_dir, mut store, registry, count) = setup();
+    let mut call = invocation("rejected-call");
+    call.call
+        .arguments
+        .insert("path".into(), json!("forbidden.txt"));
+    store.admit_tool(&registry, &policy(false), call).unwrap();
+    let events = store.list_events(SESSION).unwrap();
+    let completion = events
+        .iter()
+        .find(|e| e.kind == EventKind::ToolCompleted)
+        .unwrap();
+    assert_eq!(completion.payload["reason"], "policy:ArgumentsNotAllowed");
+    let context = snapshot(&events, &registry).unwrap();
+    let rendered = render(&context, TEMPLATE, render_limits()).unwrap();
+    let line = rendered
+        .text()
+        .lines()
+        .find_map(|l| l.strip_prefix("tool: "))
+        .unwrap();
+    let outer: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(outer["is_error"], true);
+    let content = outer["content"].as_str().unwrap();
+    assert!(content.len() <= harness_core::context::MODEL_ERROR_CONTEXT_BYTES);
+    let projected: Value = serde_json::from_str(content).unwrap();
+    assert_eq!(projected["kind"], "policy");
+    assert_eq!(projected["details"]["state"], "Rejected");
+    assert_eq!(projected["details"]["reason"], "policy:ArgumentsNotAllowed");
+    assert_eq!(events, store.list_events(SESSION).unwrap());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn large_error_context_is_explicitly_bounded_without_changing_durable_result() {
     let (_dir, mut store, registry, _count) = setup();
     let original =
