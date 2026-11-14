@@ -656,3 +656,39 @@ retain changed-render/prefix, cold equivalence and cache/capability checks. Rout
 the real skill fixtures through the existing observational recorder for opt-in
 failure replay. Compile the target and rerun these three actual Ornith tests;
 production context, policy and decoder behavior stay unchanged in this batch.
+
+### #97 Phi-4-mini pinned configuration and position math (2026-11-14)
+
+Publisher `microsoft/Phi-4-mini-instruct` is pinned at
+`cfbefacb99257ffa30c83adab238a50856ac3083` (standalone MIT LICENSE verified).
+Preconverted `mlx-community/Phi-4-mini-instruct-4bit` is pinned at
+`ac1c269cb4222a4e136a3d09edad301056c1f36a`, affine4/group64. Its configuration
+hash is `431eafdf55dc6d4a76dc3e9f22b0d06eac42d9ac6dc7cbd7ff8ca1e38f18cdb1`;
+the published packed weight SHA-256 is
+`9dcfcdc0a579494283f2d2317ad686123782ce461d1111690ede7c904ff3f87b`.
+The real architecture has hidden3072/intermediate8192,32 layers,24 query and8
+KV heads of width128,96 rotary dimensions,tied embeddings and vocabulary200064.
+QKV and gate/up projections are fused; splitting trained matrix geometry is not
+a brand alias or a reason to skip numerical validation.
+
+First add `crates/inference-infra/src/decoder/phi/{mod.rs,config.rs}` and export
+it from `src/decoder/mod.rs`. Add exact converted configuration fixture
+`crates/inference-infra/tests/fixtures/phi4_mini_config.json` and tests
+`crates/inference-infra/tests/phi_config.rs` named
+`phi4mini_pinned_geometry_and_longrope_parameters`,
+`phi4mini_rejects_unsupported_or_inconsistent_architecture`, and
+`phi4mini_longrope_boundary_math_preserves_partial_dimensions`. Validate fused
+projection widths, positive bounded dimensions, partial rotary width, both
+factor arrays, norms/tied embeddings, full-attention window and affine layout
+before weights. Compute short/long frequency denominators and rotary-only
+amplitude with explicit regime selection, covering4095/4096/4097 positions and
+unrotated tail against an independent scalar formula.
+
+Position semantics need an explicit profile contract: pinned mlx-lm0.31.2
+`SuScaledRoPE` uses long factors at every position, whereas current publisher
+code has a short/long update route. The native preconverted profile must match
+its pinned eager reference and bind the chosen regime to state identity; never
+silently change frequencies inside retained KV. This math batch does not settle
+or qualify engine profile selection, native model execution, loading, tool
+syntax, memory or agent behavior. Record those exact files/tests in the next
+amendment after validating the packed artifact and reference contract.
