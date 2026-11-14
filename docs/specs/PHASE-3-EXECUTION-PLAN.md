@@ -104,6 +104,15 @@ inputs in the pinned upstream eager environment to distinguish native runtime
 errors from model instruction following. Preserve exact task assertions and
 record failed qualification; do not normalize model output to obtain a pass.
 
+Because the real SmolLM agent fixture has not passed, normal `boot_native`,
+`boot_qwen3`, and the context-override wrapper must reject this profile before
+loading weights. Extend `crates/alloyd/src/boot.rs` with an explicitly named
+`boot_native_for_qualification` entry point for native conformance runners and
+route only the real tests in `tests/{llama_real_model.rs,compaction_real_model.rs}`
+through it. Test `unqualified_smollm_cannot_boot_production_or_override_context`.
+The daemon CLI must retain its normal boot route; this restriction stays until
+current complete native qualification is available through #72.
+
 ### #53 / #95 native hybrid-attention operations (2026-11-14)
 
 The mandatory Ornith artifact `ornith-ai/Ornith-1.5-9B-MLX-4bit` at
