@@ -21,6 +21,8 @@
 //! cancellation/completion policy remain runtime responsibilities.
 
 use crate::{Array, DType, Error, Stream, bindings as sys};
+mod hybrid;
+pub use hybrid::{depthwise_conv1d, exp, gated_delta_update, sigmoid, softplus};
 use std::{
     ffi::CString,
     fmt,
