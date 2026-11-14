@@ -587,3 +587,18 @@ strategy, not evidence of unsupported recurrent-state SSD restoration.
 The new resident metadata also requires updating the existing private fixture
 initializer in `crates/engine/tests/unit/runtime_model_pool_runtime.rs`; retain
 its current model-pool tests and declare its actual cache persistence support.
+
+### #49/#95 actionable bounded terminal tool errors (2026-11-14)
+
+Actual Ornith completed the authorized write and exact DONE answer, but its
+rejected follow-up received a truncated preview that omitted the policy reason.
+Fix `crates/harness-core/src/context/tool_history.rs`: project trusted terminal
+state and reason as bounded structured fields, preserving the existing error
+context byte ceiling and every original durable event. Do not enlarge tool
+output admission, normalize model answers or change the actual agent prompt.
+Retain the generic completed-error preview behavior. Add
+`terminal_error_projection_preserves_policy_reason_and_bounds` in the module
+and `terminal_policy_reason_survives_context_without_changing_history` in
+`crates/harness-core/tests/canonical_tool_context.rs`, covering long escaped
+Unicode reasons, structural markup, no tool execution and unchanged history.
+Then rerun the same actual Ornith policy-gated daemon task.
