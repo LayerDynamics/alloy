@@ -97,6 +97,13 @@ upstream eager float32 passed both limits on the same fixed inputs. The real
 quantized reference remains independently captured, hash-bound and subject to
 both strict FR8 thresholds.
 
+For a real tool-response mismatch, extend the existing test-only
+`crates/alloyd/tests/support/recording_engine.rs` to optionally emit the actual
+generation token inputs. Reuse it in `tests/llama_real_model.rs`; replay those
+inputs in the pinned upstream eager environment to distinguish native runtime
+errors from model instruction following. Preserve exact task assertions and
+record failed qualification; do not normalize model output to obtain a pass.
+
 ## Family work packages: planned files and named tests
 
 Each family uses `crates/families/<family>/Cargo.toml`, `src/{lib.rs,config.rs,model.rs,weights.rs,register.rs}`, `tests/{config.rs,numerical.rs,agent_conformance.rs}` and `fixture/` pin manifests; the exact `<family>` directories and special files follow. Shared changes are `Cargo.toml`, `Cargo.lock`, `crates/engine/src/{backends/mod.rs,registry.rs}`, `crates/alloyd/src/boot.rs`, and `bench/corpus/models.json`. These are planned paths, not claims that kernels, weights, or tests already exist. If architecture inspection shows a different decomposition, amend this list before implementing it.
