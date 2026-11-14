@@ -532,3 +532,14 @@ verify schema-typed proposals through real tokenizer IDs and real native
 generation. Actual daemon policy-gated tool execution remains the next gate.
 Check projected tool-result growth through the same grouped response delimiters
 and conservative existing Qwen byte/token calculation before real agent use.
+
+Freeze independent render expectations in
+`tests/fixtures/qwen35_tool_render/{input.json,ornith.txt,upstream.txt,generate.py}`.
+The offline generator verifies each publisher template against the frozen
+artifact profile and renders using the pinned Transformers Jinja environment.
+Include Unicode, quoted punctuation, scalar/container arguments, old assistant
+history, multiple calls and grouped results. These are product test fixtures.
+The existing Qwen projection helper has a Qwen3-only tokenizer pin and different
+response-role framing, so add a separate verified hybrid projection bound in
+`rendering.rs` and cover its pins/placeholder validation in the hybrid tests;
+do not route hybrid projections through the incompatible Qwen3-only helper.
