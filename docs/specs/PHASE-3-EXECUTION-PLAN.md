@@ -618,3 +618,15 @@ canonical-history tests; amend `crates/alloyd/tests/llama_real_model.rs` to
 require the rejected turn to report rejection, never a success marker, while
 retaining the exact one-request/zero-start/no-file-effect assertions. Run the
 unchanged real user prompts through Ornith and preserve earlier failed runs.
+
+### #95 resumed compaction diagnostic capture (2026-11-14)
+
+The actual Ornith checkpoint preserved all B.3 facts and passed source
+verification, but the reopened follow-up claimed the codename was unavailable.
+Extend only `crates/alloyd/tests/support/recording_engine.rs` so existing opt-in
+`ALLOY_TEST_TRACE_REQUESTS` captures terminal output for every recorded request,
+including partial output on failure. Preserve streaming events unchanged and
+retain always-on checkpoint traces. Compile the shared real test targets, then
+rerun `real_model_compaction_preserves_history_and_continues` with exact input
+and output capture. Replay the failing request in pinned upstream before any
+runtime/context change; do not weaken its history or continuation assertions.
