@@ -94,7 +94,7 @@ fn loading_peak_bound(
     let decode_peak = sum(&[host_limit, as_u64(workspace)?])?;
     let upload_peak = sum(&[
         host_limit.max(data.resident_bound),
-        largest_upload_buffer_bound(&data.config)?,
+        data.config.largest_upload()?,
     ])?;
     sum(&[decode_peak.max(upload_peak), limits.loader_headroom_bytes])
 }

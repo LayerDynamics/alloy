@@ -9,6 +9,10 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
+        if let BackendConfig::Hybrid(config) = &data.config {
+            return self.load_hybrid(request, data, config);
+        }
+        let BackendConfig::Transformer(config) = &data.config else { unreachable!("hybrid dispatched above") };
         let decoded_bound = data.decoded_bound;
         // Headroom covers group-size variance (planning assumes 64; some
         // fixtures/checkpoints use smaller groups with larger scale tables).
@@ -76,7 +80,7 @@ impl ModelFamily for Qwen3Backend {
             cancelled: &cancelled,
         };
         let result = load_weights_verified(
-            &data.config,
+            config,
             &data.specification.directory,
             LoadOptions {
                 // Enforce the source limit used by the workspace plan even
@@ -90,7 +94,7 @@ impl ModelFamily for Qwen3Backend {
         control.check_cancelled()?;
         let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
         let packed_bits = weights.embed_tokens.bits();
-        if !data.config.has_qk_norm() {
+        if !config.has_qk_norm() {
             validate_llama_weight_layout(&weights)?;
         }
         let decoded = weight_memory(&weights)?;
@@ -103,7 +107,7 @@ impl ModelFamily for Qwen3Backend {
             });
         }
         let model = MlxQwen3Model::from_weights(
-            data.config.clone(),
+            config.clone(),
             weights,
             request.limits().max_resident_bytes(),
             execution_stream.as_ref(),
@@ -123,7 +127,7 @@ impl ModelFamily for Qwen3Backend {
             });
         }
         let mut capabilities = self.registration.capabilities().clone();
-        if !data.config.has_qk_norm() {
+        if !config.has_qk_norm() {
             capabilities.weight_representations = vec![match packed_bits {
                 Some(8) => WeightRepresentation::Affine8 { group_size: NonZeroUsize::new(64).unwrap() },
                 Some(4) => WeightRepresentation::Affine4 { group_size: NonZeroUsize::new(64).unwrap() },
@@ -132,7 +136,7 @@ impl ModelFamily for Qwen3Backend {
         }
         capabilities.context_limit_tokens = capabilities
             .context_limit_tokens
-            .min(data.config.max_context);
+            .min(config.max_context);
         Ok(Box::new(Qwen3Loaded {
             model,
             stream: execution_stream,
@@ -141,9 +145,9 @@ impl ModelFamily for Qwen3Backend {
             registration: self.registration.clone(),
             capabilities,
             memory: BufferMemoryUsage::new(measured, payload)?,
-            vocabulary: data.config.vocab_size,
+            vocabulary: config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: product(logits_payload_bound(&data.config)?, if data.config.has_qk_norm() { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
+            logits_payload_bytes: product(logits_payload_bound(config)?, if config.has_qk_norm() { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
         }))
     }
 }

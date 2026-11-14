@@ -1,0 +1,13 @@
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}
+{%- if message.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}
+{%- endfor -%}
+{%- if ns.last_user == -1 -%}{{- raise_exception('No user query found.') -}}{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'system' and not loop.first -%}{{- raise_exception('System message must be first.') -}}{%- endif -%}
+{%- if message.role not in ['system', 'user', 'assistant'] or message.kind != 'text' -%}{{- raise_exception('Text-only profile requires text messages.') -}}{%- endif -%}
+{{- '<|im_start|>' ~ message.role ~ '\n' -}}
+{%- if message.role == 'assistant' and loop.index0 > ns.last_user -%}{{- '<think>\n\n</think>\n\n' -}}{%- endif -%}
+{{- (message.content | trim) ~ '<|im_end|>\n' -}}
+{%- endfor -%}
+{{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' -}}

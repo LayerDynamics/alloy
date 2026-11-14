@@ -107,6 +107,7 @@ impl Qwen3Execution {
     }
 }
 
+include!("architecture.rs");
 include!("artifact.rs");
 
 /// Explicit bounds; no model, output, or memory policy is silently selected.
@@ -171,7 +172,7 @@ impl Qwen3BackendLimits {
 /// Real Qwen3 backend. Normal metadata/factories may cross threads;
 /// actual model and cache instances are created by ModelFamily::load.
 pub struct Qwen3Backend {
-    family: inference_infra::decoder::config::DecoderFamily,
+    family: BackendFamily,
     registration: FamilyRegistration,
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
@@ -182,18 +183,31 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Native hybrid decoder with the upstream trained non-thinking text template.
+    /// Construction alone does not qualify a production agent profile.
+    pub fn new_qwen35(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen35)
+    }
+    /// Native hybrid decoder with Ornith's distinct assistant-history framing.
+    pub fn new_ornith(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Ornith)
+    }
+
     /// Construct the native SmolLM3 adapter with validated NoPE layer semantics.
     pub fn new_smollm3(
         specifications: Vec<Qwen3Artifact>,
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
-        Self::new_family(
-            specifications,
-            limits,
-            execution,
-            inference_infra::decoder::config::DecoderFamily::SmolLm3,
-        )
+        Self::new_family(specifications, limits, execution, BackendFamily::SmolLm3)
     }
     /// Validate pinned metadata and tokenizer configuration without loading
     /// model weights. This synchronous constructor can perform substantial
@@ -213,12 +227,7 @@ impl Qwen3Backend {
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
-        Self::new_family(
-            specifications,
-            limits,
-            execution,
-            inference_infra::decoder::config::DecoderFamily::Qwen3,
-        )
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen3)
     }
 
     /// Explicit native Llama factory. Configs never fall back to Qwen.
@@ -227,19 +236,14 @@ impl Qwen3Backend {
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
-        Self::new_family(
-            specifications,
-            limits,
-            execution,
-            inference_infra::decoder::config::DecoderFamily::Llama3,
-        )
+        Self::new_family(specifications, limits, execution, BackendFamily::Llama3)
     }
 
     fn new_family(
         specifications: Vec<Qwen3Artifact>,
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
-        family: inference_infra::decoder::config::DecoderFamily,
+        family: BackendFamily,
     ) -> Result<Self, EngineError> {
         limits.validate()?;
         if specifications.is_empty() {
@@ -305,30 +309,41 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = match family {
-                inference_infra::decoder::config::DecoderFamily::Qwen3 => {
-                    parse_config(&config_value)?
-                }
-                inference_infra::decoder::config::DecoderFamily::Llama3 => {
+                BackendFamily::Qwen3 => BackendConfig::Transformer(parse_config(&config_value)?),
+                BackendFamily::Llama3 => BackendConfig::Transformer(
                     llama3::config::parse_config(&config_value)
-                        .map_err(|e| model_error(e, "validate Llama config"))?
-                }
-                inference_infra::decoder::config::DecoderFamily::SmolLm3 => {
+                        .map_err(|e| model_error(e, "validate Llama config"))?,
+                ),
+                BackendFamily::SmolLm3 => BackendConfig::Transformer(
                     smollm::config::parse_config(&config_value)
-                        .map_err(|e| model_error(e, "validate SmolLM3 config"))?
-                }
+                        .map_err(|e| model_error(e, "validate SmolLM3 config"))?,
+                ),
+                BackendFamily::Qwen35 | BackendFamily::Ornith => BackendConfig::Hybrid(
+                    inference_infra::decoder::qwen35::config::Qwen35Config::from_json(
+                        &config_value,
+                    )
+                    .map_err(|e| model_error(e, "validate native hybrid config"))?,
+                ),
             };
             // Undeclared representation uses the conservative dense path.
             // Quantized declarations retain the existing packed estimates.
             let declares_quantization = ["quantization", "quantization_config"]
                 .iter()
                 .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
-            let (decoded_bound, resident_payload_bound) = if declares_quantization {
-                (decoded_weight_bound(&config)?, resident_bound(&config)?)
-            } else {
-                (
-                    dense_decoded_weight_bound(&config)?,
-                    dense_weight_payload_bound(&config)?,
-                )
+            let (decoded_bound, resident_payload_bound) = match &config {
+                BackendConfig::Hybrid(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan hybrid weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Transformer(c) if declares_quantization => {
+                    (decoded_weight_bound(c)?, resident_bound(c)?)
+                }
+                BackendConfig::Transformer(c) => (
+                    dense_decoded_weight_bound(c)?,
+                    dense_weight_payload_bound(c)?,
+                ),
             };
             let resident_bound = sum(&[resident_payload_bound, limits.loader_headroom_bytes])?;
             let tokenizer_bytes =
@@ -387,7 +402,7 @@ impl Qwen3Backend {
                 }
             }
             for (spelling, id) in tokenizer.tokenizer().get_vocab(true) {
-                if u64::from(id) >= as_u64(config.vocab_size)?
+                if u64::from(id) >= as_u64(config.vocabulary())?
                     || spelling.len() > limits.max_token_bytes
                 {
                     return Err(validation(
@@ -420,9 +435,40 @@ impl Qwen3Backend {
             } else {
                 config_value.get("eos_token_id").cloned()
             };
-            let eos = parse_eos(eos_value.as_ref())?;
+            let mut eos = if family.hybrid() {
+                parse_eos(
+                    eos_value
+                        .as_ref()
+                        .or_else(|| config_value.pointer("/text_config/eos_token_id")),
+                )?
+            } else {
+                parse_eos(eos_value.as_ref())?
+            };
+            if family.hybrid() {
+                let bytes = read_metadata(
+                    &specification,
+                    "tokenizer_config.json",
+                    limits.max_config_bytes,
+                )?;
+                let metadata: Value = parse_json(
+                    &specification.directory.join("tokenizer_config.json"),
+                    &bytes,
+                )?;
+                let spelling = metadata["eos_token"]
+                    .as_str()
+                    .or_else(|| metadata["eos_token"]["content"].as_str())
+                    .ok_or_else(|| {
+                        validation(Some(&specification.id), "missing pinned tokenizer EOS")
+                    })?;
+                let token = tokenizer.tokenizer().token_to_id(spelling).ok_or_else(|| {
+                    validation(Some(&specification.id), "tokenizer EOS spelling is absent")
+                })?;
+                if !eos.contains(&token) {
+                    eos.push(token);
+                }
+            }
             for &token in &eos {
-                if u64::from(token) >= as_u64(config.vocab_size)?
+                if u64::from(token) >= as_u64(config.vocabulary())?
                     || tokenizer.tokenizer().id_to_token(token).is_none()
                     || !specials.contains(&token)
                 {
@@ -503,6 +549,12 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        if self.family.hybrid() && self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "hybrid tool protocol",
+                "trained function/parameter tool parser is not yet connected",
+            ));
+        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -666,7 +718,7 @@ impl Qwen3Backend {
             })?;
         if artifact.directory() != data.specification.directory.as_path()
             || artifact.family() != self.registration.family()
-            || artifact.declared_context_limit_tokens() != data.config.max_context
+            || artifact.declared_context_limit_tokens() != data.config.context()
         {
             return Err(validation(
                 Some(artifact.id()),
@@ -678,6 +730,7 @@ impl Qwen3Backend {
 }
 
 include!("loading.rs");
+include!("hybrid_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn verify_retained_prefix_bytes(
@@ -735,7 +788,7 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
-        if self.family == inference_infra::decoder::config::DecoderFamily::SmolLm3 {
+        if self.family == BackendFamily::SmolLm3 {
             return rendering::smollm3_projected_tool_token_upper_bound(
                 &data.tokenizer,
                 rendered,
@@ -743,7 +796,7 @@ impl RuntimeBackend for Qwen3Backend {
                 projection.additional_rendered_bytes,
             );
         }
-        if self.family == inference_infra::decoder::config::DecoderFamily::Llama3 {
+        if self.family == BackendFamily::Llama3 {
             return rendering::llama3_projected_tool_token_upper_bound(
                 &data.tokenizer,
                 rendered,
@@ -779,6 +832,12 @@ impl RuntimeBackend for Qwen3Backend {
                 return Err(EngineError::unsupported(
                     "tool context",
                     "enable tool-call parsing before rendering tool context",
+                ));
+            }
+            if tool_mode && self.family.hybrid() {
+                return Err(EngineError::unsupported(
+                    "hybrid tool protocol",
+                    "trained function/parameter tool parser is not yet connected",
                 ));
             }
             let template = family_template(self.family, tool_mode);
@@ -821,7 +880,7 @@ impl RuntimeBackend for Qwen3Backend {
                 other => other,
             })?;
             // Count overflow here; generation admission enforces profile limits.
-            let vocabulary = as_u64(data.config.vocab_size)?;
+            let vocabulary = as_u64(data.config.vocabulary())?;
             if rendered
                 .token_ids()
                 .iter()
@@ -853,11 +912,9 @@ impl RuntimeBackend for Qwen3Backend {
             let load_peak = loading_peak_bound(data, &self.limits)?;
             // Full f32 KV overlap dominates long Llama requests. Bound the
             // per-layer attention workspace further once capacity exceeds 16k.
-            let chunk_tokens = if !data.config.has_qk_norm() && capacity > 16_384 {
-                self.limits.prefill_chunk_tokens.get().min(32)
-            } else {
-                self.limits.prefill_chunk_tokens.get()
-            };
+            let chunk_tokens = data
+                .config
+                .chunk_limit(self.limits.prefill_chunk_tokens.get(), capacity);
             let prefill_chunk_tokens =
                 NonZeroUsize::new(chunk_tokens).expect("nonzero configured chunk");
             Ok(RuntimePlan {
@@ -870,14 +927,13 @@ impl RuntimeBackend for Qwen3Backend {
                     family_cache_mode(self.family)?,
                     capacity,
                     sum(&[
-                        cache_bound(&data.config, capacity)?,
+                        data.config.cache_bound(capacity)?,
                         product(self.limits.execution_headroom_bytes, 2)?,
                     ])?,
                 )?,
                 // Prefill cannot process more tokens than this request
                 // supplies. Keep a one-token allowance for decode work.
-                temporary_bytes: workspace_bound(
-                    &data.config,
+                temporary_bytes: data.config.workspace_bound(
                     capacity,
                     chunk_tokens.min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
@@ -1088,19 +1144,20 @@ impl RuntimeBackend for Qwen3Backend {
 include!("cache.rs");
 
 fn registration_for(
-    family: inference_infra::decoder::config::DecoderFamily,
+    family: BackendFamily,
     context_limit: usize,
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
-    let llama = family == inference_infra::decoder::config::DecoderFamily::Llama3;
-    let smollm = family == inference_infra::decoder::config::DecoderFamily::SmolLm3;
+    let hybrid = family.hybrid();
+    let llama = family == BackendFamily::Llama3;
+    let smollm = family == BackendFamily::SmolLm3;
     let mut representations = vec![
         WeightRepresentation::F32,
         WeightRepresentation::Affine4 {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama || smollm {
+    if llama || smollm || hybrid {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
@@ -1109,7 +1166,9 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if smollm {
+            if hybrid {
+                1
+            } else if smollm {
                 smollm::register::IMPL_VERSION
             } else if llama {
                 llama3::register::IMPL_VERSION
@@ -1119,7 +1178,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if smollm {
+        (if hybrid {
+            &["Qwen3_5ForConditionalGeneration"][..]
+        } else if smollm {
             smollm::register::ARCHITECTURES
         } else if llama {
             llama3::register::ARCHITECTURES
@@ -1131,7 +1192,9 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if smollm {
+            family: if hybrid {
+                "qwen35"
+            } else if smollm {
                 "smollm3"
             } else if llama {
                 "llama3"
@@ -1337,39 +1400,33 @@ mod shared_rendering_wiring_tests;
 #[path = "../../../tests/unit/backends_qwen_dense_weight_planning_regressions.rs"]
 mod dense_weight_planning_regressions;
 
-fn family_template(
-    family: inference_infra::decoder::config::DecoderFamily,
-    tools: bool,
-) -> &'static str {
+fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        (inference_infra::decoder::config::DecoderFamily::Qwen3, false) => CHAT_TEMPLATE,
-        (inference_infra::decoder::config::DecoderFamily::Qwen3, true) => {
-            qwen3::template::TOOL_CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::Llama3, false) => {
-            llama3::template::CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::Llama3, true) => {
-            llama3::template::TOOL_CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::SmolLm3, false) => {
-            smollm::template::CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::SmolLm3, true) => {
-            smollm::template::TOOL_CHAT_TEMPLATE
-        }
+        (BackendFamily::Ornith, _) => ORNITH_TEXT_TEMPLATE,
+        (BackendFamily::Qwen35, _) => QWEN35_TEXT_TEMPLATE,
+        (BackendFamily::Qwen3, false) => CHAT_TEMPLATE,
+        (BackendFamily::Qwen3, true) => qwen3::template::TOOL_CHAT_TEMPLATE,
+        (BackendFamily::Llama3, false) => llama3::template::CHAT_TEMPLATE,
+        (BackendFamily::Llama3, true) => llama3::template::TOOL_CHAT_TEMPLATE,
+        (BackendFamily::SmolLm3, false) => smollm::template::CHAT_TEMPLATE,
+        (BackendFamily::SmolLm3, true) => smollm::template::TOOL_CHAT_TEMPLATE,
     }
 }
-fn family_cache_mode(
-    family: inference_infra::decoder::config::DecoderFamily,
-) -> Result<CacheMode, EngineError> {
-    if family == inference_infra::decoder::config::DecoderFamily::SmolLm3 {
+fn family_cache_mode(family: impl Into<BackendFamily>) -> Result<CacheMode, EngineError> {
+    let family = family.into();
+    if family.hybrid() {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(QWEN35_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::SmolLm3 {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new(smollm::register::CACHE_REPRESENTATION)?,
             kind: CacheKind::Full,
         });
     }
-    if family == inference_infra::decoder::config::DecoderFamily::Llama3 {
+    if family == BackendFamily::Llama3 {
         Ok(CacheMode {
             representation: CacheRepresentationId::new(llama3::register::CACHE_REPRESENTATION)?,
             kind: CacheKind::Full,

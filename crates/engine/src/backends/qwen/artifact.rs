@@ -52,7 +52,7 @@ impl Qwen3Artifact {
 
 struct ArtifactData {
     specification: Qwen3Artifact,
-    config: Qwen3Config,
+    config: BackendConfig,
     tokenizer: Arc<PinnedTokenizer>,
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
