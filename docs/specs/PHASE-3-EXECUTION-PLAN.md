@@ -329,3 +329,19 @@ selecting the last returned vocabulary row. Retain a separate last-only versus
 all-position cache/output equivalence check using the existing #51 bound.
 Neither fixed reference values nor FR8 thresholds may change. Both projection
 paths must advance identical cache lengths and preserve continuation behavior.
+
+### #95 required small upstream Qwen3.5 numerical execution (2026-11-14)
+
+Add `crates/inference-infra/tests/fixtures/qwen35_0_8b_profile.json` for
+`Qwen/Qwen3.5-0.8B` revision `2fc06364715b967f1860aea9cf38778875588b17`
+and `mlx-community/Qwen3.5-0.8B-4bit` revision
+`da28692b5f139cb0ec58a356b437486b7dac7462`. Verify downloaded artifacts,
+record source/license evidence and exact hashes, and retain all packed weights.
+Generalize the offline capture generator with an explicit profile argument
+and the real-artifact test helper with profile-specific expected dimensions,
+tied-head semantics and vocabulary. Add the explicitly ignored
+`qwen35_0_8b_quantized_native_reference` test alongside the mandatory Ornith
+test; neither can substitute for the other. Capture/freeze independent eager
+reference vectors before native comparison, with identical projection shapes
+and unchanged strict FR8. This remains a numerical gate only; both profiles
+remain unqualified pending actual engine/agent conformance.
