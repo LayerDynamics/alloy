@@ -741,3 +741,35 @@ validation. The initial scalar-frequency primitive passed its position tolerance
 but host `powf` must not be assumed bit-identical to native MLX for strict full-
 model FR8 near zero. Existing Phi CPU/Metal position tests and the new full-model
 references cover this addition; no existing Llama/Qwen operation is changed.
+
+### #97 Phi engine adapter and fixed-position cache identity (2026-11-14)
+
+The real packed Phi decoder passes strict FR8 on both fixed prompts and two
+cached decode steps (receipt 0f890535ea5546d280bdd0843efec5ad); last-only
+selection is bit-identical to the corresponding complete projection. Its eager
+oracle is frozen at bf2d5d13e92610c08391c814b45c71505fbd5ebfdedd372f82079393ef6a4729.
+This establishes numerical execution, not model/agent qualification.
+
+Extend `crates/engine/src/backends/qwen/{architecture.rs,backend.rs,loading.rs}`
+and add `phi_loading.rs` and `phi_text.jinja`. Add a distinct Phi backend/config
+dispatch and native loaded model with the existing full-KV transfer adapter.
+Bind the immutable long-factor regime in family/cache representation identity;
+use Phi's checked packed-weight, full-output, attention-workspace and KV-overlap
+plans for admission, including separate measured buffer padding/headroom.
+Keep CPU/Metal explicit, cancellation checked during layers, foreign-cache
+rejection, reset/truncate and actual block export/restore. Reuse policy and
+ownership contracts, not another family's decoder equations. Freeze exact
+publisher text framing and both trained end markers. Reject tool-mode selection
+until the distinct Phi trained tool protocol is implemented in a subsequent
+batch; this intermediate text adapter is not a production profile.
+
+Add `crates/engine/tests/phi_engine.rs` with
+`phi_engine_native_cache_lifecycle`,
+`phi_engine_rejects_foreign_cancelled_and_unimplemented_tools`,
+`phi_engine_text_template_and_position_identity`, and ignored
+`phi_real_engine_streaming`. Tiny CPU/Metal tests must check real prefill/decode,
+truncation/rebuild, exported/restored continuation and measured memory. The real
+frozen artifact test checks exact counted input, streaming completion and equal
+cold/repeated output through the runtime at the 8 GiB simulated budget. Run
+strict Clippy and affected engine regressions. Daemon selection, trained tools,
+long-context/compaction/restart and report issuance remain required next work.
