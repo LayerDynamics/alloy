@@ -104,6 +104,31 @@ inputs in the pinned upstream eager environment to distinguish native runtime
 errors from model instruction following. Preserve exact task assertions and
 record failed qualification; do not normalize model output to obtain a pass.
 
+### #53 / #95 native hybrid-attention operations (2026-11-14)
+
+The mandatory Ornith artifact `ornith-ai/Ornith-1.5-9B-MLX-4bit` at
+`a48173b246ac705be75c05bedf1a0666db522d53` declares 32 alternating linear/full
+layers (full attention every fourth layer), 16 key heads and 32 value heads in
+the recurrent block, 128-wide recurrent heads, and a four-tap depthwise causal
+convolution. Full-attention heads are 256-wide with a 0.25 rotary fraction and
+an output gate. This is discovery for implementation; source/license pins,
+artifact qualification and the smaller upstream profile remain open.
+
+First extend `crates/mlx-ffi/src/ops.rs` and add `src/ops/hybrid.rs` plus
+`crates/mlx-ffi/tests/hybrid.rs`. Wrap the existing vendored
+`mlx_fast_gated_delta_update` and `mlx_conv1d` with explicit streams, owned
+results and validated float32 shape contracts. Add the required native
+sigmoid/exp/softplus operations. No Python execution participates in inference.
+The recurrence result and final state must match an independent scalar oracle;
+every split must reproduce full-sequence state and outputs, including grouped
+key/value heads and nonzero initial state. Test the depthwise convolution's
+channel and tap ordering, stable softplus at extreme inputs, and invalid shapes
+before entering C. Named tests: `gated_delta_matches_scalar_and_chunked_state`,
+`hybrid_operations_reject_invalid_shapes`, and
+`causal_depthwise_convolution_and_stable_gates`. CPU and Metal runs qualify
+these operations only; the actual Ornith loader, model, state persistence and
+agent conformance remain mandatory subsequent work.
+
 ## Family work packages: planned files and named tests
 
 Each family uses `crates/families/<family>/Cargo.toml`, `src/{lib.rs,config.rs,model.rs,weights.rs,register.rs}`, `tests/{config.rs,numerical.rs,agent_conformance.rs}` and `fixture/` pin manifests; the exact `<family>` directories and special files follow. Shared changes are `Cargo.toml`, `Cargo.lock`, `crates/engine/src/{backends/mod.rs,registry.rs}`, `crates/alloyd/src/boot.rs`, and `bench/corpus/models.json`. These are planned paths, not claims that kernels, weights, or tests already exist. If architecture inspection shows a different decomposition, amend this list before implementing it.
