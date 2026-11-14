@@ -862,3 +862,40 @@ canonical history and process-restart tests with Phi. Full-KV Phi must retain
 SSD restore requirements; it is not a hybrid rebuild profile. Run strict
 Clippy and focused boot regressions before real artifact tests. Retain failures
 and diagnose exact inputs against the pinned oracle before speculative edits.
+
+### #97 Phi function-list turn boundary and canonical stop coverage (2026-11-14)
+
+Daemon receipt 190ff59eb02d49a8b23945050e58cdd6 wrote the authorized file once
+but failed the exact answer: Phi continued beyond its complete function list
+with premature DONE. Upstream replay 047995425e2147ae90507ef9c6875f73 reproduced
+both turns exactly. Two stronger prose instructions in d084c67ca20b4294a85722b57d95581b
+did not fix the boundary. Implement the protocol's complete nonempty function
+list as an explicit profile end condition, before another model token is run.
+Do not strip already-generated answer text or synthesize an EOS token.
+
+Extend `crates/engine/src/slab_parser/phi.rs` with opt-in terminal-list mode,
+completed-boundary observation and rejection of non-whitespace after that list
+within the same token. Existing general parser behavior remains separately
+tested. Extend `crates/engine/src/runtime.rs` TextDecoder with a default-false
+profile-end observer and consult it after actual token execution/decoding.
+Extend `crates/engine/src/backends/qwen/{backend.rs,output.rs,phi_tools.jinja}`
+to select this only for Phi tools; bind the changed contract in template source
+identity without changing rendered user content. EOS is the profile condition;
+usage/cache must include only the actually executed closing token, not invented
+tokens. Keep cancellation, final validation and atomic proposal publication.
+
+Extend `crates/engine/tests/{phi_tools.rs,phi_engine.rs}` with
+`phi_tools_terminal_list_boundary_is_atomic` and native decoder boundary checks:
+all character splits, nested brackets, multiple calls in one list, malformed
+later objects, whitespace at the boundary, same-token suffix rejection, no
+boundary for ordinary text, no proposals before finish. Strengthen real Phi
+tool tests to require empty ordinary text and actual closing-token usage.
+Extend `crates/engine/tests/unit/runtime_decoder_contract.rs` to prove the new
+default preserves legacy behavior. Run strict Clippy, focused parser/decoder
+checks, full engine regression and the unchanged actual daemon file task.
+
+The running canonical-history test also exposed omitted Phi `<|end|>` among
+its candidate EOS spellings. Add that actual configured token to
+`crates/alloyd/tests/compaction_real_model.rs`; retain the exact token/byte
+roundtrip requirement. Invalid checkpoint arrays are a separate unresolved
+failure, not permission to accept malformed compaction or qualify Phi.
