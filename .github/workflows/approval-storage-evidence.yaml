@@ -30,7 +30,7 @@ jobs:
           mkdir -p "$evidence"
           printf 'APPROVAL_STORAGE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
       - name: Checkout exact candidate with history
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.APPROVAL_STORAGE_CANDIDATE }}
           fetch-depth: 0
@@ -78,7 +78,7 @@ jobs:
             ' 2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
       - name: Retain approval and storage Linux evidence even after failure
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: approval-storage-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.APPROVAL_STORAGE_EVIDENCE }}/
@@ -104,7 +104,7 @@ jobs:
           mkdir -p "$evidence"
           printf 'APPROVAL_STORAGE_EVIDENCE=%s\n' "$evidence" >> "$GITHUB_ENV"
       - name: Checkout exact candidate with history
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.APPROVAL_STORAGE_CANDIDATE }}
           fetch-depth: 0
@@ -138,7 +138,7 @@ jobs:
           '
       - name: Retain approval and storage macOS evidence even after failure
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: approval-storage-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.APPROVAL_STORAGE_EVIDENCE }}/
