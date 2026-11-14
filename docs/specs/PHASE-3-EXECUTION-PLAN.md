@@ -692,3 +692,43 @@ silently change frequencies inside retained KV. This math batch does not settle
 or qualify engine profile selection, native model execution, loading, tool
 syntax, memory or agent behavior. Record those exact files/tests in the next
 amendment after validating the packed artifact and reference contract.
+
+### #97 complete native Phi model and packed-reference batch (2026-11-14)
+
+Extend `crates/inference-infra/src/decoder/phi/{mod.rs,config.rs}` and add
+`{weights.rs,model.rs,planning.rs}` in that directory. Use the existing verified
+streaming tensor loader, resident `MlxLinear`, transactional `MlxKvCache`, native
+RMSNorm/SwiGLU/attention and the validated partial LongRoPE operation. Keep fused
+QKV and gate/up matmuls and split their outputs with checked shapes. Support
+actual tied/untied heads, explicit native streams, finite logits, cancellation,
+owner-bound cache append/reset/truncation, output/work/cache/weight payload limits,
+measured backing buffers and invalidation after native failures. Reject extra or
+missing tensors, mismatched representations, foreign caches and incompatible
+position regimes before publication; do not dequantize resident packed weights.
+
+The first frozen converted Phi profile explicitly uses long-factor SuScaledRoPE
+for all positions, matching pinned mlx-lm0.31.2. The loaded model's regime is
+immutable and bound to its owner; future engine/cache metadata must include it.
+Short-regime operations remain independently tested but are not silently selected
+by chunk length or advertised as a qualified alternative profile. Current
+publisher sequence-dependent semantics are not claimed by this fixed profile.
+
+Add `crates/inference-infra/tests/{phi_model.rs,phi_quantized.rs}` and product
+fixtures `tests/fixtures/phi_model/{config.json,model.safetensors,reference.json,
+manifest.json,generate.py}` plus `tests/fixtures/phi4_mini_profile.json` and
+`tests/fixtures/phi_model/capture_real_reference.py`. Offline pinned upstream
+MLX0.32.4/mlx-lm0.31.2 captures eager float32 references, preserving packed matrices
+for the real artifact. Freeze exact config/input/weight/reference identities.
+Use the same all-position projection geometry for FR8 and report last-only
+execution separately; require maxabsolute<0.02 AND maxpointwiserelative<0.01,
+with exact equality for zero reference values. No Python runs in production.
+
+Named tests: `phi4mini_native_reference`,
+`phi4mini_native_cached_matches_cold_and_regime_is_owner_bound`,
+`phi4mini_native_cancel_and_invalid_inputs_preserve_cache`,
+`phi4mini_verified_loader_rejects_wrong_inventory_and_hashes`,
+`phi4mini_payload_plans_match_declared_representation`, and ignored
+`phi4mini_real_quantized_native_reference`. Run actual CPU/Metal tiny tests,
+strict Clippy, affected shared-infrastructure regression and the frozen real
+4-bit reference under the host lease. Engine/daemon/tool/agent integration and
+production qualification remain the next batch, not claims of these tests.
