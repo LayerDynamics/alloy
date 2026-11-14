@@ -5,7 +5,9 @@
 
 mod parser;
 mod xml;
+mod xml_stream;
 
 pub use xml::{XmlParameterType, XmlToolSchema, commit_xml_tool_call};
+pub use xml_stream::XmlToolParser;
 
 pub(crate) use parser::*;

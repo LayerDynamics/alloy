@@ -245,3 +245,197 @@ fn xml_conversion_success_allocates_no_heap() {
     assert_eq!(allocations, 0);
     assert_eq!(allocation.freeze().proposal_count(), 1);
 }
+
+const XML_CALL: &str = "<tool_call>\n<function=fs.test>\n<parameter=s>\nrésumé\n</parameter>\n</function>\n</tool_call>";
+
+#[test]
+fn xml_stream_all_chunk_boundaries_separate_reasoning() {
+    use crate::slab_parser::XmlToolParser;
+    let reasoning = format!("Maybe {XML_CALL} is useful, 2 < 3.");
+    let input = format!("pré<think>{reasoning}</think>answer{XML_CALL}\n{XML_CALL}\n");
+    for split in (0..=input.len()).filter(|i| input.is_char_boundary(*i)) {
+        let (admission, allocation) = storage(limits());
+        let mut parser = XmlToolParser::new(allocation, Schema, input.len()).unwrap();
+        let mut text = String::new();
+        let mut thoughts = String::new();
+        for part in [&input[..split], &input[split..]] {
+            parser
+                .push(
+                    part,
+                    |s| {
+                        text.push_str(s);
+                        Ok(())
+                    },
+                    |s| {
+                        thoughts.push_str(s);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        let frozen = parser.finish().unwrap();
+        assert_eq!(text, "préanswer");
+        assert_eq!(thoughts, reasoning);
+        assert_eq!(frozen.proposal_count(), 2, "reasoning call must be inert");
+        for i in 0..2 {
+            assert_eq!(
+                frozen.proposal(i).unwrap().arguments_json,
+                "{\"s\":\"résumé\"}"
+            );
+        }
+        drop(frozen);
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    }
+    let (_, allocation) = storage(limits());
+    let mut parser = XmlToolParser::new(allocation, Schema, input.len()).unwrap();
+    let mut text = String::new();
+    let mut thoughts = String::new();
+    for ch in input.chars() {
+        let mut bytes = [0; 4];
+        parser
+            .push(
+                ch.encode_utf8(&mut bytes),
+                |s| {
+                    text.push_str(s);
+                    Ok(())
+                },
+                |s| {
+                    thoughts.push_str(s);
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(text, "préanswer");
+    assert_eq!(thoughts, reasoning);
+    assert_eq!(parser.finish().unwrap().proposal_count(), 2);
+}
+
+#[test]
+fn xml_stream_later_failure_discards_every_call() {
+    use crate::slab_parser::XmlToolParser;
+    for suffix in [
+        "suffix",
+        "<think>late</think>",
+        "</tool_call>",
+        "<tool_callx>",
+        "<tool_call><function=unknown></function></tool_call>",
+        "<tool_call><function=fs.test><parameter=s>x</parameter><parameter=s>y</parameter></function></tool_call>",
+        "<tool_call><function=fs.test>",
+        "<",
+        "<tool_",
+        "<|im_end|>",
+    ] {
+        let input = format!("{XML_CALL}{suffix}");
+        for split in (0..=input.len()).filter(|i| input.is_char_boundary(*i)) {
+            let (admission, allocation) = storage(limits());
+            let mut parser = XmlToolParser::new(allocation, Schema, 8192).unwrap();
+            let first = parser.push(&input[..split], |_| Ok(()), |_| Ok(()));
+            if first.is_ok() {
+                let _ = parser.push(&input[split..], |_| Ok(()), |_| Ok(()));
+            }
+            assert!(parser.finish().is_err(), "{suffix} at {split}");
+            assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+        }
+    }
+    for input in [
+        "<think>never closed",
+        "</think>",
+        "<think><think>nested</think></think>",
+        "<function=x>",
+    ] {
+        let (admission, allocation) = storage(limits());
+        let mut parser = XmlToolParser::new(allocation, Schema, 8192).unwrap();
+        let _ = parser.push(input, |_| Ok(()), |_| Ok(()));
+        assert!(parser.finish().is_err());
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    }
+}
+
+#[test]
+fn xml_stream_limits_and_sink_failure_release_storage() {
+    use crate::slab_parser::XmlToolParser;
+    let (admission, allocation) = storage(limits());
+    let mut parser = XmlToolParser::new(allocation, Schema, XML_CALL.len() - 1).unwrap();
+    assert!(parser.push(XML_CALL, |_| Ok(()), |_| Ok(())).is_err());
+    assert!(parser.push("", |_| Ok(()), |_| Ok(())).is_err());
+    assert!(parser.finish().is_err());
+    assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    for which in [
+        "carry",
+        "call",
+        "calls",
+        "text_sink",
+        "reasoning_sink",
+        "drop",
+    ] {
+        let mut l = limits();
+        match which {
+            "carry" => l.carry_bytes = 1,
+            "call" => l.call_bytes = 1,
+            "calls" => l.calls = 1,
+            _ => {}
+        }
+        let (admission, allocation) = storage(l);
+        let parser = XmlToolParser::new(allocation, Schema, 8192);
+        if which == "carry" {
+            assert!(parser.is_err());
+        } else {
+            let mut parser = parser.unwrap();
+            match which {
+                "call" => {
+                    assert!(parser.push(XML_CALL, |_| Ok(()), |_| Ok(())).is_err());
+                }
+                "calls" => {
+                    parser.push(XML_CALL, |_| Ok(()), |_| Ok(())).unwrap();
+                    assert!(parser.push(XML_CALL, |_| Ok(()), |_| Ok(())).is_err());
+                }
+                "text_sink" => {
+                    assert!(
+                        parser
+                            .push("answer", |_| Err(bad("sink")), |_| Ok(()))
+                            .is_err()
+                    );
+                }
+                "reasoning_sink" => {
+                    assert!(
+                        parser
+                            .push("<think>reason", |_| Ok(()), |_| Err(bad("sink")))
+                            .is_err()
+                    );
+                }
+                "drop" => {
+                    parser.push(XML_CALL, |_| Ok(()), |_| Ok(())).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if which == "drop" {
+                drop(parser);
+            } else {
+                assert!(parser.finish().is_err());
+            }
+        }
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0, "{which}");
+    }
+}
+
+#[test]
+fn xml_stream_success_allocates_no_heap() {
+    use crate::slab_parser::XmlToolParser;
+    let (_, allocation) = storage(limits());
+    let mut parser = XmlToolParser::new(allocation, Schema, 8192).unwrap();
+    ALLOCATIONS.with(|n| n.set(0));
+    TRACK.with(|t| t.set(true));
+    let result = parser
+        .push(
+            "<think>inert <tool_call>fake</tool_call></think>answer",
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .and_then(|()| parser.push(XML_CALL, |_| Ok(()), |_| Ok(())))
+        .and_then(|()| parser.finish());
+    TRACK.with(|t| t.set(false));
+    let allocations = ALLOCATIONS.with(Cell::get);
+    assert_eq!(result.unwrap().proposal_count(), 1);
+    assert_eq!(allocations, 0);
+}
