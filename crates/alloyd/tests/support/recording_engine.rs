@@ -16,6 +16,7 @@ struct CheckpointTrace {
     inner: GenerationStream,
     request_id: RequestId,
     text: String,
+    label: &'static str,
 }
 
 impl GenerationEventStream for CheckpointTrace {
@@ -27,7 +28,8 @@ impl GenerationEventStream for CheckpointTrace {
                 GenerationEvent::GenerationCompleted { .. } | GenerationEvent::RequestFailed { .. },
             )) => {
                 eprintln!(
-                    "checkpoint_trace id={} output={:?} terminal={result:?}",
+                    "{} id={} output={:?} terminal={result:?}",
+                    self.label,
                     self.request_id.as_str(),
                     self.text
                 );
@@ -91,7 +93,8 @@ impl Engine for RecordingEngine {
         self.inner.estimate_memory(profile, input_tokens)
     }
     fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
-        if std::env::var_os("ALLOY_TEST_TRACE_REQUESTS").is_some() {
+        let trace_all = std::env::var_os("ALLOY_TEST_TRACE_REQUESTS").is_some();
+        if trace_all {
             let rendered = request.expected_render().expect("counted native request");
             eprintln!(
                 "native_request={}",
@@ -110,13 +113,19 @@ impl Engine for RecordingEngine {
         Box::pin(async move {
             let generation = self.inner.generate(request).await?;
             let id = generation.request_id().clone();
-            if id.as_str().contains(":compact:") || id.as_str().contains(":verify:") {
+            let checkpoint = id.as_str().contains(":compact:") || id.as_str().contains(":verify:");
+            if trace_all || checkpoint {
                 Ok(Generation::from_stream(
                     id.clone(),
                     Box::pin(CheckpointTrace {
                         inner: generation.into_events(),
                         request_id: id,
                         text: String::new(),
+                        label: if checkpoint {
+                            "checkpoint_trace"
+                        } else {
+                            "native_trace"
+                        },
                     }),
                 ))
             } else {
