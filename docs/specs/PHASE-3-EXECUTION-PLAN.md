@@ -899,3 +899,24 @@ its candidate EOS spellings. Add that actual configured token to
 `crates/alloyd/tests/compaction_real_model.rs`; retain the exact token/byte
 roundtrip requirement. Invalid checkpoint arrays are a separate unresolved
 failure, not permission to accept malformed compaction or qualify Phi.
+
+### #97 Phi policy-result interpretation (2026-11-14)
+
+Structural stopping passed all seven actual Phi adapter tests in
+6fb7db153b9847e6a653e4d7ca34a362. Daemon rerun
+98aaa7e43425417180188023b8cb61ec now writes once and returns exactly DONE after
+the successful result; the forbidden write is rejected without execution or
+retry. The remaining assertion fails because Phi attributes rejection to prior
+user instructions. Exact upstream replay f51b1562711c4861917953c0cefb8cb5
+reproduces it; an explicit general error-result instruction reports the actual
+policy rejection. Do not change policy or the task assertions.
+
+Extend `crates/engine/src/backends/qwen/phi_tools.jinja` and independently
+serialized `crates/engine/tests/fixtures/phi_tool_render/{generate.py,expected.txt}`
+with the tested instruction: interpret is_error, report the stated failure,
+identify rejected/not-executed operations accurately, and do not retry or claim
+success. Existing fixture contains both successful and failed results. Run
+`phi_engine_trained_tool_template_and_admitted_decoder`, actual
+`phi_real_engine_tool_proposals`, and the unchanged daemon
+`llama3_tool_stop_context_cache` with Phi, plus strict Clippy. Keep the original
+failed receipts and require all real task assertions before claiming that gate.
