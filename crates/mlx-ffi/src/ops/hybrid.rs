@@ -248,6 +248,18 @@ pub fn gated_delta_update(
             ));
         }
     }
+    if stream.device()?.kind()? == crate::DeviceType::Gpu && q[3].is_multiple_of(32) && q[3] <= 512
+    {
+        return super::sequential_delta::evaluate(
+            queries,
+            keys,
+            values,
+            decay,
+            beta,
+            initial_state,
+            stream,
+        );
+    }
     // SAFETY: new returns an owned vector. The RAII wrapper also frees it if
     // the native operation fails after partially constructing its results.
     let mut output = VectorArray::from_raw(unsafe { sys::mlx_vector_array_new() })?;

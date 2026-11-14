@@ -5,3 +5,4 @@ pub mod hybrid;
 pub mod loader;
 pub mod mlx_model;
 pub mod model;
+pub mod qwen35;

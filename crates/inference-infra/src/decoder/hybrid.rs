@@ -132,6 +132,47 @@ pub struct LinearAttentionWeights {
     pub output: MatrixWeight,
 }
 
+impl LinearAttentionWeights {
+    pub(crate) fn validated_bytes(&self, config: LinearAttentionConfig) -> MlxDecoderResult<u64> {
+        let c = config;
+        let g = config.geometry()?;
+        let weights = self;
+        let mut total = 0;
+        for (name, matrix, rows, cols) in [
+            (
+                "hybrid qkv",
+                &weights.qkv,
+                g.convolution_width,
+                c.hidden_size,
+            ),
+            ("hybrid z", &weights.z, g.value_width, c.hidden_size),
+            ("hybrid a", &weights.a, c.value_heads, c.hidden_size),
+            ("hybrid b", &weights.b, c.value_heads, c.hidden_size),
+            (
+                "hybrid output",
+                &weights.output,
+                c.hidden_size,
+                g.value_width,
+            ),
+        ] {
+            check_matrix(name, product(rows, cols)?, matrix, &mut total)?;
+        }
+        for (name, values, count) in [
+            (
+                "hybrid convolution",
+                &weights.convolution,
+                product(g.convolution_width, c.convolution_kernel)?,
+            ),
+            ("hybrid A_log", &weights.a_log, c.value_heads),
+            ("hybrid dt_bias", &weights.dt_bias, c.value_heads),
+            ("hybrid norm", &weights.norm, c.value_dim),
+        ] {
+            check_weight(name, count, values, &mut total)?;
+        }
+        Ok(total)
+    }
+}
+
 /// Evaluated immutable state, bound to the exact block that produced it.
 /// Recurrent history cannot be truncated by slicing a KV tensor. Rebuild an
 /// edited prefix from `None`, or restore an independently validated checkpoint.
@@ -187,38 +228,7 @@ impl MlxLinearAttention {
     ) -> MlxDecoderResult<Self> {
         let g = config.geometry()?;
         let c = config;
-        let mut total = 0;
-        for (name, matrix, rows, cols) in [
-            (
-                "hybrid qkv",
-                &weights.qkv,
-                g.convolution_width,
-                c.hidden_size,
-            ),
-            ("hybrid z", &weights.z, g.value_width, c.hidden_size),
-            ("hybrid a", &weights.a, c.value_heads, c.hidden_size),
-            ("hybrid b", &weights.b, c.value_heads, c.hidden_size),
-            (
-                "hybrid output",
-                &weights.output,
-                c.hidden_size,
-                g.value_width,
-            ),
-        ] {
-            check_matrix(name, product(rows, cols)?, matrix, &mut total)?;
-        }
-        for (name, values, count) in [
-            (
-                "hybrid convolution",
-                &weights.convolution,
-                product(g.convolution_width, c.convolution_kernel)?,
-            ),
-            ("hybrid A_log", &weights.a_log, c.value_heads),
-            ("hybrid dt_bias", &weights.dt_bias, c.value_heads),
-            ("hybrid norm", &weights.norm, c.value_dim),
-        ] {
-            check_weight(name, count, values, &mut total)?;
-        }
+        let total = weights.validated_bytes(config)?;
         limit("hybrid weights", total, weight_limit)?;
         let block = Self {
             config,
@@ -259,6 +269,15 @@ impl MlxLinearAttention {
         evaluation?;
         stream.synchronize()?;
         Ok(block)
+    }
+
+    pub(crate) fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+        for linear in [&self.qkv, &self.z, &self.a, &self.b, &self.output] {
+            linear.visit(visitor);
+        }
+        for array in [&self.convolution, &self.a_log, &self.dt_bias, &self.norm] {
+            visitor(array);
+        }
     }
 
     /// Resident weight tensor bytes, excluding allocator overhead.
@@ -354,13 +373,22 @@ impl MlxLinearAttention {
             &zero
         };
         let conv_input = ops::concatenate_axis(history, &qkv, 1, stream)?;
-        let convolution = ops::contiguous(
-            &ops::slice(
-                &conv_input,
-                &[0, t, 0],
-                &[1, t + c.convolution_kernel - 1, g.convolution_width],
+        // A contiguous slice can still retain the entire concatenation's
+        // backing buffer. Gather exactly K-1 rows to materialize bounded state.
+        let history_rows: Vec<u32> = (t..t + c.convolution_kernel - 1)
+            .map(|row| row as u32)
+            .collect();
+        let convolution = ops::reshape(
+            &ops::embedding_lookup(
+                &ops::reshape(
+                    &conv_input,
+                    &[t + c.convolution_kernel - 1, g.convolution_width],
+                    stream,
+                )?,
+                &history_rows,
                 stream,
             )?,
+            &[1, c.convolution_kernel - 1, g.convolution_width],
             stream,
         )?;
         let conv = ops::silu(

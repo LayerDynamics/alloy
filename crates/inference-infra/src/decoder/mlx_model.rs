@@ -154,9 +154,9 @@ pub type MlxDecoderResult<T> = Result<T, MlxDecoderError>;
 /// Intermediate transformer tensors remain in MLX.
 #[derive(Debug)]
 pub struct MlxLogits {
-    values: Vec<f32>,
-    rows: usize,
-    vocabulary: usize,
+    pub(crate) values: Vec<f32>,
+    pub(crate) rows: usize,
+    pub(crate) vocabulary: usize,
 }
 
 impl MlxLogits {
@@ -262,7 +262,11 @@ impl MlxLinear {
         }
     }
 
-    fn embedding_lookup(&self, tokens: &[u32], stream: &Stream) -> MlxDecoderResult<Array> {
+    pub(crate) fn embedding_lookup(
+        &self,
+        tokens: &[u32],
+        stream: &Stream,
+    ) -> MlxDecoderResult<Array> {
         match self {
             Self::Dense(weight) => Ok(ops::embedding_lookup(weight, tokens, stream)?),
             Self::Affine4 {
