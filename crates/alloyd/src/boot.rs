@@ -77,6 +77,7 @@ impl BootRequest {
                 | "llama-3.1-8b-4bit"
                 | "llama-3.1-8b-8bit"
                 | "smollm3-3b-4bit"
+                | "phi4-mini-instruct-4bit"
                 | "ornith-1.5-9b-4bit"
                 | "qwen3.5-0.8b-4bit"
         ) {
@@ -105,7 +106,11 @@ pub fn boot_qwen3_with_context_limit(
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
     request.validate_profile()?;
-    if request.profile_id == "smollm3-3b-4bit" || is_hybrid_profile(&request.profile_id) {
+    if matches!(
+        request.profile_id.as_str(),
+        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
+    ) || is_hybrid_profile(&request.profile_id)
+    {
         return Err(RpcError::invalid_params(format!(
             "{} is not qualified for production: native agent conformance has not passed",
             request.profile_id
@@ -131,6 +136,7 @@ pub fn boot_native_for_qualification(
 
     let llama = request.profile_id.starts_with("llama-");
     let smollm = request.profile_id == "smollm3-3b-4bit";
+    let phi = request.profile_id == "phi4-mini-instruct-4bit";
     let hybrid = is_hybrid_profile(&request.profile_id);
     let ornith = request.profile_id == "ornith-1.5-9b-4bit";
     let files = pin_artifact_files(
@@ -145,7 +151,9 @@ pub fn boot_native_for_qualification(
         directory: request.artifact_dir.clone(),
         files,
         template_sha256: Sha256::digest(
-            if ornith {
+            if phi {
+                engine::backends::qwen::PHI_TEXT_TEMPLATE
+            } else if ornith {
                 engine::backends::qwen::ORNITH_TEXT_TEMPLATE
             } else if hybrid {
                 engine::backends::qwen::QWEN35_TEXT_TEMPLATE
@@ -200,7 +208,7 @@ pub fn boot_native_for_qualification(
         // The base Qwen3 text path stays at 256 without relaxing admission.
         prefill_chunk_tokens: NonZeroUsize::new(if hybrid {
             32
-        } else if request.tools_enabled || llama || smollm {
+        } else if request.tools_enabled || llama || smollm || phi {
             64
         } else {
             256
@@ -218,7 +226,9 @@ pub fn boot_native_for_qualification(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = (if ornith {
+    let backend = (if phi {
+        Qwen3Backend::new_phi(vec![specification], limits, execution)
+    } else if ornith {
         Qwen3Backend::new_ornith(vec![specification], limits, execution)
     } else if hybrid {
         Qwen3Backend::new_qwen35(vec![specification], limits, execution)
@@ -441,7 +451,9 @@ fn is_hybrid_profile(profile: &str) -> bool {
 }
 
 fn is_frozen_profile(profile: &str) -> bool {
-    profile.starts_with("llama-") || profile == "smollm3-3b-4bit" || is_hybrid_profile(profile)
+    profile.starts_with("llama-")
+        || matches!(profile, "smollm3-3b-4bit" | "phi4-mini-instruct-4bit")
+        || is_hybrid_profile(profile)
 }
 
 fn hybrid_context_limit(config: &Value) -> Result<usize, RpcError> {
@@ -472,6 +484,9 @@ fn load_expected_hashes(
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
     let frozen: Option<&[u8]> = match profile_id {
+        "phi4-mini-instruct-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/phi4_mini_profile.json"
+        )),
         "smollm3-3b-4bit" => Some(include_bytes!("../../families/smollm/fixture/profile.json")),
         "ornith-1.5-9b-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/ornith_1_5_9b_profile.json"
@@ -604,6 +619,28 @@ mod llama_pins {
 #[cfg(test)]
 mod qualification_boot_tests {
     use super::*;
+    #[test]
+    fn phi_profile_ignores_external_pin_overrides() {
+        let profile = "phi4-mini-instruct-4bit";
+        let pins =
+            load_expected_hashes(Some(Path::new("/nonexistent/untrusted.json")), profile).unwrap();
+        assert_eq!(pins, load_expected_hashes(None, profile).unwrap());
+        assert_eq!(pins.len(), 6);
+        assert_eq!(
+            pins["model.safetensors"],
+            "9dcfcdc0a579494283f2d2317ad686123782ce461d1111690ede7c904ff3f87b"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+    }
+
+    #[test]
+    fn unqualified_phi_cannot_boot_production_or_override_context() {
+        assert_unqualified_production_refused("phi4-mini-instruct-4bit");
+    }
+
     #[test]
     fn hybrid_profiles_ignore_external_pin_overrides() {
         for profile in ["ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"] {

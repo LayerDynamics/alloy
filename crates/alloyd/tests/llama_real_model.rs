@@ -24,6 +24,7 @@ fn llama3_tool_stop_context_cache() {
         "llama-3.1-8b-4bit"
             | "llama-3.1-8b-8bit"
             | "smollm3-3b-4bit"
+            | "phi4-mini-instruct-4bit"
             | "ornith-1.5-9b-4bit"
             | "qwen3.5-0.8b-4bit"
     ));
@@ -128,6 +129,8 @@ fn llama3_tool_stop_context_cache() {
             "qwen35"
         } else if profile.starts_with("smollm") {
             "smollm3"
+        } else if profile.starts_with("phi4") {
+            "phi"
         } else {
             "llama3"
         }
@@ -143,6 +146,8 @@ fn llama3_tool_stop_context_cache() {
             "qwen35.mlx-f32.full-kv-and-recurrent.v1"
         } else if profile.starts_with("smollm") {
             "smollm3.mlx-f32.full.bhtd.v1"
+        } else if profile.starts_with("phi4") {
+            "phi.mlx-f32.full.bhtd.su-long-fixed.v1"
         } else {
             "llama3.mlx-f32.full.bhtd.v1"
         }
