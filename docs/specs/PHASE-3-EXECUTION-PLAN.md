@@ -383,3 +383,15 @@ checkpoint cannot silently exceed a packed load estimate. Extend
 `qwen35_model.rs` admission test and `qwen35_quantized.rs` real tests to assert
 planned weight payload equals retained payload, and reject representation
 mismatch before publication. Numerical refs remain unchanged.
+
+### #95 nested hybrid artifact registration (2026-11-14)
+
+Update `crates/engine/src/registry.rs` to obtain the declared text context
+from validated nested Qwen3.5 configuration when the registered architecture
+is exactly Qwen3_5ForConditionalGeneration. Preserve flat-family context
+handling and reject missing/invalid hybrid metadata before publication.
+Add `crates/engine/tests/qwen35_registry.rs` with named tests
+`qwen35_registry_reads_validated_nested_context` and
+`qwen35_registry_rejects_malformed_hybrid_without_publication`. Registering
+metadata does not grant production qualification or route weights through
+the homogeneous Qwen3 model.
