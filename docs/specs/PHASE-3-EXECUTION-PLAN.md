@@ -395,3 +395,11 @@ Add `crates/engine/tests/qwen35_registry.rs` with named tests
 `qwen35_registry_rejects_malformed_hybrid_without_publication`. Registering
 metadata does not grant production qualification or route weights through
 the homogeneous Qwen3 model.
+
+Registry boundary refinement: keep the shared registry family-independent.
+Validate a declared `text_config` object and use its positive context value,
+rejecting conflicting outer/nested declarations. Architecture equations stay
+in the native family adapter; registration remains metadata inspection.
+The named malformed-metadata test covers null/non-object/missing/zero text
+context and conflicting outer values, while flat-family registration remains
+covered by the existing registry suite.
