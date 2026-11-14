@@ -732,3 +732,12 @@ Named tests: `phi4mini_native_reference`,
 strict Clippy, affected shared-infrastructure regression and the frozen real
 4-bit reference under the host lease. Engine/daemon/tool/agent integration and
 production qualification remain the next batch, not claims of these tests.
+
+The complete Phi batch also extends `crates/mlx-ffi/src/attention.rs` with
+`longrope_frequencies`: compute exponentiation and factor multiplication on the
+explicit native stream, matching the pinned upstream eager graph. Route Phi's
+native position operation through it; retain the independent host formula for
+validation. The initial scalar-frequency primitive passed its position tolerance,
+but host `powf` must not be assumed bit-identical to native MLX for strict full-
+model FR8 near zero. Existing Phi CPU/Metal position tests and the new full-model
+references cover this addition; no existing Llama/Qwen operation is changed.
