@@ -21,7 +21,11 @@ fn llama3_tool_stop_context_cache() {
     let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
     assert!(matches!(
         profile.as_str(),
-        "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" | "smollm3-3b-4bit"
+        "llama-3.1-8b-4bit"
+            | "llama-3.1-8b-8bit"
+            | "smollm3-3b-4bit"
+            | "ornith-1.5-9b-4bit"
+            | "qwen3.5-0.8b-4bit"
     ));
     let root = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_native_for_qualification(
@@ -120,7 +124,9 @@ fn llama3_tool_stop_context_cache() {
     let caps = rpc("models.capabilities", json!({"artifact_id":profile}));
     assert_eq!(
         caps[0]["result"]["family"],
-        if profile.starts_with("smollm") {
+        if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
+            "qwen35"
+        } else if profile.starts_with("smollm") {
             "smollm3"
         } else {
             "llama3"
@@ -133,7 +139,9 @@ fn llama3_tool_stop_context_cache() {
     );
     assert_eq!(
         caps[0]["result"]["cache_modes"][0]["representation"],
-        if profile.starts_with("smollm") {
+        if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
+            "qwen35.mlx-f32.full-kv-and-recurrent.v1"
+        } else if profile.starts_with("smollm") {
             "smollm3.mlx-f32.full.bhtd.v1"
         } else {
             "llama3.mlx-f32.full.bhtd.v1"

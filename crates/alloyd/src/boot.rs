@@ -73,7 +73,12 @@ impl BootRequest {
     pub fn validate_profile(&self) -> Result<(), RpcError> {
         if !matches!(
             self.profile_id.as_str(),
-            "qwen3-4b-4bit" | "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" | "smollm3-3b-4bit"
+            "qwen3-4b-4bit"
+                | "llama-3.1-8b-4bit"
+                | "llama-3.1-8b-8bit"
+                | "smollm3-3b-4bit"
+                | "ornith-1.5-9b-4bit"
+                | "qwen3.5-0.8b-4bit"
         ) {
             return Err(RpcError::invalid_params(format!(
                 "unsupported native profile {}",
@@ -100,10 +105,11 @@ pub fn boot_qwen3_with_context_limit(
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
     request.validate_profile()?;
-    if request.profile_id == "smollm3-3b-4bit" {
-        return Err(RpcError::invalid_params(
-            "smollm3-3b-4bit is not qualified for production: native agent conformance has not passed",
-        ));
+    if request.profile_id == "smollm3-3b-4bit" || is_hybrid_profile(&request.profile_id) {
+        return Err(RpcError::invalid_params(format!(
+            "{} is not qualified for production: native agent conformance has not passed",
+            request.profile_id
+        )));
     }
     boot_native_for_qualification(request, context_override)
 }
@@ -125,6 +131,8 @@ pub fn boot_native_for_qualification(
 
     let llama = request.profile_id.starts_with("llama-");
     let smollm = request.profile_id == "smollm3-3b-4bit";
+    let hybrid = is_hybrid_profile(&request.profile_id);
+    let ornith = request.profile_id == "ornith-1.5-9b-4bit";
     let files = pin_artifact_files(
         &request.artifact_dir,
         request.corpus_models_json.as_deref(),
@@ -137,7 +145,11 @@ pub fn boot_native_for_qualification(
         directory: request.artifact_dir.clone(),
         files,
         template_sha256: Sha256::digest(
-            if smollm {
+            if ornith {
+                engine::backends::qwen::ORNITH_TEXT_TEMPLATE
+            } else if hybrid {
+                engine::backends::qwen::QWEN35_TEXT_TEMPLATE
+            } else if smollm {
                 smollm::template::CHAT_TEMPLATE
             } else if llama {
                 llama3::template::CHAT_TEMPLATE
@@ -153,13 +165,17 @@ pub fn boot_native_for_qualification(
         .map_err(|error| RpcError::internal(format!("read config.json: {error}")))?;
     let config: Value = serde_json::from_slice(&config_bytes)
         .map_err(|error| RpcError::internal(format!("parse config.json: {error}")))?;
-    let context_limit = config
-        .get("max_position_embeddings")
-        .and_then(Value::as_u64)
-        .unwrap_or(40_960) as usize;
+    let context_limit = if hybrid {
+        hybrid_context_limit(&config)?
+    } else {
+        config
+            .get("max_position_embeddings")
+            .and_then(Value::as_u64)
+            .unwrap_or(40_960) as usize
+    };
 
     let profile_context_limit = context_override.unwrap_or(context_limit);
-    if profile_context_limit > context_limit {
+    if profile_context_limit == 0 || profile_context_limit > context_limit {
         return Err(RpcError::invalid_params(
             "profile context limit exceeds model context",
         ));
@@ -168,7 +184,7 @@ pub fn boot_native_for_qualification(
     let limits = Qwen3BackendLimits {
         max_files: 64,
         max_config_bytes: 8 * 1024 * 1024,
-        max_tokenizer_bytes: if smollm {
+        max_tokenizer_bytes: if smollm || hybrid {
             32 * 1024 * 1024
         } else {
             16 * 1024 * 1024
@@ -180,9 +196,11 @@ pub fn boot_native_for_qualification(
         verification_chunk_bytes: 1024 * 1024,
         context_limit_tokens: context_limit,
         // Tool schemas increase prompt length; bound the actual prefill work
-        // at 64 tokens for configured tools so the full workspace estimate can
-        // fit without relaxing the admission guard. Text-only stays at 256.
-        prefill_chunk_tokens: NonZeroUsize::new(if request.tools_enabled || llama || smollm {
+        // at 32 for hybrid state and 64 for the other native tool profiles.
+        // The base Qwen3 text path stays at 256 without relaxing admission.
+        prefill_chunk_tokens: NonZeroUsize::new(if hybrid {
+            32
+        } else if request.tools_enabled || llama || smollm {
             64
         } else {
             256
@@ -200,7 +218,11 @@ pub fn boot_native_for_qualification(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = (if smollm {
+    let backend = (if ornith {
+        Qwen3Backend::new_ornith(vec![specification], limits, execution)
+    } else if hybrid {
+        Qwen3Backend::new_qwen35(vec![specification], limits, execution)
+    } else if smollm {
         Qwen3Backend::new_smollm3(vec![specification], limits, execution)
     } else if llama {
         Qwen3Backend::new_llama3(vec![specification], limits, execution)
@@ -370,9 +392,7 @@ fn pin_artifact_files(
         }
         let (byte_len, digest) = hash_file(&path)
             .map_err(|error| RpcError::internal(format!("hash {}: {error}", path.display())))?;
-        if (profile_id.starts_with("llama-") || profile_id == "smollm3-3b-4bit")
-            && !expected.contains_key(&name)
-        {
+        if is_frozen_profile(profile_id) && !expected.contains_key(&name) {
             return Err(RpcError::internal(format!(
                 "unlisted frozen profile input: {name}"
             )));
@@ -401,14 +421,14 @@ fn pin_artifact_files(
             "artifact directory missing config.json, tokenizer.json, or safetensors weights",
         ));
     }
-    if profile_id.starts_with("llama-") || profile_id == "smollm3-3b-4bit" {
+    if is_frozen_profile(profile_id) {
         for name in expected
             .keys()
             .filter(|n| !n.starts_with('.') && n.as_str() != "README.md")
         {
             if !files.contains_key(name) {
                 return Err(RpcError::internal(format!(
-                    "missing frozen Llama input: {name}"
+                    "missing frozen profile input: {name}"
                 )));
             }
         }
@@ -416,17 +436,57 @@ fn pin_artifact_files(
     Ok(files)
 }
 
+fn is_hybrid_profile(profile: &str) -> bool {
+    matches!(profile, "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit")
+}
+
+fn is_frozen_profile(profile: &str) -> bool {
+    profile.starts_with("llama-") || profile == "smollm3-3b-4bit" || is_hybrid_profile(profile)
+}
+
+fn hybrid_context_limit(config: &Value) -> Result<usize, RpcError> {
+    let text = config
+        .get("text_config")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RpcError::invalid_params("hybrid text_config must be an object"))?;
+    if let Some(outer) = config.get("max_position_embeddings")
+        && text.get("max_position_embeddings") != Some(outer)
+    {
+        return Err(RpcError::invalid_params(
+            "conflicting outer and text context limits",
+        ));
+    }
+    text.get("max_position_embeddings")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            RpcError::invalid_params(
+                "hybrid max_position_embeddings must be a positive supported integer",
+            )
+        })
+}
+
 fn load_expected_hashes(
     corpus_models_json: Option<&Path>,
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
-    if profile_id == "smollm3-3b-4bit" {
-        let profile: Value =
-            serde_json::from_slice(include_bytes!("../../families/smollm/fixture/profile.json"))
-                .map_err(|e| RpcError::internal(format!("parse frozen SmolLM3 profile: {e}")))?;
+    let frozen: Option<&[u8]> = match profile_id {
+        "smollm3-3b-4bit" => Some(include_bytes!("../../families/smollm/fixture/profile.json")),
+        "ornith-1.5-9b-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/ornith_1_5_9b_profile.json"
+        )),
+        "qwen3.5-0.8b-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/qwen35_0_8b_profile.json"
+        )),
+        _ => None,
+    };
+    if let Some(bytes) = frozen {
+        let profile: Value = serde_json::from_slice(bytes)
+            .map_err(|e| RpcError::internal(format!("parse frozen profile: {e}")))?;
         return profile["artifact"]["files"]
             .as_array()
-            .ok_or_else(|| RpcError::internal("SmolLM3 profile missing files"))?
+            .ok_or_else(|| RpcError::internal("frozen profile missing files"))?
             .iter()
             .map(|entry| {
                 Ok((
@@ -545,12 +605,63 @@ mod llama_pins {
 mod qualification_boot_tests {
     use super::*;
     #[test]
+    fn hybrid_profiles_ignore_external_pin_overrides() {
+        for profile in ["ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"] {
+            let pins =
+                load_expected_hashes(Some(Path::new("/nonexistent/untrusted.json")), profile)
+                    .unwrap();
+            assert_eq!(pins, load_expected_hashes(None, profile).unwrap());
+            assert!(pins.contains_key("chat_template.jinja"));
+            assert!(pins.contains_key("model.safetensors"));
+            let dir = tempfile::tempdir().unwrap();
+            assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+            fs::write(dir.path().join("config.json"), b"{}").unwrap();
+            assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+        }
+    }
+
+    #[test]
+    fn hybrid_context_requires_positive_consistent_metadata() {
+        use serde_json::json;
+        assert_eq!(
+            hybrid_context_limit(&json!({"text_config":{"max_position_embeddings":262144}}))
+                .unwrap(),
+            262144
+        );
+        assert_eq!(hybrid_context_limit(&json!({"max_position_embeddings":1024,"text_config":{"max_position_embeddings":1024}})).unwrap(), 1024);
+        for invalid in [
+            json!({}),
+            json!({"max_position_embeddings":40960}),
+            json!({"text_config":null}),
+            json!({"text_config":{}}),
+            json!({"text_config":{"max_position_embeddings":0}}),
+            json!({"text_config":{"max_position_embeddings":-1}}),
+            json!({"text_config":{"max_position_embeddings":1.5}}),
+            json!({"text_config":{"max_position_embeddings":"1024"}}),
+            json!({"max_position_embeddings":1024,"text_config":{"max_position_embeddings":2048}}),
+        ] {
+            assert!(hybrid_context_limit(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn unqualified_hybrids_cannot_boot_production() {
+        for profile in ["ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"] {
+            assert_unqualified_production_refused(profile);
+        }
+    }
+
+    #[test]
     fn unqualified_smollm_cannot_boot_production_or_override_context() {
+        assert_unqualified_production_refused("smollm3-3b-4bit");
+    }
+
+    fn assert_unqualified_production_refused(profile: &str) {
         for tools_enabled in [false, true] {
             for mode in 0..3 {
                 let request = BootRequest {
                     artifact_dir: PathBuf::from("/nonexistent/not-loaded"),
-                    profile_id: "smollm3-3b-4bit".into(),
+                    profile_id: profile.into(),
                     corpus_models_json: None,
                     memory_guard: MemoryGuardConfig::balanced(),
                     admission_budget_override_bytes: None,
