@@ -630,3 +630,29 @@ retain always-on checkpoint traces. Compile the shared real test targets, then
 rerun `real_model_compaction_preserves_history_and_continues` with exact input
 and output capture. Replay the failing request in pinned upstream before any
 runtime/context change; do not weaken its history or continuation assertions.
+
+### #51/#95 realistic retrieval fixtures and exact acceptance (2026-11-14)
+
+Exact upstream replay d578d964e192420bbaed41794593cccb reproduced the native
+resumed refusal. The captured first continuation explicitly treated 500 repeated
+`current` words plus a codename request as injection; its refusal mentioned
+COBALT, exposing a false positive in the substring assertion. Controlled upstream
+10444f2f540142d5a5df19695ae1737f returned exact COBALT for both continuation and
+follow-up when the current input used an ordinary document excerpt and asked for
+the project name. The same control refused a skill described as secret and
+answered its ordinary display-color equivalent. Preserve all original failures;
+these controls do not qualify native operation or justify changing authority.
+
+Update only `crates/alloyd/tests/compaction_real_model.rs`: use a fixed 2,000-
+character excerpt from the existing pinned benchmark document as current-turn
+content, preserving measured actual overflow, the 2,048-token window, every B.3
+checkpoint field, durable event equality, real reopen, cold continuation equality
+and actual cache-state assertions. Ask for the project name and require exact
+COBALT for both continuations so a refusal mentioning it cannot pass. In
+`real_rpc_skill_load_changes_next_generation` and
+`real_skill_change_invalidates_stale_cache_and_matches_cold`, use ordinary display
+colors, explicitly request only the color, and require exact COBALT then AMBER;
+retain changed-render/prefix, cold equivalence and cache/capability checks. Route
+the real skill fixtures through the existing observational recorder for opt-in
+failure replay. Compile the target and rerun these three actual Ornith tests;
+production context, policy and decoder behavior stay unchanged in this batch.
