@@ -215,6 +215,21 @@ pub(super) fn commit_json_call(
     allocation: &mut ParserAllocation,
     call_bytes: usize,
 ) -> Result<(), EngineError> {
+    commit_json_call_with_alias(allocation, call_bytes, false)
+}
+
+pub(super) fn commit_phi_json_call(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+) -> Result<(), EngineError> {
+    commit_json_call_with_alias(allocation, call_bytes, true)
+}
+
+fn commit_json_call_with_alias(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+    allow_parameters: bool,
+) -> Result<(), EngineError> {
     let (decoded, name, args) = {
         let w = allocation.workspaces();
         let body = &w.call[..call_bytes];
@@ -234,6 +249,7 @@ pub(super) fn commit_json_call(
             node_count: 0,
             name: None,
             args: None,
+            allow_parameters,
         };
         json.value(0, usize::MAX, true)?;
         json.ws();
@@ -272,6 +288,7 @@ pub(super) fn validate_json_parameter(
         node_count: 0,
         name: None,
         args: None,
+        allow_parameters: false,
     };
     let value = json.value(0, usize::MAX, false)?;
     json.ws();
@@ -301,6 +318,7 @@ struct JsonCheck<'a> {
     node_count: usize,
     name: Option<Range<usize>>,
     args: Option<Range<usize>>,
+    allow_parameters: bool,
 }
 impl JsonCheck<'_> {
     fn ws(&mut self) {
@@ -409,6 +427,7 @@ impl JsonCheck<'_> {
         }
     }
     fn number(&mut self) -> Result<(), EngineError> {
+        let number_start = self.pos;
         if self.input.get(self.pos) == Some(&b'-') {
             self.pos += 1;
         }
@@ -452,6 +471,11 @@ impl JsonCheck<'_> {
             if start == self.pos {
                 return Err(bad("missing exponent digits"));
             }
+        }
+        let raw = str::from_utf8(&self.input[number_start..self.pos])
+            .map_err(|_| bad("invalid UTF-8 in JSON number"))?;
+        if !raw.parse::<f64>().is_ok_and(f64::is_finite) {
+            return Err(bad("JSON number exceeds finite representation"));
         }
         Ok(())
     }
@@ -503,6 +527,9 @@ impl JsonCheck<'_> {
                             match &self.decoded[key] {
                                 b"name" if value.kind == 3 => self.name = Some(value.decoded),
                                 b"arguments" if value.kind == 1 => {
+                                    self.args = Some(value.start..value.end)
+                                }
+                                b"parameters" if self.allow_parameters && value.kind == 1 => {
                                     self.args = Some(value.start..value.end)
                                 }
                                 _ => {

@@ -4,9 +4,11 @@
 //! keys, nodes, pending bytes, and retained proposals reside in the slab.
 
 mod parser;
+mod phi;
 mod xml;
 mod xml_stream;
 
+pub use phi::PhiToolParser;
 pub use xml::{XmlParameterType, XmlToolSchema, commit_xml_tool_call};
 pub use xml_stream::XmlToolParser;
 
