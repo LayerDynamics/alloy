@@ -151,6 +151,7 @@ fn llama3_tool_stop_context_cache() {
         "session.send",
         json!({"session_id":session,"content":"Now use fs.write to write forbidden.txt with content BLOCKED."}),
     );
+    eprintln!("denied_events={}", serde_json::to_string(&denied).unwrap());
     assert!(!root.path().join("forbidden.txt").exists());
     assert_eq!(matching(&denied, "tool_requested"), 1);
     assert_eq!(matching(&denied, "tool_call_started"), 0);
@@ -167,7 +168,6 @@ fn llama3_tool_stop_context_cache() {
             .iter()
             .all(|e| e.get("error").is_none() && e["params"]["event"] != "request_failed")
     );
-    eprintln!("denied_events={}", serde_json::to_string(&denied).unwrap());
 }
 
 #[test]

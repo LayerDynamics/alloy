@@ -1919,6 +1919,8 @@ struct Resident {
     model: Box<dyn LoadedModel>,
     weights: MemoryReservation,
     capabilities: Capabilities,
+    // Derived from the actual cache, retained even after hot eviction.
+    supports_disk_cache: bool,
     candidate: Option<StateCandidate>,
 }
 
@@ -2781,18 +2783,19 @@ impl NativeState {
                         .chain(self.pool.iter())
                         .chain(self.states.values().map(|entry| &entry.resident))
                         .find(|resident| resident.model.artifact_id() == &artifact)
-                        .map(|resident| resident.capabilities.clone())
+                        .map(|resident| {
+                            (resident.capabilities.clone(), resident.supports_disk_cache)
+                        })
                         .ok_or_else(|| EngineError::NotFound {
                             resource: "verified loaded artifact",
                             id: artifact.into_string(),
                         })
-                        .and_then(|mut capabilities| {
-                            if let Some(store) = &self.tiered
-                                && !store.metrics.disk_enabled
-                            {
+                        .and_then(|(mut capabilities, supports_disk_cache)| {
+                            if let Some(store) = &self.tiered {
                                 let budget = self.admission.snapshot()?.budget_bytes();
                                 capabilities.supports_prefix_reuse &=
-                                    store.config.hot_limit.bytes(budget) > 0;
+                                    store.config.hot_limit.bytes(budget) > 0
+                                        || (store.metrics.disk_enabled && supports_disk_cache);
                             }
                             Ok(capabilities)
                         });
@@ -3875,6 +3878,7 @@ impl NativeState {
                 model,
                 weights,
                 capabilities,
+                supports_disk_cache: false,
                 candidate: None,
             });
         }
@@ -3916,6 +3920,7 @@ impl NativeState {
                 return Err(internal("family allocated an incompatible cache"));
             }
             check_cache_bytes(cache.as_ref(), reservation.bytes())?;
+            resident.supports_disk_cache = cache.kv_block_spec().is_some();
             resident.cache = Some(ResidentCache { cache, reservation });
         }
 

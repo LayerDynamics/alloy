@@ -4,6 +4,12 @@ mod recording_engine;
 fn real_profile() -> String {
     std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| "qwen3-4b-4bit".to_owned())
 }
+fn hybrid_rebuild_profile() -> bool {
+    matches!(
+        real_profile().as_str(),
+        "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit"
+    )
+}
 use alloyd::BootRequest;
 use engine::{
     api::Engine,
@@ -135,7 +141,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     );
     assert_eq!(
         caps[0]["result"]["supports_prefix_reuse"],
-        std::env::var_os("ALLOY_TEST_COLD").is_none(),
+        std::env::var_os("ALLOY_TEST_COLD").is_none() && !hybrid_rebuild_profile(),
         "{caps:?}"
     );
 }
@@ -255,7 +261,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
             .capabilities(ArtifactId::new(real_profile().as_str()).unwrap()),
     )
     .unwrap();
-    assert!(caps.supports_prefix_reuse);
+    assert_eq!(caps.supports_prefix_reuse, !hybrid_rebuild_profile());
     let rpc_telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
         HardwareTier::Unknown,
@@ -276,7 +282,8 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     service.handle(request, &mut response).unwrap();
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(
-        response["result"]["supports_prefix_reuse"], true,
+        response["result"]["supports_prefix_reuse"],
+        !hybrid_rebuild_profile(),
         "{response}"
     );
     drop(service);
@@ -427,7 +434,15 @@ fn real_model_ssd_prefix_survives_process_restart() {
             .run_turn(&Mutex::new(db), "real-ssd", &prompt, 16)
             .expect("real Qwen turn");
         let metrics = supervisor.engine().runtime().tiered_kv_snapshot();
-        if phase == "seed" {
+        if hybrid_rebuild_profile() {
+            assert_eq!(metrics.spill_count, 0, "{metrics:?}");
+            assert_eq!(metrics.restore_count, 0, "{metrics:?}");
+            assert_eq!(metrics.restored_tokens, 0, "{metrics:?}");
+            assert!(
+                metrics.hot_evictions > 0,
+                "hybrid must actually discard state: {metrics:?}"
+            );
+        } else if phase == "seed" {
             assert!(metrics.spill_count > 0, "{metrics:?}");
             assert_eq!(metrics.restore_count, 0);
         } else {
@@ -475,7 +490,10 @@ fn real_model_ssd_prefix_survives_process_restart() {
     let restored = read("restore");
     assert_eq!(cold["text"], restored["text"]);
     assert_eq!(cold["input_tokens"], restored["input_tokens"]);
-    assert!(restored["restored_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        restored["restored_tokens"].as_u64().unwrap() > 0,
+        !hybrid_rebuild_profile()
+    );
     println!("real_ssd_restart: cold={cold}, restored={restored}");
 }
 
@@ -655,10 +673,17 @@ fn real_model_compaction_preserves_history_and_continues() {
         followup.assistant_text
     );
     let after_restore = supervisor.engine().runtime().tiered_kv_snapshot();
-    assert!(
-        after_restore.restore_count > before_restore,
-        "compacted session did not restore KV: {after_restore:?}"
-    );
+    if hybrid_rebuild_profile() {
+        assert_eq!(after_restore.restore_count, 0, "{after_restore:?}");
+        assert_eq!(after_restore.spill_count, 0, "{after_restore:?}");
+        assert_eq!(after_restore.restored_tokens, 0, "{after_restore:?}");
+        assert!(after_restore.hot_evictions > 0, "{after_restore:?}");
+    } else {
+        assert!(
+            after_restore.restore_count > before_restore,
+            "compacted session did not restore KV: {after_restore:?}"
+        );
+    }
     drop(supervisor);
     let cold_boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {

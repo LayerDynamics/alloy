@@ -568,6 +568,105 @@ fn qwen35_engine_xml_decoder_uses_advertised_schema() {
 }
 
 #[test]
+fn qwen35_engine_retention_capabilities() {
+    use engine::tiered_kv::{HotCacheLimit, TieredKvConfig};
+    let mut fixture = Fixture::new(false);
+    // This numerical fixture is not a trained UTF-8 language model. Stop after
+    // actual prefill/selection, before decoding an arbitrary byte token.
+    let path = fixture.root.join("config.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["text_config"]["eos_token_id"] = json!((0..256).collect::<Vec<_>>());
+    let bytes = serde_json::to_vec(&config).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    fixture.specification.files.insert(
+        "config.json".into(),
+        FilePin {
+            bytes: bytes.len() as u64,
+            sha256: hash(&bytes),
+        },
+    );
+    let path = fixture.root.join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // EOS validation correctly requires declared special tokens. This fixture
+    // makes every output a declared stop; it exercises retention, not language.
+    tokenizer["added_tokens"] = Value::Array(
+        tokenizer["model"]["vocab"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(content, id)| {
+                json!({"id":id,"content":content,"single_word":false,
+            "lstrip":false,"rstrip":false,"normalized":false,"special":true})
+            })
+            .collect(),
+    );
+    let bytes = serde_json::to_vec(&tokenizer).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    fixture.specification.files.insert(
+        "tokenizer.json".into(),
+        FilePin {
+            bytes: bytes.len() as u64,
+            sha256: hash(&bytes),
+        },
+    );
+    for (disk, hot) in [(false, false), (true, false), (false, true), (true, true)] {
+        let backend = fixture.backend(Qwen3Execution::MlxCpu, false);
+        let engine = backend
+            .into_engine(
+                vec![profile(128)],
+                AdmissionController::new(1 << 30).unwrap(),
+                Scheduler::new(8).unwrap(),
+                RetentionPolicy {
+                    retain_model: true,
+                    retain_cache_buffers: true,
+                },
+            )
+            .unwrap();
+        engine
+            .runtime()
+            .configure_tiered_kv(TieredKvConfig::new(
+                disk.then(|| fixture.root.join(format!("cache-{hot}"))),
+                HotCacheLimit::Bytes(if hot { 1 << 28 } else { 0 }),
+            ))
+            .unwrap();
+        let context = ContextSnapshot::new(
+            ContextSnapshotId::new("retention").unwrap(),
+            profile_id(),
+            vec![Message {
+                role: MessageRole::User,
+                content: "hi".into(),
+            }],
+        )
+        .unwrap();
+        let request = GenerationRequest::new(
+            RequestId::new("retention").unwrap(),
+            profile_id(),
+            context,
+            GenerationOptions::greedy(1).unwrap(),
+        )
+        .unwrap();
+        let mut events = wait(engine.generate(request)).unwrap().into_events();
+        let mut completed = false;
+        while let Some(event) = wait(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
+            match event {
+                GenerationEvent::GenerationCompleted { .. } => completed = true,
+                GenerationEvent::TextDelta { .. } | GenerationEvent::RuntimeWarning { .. } => {}
+                other => panic!("unexpected retention event: {other:?}"),
+            }
+        }
+        assert!(completed);
+        let caps = wait(engine.capabilities(ArtifactId::new("hybrid").unwrap())).unwrap();
+        assert_eq!(caps.supports_prefix_reuse, hot, "disk={disk} hot={hot}");
+        let metrics = engine.runtime().tiered_kv_snapshot();
+        assert_eq!(metrics.spill_count, 0);
+        assert_eq!(metrics.restore_count, 0);
+        if !hot {
+            assert!(metrics.hot_evictions > 0, "{metrics:?}");
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires ALLOY_HYBRID_ARTIFACT and Metal; ALLOY_HYBRID_PROFILE=ornith selects the mandatory 9B artifact"]
 fn qwen35_real_engine_streaming() {
     real_engine(false);
