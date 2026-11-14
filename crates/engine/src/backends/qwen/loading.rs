@@ -9,6 +9,9 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
+        if let BackendConfig::Phi(config) = &data.config {
+            return self.load_phi(request, data, config);
+        }
         if let BackendConfig::Hybrid(config) = &data.config {
             return self.load_hybrid(request, data, config);
         }

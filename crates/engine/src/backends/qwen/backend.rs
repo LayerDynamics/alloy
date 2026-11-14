@@ -183,6 +183,15 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Native Phi fused decoder with immutable long-factor SuScaledRoPE.
+    /// Construction is not a production qualification.
+    pub fn new_phi(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Phi)
+    }
     /// Native hybrid decoder with the upstream trained non-thinking text template.
     /// Construction alone does not qualify a production agent profile.
     pub fn new_qwen35(
@@ -309,6 +318,10 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = match family {
+                BackendFamily::Phi => BackendConfig::Phi(
+                    inference_infra::decoder::phi::PhiConfig::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Phi config"))?,
+                ),
                 BackendFamily::Qwen3 => BackendConfig::Transformer(parse_config(&config_value)?),
                 BackendFamily::Llama3 => BackendConfig::Transformer(
                     llama3::config::parse_config(&config_value)
@@ -331,6 +344,12 @@ impl Qwen3Backend {
                 .iter()
                 .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
             let (decoded_bound, resident_payload_bound) = match &config {
+                BackendConfig::Phi(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan Phi weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
                 BackendConfig::Hybrid(c) => {
                     let p = c
                         .weight_payload_plan()
@@ -444,7 +463,7 @@ impl Qwen3Backend {
             } else {
                 parse_eos(eos_value.as_ref())?
             };
-            if family.hybrid() {
+            if family.hybrid() || family == BackendFamily::Phi {
                 let bytes = read_metadata(
                     &specification,
                     "tokenizer_config.json",
@@ -536,6 +555,12 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
+        if self.family == BackendFamily::Phi {
+            return Err(EngineError::unsupported(
+                "Phi tool protocol",
+                "native Phi tool parsing is not implemented",
+            ));
+        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -549,6 +574,12 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        if self.family == BackendFamily::Phi && self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "Phi tool protocol",
+                "native Phi tool parsing is not implemented",
+            ));
+        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -725,6 +756,7 @@ impl Qwen3Backend {
 
 include!("loading.rs");
 include!("hybrid_loading.rs");
+include!("phi_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn verify_retained_prefix_bytes(
@@ -831,6 +863,12 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
+            if tool_mode && self.family == BackendFamily::Phi {
+                return Err(EngineError::unsupported(
+                    "Phi tool protocol",
+                    "native Phi tool rendering is not implemented",
+                ));
+            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -1203,13 +1241,14 @@ fn registration_for(
     let hybrid = family.hybrid();
     let llama = family == BackendFamily::Llama3;
     let smollm = family == BackendFamily::SmolLm3;
+    let phi = family == BackendFamily::Phi;
     let mut representations = vec![
         WeightRepresentation::F32,
         WeightRepresentation::Affine4 {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama || smollm || hybrid {
+    if llama || smollm || hybrid || phi {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
@@ -1218,7 +1257,7 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if hybrid {
+            if hybrid || phi {
                 1
             } else if smollm {
                 smollm::register::IMPL_VERSION
@@ -1230,7 +1269,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if hybrid {
+        (if phi {
+            &["Phi3ForCausalLM"][..]
+        } else if hybrid {
             &["Qwen3_5ForConditionalGeneration"][..]
         } else if smollm {
             smollm::register::ARCHITECTURES
@@ -1244,7 +1285,9 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if hybrid {
+            family: if phi {
+                "phi"
+            } else if hybrid {
                 "qwen35"
             } else if smollm {
                 "smollm3"
@@ -1454,6 +1497,7 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
+        (BackendFamily::Phi, _) => PHI_TEXT_TEMPLATE,
         (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
         (BackendFamily::Ornith, true) => ORNITH_TOOL_TEMPLATE,
         (BackendFamily::Qwen35, false) => QWEN35_TEXT_TEMPLATE,
@@ -1468,6 +1512,12 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
 }
 fn family_cache_mode(family: impl Into<BackendFamily>) -> Result<CacheMode, EngineError> {
     let family = family.into();
+    if family == BackendFamily::Phi {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(PHI_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
     if family.hybrid() {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new(QWEN35_CACHE_REPRESENTATION)?,
