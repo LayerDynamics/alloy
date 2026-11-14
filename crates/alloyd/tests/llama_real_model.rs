@@ -24,7 +24,7 @@ fn llama3_tool_stop_context_cache() {
         "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" | "smollm3-3b-4bit"
     ));
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: profile.clone(),
@@ -189,7 +189,7 @@ fn llama3_long_context_stream_cancel_memory() {
         ))
     };
     // The 8 GB simulation constrains admission, not the host's physical RAM.
-    let small = alloyd::boot::boot_qwen3_with_context_limit(
+    let small = alloyd::boot::boot_native_for_qualification(
         request(Some(8 * 1024 * 1024 * 1024)),
         Some(40960),
     )
@@ -220,7 +220,7 @@ fn llama3_long_context_stream_cancel_memory() {
         }
     }
     drop(small_supervisor);
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(request(None), Some(40960)).unwrap();
+    let boot = alloyd::boot::boot_native_for_qualification(request(None), Some(40960)).unwrap();
     let mut db = SessionStore::open(root.path().join("long.sqlite")).unwrap();
     for session in ["long8", "long32", "cancel", "after_cancel"] {
         db.create_session(session, &profile).unwrap();
@@ -357,7 +357,7 @@ fn llama3_stream_cancel_recovery() {
     use harness_core::{SessionStore, Supervisor};
     let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: profile.clone(),

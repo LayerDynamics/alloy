@@ -4,7 +4,7 @@ mod recording_engine;
 fn real_profile() -> String {
     std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| "qwen3-4b-4bit".to_owned())
 }
-use alloyd::{BootRequest, boot_qwen3};
+use alloyd::BootRequest;
 use engine::{
     api::Engine,
     memory_guard::{MemoryGuardConfig, MemoryGuardTier},
@@ -49,7 +49,7 @@ fn wait_future<F: std::future::Future>(future: F) -> F::Output {
 #[ignore = "requires local pinned model and native MLX"]
 fn real_rpc_skill_load_changes_next_generation() {
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -160,7 +160,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         tools_enabled: true,
         tiered_kv: TieredKvConfig::new(disk, HotCacheLimit::Bytes(0)),
     };
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         make_request(Some(root.path().join("cache"))),
         Some(2048),
     )
@@ -282,7 +282,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     drop(service);
     drop(supervisor);
     let cold_boot =
-        alloyd::boot::boot_qwen3_with_context_limit(make_request(None), Some(2048)).unwrap();
+        alloyd::boot::boot_native_for_qualification(make_request(None), Some(2048)).unwrap();
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
         HardwareTier::Unknown,
@@ -312,7 +312,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
 #[ignore = "requires local pinned model and native MLX"]
 fn real_model_generated_history_has_verified_canonical_bytes() {
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -389,7 +389,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
     const PHASE: &str = "ALLOY_TEST_REAL_SSD_PHASE";
     if let Ok(phase) = std::env::var(PHASE) {
         let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-        let boot = alloyd::boot::boot_qwen3_with_context_limit(
+        let boot = alloyd::boot::boot_native_for_qualification(
             BootRequest {
                 artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
                 profile_id: real_profile().as_str().into(),
@@ -484,7 +484,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
 fn real_model_compaction_preserves_history_and_continues() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let dir = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: artifact,
             profile_id: real_profile().as_str().into(),
@@ -660,7 +660,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         "compacted session did not restore KV: {after_restore:?}"
     );
     drop(supervisor);
-    let cold_boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let cold_boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -748,23 +748,26 @@ fn real_model_compaction_preserves_history_and_continues() {
 #[ignore = "requires pinned artifact; timing must use an optimized build"]
 fn real_model_render_32k_latency() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
-    let boot = boot_qwen3(BootRequest {
-        artifact_dir: artifact,
-        profile_id: real_profile().as_str().into(),
-        corpus_models_json: Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
-        ),
-        memory_guard: MemoryGuardConfig {
-            tier: MemoryGuardTier::Balanced,
-            custom_ceiling_bytes: 0,
-            enabled: true,
+    let boot = alloyd::boot::boot_native_for_qualification(
+        BootRequest {
+            artifact_dir: artifact,
+            profile_id: real_profile().as_str().into(),
+            corpus_models_json: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
+            ),
+            memory_guard: MemoryGuardConfig {
+                tier: MemoryGuardTier::Balanced,
+                custom_ceiling_bytes: 0,
+                enabled: true,
+            },
+            admission_budget_override_bytes: None,
+            prefer_metal: true,
+            tools_enabled: false,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        admission_budget_override_bytes: None,
-        prefer_metal: true,
-        tools_enabled: false,
-        tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
-    })
-    .expect("boot Qwen renderer");
+        None,
+    )
+    .expect("boot native qualification renderer");
     let doc = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/corpus/fixtures/documents/document-32k.txt"),

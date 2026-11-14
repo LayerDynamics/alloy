@@ -100,6 +100,22 @@ pub fn boot_qwen3_with_context_limit(
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
     request.validate_profile()?;
+    if request.profile_id == "smollm3-3b-4bit" {
+        return Err(RpcError::invalid_params(
+            "smollm3-3b-4bit is not qualified for production: native agent conformance has not passed",
+        ));
+    }
+    boot_native_for_qualification(request, context_override)
+}
+
+/// Construct an experimental native engine solely for profile qualification.
+/// This does not establish support or make a profile available through the CLI.
+/// Callers must retain failed observations; production uses `boot_native`.
+pub fn boot_native_for_qualification(
+    request: BootRequest,
+    context_override: Option<usize>,
+) -> Result<BootedEngine, RpcError> {
+    request.validate_profile()?;
     if !request.artifact_dir.is_dir() {
         return Err(RpcError::internal(format!(
             "artifact directory does not exist: {}",
@@ -522,5 +538,40 @@ mod llama_pins {
         assert!(pin_artifact_files(dir.path(), None, "llama-3.1-8b-4bit").is_err());
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
         assert!(pin_artifact_files(dir.path(), None, "llama-3.1-8b-4bit").is_err());
+    }
+}
+
+#[cfg(test)]
+mod qualification_boot_tests {
+    use super::*;
+    #[test]
+    fn unqualified_smollm_cannot_boot_production_or_override_context() {
+        for tools_enabled in [false, true] {
+            for mode in 0..3 {
+                let request = BootRequest {
+                    artifact_dir: PathBuf::from("/nonexistent/not-loaded"),
+                    profile_id: "smollm3-3b-4bit".into(),
+                    corpus_models_json: None,
+                    memory_guard: MemoryGuardConfig::balanced(),
+                    admission_budget_override_bytes: None,
+                    prefer_metal: true,
+                    tools_enabled,
+                    tiered_kv: TieredKvConfig::new(
+                        None,
+                        engine::tiered_kv::HotCacheLimit::Bytes(0),
+                    ),
+                };
+                let result = match mode {
+                    0 => boot_native(request),
+                    1 => boot_qwen3(request),
+                    _ => boot_qwen3_with_context_limit(request, Some(2048)),
+                };
+                let error = result.err().expect("unqualified profile must be refused");
+                assert!(
+                    error.message.contains("not qualified for production"),
+                    "{error:?}"
+                );
+            }
+        }
     }
 }
