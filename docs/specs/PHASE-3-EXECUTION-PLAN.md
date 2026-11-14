@@ -28,9 +28,10 @@ dependency/pin digest, family implementation, actual artifact manifest,
 tokenizer, text/tool templates, profile settings and fixture suite. Numerical
 results are calculated from paired finite vectors, not accepted as caller-supplied
 pass flags. Enforce both strict FR-8 limits: maximum absolute error <0.02 and
-relative L2 error <0.01, with an all-zero reference requiring exact equality.
-Report maximum pointwise relative error separately; do not use an additive
-absolute-plus-relative tolerance as a substitute for either FR-8 gate.
+maximum pointwise relative error <0.01, preserving the existing real Llama
+qualification rule. A zero reference logit requires exact equality. Report
+relative L2 error separately; neither L2 nor an additive absolute-plus-relative
+tolerance substitutes for either FR-8 gate.
 
 Named tests: `m3_profile_numerical_reference`,
 `m3_profile_requires_every_declared_fixture`,
