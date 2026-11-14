@@ -403,3 +403,11 @@ in the native family adapter; registration remains metadata inspection.
 The named malformed-metadata test covers null/non-object/missing/zero text
 context and conflicting outer values, while flat-family registration remains
 covered by the existing registry suite.
+
+Focused parallel conformance tests exposed temporary-directory ownership
+failure: wall-clock names can collide, and the helper constructs its cleanup
+owner before create_dir succeeds. Add a process-local atomic nonce to test
+directories and construct cleanup ownership only after successful creation in
+`tests/m3_profile_conformance.rs` and the new nested-registry tests. Verify the
+normal parallel invocation, not only a serialized workaround. No production
+qualification rules change.
