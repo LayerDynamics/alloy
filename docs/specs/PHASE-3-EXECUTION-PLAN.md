@@ -467,3 +467,20 @@ Add `tests/unit/qwen35_xml_tools.rs` with `xml_schema_types_preserve_values`,
 building block; runtime schema transport, incremental reasoning separation,
 trained tool templates and real agent validation remain required before the
 hybrid tool-mode rejection is removed.
+
+### #95 incremental XML and reasoning boundary (2026-11-14)
+
+Add `crates/engine/src/slab_parser/xml_stream.rs`, export `XmlToolParser` from
+`slab_parser/mod.rs`, and extend `tests/unit/qwen35_xml_tools.rs`. The parser
+owns its admitted slab and schema resolver, handles arbitrary UTF-8 chunk
+boundaries, routes reasoning to a separate sink, and treats tool-looking
+reasoning as inert text. Publish retained proposals only at successful finish;
+malformed later output, cancellation/drop, incomplete syntax, capacity refusal
+or sink failure discards the whole batch. Reject non-whitespace text after a
+tool call as required by the trained tool prompt, while permitting multiple
+complete calls. Reuse the bounded converter, never a fallback JSON tree.
+Named tests: `xml_stream_all_chunk_boundaries_separate_reasoning`,
+`xml_stream_later_failure_discards_every_call`,
+`xml_stream_limits_and_sink_failure_release_storage`, and
+`xml_stream_success_allocates_no_heap`. Keep production hybrid tool mode
+disabled until exact schema transport and publisher tool rendering are wired.
