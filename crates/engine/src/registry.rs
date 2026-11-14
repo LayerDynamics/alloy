@@ -621,7 +621,26 @@ impl Registry {
             .family()
             .to_owned();
 
-        let declared_context_limit_tokens = object
+        // Composite families declare their text context inside text_config.
+        // Architecture validation belongs to the selected native family;
+        // this registry inspects metadata without inventing a context limit.
+        let text = if let Some(nested) = object.get("text_config") {
+            let nested = nested.as_object().ok_or_else(|| {
+                artifact_validation(&id, "text_config must be an object when declared")
+            })?;
+            if let Some(outer) = object.get("max_position_embeddings")
+                && nested.get("max_position_embeddings") != Some(outer)
+            {
+                return Err(artifact_validation(
+                    &id,
+                    "conflicting outer and text context limits",
+                ));
+            }
+            nested
+        } else {
+            object
+        };
+        let declared_context_limit_tokens = text
             .get("max_position_embeddings")
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())

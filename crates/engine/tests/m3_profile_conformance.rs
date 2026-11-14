@@ -223,13 +223,16 @@ impl Drop for Directory {
 }
 
 fn registry() -> (Registry, ModelProfileId, QualificationSpec, Directory) {
+    static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir =
-        Directory(std::env::temp_dir().join(format!("alloy-m3-{}-{stamp}", std::process::id())));
-    std::fs::create_dir(&dir.0).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("alloy-m3-{}-{stamp}-{nonce}", std::process::id()));
+    std::fs::create_dir(&path).unwrap();
+    let dir = Directory(path);
     std::fs::write(
         dir.0.join("config.json"),
         br#"{"architectures":["FixtureForCausalLM"],"max_position_embeddings":128}"#,
