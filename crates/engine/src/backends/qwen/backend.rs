@@ -549,12 +549,6 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
-        if self.family.hybrid() && self.tool_call_parsing {
-            return Err(EngineError::unsupported(
-                "hybrid tool protocol",
-                "trained function/parameter tool parser is not yet connected",
-            ));
-        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -788,6 +782,15 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family.hybrid() {
+            return rendering::qwen35_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+                projection.additional_ascii_escape_bytes,
+            );
+        }
         if self.family == BackendFamily::SmolLm3 {
             return rendering::smollm3_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -832,12 +835,6 @@ impl RuntimeBackend for Qwen3Backend {
                 return Err(EngineError::unsupported(
                     "tool context",
                     "enable tool-call parsing before rendering tool context",
-                ));
-            }
-            if tool_mode && self.family.hybrid() {
-                return Err(EngineError::unsupported(
-                    "hybrid tool protocol",
-                    "trained function/parameter tool parser is not yet connected",
                 ));
             }
             let template = family_template(self.family, tool_mode);
@@ -1035,6 +1032,7 @@ impl RuntimeBackend for Qwen3Backend {
             finished: false,
             parser,
             slab: None,
+            xml: None,
             completed_slab: None,
         }))
     }
@@ -1049,12 +1047,65 @@ impl RuntimeBackend for Qwen3Backend {
         self.selected_parser_capacities()
     }
 
+    fn decoder_with_tool_context(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if !self.family.hybrid() || !self.tool_call_parsing {
+            return self.decoder_with_parser_allocation(registry, profile, allocation);
+        }
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
+        let limits = self
+            .selected_parser_capacities()?
+            .ok_or_else(|| internal("missing hybrid parser capacities"))?;
+        let expected = ParserAllocation::required_bytes(limits)
+            .map_err(|e| EngineError::invalid_request("parser capacities", e.to_string()))?;
+        let allocation = allocation.ok_or_else(|| {
+            EngineError::invalid_request(
+                "parser allocation",
+                "hybrid tools require the admitted slab",
+            )
+        })?;
+        if allocation.reserved_bytes() != expected {
+            return Err(internal(
+                "hybrid parser allocation differs from planned size",
+            ));
+        }
+        let xml = crate::slab_parser::XmlToolParser::new(
+            allocation,
+            output::HybridToolSchema(tools),
+            self.tool_parser_limits().max_output_bytes,
+        )?;
+        output::box_slab_decoder(Qwen3TextDecoder {
+            tokenizer: Arc::clone(&data.tokenizer),
+            special_tokens: Arc::clone(&data.special_tokens),
+            byte_decoder: Arc::clone(&data.byte_decoder),
+            pending: Vec::new(),
+            max_token_bytes: self.limits.max_token_bytes,
+            finished: false,
+            parser: None,
+            slab: None,
+            xml: Some(xml),
+            completed_slab: None,
+        })
+    }
+
     fn decoder_with_parser_allocation(
         &self,
         registry: &Registry,
         profile: &ModelProfileId,
         allocation: Option<ParserAllocation>,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if self.family.hybrid() && self.tool_call_parsing {
+            return Err(EngineError::invalid_request(
+                "tool schemas",
+                "use the generation-bound decoder hook",
+            ));
+        }
         let resolved = registry.resolve_profile(profile)?;
         self.data(resolved.artifact())?;
         match (self.selected_parser_capacities()?, allocation) {
@@ -1082,6 +1133,7 @@ impl RuntimeBackend for Qwen3Backend {
                     finished: false,
                     parser: None,
                     slab: Some(slab),
+                    xml: None,
                     completed_slab: None,
                 })
             }
@@ -1402,8 +1454,10 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        (BackendFamily::Ornith, _) => ORNITH_TEXT_TEMPLATE,
-        (BackendFamily::Qwen35, _) => QWEN35_TEXT_TEMPLATE,
+        (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
+        (BackendFamily::Ornith, true) => ORNITH_TOOL_TEMPLATE,
+        (BackendFamily::Qwen35, false) => QWEN35_TEXT_TEMPLATE,
+        (BackendFamily::Qwen35, true) => QWEN35_TOOL_TEMPLATE,
         (BackendFamily::Qwen3, false) => CHAT_TEMPLATE,
         (BackendFamily::Qwen3, true) => qwen3::template::TOOL_CHAT_TEMPLATE,
         (BackendFamily::Llama3, false) => llama3::template::CHAT_TEMPLATE,

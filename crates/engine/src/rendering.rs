@@ -442,6 +442,88 @@ pub fn qwen3_projected_tool_token_upper_bound(
         .ok_or_else(|| EngineError::invalid_request("projection", "token bound overflow"))
 }
 
+// Explicit opt-in formatting used by the pinned hybrid publisher templates.
+// Ordinary `tojson` and all existing family templates keep their behavior.
+struct HuggingFaceJson;
+impl serde_json::ser::Formatter for HuggingFaceJson {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        if !value.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-finite template number",
+            ));
+        }
+        let magnitude = value.abs();
+        if magnitude != 0.0 && !(1e-4..1e16).contains(&magnitude) {
+            let scientific = format!("{value:e}");
+            let (mantissa, exponent) = scientific.split_once('e').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid scientific number")
+            })?;
+            let exponent: i32 = exponent.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid exponent")
+            })?;
+            write!(writer, "{mantissa}e{exponent:+03}")
+        } else if value.fract() == 0.0 {
+            write!(writer, "{value}.0")
+        } else {
+            write!(writer, "{value}")
+        }
+    }
+}
+fn hf_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
+    let mut output = Vec::new();
+    serde::Serialize::serialize(
+        &value,
+        &mut serde_json::Serializer::with_formatter(&mut output, HuggingFaceJson),
+    )
+    .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    String::from_utf8(output)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
+}
+fn hf_tool_value(value: minijinja::Value) -> Result<String, TemplateError> {
+    let json = serde_json::to_value(&value)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    match json {
+        Value::String(s) => Ok(s),
+        Value::Bool(true) => Ok("True".to_owned()),
+        Value::Bool(false) => Ok("False".to_owned()),
+        Value::Null => Ok("None".to_owned()),
+        _ => hf_tojson(value),
+    }
+}
+
 /// Render exact model-visible text from a structured text snapshot.
 ///
 /// Uses the supplied pinned template. No fallback template is selected.
@@ -497,6 +579,7 @@ pub fn render_chat(
     let mut variables = Map::new();
     if let Some(tools) = context.tool_context() {
         variables.insert("tools_json".to_owned(), Value::String(tools.tools_json()?));
+        variables.insert("tools".to_owned(), tools.tool_values());
     }
 
     variables.insert("messages".to_owned(), Value::Array(messages));
@@ -511,6 +594,8 @@ pub fn render_chat(
     }
 
     let mut environment = Environment::new();
+    environment.add_filter("hf_tojson", hf_tojson);
+    environment.add_filter("hf_tool_value", hf_tool_value);
 
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
 
@@ -982,4 +1067,95 @@ pub fn smollm3_projected_tool_token_upper_bound(
         .len()
         .checked_add(additional_bytes)
         .ok_or_else(|| EngineError::invalid_request("projection", "SmolLM3 byte bound overflow"))
+}
+
+/// Bound changed grouped hybrid tool responses using the pinned ByteLevel BPE
+/// tokenizers and the shared NFC eight-byte expansion bound. Each im_start is
+/// a non-normalized, non-stripping added token, isolating each changing user
+/// segment. Charge the exact skeleton plus each complete changing segment
+/// again; never subtract estimated tokens or assume stable merges within it.
+pub fn qwen35_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+    ascii_escape_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PINS: [[u8; 32]; 2] = [
+        [
+            0x06, 0xb9, 0x50, 0x93, 0x52, 0xd2, 0xaf, 0x50, 0x38, 0x1a, 0xb2, 0x24, 0x7e, 0x08,
+            0x3b, 0x80, 0xd3, 0x2d, 0x5c, 0x0a, 0xba, 0x91, 0xc2, 0x72, 0xca, 0x9f, 0xf7, 0x29,
+            0xb6, 0xa0, 0xe5, 0x23,
+        ],
+        [
+            0x87, 0xa7, 0x83, 0x0d, 0x63, 0xfc, 0xf4, 0x3b, 0xf2, 0x41, 0xc3, 0xc5, 0x24, 0x2e,
+            0x96, 0xe6, 0x2d, 0xd3, 0xfd, 0xc2, 0x92, 0x24, 0xca, 0x26, 0xfe, 0xd8, 0xea, 0x33,
+            0x3d, 0xb7, 0x2d, 0xe4,
+        ],
+    ];
+    if !PINS.contains(tokenizer.source_sha256()) || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified hybrid tokenizer or empty result projection",
+        ));
+    }
+    const START: &str = "<|im_start|>";
+    const RESULT: &str = "\n<tool_response>\n";
+    const END: &str = "\n</tool_response>";
+    let text = rendered.text();
+    let mut previous_group = None;
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (at, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let body = &text[at + RESULT.len()..];
+        let end = body.find(END).ok_or_else(|| {
+            EngineError::invalid_request("projection", "incomplete hybrid result placeholder")
+        })?;
+        if !body[..end].contains("\"content\":\"\"") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "hybrid result placeholder is not empty",
+            ));
+        }
+        let start = text[..at].rfind(START).ok_or_else(|| {
+            EngineError::invalid_request("projection", "missing hybrid result role boundary")
+        })?;
+        if !text[start..].starts_with("<|im_start|>user\n<tool_response>\n") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "hybrid result must belong to a grouped user turn",
+            ));
+        }
+        let next = text[at + RESULT.len() + end..]
+            .find(START)
+            .map(|n| at + RESULT.len() + end + n)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "missing next hybrid role boundary")
+            })?;
+        if previous_group != Some(start) {
+            segment_bytes = segment_bytes.checked_add(next - start).ok_or_else(|| {
+                EngineError::invalid_request("projection", "hybrid segment byte overflow")
+            })?;
+            previous_group = Some(start);
+        }
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing hybrid result placeholders",
+        ));
+    }
+    let variable = additional_bytes
+        .checked_sub(ascii_escape_bytes)
+        .and_then(|n| n.checked_add(segment_bytes))
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(ascii_escape_bytes))
+        .ok_or_else(|| {
+            EngineError::invalid_request("projection", "hybrid result bound overflow")
+        })?;
+    rendered
+        .token_count()
+        .checked_add(variable)
+        .ok_or_else(|| EngineError::invalid_request("projection", "hybrid token bound overflow"))
 }

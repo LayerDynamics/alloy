@@ -91,5 +91,15 @@ impl BackendConfig {
 pub const ORNITH_TEXT_TEMPLATE: &str = include_str!("ornith_text.jinja");
 /// Trained upstream Qwen3.5 text serialization with explicit non-thinking generation.
 pub const QWEN35_TEXT_TEMPLATE: &str = include_str!("qwen35_text.jinja");
+/// Trained Ornith function/parameter tool protocol with its assistant history.
+pub const ORNITH_TOOL_TEMPLATE: &str = concat!(
+    "{% set ornith = true %}",
+    include_str!("hybrid_tools.jinja")
+);
+/// Trained upstream Qwen3.5 function/parameter tool protocol.
+pub const QWEN35_TOOL_TEMPLATE: &str = concat!(
+    "{% set ornith = false %}",
+    include_str!("hybrid_tools.jinja")
+);
 /// Combined full-attention KV, convolution history and recurrent matrix state.
 pub const QWEN35_CACHE_REPRESENTATION: &str = "qwen35.mlx-f32.full-kv-and-recurrent.v1";

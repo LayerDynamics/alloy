@@ -47,6 +47,7 @@ fn decoder(parsing: bool) -> Qwen3TextDecoder {
         finished: false,
         parser: parsing.then(|| ToolCallParser::new(ParserLimits::default()).expect("parser")),
         slab: None,
+        xml: None,
         completed_slab: None,
     }
 }

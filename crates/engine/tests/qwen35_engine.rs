@@ -102,6 +102,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     fn new(ornith: bool) -> Self {
+        Self::with_context(ornith, 128)
+    }
+    fn with_context(ornith: bool, context: usize) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = loop {
             let p = std::env::temp_dir().join(format!(
@@ -120,6 +123,7 @@ impl Fixture {
         ))
         .unwrap();
         config["text_config"]["eos_token_id"] = json!(255);
+        config["text_config"]["max_position_embeddings"] = json!(context);
         std::fs::write(
             root.join("config.json"),
             serde_json::to_vec(&config).unwrap(),
@@ -197,11 +201,19 @@ impl Fixture {
         }
     }
     fn backend(&self, execution: Qwen3Execution, ornith: bool) -> Qwen3Backend {
+        self.backend_with_context(execution, ornith, 128)
+    }
+    fn backend_with_context(
+        &self,
+        execution: Qwen3Execution,
+        ornith: bool,
+        context: usize,
+    ) -> Qwen3Backend {
         if ornith {
-            Qwen3Backend::new_ornith(vec![self.specification.clone()], limits(128), execution)
+            Qwen3Backend::new_ornith(vec![self.specification.clone()], limits(context), execution)
                 .unwrap()
         } else {
-            Qwen3Backend::new_qwen35(vec![self.specification.clone()], limits(128), execution)
+            Qwen3Backend::new_qwen35(vec![self.specification.clone()], limits(context), execution)
                 .unwrap()
         }
     }
@@ -368,9 +380,206 @@ fn qwen35_engine_text_template_contract() {
     }
 }
 
+fn parser_limits() -> engine::parser_allocation::ParserAllocationLimits {
+    engine::parser_allocation::ParserAllocationLimits {
+        carry_bytes: 64,
+        call_bytes: 8192,
+        decoded_bytes: 8192,
+        depth: 64,
+        keys: 512,
+        nodes: 1024,
+        proposal_bytes: 16384,
+        calls: 8,
+    }
+}
+fn tool_fixture_context() -> ContextSnapshot {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let input: Value =
+        serde_json::from_str(include_str!("fixtures/qwen35_tool_render/input.json")).unwrap();
+    let role = |s: &str| match s {
+        "system" => MessageRole::System,
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        _ => panic!("role"),
+    };
+    let messages = input["base_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Message {
+            role: role(v["role"].as_str().unwrap()),
+            content: v["content"].as_str().unwrap().into(),
+        })
+        .collect();
+    let tools = input["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let f = &v["function"];
+            RenderingTool::new(
+                f["name"].as_str().unwrap().into(),
+                f["version"].as_str().unwrap().into(),
+                f["description"].as_str().unwrap().into(),
+                f["parameters"].clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let history = input["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| match v["kind"].as_str().unwrap() {
+            "call" => ToolHistoryBlock::AssistantCall {
+                call_id: v["call_id"].as_str().unwrap().into(),
+                tool_id: v["tool_id"].as_str().unwrap().into(),
+                arguments: v["arguments"].as_object().unwrap().clone(),
+            },
+            "result" => ToolHistoryBlock::ToolResult {
+                call_id: v["call_id"].as_str().unwrap().into(),
+                content: v["content"].as_str().unwrap().into(),
+                is_error: v["is_error"].as_bool().unwrap(),
+            },
+            "text" => ToolHistoryBlock::Text(Message {
+                role: role(v["role"].as_str().unwrap()),
+                content: v["content"].as_str().unwrap().into(),
+            }),
+            _ => panic!("history kind"),
+        })
+        .collect();
+    ContextSnapshot::new(
+        ContextSnapshotId::new("tool-template").unwrap(),
+        profile_id(),
+        messages,
+    )
+    .unwrap()
+    .with_tool_context(
+        ToolContext::new(
+            tools,
+            history,
+            ToolContextLimits {
+                max_tools: 8,
+                max_history_blocks: 16,
+                max_json_bytes: 32768,
+            },
+        )
+        .unwrap(),
+    )
+}
+#[test]
+fn qwen35_engine_tool_template_contract() {
+    for ornith in [false, true] {
+        let fixture = Fixture::with_context(ornith, 4096);
+        let backend = fixture
+            .backend_with_context(Qwen3Execution::MlxCpu, ornith, 4096)
+            .with_parser_allocation_limits(parser_limits())
+            .unwrap();
+        let registry = backend.registry(vec![profile(4096)]).unwrap();
+        let context = tool_fixture_context();
+        let expected_hash = *context.tool_context().unwrap().schema_hash();
+        let rendered = wait(backend.render_and_count(&registry, context)).unwrap();
+        let expected = if ornith {
+            include_str!("fixtures/qwen35_tool_render/ornith.txt")
+        } else {
+            include_str!("fixtures/qwen35_tool_render/upstream.txt")
+        };
+        assert_eq!(rendered.text(), expected);
+        assert_eq!(rendered.tool_schema_hash(), Some(&expected_hash));
+        assert!(
+            backend
+                .decoder_with_parser_allocation(&registry, &profile_id(), None)
+                .is_err()
+        );
+    }
+}
+#[test]
+fn qwen35_engine_xml_decoder_uses_advertised_schema() {
+    use engine::parser_allocation::ParserAllocation;
+    for ornith in [false, true] {
+        let fixture = Fixture::new(ornith);
+        let backend = fixture
+            .backend(Qwen3Execution::MlxCpu, ornith)
+            .with_parser_allocation_limits(parser_limits())
+            .unwrap();
+        let registry = backend.registry(vec![profile(128)]).unwrap();
+        let tokenizer =
+            tokenizers::Tokenizer::from_file(fixture.root.join("tokenizer.json")).unwrap();
+        for (text, schema, valid) in [
+            (
+                "<think>inert <tool_call>not executable</tool_call></think>answer<tool_call><function=fs.test><parameter=s>0012</parameter><parameter=i>7</parameter></function></tool_call>",
+                true,
+                true,
+            ),
+            (
+                "<tool_call><function=fs.test><parameter=unknown>x</parameter></function></tool_call>",
+                true,
+                false,
+            ),
+            (
+                "<tool_call><function=fs.test></function></tool_call>",
+                false,
+                false,
+            ),
+            ("plain answer", false, true),
+        ] {
+            let bytes = ParserAllocation::required_bytes(parser_limits()).unwrap();
+            let admission = AdmissionController::new(bytes).unwrap();
+            let mut grant = admission.reserve_grant("XML decoder", &[bytes]).unwrap();
+            let slab = ParserAllocation::from_grant(&mut grant, parser_limits()).unwrap();
+            let tools =
+                schema.then(|| Arc::new(tool_fixture_context().tool_context().unwrap().clone()));
+            let mut decoder = backend
+                .decoder_with_tool_context(&registry, &profile_id(), Some(slab), tools)
+                .unwrap();
+            let tokens = tokenizer.encode(text, false).unwrap();
+            let mut visible = String::new();
+            let result = (|| {
+                for &token in tokens.get_ids() {
+                    for block in decoder.push_blocks(token)? {
+                        match block {
+                            engine::types::GenerationOutputBlock::Text(text) => {
+                                visible.push_str(&text)
+                            }
+                            _ => panic!("early proposal"),
+                        }
+                    }
+                    assert!(decoder.take_parser_proposals().is_none());
+                }
+                decoder.finish_blocks()?;
+                Ok::<_, engine::error::EngineError>(())
+            })();
+            assert_eq!(result.is_ok(), valid, "{text}: {result:?}");
+            if valid {
+                let owner = decoder.take_parser_proposals().unwrap();
+                assert_eq!(visible, if schema { "answer" } else { "plain answer" });
+                assert_eq!(owner.proposal_count(), usize::from(schema));
+                if schema {
+                    assert_eq!(
+                        owner.proposal(0).unwrap().arguments_json,
+                        "{\"s\":\"0012\",\"i\":7}"
+                    );
+                }
+            }
+            drop(decoder);
+            assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires ALLOY_HYBRID_ARTIFACT and Metal; ALLOY_HYBRID_PROFILE=ornith selects the mandatory 9B artifact"]
 fn qwen35_real_engine_streaming() {
+    real_engine(false);
+}
+#[test]
+#[ignore = "requires ALLOY_HYBRID_ARTIFACT and Metal; ALLOY_HYBRID_PROFILE=ornith selects Ornith"]
+fn qwen35_real_engine_tool_proposals() {
+    real_engine(true);
+}
+fn real_engine(tool_mode: bool) {
+    let context_limit = if tool_mode { 4096 } else { 512 };
+    let output_limit = if tool_mode { 192 } else { 32 };
     let ornith = std::env::var("ALLOY_HYBRID_PROFILE").is_ok_and(|s| s == "ornith");
     let frozen: Value = serde_json::from_str(if ornith {
         include_str!("../../inference-infra/tests/fixtures/ornith_1_5_9b_profile.json")
@@ -412,17 +621,110 @@ fn qwen35_real_engine_streaming() {
         ),
     };
     let backend = if ornith {
-        Qwen3Backend::new_ornith(vec![specification], limits(512), Qwen3Execution::MlxMetal)
+        Qwen3Backend::new_ornith(
+            vec![specification],
+            limits(context_limit),
+            Qwen3Execution::MlxMetal,
+        )
     } else {
-        Qwen3Backend::new_qwen35(vec![specification], limits(512), Qwen3Execution::MlxMetal)
+        Qwen3Backend::new_qwen35(
+            vec![specification],
+            limits(context_limit),
+            Qwen3Execution::MlxMetal,
+        )
     }
     .unwrap();
+    let backend = if tool_mode {
+        backend
+            .with_parser_allocation_limits(parser_limits())
+            .unwrap()
+    } else {
+        backend
+    };
+    let configured_profile = ModelProfile::new(
+        profile_id(),
+        ArtifactId::new("hybrid").unwrap(),
+        context_limit,
+        output_limit,
+        8,
+        GenerationOptions::greedy(output_limit).unwrap(),
+    )
+    .unwrap();
+    let context = if tool_mode {
+        real_tools_context(None)
+    } else {
+        ContextSnapshot::new(
+            ContextSnapshotId::new("real-hybrid").unwrap(),
+            profile_id(),
+            vec![Message {
+                role: MessageRole::User,
+                content: "Calculate 2 + 2. Answer briefly.".into(),
+            }],
+        )
+        .unwrap()
+    };
+    if tool_mode {
+        let registry = backend.registry(vec![configured_profile.clone()]).unwrap();
+        let empty =
+            wait(backend.render_and_count(&registry, real_tools_context(Some("")))).unwrap();
+        for content in [
+            "snow 雪",
+            "\u{0344}\u{0344}\u{0344}",
+            "\n\t\u{1}quoted \" text",
+            "ASCII",
+        ] {
+            let actual =
+                wait(backend.render_and_count(&registry, real_tools_context(Some(content))))
+                    .unwrap();
+            let bound = backend
+                .projected_token_upper_bound(
+                    &registry,
+                    engine::api::ProjectedToolRender {
+                        rendered: &empty,
+                        result_count: 2,
+                        input_bytes: actual.text().len(),
+                        additional_rendered_bytes: actual.text().len() - empty.text().len(),
+                        additional_ascii_escape_bytes: 0,
+                    },
+                )
+                .unwrap();
+            assert!(actual.token_count() <= bound);
+            assert!(
+                backend
+                    .projected_token_upper_bound(
+                        &registry,
+                        engine::api::ProjectedToolRender {
+                            rendered: &actual,
+                            result_count: 2,
+                            input_bytes: actual.text().len(),
+                            additional_rendered_bytes: 0,
+                            additional_ascii_escape_bytes: 0,
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            backend
+                .projected_token_upper_bound(
+                    &registry,
+                    engine::api::ProjectedToolRender {
+                        rendered: &empty,
+                        result_count: 3,
+                        input_bytes: empty.text().len(),
+                        additional_rendered_bytes: 0,
+                        additional_ascii_escape_bytes: 0,
+                    }
+                )
+                .is_err()
+        );
+    }
     let scheduler = Scheduler::new(8).unwrap();
     let small_budget = 8 * 1024 * 1024 * 1024;
     let admission = AdmissionController::new(small_budget).unwrap();
     let engine = backend
         .into_engine(
-            vec![profile(512)],
+            vec![configured_profile],
             admission.clone(),
             scheduler.clone(),
             RetentionPolicy {
@@ -431,21 +733,12 @@ fn qwen35_real_engine_streaming() {
             },
         )
         .unwrap();
-    let context = ContextSnapshot::new(
-        ContextSnapshotId::new("real-hybrid").unwrap(),
-        profile_id(),
-        vec![Message {
-            role: MessageRole::User,
-            content: "Calculate 2 + 2. Answer briefly.".into(),
-        }],
-    )
-    .unwrap();
     if ornith {
         let request = GenerationRequest::new(
             RequestId::new("hybrid-small-tier-refusal").unwrap(),
             profile_id(),
             context.clone(),
-            GenerationOptions::greedy(32).unwrap(),
+            GenerationOptions::greedy(output_limit).unwrap(),
         )
         .unwrap();
         let error = match wait(engine.generate(request)) {
@@ -473,22 +766,65 @@ fn qwen35_real_engine_streaming() {
             RequestId::new(name).unwrap(),
             profile_id(),
             context.clone(),
-            GenerationOptions::greedy(32).unwrap(),
+            GenerationOptions::greedy(output_limit).unwrap(),
         )
         .unwrap();
         let generation = wait(engine.generate(request)).unwrap();
         let mut events = generation.into_events();
         let mut text = String::new();
         let mut completed = false;
+        let mut proposals = 0;
         while let Some(event) = wait(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
             assert!(!completed, "event after terminal");
             match event {
                 GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
-                GenerationEvent::GenerationCompleted { .. } => completed = true,
+                GenerationEvent::GenerationCompleted {
+                    finish_reason,
+                    usage,
+                } => {
+                    eprintln!(
+                        "{} {name} completion: {finish_reason:?}, {usage:?}",
+                        frozen["id"]
+                    );
+                    completed = true;
+                }
+                GenerationEvent::ToolCallProposed { proposal } if tool_mode => {
+                    eprintln!("{} {name} proposal: {:?}", frozen["id"], proposal);
+                    assert_eq!(proposal.name(), "fs.read");
+                    assert_eq!(
+                        proposal.arguments(),
+                        json!({"path":"README.md"}).as_object().unwrap()
+                    );
+                    proposals += 1;
+                }
+                GenerationEvent::ToolCallBatchProposed { proposals: batch } if tool_mode => {
+                    for index in 0..batch.proposal_count() {
+                        let proposal = batch.proposal(index).unwrap();
+                        eprintln!(
+                            "{} {name} proposal: {} {}",
+                            frozen["id"], proposal.name, proposal.arguments_json
+                        );
+                        assert_eq!(proposal.name, "fs.read");
+                        assert_eq!(
+                            serde_json::from_str::<Value>(proposal.arguments_json).unwrap(),
+                            json!({"path":"README.md"})
+                        );
+                        proposals += 1;
+                    }
+                }
                 other => panic!("unexpected real hybrid event {other:?}"),
             }
         }
-        assert!(completed && !text.trim().is_empty());
+        assert!(completed);
+        if tool_mode {
+            assert_eq!(
+                proposals, 1,
+                "{} {name} visible output: {text:?}",
+                frozen["id"]
+            );
+        } else {
+            assert!(!text.trim().is_empty());
+        }
         eprintln!("{} {name}: {text:?}", frozen["id"]);
         outputs.push(text);
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -498,4 +834,48 @@ fn qwen35_real_engine_streaming() {
         }
     }
     assert_eq!(outputs[0], outputs[1]);
+}
+
+fn real_tools_context(result: Option<&str>) -> ContextSnapshot {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let tool = RenderingTool::new("fs.read".into(), "1.0.0".into(), "Read a UTF-8 file by its relative path.".into(),
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false})).unwrap();
+    let mut history = Vec::new();
+    if let Some(content) = result {
+        for id in ["c1", "c2"] {
+            history.push(ToolHistoryBlock::AssistantCall {
+                call_id: id.into(),
+                tool_id: "fs.read".into(),
+                arguments: json!({"path":"README.md"}).as_object().unwrap().clone(),
+            });
+        }
+        for id in ["c1", "c2"] {
+            history.push(ToolHistoryBlock::ToolResult {
+                call_id: id.into(),
+                content: content.into(),
+                is_error: false,
+            });
+        }
+    }
+    ContextSnapshot::new(
+        ContextSnapshotId::new("real-hybrid-tools").unwrap(),
+        profile_id(),
+        vec![Message {
+            role: MessageRole::User,
+            content: "Call fs.read with path README.md. Do not answer from memory.".into(),
+        }],
+    )
+    .unwrap()
+    .with_tool_context(
+        ToolContext::new(
+            vec![tool],
+            history,
+            ToolContextLimits {
+                max_tools: 8,
+                max_history_blocks: 16,
+                max_json_bytes: 32768,
+            },
+        )
+        .unwrap(),
+    )
 }

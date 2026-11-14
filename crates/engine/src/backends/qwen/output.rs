@@ -9,7 +9,11 @@ use crate::{
     runtime::TextDecoder,
     types::{GenerationOutputBlock, ToolCallProposal},
 };
-use crate::{parser_allocation::FrozenParserAllocation, slab_parser::SlabParser};
+use crate::{
+    parser_allocation::FrozenParserAllocation,
+    slab_parser::{SlabParser, XmlParameterType, XmlToolParser, XmlToolSchema},
+    types::ToolContext,
+};
 use qwen3::tool_calls::{ParsedBlock, ToolCallParser, ToolParseError};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,7 +30,39 @@ pub(super) struct Qwen3TextDecoder {
     /// Present only when tool-call parsing is enabled for this generation.
     pub(super) parser: Option<ToolCallParser>,
     pub(super) slab: Option<SlabParser>,
+    pub(super) xml: Option<XmlToolParser<HybridToolSchema>>,
     pub(super) completed_slab: Option<FrozenParserAllocation>,
+}
+
+pub(super) struct HybridToolSchema(pub(super) Option<Arc<ToolContext>>);
+impl XmlToolSchema for HybridToolSchema {
+    fn validate_tool(&self, name: &str) -> Result<(), EngineError> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::invalid_request(
+                    "tool schemas",
+                    "no tools advertised in this generation",
+                )
+            })?
+            .validate_tool(name)
+    }
+    fn parameter_type(
+        &self,
+        tool: &str,
+        parameter: &str,
+        raw: &str,
+    ) -> Result<XmlParameterType, EngineError> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::invalid_request(
+                    "tool schemas",
+                    "no tools advertised in this generation",
+                )
+            })?
+            .parameter_type(tool, parameter, raw)
+    }
 }
 
 fn text_blocks(text: String) -> Vec<GenerationOutputBlock> {
@@ -81,7 +117,9 @@ impl TextDecoder for Qwen3TextDecoder {
         // W2_QWEN_PROTOCOL_SPECIAL_TOKENS_V1
         // Protocol delimiters are syntax, not ByteLevel alphabet data.
         if self.special_tokens.contains(&token) {
-            if matches!(spelling.as_str(), "<tool_call>" | "</tool_call>") {
+            if matches!(spelling.as_str(), "<tool_call>" | "</tool_call>")
+                || (self.xml.is_some() && matches!(spelling.as_str(), "<think>" | "</think>"))
+            {
                 if !self.pending.is_empty() {
                     return Err(execution_error(
                         "detokenize",
@@ -138,6 +176,18 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn push_blocks(&mut self, token: u32) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let text = self.push(token)?;
+        if let Some(parser) = self.xml.as_mut() {
+            let mut emitted = String::new();
+            parser.push(
+                &text,
+                |part| {
+                    emitted.push_str(part);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )?;
+            return Ok(text_blocks(emitted));
+        }
         if let Some(parser) = self.slab.as_mut() {
             let mut emitted = String::new();
             parser.push(&text, |part| {
@@ -157,6 +207,19 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn finish_blocks(&mut self) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let tail = self.finish()?;
+        if let Some(mut parser) = self.xml.take() {
+            let mut emitted = String::new();
+            parser.push(
+                &tail,
+                |part| {
+                    emitted.push_str(part);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )?;
+            self.completed_slab = Some(parser.finish()?);
+            return Ok(text_blocks(emitted));
+        }
         if let Some(mut parser) = self.slab.take() {
             let mut emitted = String::new();
             parser.push(&tail, |part| {

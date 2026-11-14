@@ -225,6 +225,9 @@ impl ToolContext {
             self.tools.iter().map(RenderingTool::value).collect(),
         )))
     }
+    pub(crate) fn tool_values(&self) -> Value {
+        Value::Array(self.tools.iter().map(RenderingTool::value).collect())
+    }
     /// Reject reserved control syntax in all model-facing data before rendering.
     pub(crate) fn validate_spellings(&self, reserved: &[&str]) -> Result<(), EngineError> {
         for value in self
@@ -245,7 +248,19 @@ impl ToolContext {
     }
     /// Values are separate role-bearing messages, never injected into system content.
     pub(crate) fn messages(&self) -> Vec<Value> {
-        self.history.iter().map(history_value).collect()
+        self.history
+            .iter()
+            .map(|block| {
+                let mut value = history_value(block);
+                if let ToolHistoryBlock::AssistantCall {
+                    tool_id, arguments, ..
+                } = block
+                {
+                    value["call"] = canonical(json!({"name":tool_id, "arguments":arguments}));
+                }
+                value
+            })
+            .collect()
     }
 }
 
