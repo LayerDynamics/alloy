@@ -15,6 +15,37 @@ Baseline: `4d158b9cd3cf67ceefdd836095167b9ddf60049d`. Phase 2 prerequisite #34 i
 
 Each focused change retains actual command exit status, candidate SHA, pinned dependencies and artifacts; report host fixtures separately from real-model and performance evidence. A plan, source review, mock, or successful build is not a runtime qualification. Fail closed on missing profile evidence. No later registry, scheduling or conversion milestone is a circular prerequisite for initial M3 native profiles.
 
+### #53 / #72 qualification implementation amendment (2026-11-14)
+
+Start from `ba00e92` with the already delivered context, compaction, cache and
+Llama implementations intact. The first implementation batch adds
+`crates/engine/src/conformance.rs` and
+`crates/engine/tests/m3_profile_conformance.rs`, and extends
+`crates/engine/src/{lib.rs,registry.rs}`. It implements machine-readable,
+identity-bound qualification and registry rejection of missing, failed or stale
+qualification for profiles that require it. Identity includes the candidate,
+dependency/pin digest, family implementation, actual artifact manifest,
+tokenizer, text/tool templates, profile settings and fixture suite. Numerical
+results are calculated from paired finite vectors, not accepted as caller-supplied
+pass flags. Enforce both strict FR-8 limits: maximum absolute error <0.02 and
+relative L2 error <0.01, with an all-zero reference requiring exact equality.
+Report maximum pointwise relative error separately; do not use an additive
+absolute-plus-relative tolerance as a substitute for either FR-8 gate.
+
+Named tests: `m3_profile_numerical_reference`,
+`m3_profile_requires_every_declared_fixture`,
+`m3_profile_identity_changes_invalidate_qualification`,
+`m3_profile_failure_revokes_prior_qualification`,
+`m3_profile_registry_rejects_missing_or_stale_qualification`, and
+`m3_profile_report_roundtrip_preserves_failures`. Fixtures include tools/schema,
+stops, exact counting, long context, compaction, cached/uncached execution,
+streaming, cancellation, restart, memory tiers and a real policy-gated task.
+The report evaluator validates evidence structure and identity; trusted native
+fixture execution must supply the observations. Unit tests of the evaluator do
+not qualify any real model. Production daemon adoption, native runner/report
+issuance and family implementations remain required follow-on batches; neither
+#72 nor #53 closes on this batch alone.
+
 ## Family work packages: planned files and named tests
 
 Each family uses `crates/families/<family>/Cargo.toml`, `src/{lib.rs,config.rs,model.rs,weights.rs,register.rs}`, `tests/{config.rs,numerical.rs,agent_conformance.rs}` and `fixture/` pin manifests; the exact `<family>` directories and special files follow. Shared changes are `Cargo.toml`, `Cargo.lock`, `crates/engine/src/{backends/mod.rs,registry.rs}`, `crates/alloyd/src/boot.rs`, and `bench/corpus/models.json`. These are planned paths, not claims that kernels, weights, or tests already exist. If architecture inspection shows a different decomposition, amend this list before implementing it.
