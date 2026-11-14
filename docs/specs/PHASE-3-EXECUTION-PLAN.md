@@ -602,3 +602,19 @@ and `terminal_policy_reason_survives_context_without_changing_history` in
 `crates/harness-core/tests/canonical_tool_context.rs`, covering long escaped
 Unicode reasons, structural markup, no tool execution and unchanged history.
 Then rerun the same actual Ornith policy-gated daemon task.
+
+### #49/#95 terminal rejection semantics for actual agent recovery (2026-11-14)
+
+Exact upstream replay reproduced Ornith's duplicate rejected call. A controlled
+replay with explicit no-effect semantics instead returned an accurate rejection
+and no tools (0784b9b4ebb3462f968ed451fb9463b5). Extend
+`crates/harness-core/src/context/tool_history.rs` terminal projection with a
+trusted human-readable message for policy rejections/denials, stating the
+operation was not executed and must not be retried or bypassed. Keep other
+terminal states accurate, especially unknown outcomes, and keep the 256-byte
+ceiling with UTF-8-safe, explicitly marked reason truncation. Preserve exact
+state/reason and all durable events. Extend the existing named projection and
+canonical-history tests; amend `crates/alloyd/tests/llama_real_model.rs` to
+require the rejected turn to report rejection, never a success marker, while
+retaining the exact one-request/zero-start/no-file-effect assertions. Run the
+unchanged real user prompts through Ornith and preserve earlier failed runs.
