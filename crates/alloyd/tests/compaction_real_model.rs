@@ -374,6 +374,7 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     let mut published = None;
     for suffix in [
         "",
+        "<|end|>",
         "<|im_end|>",
         "<|endoftext|>",
         "<|eot_id|>",
