@@ -113,6 +113,134 @@ pub struct CheckpointVerification<'a> {
     pub cancelled: &'a dyn Fn() -> bool,
 }
 
+/// Logical tensor requested by a family after validating its pinned config.
+#[derive(Clone, Debug)]
+pub enum TensorRequest {
+    /// Floating tensor, including convolution kernels and norm vectors.
+    Float(Vec<usize>),
+    /// Dense or packed affine matrix with this decoded logical geometry.
+    Matrix { rows: usize, cols: usize },
+}
+
+/// Exact family tensor inventory. Packed scales/biases are selected implicitly
+/// by each matrix request and must not also be requested separately.
+pub struct TensorLayout {
+    /// Four or eight packed bits, validated against the family configuration.
+    pub quantization_bits: u8,
+    /// Declared affine group size, or None to infer from validated shapes.
+    pub group_size: Option<usize>,
+    /// Complete logical inventory; unexplained extra artifact tensors fail.
+    pub tensors: BTreeMap<String, TensorRequest>,
+}
+
+/// Verified owned tensor. No payload is returned before all hashes pass.
+#[derive(Debug)]
+pub enum CheckpointTensor {
+    /// Row-major floats with the requested, header-validated shape.
+    Float { shape: Vec<usize>, values: Vec<f32> },
+    /// Resident packed or dense matrix, never implicitly dequantized.
+    Matrix(MatrixWeight),
+}
+
+/// Complete verified family payload, keyed by exact checkpoint tensor names.
+pub type LoadedTensorSet = BTreeMap<String, CheckpointTensor>;
+
+/// Load a family's exact tensor set through the same bounded streaming path as
+/// the shared decoders. `configure` sees hash-verified JSON and must reject
+/// unsupported architecture/quantization fields before declaring the layout.
+/// Its returned metadata is published together with the fully verified tensors.
+/// Config is required; an absent or unpinned config cannot invoke the callback.
+pub fn load_tensor_set_verified<'a, T>(
+    path: &Path,
+    options: LoadOptions,
+    verification: &'a CheckpointVerification<'a>,
+    configure: impl FnOnce(&serde_json::Value) -> Result<(T, TensorLayout), ModelError>,
+) -> Result<(T, LoadedTensorSet), ModelError> {
+    let cancelled = Some(verification.cancelled);
+    check_loading_cancelled(cancelled)?;
+    let (supplied, root, is_directory) = resolve_source(path)?;
+    if supplied.as_os_str().len() > PATH_BYTES_LIMIT || root.as_os_str().len() > PATH_BYTES_LIMIT {
+        return Err(invalid("checkpoint path exceeds loader path limit"));
+    }
+    let mut budget = RawBudget {
+        used: 0,
+        limit: options.max_file_bytes,
+        verification: Some(verification),
+    };
+    let config_bytes = budget.read(&root.join("config.json"), CONFIG_BYTES_LIMIT)?;
+    let data = serde_json::from_slice(&config_bytes).map_err(json_error)?;
+    let (metadata, layout) = configure(&data)?;
+    drop(data);
+    drop(config_bytes);
+    if !matches!(layout.quantization_bits, 4 | 8)
+        || layout.group_size == Some(0)
+        || layout.tensors.is_empty()
+        || layout.tensors.len() > TENSOR_COUNT_LIMIT
+    {
+        return Err(invalid("invalid family tensor layout"));
+    }
+    let OpenInventory { shards, names } =
+        open_inventory(supplied, &root, is_directory, &mut budget, cancelled)?;
+    let mut inventory = Inventory {
+        shards: &shards,
+        names: &names,
+        needed: BTreeSet::new(),
+        matrices: BTreeMap::new(),
+        used: 0,
+        limit: options.max_weight_bytes,
+        group_size: layout.group_size,
+        bits: layout.quantization_bits,
+        cancelled,
+    };
+    for (name, request) in &layout.tensors {
+        match request {
+            TensorRequest::Float(shape) => inventory.float_tensor(name, shape)?,
+            TensorRequest::Matrix { rows, cols } => {
+                if *rows == 0 || *cols == 0 {
+                    return Err(invalid("zero matrix dimension"));
+                }
+                inventory.matrix(name, &[*rows, *cols])?;
+            }
+        }
+    }
+    if inventory.needed.len() != names.len() {
+        return Err(invalid("unsupported tensors in family checkpoint"));
+    }
+    let Inventory {
+        needed,
+        matrices,
+        used,
+        ..
+    } = inventory;
+    drop(names);
+    let (tensors, stats) = decode_shards(shards, &needed, options.max_file_bytes, cancelled)?;
+    debug_assert_eq!(stats.decoded_payload_bytes, used);
+    let mut reader = Reader {
+        tensors,
+        matrices,
+        cancelled,
+    };
+    let mut result = BTreeMap::new();
+    for (name, request) in layout.tensors {
+        check_loading_cancelled(cancelled)?;
+        let tensor = match request {
+            TensorRequest::Float(shape) => CheckpointTensor::Float {
+                shape,
+                values: reader.floats(&name)?,
+            },
+            TensorRequest::Matrix { rows, cols } => {
+                CheckpointTensor::Matrix(reader.matrix(&name, &[rows, cols])?)
+            }
+        };
+        result.insert(name, tensor);
+    }
+    if !reader.tensors.is_empty() || !reader.matrices.is_empty() {
+        return Err(invalid("unconsumed family tensor inventory"));
+    }
+    check_loading_cancelled(cancelled)?;
+    Ok((metadata, result))
+}
+
 /// Source accepted by ordinary model construction.
 ///
 /// Paths use the ordinary bounded loader. Engine execution requiring a
@@ -823,106 +951,8 @@ fn load_weights_impl<'a>(
         None
     };
 
-    let mut paths: BTreeSet<Arc<PathBuf>> = BTreeSet::new();
-    let mut index_map: BTreeMap<String, Arc<PathBuf>> = BTreeMap::new();
-
-    let index_path = root.join("model.safetensors.index.json");
-
-    let indexed = is_directory && optional_file(&index_path)?;
-
-    if !is_directory {
-        paths.insert(Arc::new(supplied));
-    } else if indexed {
-        let bytes = budget.read(&index_path, INDEX_BYTES_LIMIT)?;
-
-        let index: serde_json::Value = serde_json::from_slice(&bytes).map_err(json_error)?;
-
-        let map = index
-            .get("weight_map")
-            .and_then(|value| value.as_object())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| invalid("missing or empty weight_map"))?;
-
-        if map.len() > TENSOR_COUNT_LIMIT {
-            return Err(invalid("checkpoint index exceeds tensor count limit"));
-        }
-
-        for (name, file) in map {
-            check_loading_cancelled(cancelled)?;
-
-            let filename = file
-                .as_str()
-                .ok_or_else(|| invalid("invalid shard filename"))?;
-
-            let child = Path::new(filename);
-
-            if child.components().count() != 1
-                || child.extension().and_then(|value| value.to_str()) != Some("safetensors")
-            {
-                return Err(invalid("unsafe shard filename"));
-            }
-
-            let candidate = root.join(child);
-
-            let resolved = candidate
-                .canonicalize()
-                .map_err(|error| io_error("canonicalize shard", &candidate, error))?;
-
-            if resolved.parent() != Some(root.as_path()) {
-                return Err(invalid("shard escapes checkpoint directory"));
-            }
-
-            if resolved.as_os_str().len() > PATH_BYTES_LIMIT {
-                return Err(invalid("checkpoint path exceeds loader path limit"));
-            }
-            let interned = if let Some(existing) = paths.get(&resolved) {
-                Arc::clone(existing)
-            } else {
-                if paths.len() == SHARD_COUNT_LIMIT {
-                    return Err(invalid("checkpoint exceeds shard count limit"));
-                }
-                let interned = Arc::new(resolved);
-                paths.insert(Arc::clone(&interned));
-                interned
-            };
-            index_map.insert(name.clone(), interned);
-        }
-    } else {
-        paths.insert(Arc::new(root.join("model.safetensors")));
-    }
-
-    let mut shards = Vec::new();
-    let mut names = BTreeMap::new();
-    let mut header_bytes = 0usize;
-    let mut tensor_count = 0usize;
-
-    for path in paths {
-        check_loading_cancelled(cancelled)?;
-        let shard = OpenShard::open(path, &mut budget, &mut header_bytes, &mut tensor_count)?;
-        let shard_index = shards.len();
-        for (tensor_index, (name, _)) in shard.tensors.iter().enumerate() {
-            if names
-                .insert(name.clone(), (shard_index, tensor_index))
-                .is_some()
-            {
-                return Err(invalid(format!("duplicate tensor: {name}")));
-            }
-        }
-        shards.push(shard);
-    }
-
-    if indexed
-        && (names.len() != index_map.len()
-            || names
-                .iter()
-                .any(|(name, &(shard, _))| index_map.get(name) != Some(&shards[shard].path)))
-    {
-        return Err(invalid(
-            "shard inventory must exactly match weight_map \
-             (names and files)",
-        ));
-    }
-    drop(index_map);
+    let OpenInventory { shards, names } =
+        open_inventory(supplied, &root, is_directory, &mut budget, cancelled)?;
 
     // A declared head in a tied checkpoint is never silently retained
     // or ignored.
@@ -1063,6 +1093,123 @@ fn load_weights_impl<'a>(
     })
 }
 
+struct OpenInventory {
+    shards: Vec<OpenShard>,
+    names: BTreeMap<String, (usize, usize)>,
+}
+
+// Shared descriptor/inventory path. Family-specific tensor selection occurs
+// only after every header and the complete index mapping have been validated.
+fn open_inventory(
+    supplied: PathBuf,
+    root: &Path,
+    is_directory: bool,
+    budget: &mut RawBudget<'_>,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<OpenInventory, ModelError> {
+    let mut paths: BTreeSet<Arc<PathBuf>> = BTreeSet::new();
+    let mut index_map: BTreeMap<String, Arc<PathBuf>> = BTreeMap::new();
+
+    let index_path = root.join("model.safetensors.index.json");
+
+    let indexed = is_directory && optional_file(&index_path)?;
+
+    if !is_directory {
+        paths.insert(Arc::new(supplied));
+    } else if indexed {
+        let bytes = budget.read(&index_path, INDEX_BYTES_LIMIT)?;
+
+        let index: serde_json::Value = serde_json::from_slice(&bytes).map_err(json_error)?;
+
+        let map = index
+            .get("weight_map")
+            .and_then(|value| value.as_object())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid("missing or empty weight_map"))?;
+
+        if map.len() > TENSOR_COUNT_LIMIT {
+            return Err(invalid("checkpoint index exceeds tensor count limit"));
+        }
+
+        for (name, file) in map {
+            check_loading_cancelled(cancelled)?;
+
+            let filename = file
+                .as_str()
+                .ok_or_else(|| invalid("invalid shard filename"))?;
+
+            let child = Path::new(filename);
+
+            if child.components().count() != 1
+                || child.extension().and_then(|value| value.to_str()) != Some("safetensors")
+            {
+                return Err(invalid("unsafe shard filename"));
+            }
+
+            let candidate = root.join(child);
+
+            let resolved = candidate
+                .canonicalize()
+                .map_err(|error| io_error("canonicalize shard", &candidate, error))?;
+
+            if resolved.parent() != Some(root) {
+                return Err(invalid("shard escapes checkpoint directory"));
+            }
+
+            if resolved.as_os_str().len() > PATH_BYTES_LIMIT {
+                return Err(invalid("checkpoint path exceeds loader path limit"));
+            }
+            let interned = if let Some(existing) = paths.get(&resolved) {
+                Arc::clone(existing)
+            } else {
+                if paths.len() == SHARD_COUNT_LIMIT {
+                    return Err(invalid("checkpoint exceeds shard count limit"));
+                }
+                let interned = Arc::new(resolved);
+                paths.insert(Arc::clone(&interned));
+                interned
+            };
+            index_map.insert(name.clone(), interned);
+        }
+    } else {
+        paths.insert(Arc::new(root.join("model.safetensors")));
+    }
+
+    let mut shards = Vec::new();
+    let mut names = BTreeMap::new();
+    let mut header_bytes = 0usize;
+    let mut tensor_count = 0usize;
+
+    for path in paths {
+        check_loading_cancelled(cancelled)?;
+        let shard = OpenShard::open(path, budget, &mut header_bytes, &mut tensor_count)?;
+        let shard_index = shards.len();
+        for (tensor_index, (name, _)) in shard.tensors.iter().enumerate() {
+            if names
+                .insert(name.clone(), (shard_index, tensor_index))
+                .is_some()
+            {
+                return Err(invalid(format!("duplicate tensor: {name}")));
+            }
+        }
+        shards.push(shard);
+    }
+
+    if indexed
+        && (names.len() != index_map.len()
+            || names
+                .iter()
+                .any(|(name, &(shard, _))| index_map.get(name) != Some(&shards[shard].path)))
+    {
+        return Err(invalid(
+            "shard inventory must exactly match weight_map \
+             (names and files)",
+        ));
+    }
+    drop(index_map);
+    Ok(OpenInventory { shards, names })
+}
+
 #[derive(Clone, Copy)]
 struct MatrixSpec {
     rows: usize,
@@ -1086,6 +1233,19 @@ struct Inventory<'a> {
 }
 
 impl Inventory<'_> {
+    fn float_tensor(&mut self, name: &str, shape: &[usize]) -> Result<(), ModelError> {
+        check_loading_cancelled(self.cancelled)?;
+        if shape.is_empty() || shape.len() > TENSOR_RANK_LIMIT || shape.contains(&0) {
+            return Err(invalid("invalid floating tensor shape"));
+        }
+        let count = shape.iter().try_fold(1, |n, &dim| product(n, dim))?;
+        let info = self.info(name)?;
+        if info.shape != shape {
+            return Err(invalid(format!("wrong tensor shape: {name}")));
+        }
+        validate_float_dtype(info.dtype)?;
+        self.require(name, count)
+    }
     fn info(&self, name: &str) -> Result<&TensorInfo, ModelError> {
         let &(shard, tensor) = self
             .names
@@ -1521,6 +1681,313 @@ mod hardening_unit_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct HybridFixture {
+        directory: TestDirectory,
+        pins: BTreeMap<PathBuf, [u8; 32]>,
+        source_bytes: usize,
+    }
+    impl HybridFixture {
+        fn new() -> Self {
+            let directory = TestDirectory::new();
+            let convolution: Vec<u8> = (0..6)
+                .flat_map(|i| (i as f32 / 4.0).to_le_bytes())
+                .collect();
+            let norm = [1.0_f32, 1.5]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let packed = [0x7654_3210_u32; 16]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let scales = [half::bf16::from_f32(0.5); 2]
+                .into_iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect::<Vec<_>>();
+            let biases = [half::f16::from_f32(-1.0); 2]
+                .into_iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect::<Vec<_>>();
+            let tensors = vec![
+                (
+                    "conv.weight",
+                    safetensors::tensor::TensorView::new(Dtype::F32, vec![2, 3, 1], &convolution)
+                        .unwrap(),
+                ),
+                (
+                    "norm.weight",
+                    safetensors::tensor::TensorView::new(Dtype::F32, vec![2], &norm).unwrap(),
+                ),
+                (
+                    "proj.weight",
+                    safetensors::tensor::TensorView::new(Dtype::U32, vec![2, 8], &packed).unwrap(),
+                ),
+                (
+                    "proj.scales",
+                    safetensors::tensor::TensorView::new(Dtype::BF16, vec![2, 1], &scales).unwrap(),
+                ),
+                (
+                    "proj.biases",
+                    safetensors::tensor::TensorView::new(Dtype::F16, vec![2, 1], &biases).unwrap(),
+                ),
+            ];
+            let weight_map: BTreeMap<_, _> = tensors
+                .iter()
+                .map(|(n, _)| (*n, "model.safetensors"))
+                .collect();
+            let mut pins = BTreeMap::new();
+            let mut source_bytes = 0;
+            for (name, content) in [
+                (
+                    "config.json",
+                    br#"{"model_type":"hybrid-test","quantization":{"bits":4,"group_size":64}}"#
+                        .to_vec(),
+                ),
+                (
+                    "model.safetensors.index.json",
+                    serde_json::to_vec(&serde_json::json!({"weight_map":weight_map})).unwrap(),
+                ),
+                (
+                    "model.safetensors",
+                    safetensors::tensor::serialize(tensors, None).unwrap(),
+                ),
+            ] {
+                let path = directory.0.join(name);
+                std::fs::write(&path, &content).unwrap();
+                source_bytes += content.len();
+                pins.insert(path, Sha256::digest(&content).into());
+            }
+            Self {
+                directory,
+                pins,
+                source_bytes,
+            }
+        }
+        fn options(&self) -> LoadOptions {
+            LoadOptions {
+                max_file_bytes: self.source_bytes,
+                max_weight_bytes: 112,
+            }
+        }
+        fn layout() -> TensorLayout {
+            TensorLayout {
+                quantization_bits: 4,
+                group_size: Some(64),
+                tensors: BTreeMap::from([
+                    ("conv.weight".into(), TensorRequest::Float(vec![2, 3, 1])),
+                    ("norm.weight".into(), TensorRequest::Float(vec![2])),
+                    (
+                        "proj.weight".into(),
+                        TensorRequest::Matrix { rows: 2, cols: 64 },
+                    ),
+                ]),
+            }
+        }
+        fn configure(data: &serde_json::Value) -> Result<(String, TensorLayout), ModelError> {
+            if data["model_type"] != "hybrid-test"
+                || data["quantization"]["bits"] != 4
+                || data["quantization"]["group_size"] != 64
+            {
+                return Err(invalid("unsupported hybrid fixture config"));
+            }
+            Ok(("validated-hybrid".into(), Self::layout()))
+        }
+    }
+
+    #[test]
+    fn verified_tensor_set_preserves_hybrid_shapes_and_packed_weights() {
+        let fixture = HybridFixture::new();
+        let verification = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| false,
+        };
+        let (metadata, mut tensors) = load_tensor_set_verified(
+            &fixture.directory.0,
+            fixture.options(),
+            &verification,
+            HybridFixture::configure,
+        )
+        .unwrap();
+        assert_eq!(metadata, "validated-hybrid");
+        assert_eq!(tensors.len(), 3);
+        match tensors.remove("conv.weight").unwrap() {
+            CheckpointTensor::Float { shape, values } => {
+                assert_eq!(shape, [2, 3, 1]);
+                assert_eq!(values, [0.0, 0.25, 0.5, 0.75, 1.0, 1.25]);
+            }
+            _ => panic!("convolution must stay floating"),
+        }
+        match tensors.remove("proj.weight").unwrap() {
+            CheckpointTensor::Matrix(MatrixWeight::Affine4 {
+                packed,
+                scales,
+                biases,
+                rows,
+                cols,
+                group_size,
+            }) => {
+                assert_eq!((rows, cols, group_size), (2, 64, 64));
+                assert_eq!(packed, [0x7654_3210; 16]);
+                assert_eq!(scales, [0.5; 2]);
+                assert_eq!(biases, [-1.0; 2]);
+            }
+            _ => panic!("projection must stay packed"),
+        }
+        // The shared inventory helper also preserves the unindexed direct-file route.
+        assert!(
+            load_tensor_set_verified(
+                &fixture.directory.0.join("model.safetensors"),
+                fixture.options(),
+                &verification,
+                HybridFixture::configure
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn verified_tensor_set_rejects_wrong_shapes_extras_and_limits() {
+        let fixture = HybridFixture::new();
+        let verification = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| false,
+        };
+        for case in 0..8 {
+            let mut layout = HybridFixture::layout();
+            match case {
+                0 => {
+                    layout
+                        .tensors
+                        .insert("conv.weight".into(), TensorRequest::Float(vec![6]));
+                }
+                1 => {
+                    layout.tensors.remove("norm.weight");
+                }
+                2 => {
+                    layout
+                        .tensors
+                        .insert("absent".into(), TensorRequest::Float(vec![1]));
+                }
+                3 => {
+                    layout
+                        .tensors
+                        .insert("proj.scales".into(), TensorRequest::Float(vec![2, 1]));
+                }
+                4 => {
+                    layout.group_size = Some(32);
+                }
+                5 => {
+                    layout.quantization_bits = 3;
+                }
+                6 => {
+                    layout.tensors.insert(
+                        "conv.weight".into(),
+                        TensorRequest::Float(vec![usize::MAX, 2]),
+                    );
+                }
+                _ => {
+                    layout.tensors.insert(
+                        "proj.weight".into(),
+                        TensorRequest::Matrix { rows: 0, cols: 64 },
+                    );
+                }
+            }
+            assert!(
+                load_tensor_set_verified(
+                    &fixture.directory.0,
+                    fixture.options(),
+                    &verification,
+                    |_| Ok(((), layout))
+                )
+                .is_err(),
+                "case {case}"
+            );
+        }
+        for options in [
+            LoadOptions {
+                max_file_bytes: fixture.source_bytes - 1,
+                ..fixture.options()
+            },
+            LoadOptions {
+                max_weight_bytes: 111,
+                ..fixture.options()
+            },
+        ] {
+            assert!(matches!(
+                load_tensor_set_verified(
+                    &fixture.directory.0,
+                    options,
+                    &verification,
+                    HybridFixture::configure
+                ),
+                Err(ModelError::MemoryLimit { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn verified_tensor_set_rejects_digest_or_configuration_failure() {
+        let fixture = HybridFixture::new();
+        let mut wrong_pins = fixture.pins.clone();
+        wrong_pins.insert(fixture.directory.0.join("config.json"), [0; 32]);
+        let verification = CheckpointVerification {
+            sha256: &wrong_pins,
+            cancelled: &|| false,
+        };
+        let called = std::cell::Cell::new(false);
+        assert!(
+            load_tensor_set_verified(
+                &fixture.directory.0,
+                fixture.options(),
+                &verification,
+                |v| {
+                    called.set(true);
+                    HybridFixture::configure(v)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            !called.get(),
+            "unverified config must never reach family parser"
+        );
+        let verification = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| false,
+        };
+        assert!(
+            matches!(load_tensor_set_verified::<()>(&fixture.directory.0,fixture.options(),&verification,|_|Err(invalid("unsupported architecture"))),Err(ModelError::CheckpointValidation(message)) if message=="unsupported architecture")
+        );
+        // Alter a body byte while keeping the same size and valid header. No
+        // partially decoded tensor set may escape a whole-shard digest failure.
+        let path = fixture.directory.0.join("model.safetensors");
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            load_tensor_set_verified(
+                &fixture.directory.0,
+                fixture.options(),
+                &verification,
+                HybridFixture::configure
+            )
+            .is_err()
+        );
+        let verification = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| true,
+        };
+        assert!(matches!(
+            load_tensor_set_verified(
+                Path::new("/does-not-exist"),
+                fixture.options(),
+                &verification,
+                HybridFixture::configure
+            ),
+            Err(ModelError::Cancelled)
+        ));
     }
 
     #[test]
