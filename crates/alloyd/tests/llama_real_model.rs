@@ -1,4 +1,6 @@
-//! Real Llama conformance. Run each frozen profile with ALLOY_REAL_MODEL/PROFILE.
+//! Real shared native conformance. Run each frozen profile with ALLOY_REAL_MODEL/PROFILE.
+#[path = "support/recording_engine.rs"]
+mod recording_engine;
 use alloyd::{BootRequest, DaemonService, RpcRequest};
 use engine::{
     memory_guard::MemoryGuardConfig,
@@ -19,7 +21,7 @@ fn llama3_tool_stop_context_cache() {
     let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
     assert!(matches!(
         profile.as_str(),
-        "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit"
+        "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" | "smollm3-3b-4bit"
     ));
     let root = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_qwen3_with_context_limit(
@@ -38,7 +40,7 @@ fn llama3_tool_stop_context_cache() {
     .unwrap();
     let service = DaemonService::open(
         root.path().join("session.sqlite"),
-        boot.engine,
+        recording_engine::RecordingEngine::new(boot.engine),
         Arc::new(TelemetryClient::with_transport(
             "test",
             HardwareTier::Unknown,
@@ -74,7 +76,7 @@ fn llama3_tool_stop_context_cache() {
     let session = create[0]["result"]["session_id"].as_str().unwrap();
     let events = rpc(
         "session.send",
-        json!({"session_id":session,"content":"Use fs.write exactly once to write marker.txt with exactly the content COBALT. After the tool succeeds, reply DONE. Do not use any other tool."}),
+        json!({"session_id":session,"content":"Use fs.write exactly once to write marker.txt with exactly the content COBALT. After the tool succeeds, reply with exactly the four uppercase letters DONE, without punctuation, whitespace, or any other text. Do not use any other tool."}),
     );
     eprintln!(
         "tool_generation={}",
@@ -116,7 +118,14 @@ fn llama3_tool_stop_context_cache() {
     );
     assert_eq!(events.last().unwrap()["result"]["assistant_text"], "DONE");
     let caps = rpc("models.capabilities", json!({"artifact_id":profile}));
-    assert_eq!(caps[0]["result"]["family"], "llama3");
+    assert_eq!(
+        caps[0]["result"]["family"],
+        if profile.starts_with("smollm") {
+            "smollm3"
+        } else {
+            "llama3"
+        }
+    );
     assert_eq!(caps[0]["result"]["backend"]["kind"], "mlx_metal");
     assert_eq!(
         caps[0]["result"]["weight_representations"],
@@ -124,7 +133,11 @@ fn llama3_tool_stop_context_cache() {
     );
     assert_eq!(
         caps[0]["result"]["cache_modes"][0]["representation"],
-        "llama3.mlx-f32.full.bhtd.v1"
+        if profile.starts_with("smollm") {
+            "smollm3.mlx-f32.full.bhtd.v1"
+        } else {
+            "llama3.mlx-f32.full.bhtd.v1"
+        }
     );
     let denied = rpc(
         "session.send",
@@ -268,7 +281,13 @@ fn llama3_long_context_stream_cancel_memory() {
         assert!(ended);
         assert_eq!(streamed, outcome.assistant_text);
         assert!(streamed.contains("COBALT-7392"), "{streamed}");
-        for marker in ["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"] {
+        for marker in [
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<|end_of_text|>",
+            "<|im_start|>",
+            "<|im_end|>",
+        ] {
             assert!(!streamed.contains(marker));
         }
         eprintln!(

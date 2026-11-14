@@ -102,6 +102,8 @@ jobs:
               cargo test --locked -p qwen3 --doc
               cargo test --locked -p llama3 --all-targets
               cargo test --locked -p llama3 --doc
+              cargo test --locked -p smollm --all-targets
+              cargo test --locked -p smollm --doc
               cargo check --locked -p engine --all-targets
               cargo test --locked -p engine --all-targets
               cargo test --locked -p engine --doc

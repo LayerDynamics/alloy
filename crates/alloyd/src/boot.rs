@@ -73,7 +73,7 @@ impl BootRequest {
     pub fn validate_profile(&self) -> Result<(), RpcError> {
         if !matches!(
             self.profile_id.as_str(),
-            "qwen3-4b-4bit" | "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit"
+            "qwen3-4b-4bit" | "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" | "smollm3-3b-4bit"
         ) {
             return Err(RpcError::invalid_params(format!(
                 "unsupported native profile {}",
@@ -108,6 +108,7 @@ pub fn boot_qwen3_with_context_limit(
     }
 
     let llama = request.profile_id.starts_with("llama-");
+    let smollm = request.profile_id == "smollm3-3b-4bit";
     let files = pin_artifact_files(
         &request.artifact_dir,
         request.corpus_models_json.as_deref(),
@@ -120,7 +121,9 @@ pub fn boot_qwen3_with_context_limit(
         directory: request.artifact_dir.clone(),
         files,
         template_sha256: Sha256::digest(
-            if llama {
+            if smollm {
+                smollm::template::CHAT_TEMPLATE
+            } else if llama {
                 llama3::template::CHAT_TEMPLATE
             } else {
                 CHAT_TEMPLATE
@@ -149,7 +152,11 @@ pub fn boot_qwen3_with_context_limit(
     let limits = Qwen3BackendLimits {
         max_files: 64,
         max_config_bytes: 8 * 1024 * 1024,
-        max_tokenizer_bytes: 16 * 1024 * 1024,
+        max_tokenizer_bytes: if smollm {
+            32 * 1024 * 1024
+        } else {
+            16 * 1024 * 1024
+        },
         max_messages: 256,
         max_input_bytes: 1024 * 1024,
         max_rendered_bytes: 2 * 1024 * 1024,
@@ -159,7 +166,7 @@ pub fn boot_qwen3_with_context_limit(
         // Tool schemas increase prompt length; bound the actual prefill work
         // at 64 tokens for configured tools so the full workspace estimate can
         // fit without relaxing the admission guard. Text-only stays at 256.
-        prefill_chunk_tokens: NonZeroUsize::new(if request.tools_enabled || llama {
+        prefill_chunk_tokens: NonZeroUsize::new(if request.tools_enabled || llama || smollm {
             64
         } else {
             256
@@ -177,7 +184,9 @@ pub fn boot_qwen3_with_context_limit(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = (if llama {
+    let backend = (if smollm {
+        Qwen3Backend::new_smollm3(vec![specification], limits, execution)
+    } else if llama {
         Qwen3Backend::new_llama3(vec![specification], limits, execution)
     } else {
         Qwen3Backend::new_with_execution(vec![specification], limits, execution)
@@ -345,8 +354,12 @@ fn pin_artifact_files(
         }
         let (byte_len, digest) = hash_file(&path)
             .map_err(|error| RpcError::internal(format!("hash {}: {error}", path.display())))?;
-        if profile_id.starts_with("llama-") && !expected.contains_key(&name) {
-            return Err(RpcError::internal(format!("unlisted Llama input: {name}")));
+        if (profile_id.starts_with("llama-") || profile_id == "smollm3-3b-4bit")
+            && !expected.contains_key(&name)
+        {
+            return Err(RpcError::internal(format!(
+                "unlisted frozen profile input: {name}"
+            )));
         }
         if let Some(expected_hex) = expected.get(&name) {
             let actual_hex = hex_encode(&digest);
@@ -372,7 +385,7 @@ fn pin_artifact_files(
             "artifact directory missing config.json, tokenizer.json, or safetensors weights",
         ));
     }
-    if profile_id.starts_with("llama-") {
+    if profile_id.starts_with("llama-") || profile_id == "smollm3-3b-4bit" {
         for name in expected
             .keys()
             .filter(|n| !n.starts_with('.') && n.as_str() != "README.md")
@@ -391,6 +404,28 @@ fn load_expected_hashes(
     corpus_models_json: Option<&Path>,
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
+    if profile_id == "smollm3-3b-4bit" {
+        let profile: Value =
+            serde_json::from_slice(include_bytes!("../../families/smollm/fixture/profile.json"))
+                .map_err(|e| RpcError::internal(format!("parse frozen SmolLM3 profile: {e}")))?;
+        return profile["artifact"]["files"]
+            .as_array()
+            .ok_or_else(|| RpcError::internal("SmolLM3 profile missing files"))?
+            .iter()
+            .map(|entry| {
+                Ok((
+                    entry["path"]
+                        .as_str()
+                        .ok_or_else(|| RpcError::internal("missing file path"))?
+                        .to_owned(),
+                    entry["sha256"]
+                        .as_str()
+                        .ok_or_else(|| RpcError::internal("missing file hash"))?
+                        .to_owned(),
+                ))
+            })
+            .collect();
+    }
     // Llama runtime inputs must match the immutable corpus compiled into this
     // source revision, even when an external corpus path is supplied.
     let bytes = if profile_id.starts_with("llama-") {

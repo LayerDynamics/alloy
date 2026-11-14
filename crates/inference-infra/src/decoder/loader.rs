@@ -574,11 +574,21 @@ fn validate_config(
         return Err(invalid("config must be a JSON object"));
     }
 
-    if !config.has_qk_norm()
+    if config.family == super::config::DecoderFamily::Llama3
         && (data["model_type"].as_str() != Some("llama")
             || data["architectures"] != serde_json::json!(["LlamaForCausalLM"]))
     {
         return Err(invalid("Llama architecture mismatch"));
+    }
+    if config.family == super::config::DecoderFamily::SmolLm3
+        && (data["model_type"].as_str() != Some("smollm3")
+            || data["architectures"] != serde_json::json!(["SmolLM3ForCausalLM"])
+            || config.rope_layers.as_ref()
+                != Some(
+                    &super::config::smollm_rope_layers(data, config.num_layers).map_err(invalid)?,
+                ))
+    {
+        return Err(invalid("SmolLM3 architecture or NoPE schedule mismatch"));
     }
     for (name, expected) in [
         ("hidden_size", config.hidden_size),
@@ -600,6 +610,11 @@ fn validate_config(
     if data
         .get("tie_word_embeddings")
         .and_then(|value| value.as_bool())
+        .or_else(|| {
+            (config.family == super::config::DecoderFamily::SmolLm3
+                && data.get("tie_word_embeddings").is_none())
+            .then_some(true)
+        })
         != Some(config.tie_embeddings)
     {
         return Err(invalid("config mismatch: tie_word_embeddings"));

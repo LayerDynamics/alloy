@@ -955,3 +955,31 @@ pub fn llama3_projected_tool_token_upper_bound(
         .checked_add(additional_bytes)
         .ok_or_else(|| EngineError::invalid_request("projection", "Llama byte bound overflow"))
 }
+
+/// Conservative bound for the pinned SmolLM3 ByteLevel BPE tokenizer. It has no
+/// normalizer, no prefix-space insertion and no added post-processing tokens.
+/// Regex splitting preserves bytes and BPE only merges; one token per UTF-8
+/// byte bounds the complete rendered prompt plus already-escaped result growth.
+pub fn smollm3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x7b, 0x6a, 0x50, 0x0b, 0x66, 0x2a, 0x34, 0xeb, 0x3f, 0x03, 0x74, 0xdb, 0x85, 0x6b, 0xa4,
+        0xad, 0x7d, 0xe4, 0xc8, 0x10, 0x40, 0x57, 0x1d, 0x78, 0xdc, 0x0d, 0x35, 0x72, 0x38, 0x93,
+        0x00, 0x05,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified SmolLM3 tokenizer or empty result projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "SmolLM3 byte bound overflow"))
+}

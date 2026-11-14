@@ -4,6 +4,8 @@ pub struct DecoderConfig {
     pub family: DecoderFamily,
     pub rms_eps: f32,
     pub rope_scaling: Option<Llama31Scaling>,
+    /// Explicit per-layer RoPE schedule for SmolLM3. None means every layer.
+    pub rope_layers: Option<Vec<bool>>,
     pub quantization_bits: u8,
     pub hidden_size: usize,
     pub num_layers: usize,
@@ -26,6 +28,7 @@ impl DecoderConfig {
             family: DecoderFamily::Qwen3,
             rms_eps: 1e-6,
             rope_scaling: None,
+            rope_layers: None,
             quantization_bits: 4,
             hidden_size: 32,
             num_layers: 2,
@@ -48,6 +51,7 @@ impl DecoderConfig {
             family: DecoderFamily::Qwen3,
             rms_eps: 1e-6,
             rope_scaling: None,
+            rope_layers: None,
             quantization_bits: 4,
             hidden_size: 2560,
             num_layers: 36,
@@ -87,6 +91,45 @@ impl DecoderConfig {
 pub enum DecoderFamily {
     Qwen3,
     Llama3,
+    SmolLm3,
+}
+
+/// Parse the publisher's 0=NoPE/1=RoPE schedule, with explicit overrides taking
+/// precedence over the periodic default. Shared by metadata and weight loading.
+pub fn smollm_rope_layers(
+    value: &serde_json::Value,
+    layers: usize,
+) -> Result<Vec<bool>, &'static str> {
+    if layers == 0 || layers > 4096 {
+        return Err("invalid SmolLM3 layer count");
+    }
+    if let Some(explicit) = value.get("no_rope_layers").filter(|v| !v.is_null()) {
+        let entries = explicit
+            .as_array()
+            .ok_or("no_rope_layers must be an array")?;
+        if entries.len() != layers {
+            return Err("no_rope_layers length mismatch");
+        }
+        return entries
+            .iter()
+            .map(|entry| match entry.as_u64() {
+                Some(0) => Ok(false),
+                Some(1) => Ok(true),
+                _ => Err("no_rope_layers entries must be 0 or 1"),
+            })
+            .collect();
+    }
+    let interval = match value.get("no_rope_layer_interval") {
+        None => 4,
+        Some(v) => v
+            .as_u64()
+            .and_then(|x| usize::try_from(x).ok())
+            .filter(|x| *x > 0)
+            .ok_or("invalid no_rope_layer_interval")?,
+    };
+    Ok((0..layers)
+        .map(|i| !(i + 1).is_multiple_of(interval))
+        .collect())
 }
 
 /// Llama 3.1 wavelength scaling, applied to inverse angular frequencies.
@@ -124,6 +167,10 @@ impl Llama31Scaling {
     }
 }
 impl DecoderConfig {
+    /// NoPE layers keep raw Q/K while retaining the same causal KV layout.
+    pub fn uses_rope(&self, layer: usize) -> bool {
+        self.rope_layers.as_ref().is_none_or(|layers| layers[layer])
+    }
     pub fn has_qk_norm(&self) -> bool {
         self.family == DecoderFamily::Qwen3
     }

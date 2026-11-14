@@ -91,6 +91,18 @@ impl Engine for RecordingEngine {
         self.inner.estimate_memory(profile, input_tokens)
     }
     fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
+        if std::env::var_os("ALLOY_TEST_TRACE_REQUESTS").is_some() {
+            let rendered = request.expected_render().expect("counted native request");
+            eprintln!(
+                "native_request={}",
+                serde_json::json!({
+                    "id": request.request_id().as_str(),
+                    "profile": request.profile_id().as_str(),
+                    "tokens": rendered.token_ids(),
+                    "text": rendered.text(),
+                })
+            );
+        }
         self.requests
             .lock()
             .unwrap()

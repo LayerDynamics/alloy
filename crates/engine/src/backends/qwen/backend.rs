@@ -182,6 +182,19 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Construct the native SmolLM3 adapter with validated NoPE layer semantics.
+    pub fn new_smollm3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(
+            specifications,
+            limits,
+            execution,
+            inference_infra::decoder::config::DecoderFamily::SmolLm3,
+        )
+    }
     /// Validate pinned metadata and tokenizer configuration without loading
     /// model weights. This synchronous constructor can perform substantial
     /// tokenizer parsing; call it during setup, not on a cancellation loop.
@@ -298,6 +311,10 @@ impl Qwen3Backend {
                 inference_infra::decoder::config::DecoderFamily::Llama3 => {
                     llama3::config::parse_config(&config_value)
                         .map_err(|e| model_error(e, "validate Llama config"))?
+                }
+                inference_infra::decoder::config::DecoderFamily::SmolLm3 => {
+                    smollm::config::parse_config(&config_value)
+                        .map_err(|e| model_error(e, "validate SmolLM3 config"))?
                 }
             };
             // Undeclared representation uses the conservative dense path.
@@ -718,6 +735,14 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family == inference_infra::decoder::config::DecoderFamily::SmolLm3 {
+            return rendering::smollm3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
         if self.family == inference_infra::decoder::config::DecoderFamily::Llama3 {
             return rendering::llama3_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -1068,13 +1093,14 @@ fn registration_for(
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
     let llama = family == inference_infra::decoder::config::DecoderFamily::Llama3;
+    let smollm = family == inference_infra::decoder::config::DecoderFamily::SmolLm3;
     let mut representations = vec![
         WeightRepresentation::F32,
         WeightRepresentation::Affine4 {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama {
+    if llama || smollm {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
@@ -1083,7 +1109,9 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if llama {
+            if smollm {
+                smollm::register::IMPL_VERSION
+            } else if llama {
                 llama3::register::IMPL_VERSION
             } else {
                 qwen3::register::IMPL_VERSION
@@ -1091,7 +1119,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if llama {
+        (if smollm {
+            smollm::register::ARCHITECTURES
+        } else if llama {
             llama3::register::ARCHITECTURES
         } else {
             qwen3::register::ARCHITECTURES
@@ -1101,7 +1131,14 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if llama { "llama3" } else { "qwen3" }.to_owned(),
+            family: if smollm {
+                "smollm3"
+            } else if llama {
+                "llama3"
+            } else {
+                "qwen3"
+            }
+            .to_owned(),
             backend: execution.backend(),
             weight_representations: representations,
             cache_modes: vec![family_cache_mode(family)?],
@@ -1315,11 +1352,23 @@ fn family_template(
         (inference_infra::decoder::config::DecoderFamily::Llama3, true) => {
             llama3::template::TOOL_CHAT_TEMPLATE
         }
+        (inference_infra::decoder::config::DecoderFamily::SmolLm3, false) => {
+            smollm::template::CHAT_TEMPLATE
+        }
+        (inference_infra::decoder::config::DecoderFamily::SmolLm3, true) => {
+            smollm::template::TOOL_CHAT_TEMPLATE
+        }
     }
 }
 fn family_cache_mode(
     family: inference_infra::decoder::config::DecoderFamily,
 ) -> Result<CacheMode, EngineError> {
+    if family == inference_infra::decoder::config::DecoderFamily::SmolLm3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(smollm::register::CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
     if family == inference_infra::decoder::config::DecoderFamily::Llama3 {
         Ok(CacheMode {
             representation: CacheRepresentationId::new(llama3::register::CACHE_REPRESENTATION)?,

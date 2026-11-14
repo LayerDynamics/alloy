@@ -51,6 +51,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smollm",
  "tempfile",
  "tokenizers",
  "tool-registry",
@@ -499,6 +500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smollm",
  "tokenizers",
  "unicode-normalization-alignments",
 ]
@@ -1719,6 +1721,17 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+
+[[package]]
+name = "smollm"
+version = "0.1.0"
+dependencies = [
+ "inference-infra",
+ "mlx-ffi",
+ "safetensors",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "spm_precompiled"

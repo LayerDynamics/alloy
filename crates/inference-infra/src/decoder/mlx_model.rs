@@ -828,8 +828,16 @@ impl MlxDecoderModel {
             let key = ops::transpose(&key, &[0, 2, 1, 3], stream)?;
             let value = ops::transpose(&value, &[0, 2, 1, 3], stream)?;
 
-            let query = apply_rope(&query, c, position, stream)?;
-            let key = apply_rope(&key, c, position, stream)?;
+            let query = if c.uses_rope(index) {
+                apply_rope(&query, c, position, stream)?
+            } else {
+                query
+            };
+            let key = if c.uses_rope(index) {
+                apply_rope(&key, c, position, stream)?
+            } else {
+                key
+            };
 
             let prefix = append.stage_layer(index, &key, &value)?;
 
@@ -1129,6 +1137,17 @@ fn check_matrix(
 }
 
 fn validate_weights(c: &DecoderConfig, weights: &DecoderWeights) -> Result<u64, ModelError> {
+    use super::config::DecoderFamily;
+    if match (&c.family, &c.rope_layers) {
+        (DecoderFamily::SmolLm3, Some(layers)) => layers.len() != c.num_layers,
+        (DecoderFamily::SmolLm3, None) => true,
+        (_, Some(_)) => true,
+        (_, None) => false,
+    } {
+        return Err(ModelError::InvalidConfig(
+            "invalid family-specific RoPE layer schedule",
+        ));
+    }
     if !c.rms_eps.is_finite() || c.rms_eps <= 0.0 || c.rope_scaling.is_some_and(|s| !s.validate()) {
         return Err(ModelError::InvalidConfig(
             "invalid normalization or RoPE scaling",

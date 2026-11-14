@@ -1,0 +1,18 @@
+[package]
+name = "smollm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+inference-infra = { path = "../../inference-infra" }
+mlx-ffi = { path = "../../mlx-ffi" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = "=0.10.9"
+safetensors = "=0.8.0"
+
+[lints]
+workspace = true
