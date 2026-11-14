@@ -15,6 +15,7 @@ pub mod backends;
 pub mod cache;
 pub mod cache_identity;
 pub mod cancellation;
+pub mod conformance;
 pub mod error;
 pub mod family;
 pub mod generation;

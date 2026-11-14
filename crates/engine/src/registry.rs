@@ -12,6 +12,7 @@
 //! protect this registry with their chosen synchronization mechanism.
 
 use crate::{
+    conformance::{QualificationReport, QualificationSpec, QualificationVerdict},
     error::{EngineError, MemoryLimitReason},
     types::{
         ArtifactId, Capabilities, DecodingCapability, DecodingMode, GenerationOptions,
@@ -250,6 +251,29 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// Digest of the actual bounded profile settings used for qualification.
+    /// Includes IDs, context/output/margin, decoding parameters and random seed.
+    pub fn qualification_sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let decoding = match self.default_generation.decoding() {
+            DecodingMode::Greedy => serde_json::json!({"mode": "greedy"}),
+            DecodingMode::Sampling {
+                temperature,
+                top_p,
+                top_k,
+            } => serde_json::json!({"mode": "sampling", "temperature": temperature,
+                    "top_p": top_p, "top_k": top_k}),
+        };
+        let settings = serde_json::json!({
+            "version": 1, "profile": self.id.as_str(), "artifact": self.artifact_id.as_str(),
+            "context": self.context_limit_tokens, "output": self.max_output_tokens,
+            "margin": self.safety_margin_tokens,
+            "default_output": self.default_generation.max_output_tokens(),
+            "decoding": decoding, "seed": self.default_generation.seed(),
+        });
+        format!("{:x}", Sha256::digest(settings.to_string().as_bytes()))
+    }
+
     /// Construct structurally valid profile settings.
     ///
     /// Registry insertion additionally checks the selected artifact and
@@ -411,6 +435,7 @@ pub struct Registry {
     artifacts: BTreeMap<ArtifactId, ArtifactRegistration>,
     directory_owners: BTreeMap<PathBuf, ArtifactId>,
     profiles: BTreeMap<ModelProfileId, ModelProfile>,
+    qualifications: BTreeMap<ModelProfileId, (QualificationSpec, Option<QualificationVerdict>)>,
 }
 
 impl Registry {
@@ -675,11 +700,79 @@ impl Registry {
         })
     }
 
+    /// Require current native conformance before this profile can resolve for
+    /// execution. Calling again replaces expectations and revokes prior results.
+    ///
+    /// The owner must derive the candidate, dependency, artifact and protocol
+    /// hashes from trusted actual inputs. This checks the registry-owned fields;
+    /// it cannot establish the provenance of caller-supplied observations.
+    pub fn require_qualification(&mut self, spec: QualificationSpec) -> Result<(), EngineError> {
+        spec.sha256()
+            .map_err(|message| EngineError::invalid_request("qualification", message))?;
+        let id = ModelProfileId::new(spec.profile_id.clone())?;
+        let profile = self.profile(&id)?;
+        let artifact = self.artifact(profile.artifact_id())?;
+        let family = self.family(artifact.family())?;
+        if spec.artifact_id != artifact.id().as_str()
+            || spec.identity.profile_sha256 != profile.qualification_sha256()
+            || spec.identity.family != family.family()
+            || spec.identity.family_version != family.implementation_version().to_string()
+        {
+            return Err(EngineError::invalid_request(
+                "qualification",
+                "qualification does not match registered profile/artifact/family",
+            ));
+        }
+        self.qualifications.insert(id, (spec, None));
+        Ok(())
+    }
+
+    /// Re-evaluate and retain a terminal report verdict. A failing or stale
+    /// report revokes earlier success; subsequent execution resolution fails.
+    pub fn record_qualification(
+        &mut self,
+        id: &ModelProfileId,
+        report: &QualificationReport,
+    ) -> Result<QualificationVerdict, EngineError> {
+        let (spec, saved) = self.qualifications.get_mut(id).ok_or_else(|| {
+            EngineError::invalid_request(
+                "qualification",
+                "profile has no trusted qualification requirements",
+            )
+        })?;
+        let verdict = spec.evaluate(report);
+        *saved = Some(verdict.clone());
+        Ok(verdict)
+    }
+
+    /// Most recent terminal result, including failure diagnostics. `None` means
+    /// no terminal result; it is never evidence of qualification.
+    pub fn qualification_verdict(&self, id: &ModelProfileId) -> Option<&QualificationVerdict> {
+        self.qualifications
+            .get(id)
+            .and_then(|(_, verdict)| verdict.as_ref())
+    }
+
     /// Resolve a profile, its artifact, and its unique family.
     ///
     /// Resolution does not acquire execution ownership or memory.
     pub fn resolve_profile(&self, id: &ModelProfileId) -> Result<ResolvedProfile<'_>, EngineError> {
         let profile = self.profile(id)?;
+        if let Some((_, verdict)) = self.qualifications.get(id)
+            && !verdict.as_ref().is_some_and(|value| value.usable)
+        {
+            return Err(EngineError::unsupported(
+                "profile qualification",
+                match verdict {
+                    Some(value) => {
+                        format!("profile {id} is unsupported: {}", value.failures.join("; "))
+                    }
+                    None => {
+                        format!("profile {id} requires native conformance before execution")
+                    }
+                },
+            ));
+        }
         let artifact = self.artifact(profile.artifact_id())?;
         let family = self.family(artifact.family())?;
 
