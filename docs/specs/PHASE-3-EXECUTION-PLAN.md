@@ -411,3 +411,29 @@ directories and construct cleanup ownership only after successful creation in
 `tests/m3_profile_conformance.rs` and the new nested-registry tests. Verify the
 normal parallel invocation, not only a serialized workaround. No production
 qualification rules change.
+
+### #95 shared engine hybrid execution adapter (2026-11-14)
+
+Extend `crates/engine/src/backends/qwen/{backend.rs,artifact.rs,loading.rs,memory.rs}`
+and add `architecture.rs`, `hybrid_loading.rs`, `ornith_text.jinja`,
+`qwen35_text.jinja` within that directory. Use an adapter-local family/config
+enum to keep actual hybrid configuration separate from the homogeneous decoder.
+Add explicit Qwen3.5/Ornith text constructors and pinned selected templates.
+Share existing verified metadata, tokenization, rendering identities, admission,
+streaming, output bounds and runtime orchestration; load weights only through
+MlxQwen35Model and its verified exact tensor loader. Use shared weight/cache/step
+plans, measured buffers and explicit native streams. Cache wraps both state
+kinds, rejects foreign owners/truncation, and exposes no partial-KV disk export.
+Existing runtime reset/rebuild handles edits and restart honestly. Text templates
+match each publisher's explicit non-thinking text path; tool mode must reject
+until the trained function/parameter protocol is implemented in the next batch.
+EOS includes only explicitly pinned configuration/tokenizer EOS declarations.
+
+Add `crates/engine/tests/qwen35_engine.rs`: named tests
+`qwen35_engine_native_cache_lifecycle`, `qwen35_engine_rejects_foreign_and_cancelled_state`,
+`qwen35_engine_text_template_contract`, and ignored real-artifact
+`qwen35_real_engine_streaming`. Verify plans/load/CPU+Metal prefill/decode through
+public engine interfaces, exact rebuilt cache versus cold execution, template
+history differences, cancellation and missing-tool support rejection. Preserve
+Qwen3/Llama/SmolLM regression behavior. Production boot and agent qualification
+remain subsequent gates; constructors do not declare either profile qualified.
