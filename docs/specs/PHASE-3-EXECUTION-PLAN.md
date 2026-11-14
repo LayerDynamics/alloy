@@ -345,3 +345,16 @@ test; neither can substitute for the other. Capture/freeze independent eager
 reference vectors before native comparison, with identical projection shapes
 and unchanged strict FR8. This remains a numerical gate only; both profiles
 remain unqualified pending actual engine/agent conformance.
+
+The upstream 0.8B converted artifact includes 153 `vision_tower` tensors.
+The text loader must retain its exact inventory rejection. Add offline
+`tests/fixtures/qwen35_model/extract_text.py` to verify all pinned source files
+and derive a new single-shard text artifact by copying the language tensor
+byte ranges unchanged, with a rebuilt exact index. Reject any source namespace
+other than language_model/vision_tower, invalid offsets, or existing output.
+Record both original and derived file hashes plus recipe digest in the fixed
+small-model profile. Verify each retained tensor's dtype, shape and raw payload
+against the source before freezing the derived artifact. The pinned eager
+reference from the original artifact must also match the derived artifact
+capture exactly. No vision runtime support or relaxed production loader is
+implied.
