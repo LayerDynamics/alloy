@@ -484,3 +484,25 @@ Named tests: `xml_stream_all_chunk_boundaries_separate_reasoning`,
 `xml_stream_limits_and_sink_failure_release_storage`, and
 `xml_stream_success_allocates_no_heap`. Keep production hybrid tool mode
 disabled until exact schema transport and publisher tool rendering are wired.
+
+### #95 immutable schema transport to native decoders (2026-11-14)
+
+Update `crates/engine/src/types/{contracts.rs,tool_context.rs}` so snapshots
+share immutable ToolContext ownership through Arc. Preserve the public borrowed
+accessor and existing schema hash/rendering behavior. Implement XmlToolSchema
+against these exact definitions: explicit JSON primitive/container types and
+single-type nullable unions; reject unknown tools/parameters, missing types,
+ambiguous unions and unsupported composition/reference constructs. Full schema
+constraints and tool authority remain downstream. Add Arc delegation in
+`slab_parser/xml.rs` without allocating schema copies in the parser.
+
+Extend `crates/engine/src/runtime.rs` with a default-compatible decoder hook
+carrying the shared tool context. Validate its schema hash against the counted
+render before admission, retain the same owner in Setup, and pass it to the
+native worker's decoder construction. Existing JSON backends delegate through
+their existing admitted-parser hook. Add
+`tests/tool_rendering.rs::xml_tool_context_resolves_declared_types_and_rejects_ambiguity`
+and extend the observing native backend in `tests/generation.rs` with
+`decoder_receives_the_rendered_schema_owner_on_each_generation` to verify exact
+owner/hash transport across changed schemas and removal while actual model
+generation still executes. This does not yet remove hybrid tool-mode rejection.
