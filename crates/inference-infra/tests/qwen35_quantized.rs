@@ -108,8 +108,10 @@ fn ornith_9b_quantized_native_reference() {
     let cases = reference["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 2);
     let options = ForwardOptions {
-        all_logits: false,
-        output_limit: 8 * 1024 * 1024,
+        // The frozen eager reference projects every prompt position, then
+        // selects the final row. Match that matrix geometry for strict FR8.
+        all_logits: true,
+        output_limit: 16 * 1024 * 1024,
         work_limit: 1024 * 1024 * 1024,
     };
     let mut maximum_absolute = 0f64;
@@ -136,9 +138,38 @@ fn ornith_9b_quantized_native_reference() {
             );
         }
         assert_eq!(cache.len(), tokens.len() + 2);
+        let mut last_cache = model
+            .new_cache(tokens.len() + 2, 1024 * 1024 * 1024, &stream)
+            .unwrap();
+        for (row, chunk) in [tokens.as_slice(), &[19], &[13]].into_iter().enumerate() {
+            let last = model
+                .forward(
+                    chunk,
+                    &mut last_cache,
+                    ForwardOptions {
+                        all_logits: false,
+                        ..options
+                    },
+                    &stream,
+                    &|| false,
+                )
+                .unwrap()
+                .into_values();
+            let full = &actual[row][actual[row].len() - 248320..];
+            assert_eq!(last.len(), full.len());
+            for (&a, &b) in last.iter().zip(full) {
+                assert!(a.is_finite() && (a - b).abs() <= 0.02 + 0.01 * b.abs());
+            }
+            // Selecting logits must not change recurrent or KV continuation.
+            if row > 0 {
+                assert_eq!(last, full);
+            }
+        }
+        assert_eq!(last_cache.len(), cache.len());
         let expected = case["logits"].as_array().unwrap();
         assert_eq!(expected.len(), 3);
         for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let actual = &actual[actual.len() - 248320..];
             let expected: Vec<f64> = serde_json::from_value(expected.clone()).unwrap();
             assert_eq!(actual.len(), 248320);
             assert_eq!(actual.len(), expected.len());
