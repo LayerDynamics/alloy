@@ -274,6 +274,20 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         legacy_decoder_with_parser(allocation, || self.decoder(registry, profile))
     }
 
+    /// Construct the decoder using the exact immutable schemas bound to the
+    /// counted render. The context is shared with the input, never reconstructed
+    /// from model output or copied into unadmitted parser scratch. Existing
+    /// protocols retain their admitted-parser constructor by default.
+    fn decoder_with_tool_context(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        _tools: Option<Arc<crate::types::ToolContext>>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        self.decoder_with_parser_allocation(registry, profile, allocation)
+    }
+
     /// Conservative incremental MLX allocation forecast for this plan.
     ///
     /// Runs on the native worker. Exclude reused active buffers and host
@@ -1109,6 +1123,11 @@ impl EngineRuntime for FamilyRuntime {
             if execution.request_id() != request.request_id()
                 || rendered.profile_id() != request.profile_id()
                 || rendered.snapshot_id() != request.context().snapshot_id()
+                || rendered.tool_schema_hash()
+                    != request
+                        .context()
+                        .tool_context()
+                        .map(crate::types::ToolContext::schema_hash)
             {
                 return Err(internal("generation startup identities disagree"));
             }
@@ -1158,6 +1177,7 @@ impl EngineRuntime for FamilyRuntime {
                 backend,
                 plan,
                 parser_limits,
+                tool_context: request.context().shared_tool_context(),
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
                 pressure_policy: self.pressure_policy,
@@ -1238,6 +1258,7 @@ struct Setup {
     // W2_RUNTIME_PARSER_ALLOCATION_V1
     // Immutable metadata snapshot; allocation remains native-worker owned.
     parser_limits: Option<ParserAllocationLimits>,
+    tool_context: Option<Arc<crate::types::ToolContext>>,
     profile: ModelProfileId,
     options: GenerationOptions,
     pressure_policy: Option<crate::pressure::PressurePolicy>,
@@ -3999,10 +4020,11 @@ impl NativeState {
             .as_mut()
             .ok_or_else(|| internal("decoder construction lost its admitted startup"))?
             .take_parser(setup.parser_limits)?;
-        let decoder = setup.backend.decoder_with_parser_allocation(
+        let decoder = setup.backend.decoder_with_tool_context(
             &setup.registry,
             &setup.profile,
             parser,
+            setup.tool_context.clone(),
         )?;
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
 

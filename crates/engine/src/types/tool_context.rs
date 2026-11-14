@@ -248,6 +248,120 @@ impl ToolContext {
         self.history.iter().map(history_value).collect()
     }
 }
+
+impl crate::slab_parser::XmlToolSchema for ToolContext {
+    fn validate_tool(&self, name: &str) -> Result<(), EngineError> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.id == name)
+            .ok_or_else(|| invalid("XML tool schema", "tool was not advertised"))?;
+        reject_xml_composition(&tool.input_schema)?;
+        if tool.input_schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(invalid(
+                "XML tool schema",
+                "explicit object parameter schema required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parameter_type(
+        &self,
+        name: &str,
+        parameter: &str,
+        raw: &str,
+    ) -> Result<crate::slab_parser::XmlParameterType, EngineError> {
+        use crate::slab_parser::XmlParameterType as Kind;
+        self.validate_tool(name)?;
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.id == name)
+            .ok_or_else(|| invalid("XML tool schema", "tool was not advertised"))?;
+        let definition = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(parameter))
+            .ok_or_else(|| invalid("XML parameter schema", "parameter was not advertised"))?;
+        reject_xml_composition(definition)?;
+        let declared = definition
+            .get("type")
+            .ok_or_else(|| invalid("XML parameter schema", "explicit type required"))?;
+        let kind = if let Some(kind) = declared.as_str() {
+            kind
+        } else if let Some(types) = declared.as_array() {
+            if types.len() != 2
+                || types
+                    .iter()
+                    .filter(|kind| kind.as_str() == Some("null"))
+                    .count()
+                    != 1
+            {
+                return Err(invalid(
+                    "XML parameter schema",
+                    "only single-type nullable unions are supported",
+                ));
+            }
+            let non_null = types
+                .iter()
+                .find(|kind| kind.as_str() != Some("null"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("XML parameter schema", "invalid nullable type"))?;
+            // Validate the alternative even when this value happens to be null.
+            xml_kind(non_null)?;
+            if raw.eq_ignore_ascii_case("null") {
+                return Ok(Kind::Null);
+            }
+            non_null
+        } else {
+            return Err(invalid("XML parameter schema", "invalid type declaration"));
+        };
+        xml_kind(kind)
+    }
+}
+
+fn reject_xml_composition(schema: &Value) -> Result<(), EngineError> {
+    if !schema.is_object()
+        || [
+            "$ref",
+            "$dynamicRef",
+            "oneOf",
+            "anyOf",
+            "allOf",
+            "if",
+            "then",
+            "else",
+            "not",
+            "dependentSchemas",
+        ]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return Err(invalid(
+            "XML tool schema",
+            "unsupported schema reference or composition",
+        ));
+    }
+    Ok(())
+}
+fn xml_kind(kind: &str) -> Result<crate::slab_parser::XmlParameterType, EngineError> {
+    use crate::slab_parser::XmlParameterType as Kind;
+    match kind {
+        "string" => Ok(Kind::String),
+        "integer" => Ok(Kind::Integer),
+        "number" => Ok(Kind::Number),
+        "boolean" => Ok(Kind::Boolean),
+        "object" => Ok(Kind::Object),
+        "array" => Ok(Kind::Array),
+        "null" => Ok(Kind::Null),
+        _ => Err(invalid(
+            "XML parameter schema",
+            "unsupported declared JSON type",
+        )),
+    }
+}
 fn history_value(block: &ToolHistoryBlock) -> Value {
     match block {
         ToolHistoryBlock::Text(message) => json!({

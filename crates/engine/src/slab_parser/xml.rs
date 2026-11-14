@@ -37,6 +37,20 @@ pub trait XmlToolSchema {
     ) -> Result<XmlParameterType, EngineError>;
 }
 
+impl<T: XmlToolSchema + ?Sized> XmlToolSchema for std::sync::Arc<T> {
+    fn validate_tool(&self, name: &str) -> Result<(), EngineError> {
+        self.as_ref().validate_tool(name)
+    }
+    fn parameter_type(
+        &self,
+        tool: &str,
+        parameter: &str,
+        raw: &str,
+    ) -> Result<XmlParameterType, EngineError> {
+        self.as_ref().parameter_type(tool, parameter, raw)
+    }
+}
+
 fn bad(message: &'static str) -> EngineError {
     EngineError::ExecutionFailed {
         stage: "XML tool parsing",

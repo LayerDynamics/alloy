@@ -451,6 +451,13 @@ struct Observations {
     loads: AtomicUsize,
     cache_allocations: AtomicUsize,
     requests: Mutex<BTreeMap<RequestId, RequestWork>>,
+    decoder_schemas: Mutex<Vec<Option<ObservedSchema>>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObservedSchema {
+    pointer: usize,
+    hash: [u8; 32],
 }
 
 impl Observations {
@@ -599,6 +606,24 @@ impl ModelFamily for ObservedBackend {
 }
 
 impl RuntimeBackend for ObservedBackend {
+    fn decoder_with_tool_context(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<engine::parser_allocation::ParserAllocation>,
+        tools: Option<Arc<engine::types::ToolContext>>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        self.observations
+            .decoder_schemas
+            .lock()
+            .unwrap()
+            .push(tools.as_ref().map(|tools| ObservedSchema {
+                pointer: Arc::as_ptr(tools) as usize,
+                hash: *tools.schema_hash(),
+            }));
+        self.inner
+            .decoder_with_tool_context(registry, profile, allocation, tools)
+    }
     fn cache_manifest_digest(
         &self,
         artifact: &ArtifactRegistration,
@@ -727,6 +752,54 @@ impl RuntimeBackend for ObservedBackend {
     ) -> Result<Vec<u32>, EngineError> {
         self.inner.eos_tokens(registry, profile)
     }
+}
+
+#[test]
+fn decoder_receives_the_rendered_schema_owner_on_each_generation() {
+    let env = TestEnvironment::prefix(retained_policy());
+    let mut expected = Vec::new();
+    for (name, kind) in [
+        ("schema-string", Some("string")),
+        ("schema-integer", Some("integer")),
+        ("schema-removed", None),
+    ] {
+        let mut input = context("same-snapshot", profile_id(), "hello");
+        if let Some(kind) = kind {
+            let tool = engine::types::RenderingTool::new(
+                "test.probe".into(),
+                "1.0.0".into(),
+                "Probe".into(),
+                json!({"type":"object","properties":{"value":{"type":kind}}}),
+            )
+            .unwrap();
+            input = input.with_tool_context(
+                engine::types::ToolContext::new(
+                    vec![tool],
+                    vec![],
+                    engine::types::ToolContextLimits {
+                        max_tools: 2,
+                        max_history_blocks: 2,
+                        max_json_bytes: 4096,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        expected.push(input.tool_context().map(|tools| ObservedSchema {
+            pointer: std::ptr::from_ref(tools) as usize,
+            hash: *tools.schema_hash(),
+        }));
+        let counted = env.render(input.clone());
+        assert_eq!(
+            counted.tool_schema_hash(),
+            input
+                .tool_context()
+                .map(engine::types::ToolContext::schema_hash)
+        );
+        let output = env.run(name, input);
+        assert!(!output.text.is_empty());
+    }
+    assert_eq!(*env.observations.decoder_schemas.lock().unwrap(), expected);
 }
 
 struct TestEnvironment {

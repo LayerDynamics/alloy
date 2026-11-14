@@ -11,6 +11,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 pub use tool_context::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
@@ -208,7 +209,7 @@ pub struct ContextSnapshot {
     snapshot_id: ContextSnapshotId,
     profile_id: ModelProfileId,
     messages: Vec<Message>,
-    tool_context: Option<ToolContext>,
+    tool_context: Option<Arc<ToolContext>>,
 }
 
 impl ContextSnapshot {
@@ -252,13 +253,17 @@ impl ContextSnapshot {
     /// Callers source metadata from validated registrations and bind historical
     /// IDs before construction. This does not authorize new effects.
     pub fn with_tool_context(mut self, context: ToolContext) -> Self {
-        self.tool_context = Some(context);
+        self.tool_context = Some(Arc::new(context));
         self
     }
 
     /// Borrow optional model-facing tool schemas and linked history.
     pub fn tool_context(&self) -> Option<&ToolContext> {
-        self.tool_context.as_ref()
+        self.tool_context.as_deref()
+    }
+
+    pub(crate) fn shared_tool_context(&self) -> Option<Arc<ToolContext>> {
+        self.tool_context.clone()
     }
 }
 
