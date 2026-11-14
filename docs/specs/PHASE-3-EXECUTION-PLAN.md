@@ -196,3 +196,32 @@ Tests are `crates/harness-core/tests/{compaction_runtime.rs,canonical_tool_conte
 Review hardening adds `rejected_source_verification_retries_then_preserves_history`, `summary_render_failure_retains_the_original_cause`, `summary_registration_failure_clears_the_registered_request`, `checkpoint_records_conservative_source_provenance`, and `checkpoint_rejects_unowned_durable_artifact_and_preserves_history`. The same session model checks each candidate against labeled source events and a negative or malformed verdict triggers the one stricter retry; original events remain authoritative. The check is a probabilistic model judgment, not a proof of semantic completeness or resistance to prompt injection. Source event identities and trust classes are recorded, and the entire generated checkpoint is treated as untrusted; tool authorization remains a separate policy and receipt decision. Payload provenance increments the event schema version, with older checkpoints treated conservatively as untrusted.
 
 The review file set also includes `crates/engine/src/{error.rs,rendering.rs}` and `crates/engine/tests/unit/backends_qwen_shared_rendering_wiring.rs` for a typed context-render buffer refusal, plus `crates/alloyd/tests/rpc_surface.rs` for the output-reserve boundary. Additional gates are `summary_render_buffer_limit_tries_earlier_completed_boundary`, `schema_v3_checkpoint_migrates_without_rewriting_history`, and `checkpoint_instructions_do_not_authorize_a_tool_effect`.
+
+### #95 native recurrent attention block integration (2026-11-14)
+
+Implement the actual Qwen3.5/Ornith linear attention block in
+`crates/inference-infra/src/decoder/hybrid.rs`, exported by `decoder/mod.rs`.
+Reuse resident dense/affine projections through crate-visible helpers in
+`decoder/mlx_model.rs`; do not dequantize packed matrices. Extend
+`crates/mlx-ffi/src/ops/{hybrid.rs}` and `ops.rs` with explicit, shape-checked
+broadcasting, scalar scaling, concatenation and unweighted RMS normalization
+needed by the trained equations. Keep existing strict equal-shape operations.
+
+The block owns QKV, Z, A, B, convolution, gated normalization and output weights.
+Its cache carries both convolution history and recurrent state, bound to the
+loaded block identity. Forward produces a new immutable state; cancellation or
+failed evaluation must not publish it. Bound weights, state and per-chunk
+payloads before constructing native arrays. Reset/rebuild is explicit; no
+unsupported recurrent truncation is advertised.
+
+Add `crates/inference-infra/tests/qwen35_hybrid.rs` and
+`tests/fixtures/qwen35_hybrid/{generate.py,reference.json}`. The offline generator
+uses the pinned mlx-lm 0.31.2 / MLX 0.32.4 reference GatedDeltaNet with deterministic
+weights and input; it never runs in production. Named checks:
+`qwen35_linear_projection_layout`, `qwen35_recurrent_chunk_equivalence`, and
+`qwen35_recurrent_owner_limits_and_reset`. Compare every output and both state
+components, every sequence split and token-at-a-time continuation; reject wrong
+owners, shape/nonfinite weights and payload overflow without changing prior
+state. Native CPU and Metal runs qualify this block, not the whole Ornith model.
+The complete hybrid model, bounded real-artifact loader, engine integration,
+real agent fixtures and persistent state/rebuild qualification remain required.
