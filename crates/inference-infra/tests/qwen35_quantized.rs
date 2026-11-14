@@ -14,15 +14,39 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[test]
 #[ignore = "requires ALLOY_ORNITH_ARTIFACT and ALLOY_ORNITH_REFERENCE with pinned offline capture"]
 fn ornith_9b_quantized_native_reference() {
-    let root = PathBuf::from(std::env::var_os("ALLOY_ORNITH_ARTIFACT").expect("artifact"))
+    check_quantized_reference(
+        "ALLOY_ORNITH_ARTIFACT",
+        "ALLOY_ORNITH_REFERENCE",
+        include_str!("fixtures/ornith_1_5_9b_profile.json"),
+        (4096, 32, 32, false),
+    );
+}
+
+#[test]
+#[ignore = "requires ALLOY_QWEN35_SMALL_ARTIFACT and ALLOY_QWEN35_SMALL_REFERENCE with pinned offline capture"]
+fn qwen35_0_8b_quantized_native_reference() {
+    check_quantized_reference(
+        "ALLOY_QWEN35_SMALL_ARTIFACT",
+        "ALLOY_QWEN35_SMALL_REFERENCE",
+        include_str!("fixtures/qwen35_0_8b_profile.json"),
+        (1024, 24, 16, true),
+    );
+}
+
+fn check_quantized_reference(
+    artifact_env: &str,
+    reference_env: &str,
+    profile_json: &str,
+    (hidden, layers, value_heads, tied): (usize, usize, usize, bool),
+) {
+    let root = PathBuf::from(std::env::var_os(artifact_env).expect("artifact"))
         .canonicalize()
         .unwrap();
-    let reference_path =
-        PathBuf::from(std::env::var_os("ALLOY_ORNITH_REFERENCE").expect("reference"));
+    let reference_path = PathBuf::from(std::env::var_os(reference_env).expect("reference"));
     assert!(std::fs::metadata(&reference_path).unwrap().len() < 64 * 1024 * 1024);
     let bytes = std::fs::read(reference_path).unwrap();
-    let profile: Value =
-        serde_json::from_str(include_str!("fixtures/ornith_1_5_9b_profile.json")).unwrap();
+    let profile: Value = serde_json::from_str(profile_json).unwrap();
+    let label = profile["id"].as_str().unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(&bytes)),
         profile["reference"]["sha256"]
@@ -65,7 +89,7 @@ fn ornith_9b_quantized_native_reference() {
     .unwrap();
     assert_eq!(
         (c.hidden, c.vocabulary, c.linear_layers.len()),
-        (4096, 248320, 32)
+        (hidden, 248320, layers)
     );
     assert_eq!(
         (
@@ -74,11 +98,15 @@ fn ornith_9b_quantized_native_reference() {
             c.linear.key_heads,
             c.linear.value_heads
         ),
-        (256, 64, 16, 32)
+        (256, 64, 16, value_heads)
     );
     assert_eq!((c.quantization_bits, c.group_size), (4, Some(64)));
     assert_eq!(w.embedding.bits(), Some(4));
-    assert_eq!(w.head.as_ref().unwrap().bits(), Some(4));
+    assert_eq!(c.tied_embeddings, tied);
+    assert_eq!(w.head.is_none(), tied);
+    if let Some(head) = &w.head {
+        assert_eq!(head.bits(), Some(4));
+    }
     for (i, layer) in w.layers.iter().enumerate() {
         for matrix in [&layer.gate, &layer.up, &layer.down] {
             assert_eq!(matrix.bits(), Some(4));
@@ -101,7 +129,7 @@ fn ornith_9b_quantized_native_reference() {
     let stream = Stream::new(&Device::new(DeviceType::Gpu, 0).unwrap()).unwrap();
     let model = MlxQwen35Model::from_weights(c, w, 8 * 1024 * 1024 * 1024, &stream).unwrap();
     eprintln!(
-        "Ornith resident payload={} measured_buffers={}",
+        "{label} resident payload={} measured_buffers={}",
         model.weight_payload_bytes(),
         model.weight_buffer_bytes().unwrap()
     );
@@ -191,7 +219,7 @@ fn ornith_9b_quantized_native_reference() {
                 }
             }
             eprintln!(
-                "Ornith case={case_index} row={row} max_abs={abs} max_pointwise_relative={rel} worst={worst:?}"
+                "{label} case={case_index} row={row} max_abs={abs} max_pointwise_relative={rel} worst={worst:?}"
             );
             maximum_absolute = maximum_absolute.max(abs);
             maximum_relative = maximum_relative.max(rel);
@@ -199,6 +227,6 @@ fn ornith_9b_quantized_native_reference() {
     }
     assert!(
         maximum_absolute < 0.02 && maximum_relative < 0.01,
-        "strict Ornith FR8 failed: max_abs={maximum_absolute}, max_relative={maximum_relative}"
+        "strict {label} FR8 failed: max_abs={maximum_absolute}, max_relative={maximum_relative}"
     );
 }

@@ -97,12 +97,11 @@ def tiny_reference():
     print(json.dumps(manifest))
 
 
-def capture_artifact(artifact, output):
+def capture_artifact(artifact, output, profile_path):
     # Reference generation only: production inference remains entirely native.
     from mlx_lm.utils import load_model
     from mlx_lm.models.cache import make_prompt_cache
     from tokenizers import Tokenizer
-    profile_path = Path(__file__).parent.parent / "ornith_1_5_9b_profile.json"
     profile = json.loads(profile_path.read_text())
     versions = {p: importlib.metadata.version(p) for p in ["mlx", "mlx-lm", "numpy"]}
     assert versions == profile["reference"]["versions"], versions
@@ -141,6 +140,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--profile", type=Path, default=Path(__file__).parent.parent / "ornith_1_5_9b_profile.json")
     args = parser.parse_args()
     if args.artifact is None:
         if args.output is not None:
@@ -149,4 +149,4 @@ if __name__ == "__main__":
     else:
         if args.output is None:
             parser.error("--artifact requires --output")
-        capture_artifact(args.artifact, args.output)
+        capture_artifact(args.artifact, args.output, args.profile)
