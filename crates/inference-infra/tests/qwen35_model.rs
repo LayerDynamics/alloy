@@ -18,6 +18,24 @@ fn qwen35_admission_matches_execution() {
     for stream in streams() {
         let model = model(&stream);
         let c = model.config();
+        let weight_plan = c.weight_payload_plan().unwrap();
+        assert_eq!(weight_plan.payload_bytes, model.weight_payload_bytes());
+        assert_eq!(weight_plan.largest_upload_bytes, (512 * 64 * 4) as u64);
+        let pins = pins();
+        let (mut mismatch, weights) = load_verified(
+            &root(),
+            LoadOptions {
+                max_file_bytes: 8 << 20,
+                max_weight_bytes: 8 << 20,
+            },
+            &CheckpointVerification {
+                sha256: &pins,
+                cancelled: &|| false,
+            },
+        )
+        .unwrap();
+        mismatch.group_size = Some(64);
+        assert!(MlxQwen35Model::from_weights(mismatch, weights, 8 << 20, &stream).is_err());
         let cache_plan = c.cache_payload_plan(TOKENS.len()).unwrap();
         let linear = c.linear_layers.iter().filter(|&&v| v).count() as u64;
         let full = c.linear_layers.len() as u64 - linear;

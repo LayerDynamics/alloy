@@ -1,6 +1,9 @@
 //! Checked logical buffer plans shared by native execution and engine admission.
 use super::config::{Qwen35Config, invalid};
-use crate::{decoder::mlx_model::MlxDecoderResult, kv_cache::KvCacheSpec};
+use crate::{
+    decoder::{loader::TensorRequest, mlx_model::MlxDecoderResult},
+    kv_cache::KvCacheSpec,
+};
 
 fn add(a: u64, b: u64) -> MlxDecoderResult<u64> {
     a.checked_add(b)
@@ -28,7 +31,52 @@ pub struct StepPayloadPlan {
     pub work_bytes: u64,
 }
 
+/// Declared matrix representation plus float32 normalization/convolution data.
+/// Host containers, metadata and native allocator padding are separate charges.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightPayloadPlan {
+    pub payload_bytes: u64,
+    /// Largest owned host vector temporarily copied during native upload.
+    pub largest_upload_bytes: u64,
+}
+
 impl Qwen35Config {
+    pub fn weight_payload_plan(&self) -> MlxDecoderResult<WeightPayloadPlan> {
+        let layout = self.tensor_layout()?;
+        let mut payload_bytes = 0;
+        let mut largest_upload_bytes = 0;
+        for tensor in layout.tensors.values() {
+            let (total, largest) = match tensor {
+                TensorRequest::Float(shape) => {
+                    let elements = shape.iter().try_fold(1, |n, &d| mul(n, d as u64))?;
+                    let bytes = mul(elements, 4)?;
+                    (bytes, bytes)
+                }
+                TensorRequest::Matrix { rows, cols } => {
+                    let elements = mul(*rows as u64, *cols as u64)?;
+                    if let Some(group) = self.group_size {
+                        let packing = 32 / self.quantization_bits as usize;
+                        if !cols.is_multiple_of(group) || !cols.is_multiple_of(packing) {
+                            return Err(invalid("Qwen3.5 packed matrix alignment mismatch").into());
+                        }
+                        let packed = mul(elements / packing as u64, 4)?;
+                        let parameter = mul(elements / group as u64, 4)?;
+                        (add(packed, mul(parameter, 2)?)?, packed.max(parameter))
+                    } else {
+                        let bytes = mul(elements, 4)?;
+                        (bytes, bytes)
+                    }
+                }
+            };
+            payload_bytes = add(payload_bytes, total)?;
+            largest_upload_bytes = largest_upload_bytes.max(largest);
+        }
+        Ok(WeightPayloadPlan {
+            payload_bytes,
+            largest_upload_bytes,
+        })
+    }
+
     pub fn cache_payload_plan(&self, capacity: usize) -> MlxDecoderResult<CachePayloadPlan> {
         self.validate()?;
         if capacity == 0 || capacity > self.context {

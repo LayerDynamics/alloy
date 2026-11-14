@@ -127,7 +127,10 @@ fn check_quantized_reference(
         }
     }
     let stream = Stream::new(&Device::new(DeviceType::Gpu, 0).unwrap()).unwrap();
+    let weight_plan = c.weight_payload_plan().unwrap();
     let model = MlxQwen35Model::from_weights(c, w, 8 * 1024 * 1024 * 1024, &stream).unwrap();
+    assert_eq!(weight_plan.payload_bytes, model.weight_payload_bytes());
+    assert!(weight_plan.largest_upload_bytes < weight_plan.payload_bytes);
     eprintln!(
         "{label} resident payload={} measured_buffers={}",
         model.weight_payload_bytes(),

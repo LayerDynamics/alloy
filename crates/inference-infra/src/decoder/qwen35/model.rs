@@ -5,6 +5,7 @@ use super::{
 };
 use crate::{
     decoder::{
+        fixture::MatrixWeight,
         hybrid::{LinearAttentionState, MlxLinearAttention},
         mlx_model::{
             MlxDecoderError, MlxDecoderResult, MlxLinear, MlxLogits, check_matrix, check_weight,
@@ -126,6 +127,18 @@ fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64
         return Err(invalid("Qwen3.5 weight/config mismatch").into());
     }
     let mut total = 0;
+    let representation = |matrix: &MatrixWeight| -> MlxDecoderResult<()> {
+        if matrix.bits() != c.group_size.map(|_| c.quantization_bits)
+            || matrix.affine4_group_size() != c.group_size
+        {
+            return Err(invalid(
+                "Qwen3.5 matrix representation differs from declared admission plan",
+            )
+            .into());
+        }
+        Ok(())
+    };
+    representation(&w.embedding)?;
     check_matrix(
         "Qwen3.5 embedding",
         mul(c.vocabulary, c.hidden)?,
@@ -133,6 +146,7 @@ fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64
         &mut total,
     )?;
     if let Some(h) = &w.head {
+        representation(h)?;
         check_matrix("Qwen3.5 head", mul(c.vocabulary, c.hidden)?, h, &mut total)?;
     }
     check_weight("Qwen3.5 norm", c.hidden, &w.norm, &mut total)?;
@@ -144,10 +158,14 @@ fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64
             ("Qwen3.5 up", &l.up, c.intermediate, c.hidden),
             ("Qwen3.5 down", &l.down, c.hidden, c.intermediate),
         ] {
+            representation(m)?;
             check_matrix(name, mul(rows, cols)?, m, &mut total)?;
         }
         match (&l.attention, c.linear_layers[i]) {
             (AttentionWeights::Linear(w), true) => {
+                for matrix in [&w.qkv, &w.z, &w.a, &w.b, &w.output] {
+                    representation(matrix)?;
+                }
                 total = add(total, w.validated_bytes(c.linear)?)?
             }
             (AttentionWeights::Full(w), false) => {
@@ -167,6 +185,7 @@ fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64
                         c.query_heads * c.head_dim,
                     ),
                 ] {
+                    representation(m)?;
                     check_matrix(name, mul(rows, cols)?, m, &mut total)?;
                 }
                 check_weight("Qwen3.5 query norm", c.head_dim, &w.q_norm, &mut total)?;
@@ -174,6 +193,9 @@ fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64
             }
             _ => return Err(invalid("Qwen3.5 layer type disagrees with weights").into()),
         }
+    }
+    if total != c.weight_payload_plan()?.payload_bytes {
+        return Err(invalid("Qwen3.5 weight payload differs from declared admission plan").into());
     }
     Ok(total)
 }
