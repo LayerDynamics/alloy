@@ -439,6 +439,45 @@ pub fn silu(input: &Array, stream: &Stream) -> OperationResult<Array> {
     multiply(input, &sigmoid, stream)
 }
 
+/// Tanh-approximate GELU, using the upstream eager float32 operation order.
+pub fn gelu_approx(input: &Array, stream: &Stream) -> OperationResult<Array> {
+    require_f32(input)?;
+    let exponent = Array::from_f32_slice(&[3.0], &[])?;
+    let mut cube = PendingArray::new();
+    // SAFETY: finite scalar exponent broadcasts to the borrowed float32 array.
+    let status = unsafe {
+        sys::mlx_power(
+            &mut cube.raw,
+            input.as_raw(),
+            exponent.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    let cube = cube.finish(status)?;
+    let inner = residual_add(input, &scale(&cube, 0.044715, stream)?, stream)?;
+    let inner = scale(&inner, (2.0 / std::f64::consts::PI).sqrt() as f32, stream)?;
+    let mut tanh = PendingArray::new();
+    // SAFETY: valid borrowed float32 input and explicit stream/output.
+    let status = unsafe { sys::mlx_tanh(&mut tanh.raw, inner.as_raw(), stream.as_raw()) };
+    let tanh = tanh.finish(status)?;
+    let one = Array::from_f32_slice(&[1.0], &[])?;
+    let mut shifted = PendingArray::new();
+    // SAFETY: scalar one broadcasts to the valid input tensor.
+    let status = unsafe {
+        sys::mlx_add(
+            &mut shifted.raw,
+            one.as_raw(),
+            tanh.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    multiply(
+        &scale(input, 0.5, stream)?,
+        &shifted.finish(status)?,
+        stream,
+    )
+}
+
 /// Multiply equal-shaped float32 tensors without implicit broadcasting.
 pub fn multiply(left: &Array, right: &Array, stream: &Stream) -> OperationResult<Array> {
     require_f32(left)?;

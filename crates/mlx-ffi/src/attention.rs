@@ -56,6 +56,14 @@ pub enum AttentionMask {
         /// Absolute key position visible to the first query token.
         offset: usize,
     },
+    /// Causal suffix restricted to the most recent `window_tokens` positions,
+    /// including the query's own position. Keys may begin at an evicted prefix.
+    SlidingCausalSuffix {
+        /// Retained keys before the current query chunk.
+        prefix_tokens: usize,
+        /// Maximum visible positions per query, including itself; nonzero.
+        window_tokens: usize,
+    },
 }
 
 struct PendingArray {
@@ -133,7 +141,19 @@ fn shape4(array: &Array) -> OperationResult<[usize; 4]> {
 /// The returned array is lazy. The caller owns evaluation and stream
 /// synchronization.
 pub fn rope(input: &Array, theta: f32, offset: usize, stream: &Stream) -> OperationResult<Array> {
-    rope_impl(input, theta, None, offset, stream)
+    rope_impl(input, theta, None, 1.0, offset, stream)
+}
+
+/// Split-half RoPE with an explicit positive position scale, matching MLX's
+/// native linear scaling graph (absolute positions are scaled before rotation).
+pub fn rope_scaled(
+    input: &Array,
+    theta: f32,
+    scale: f32,
+    offset: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    rope_impl(input, theta, None, scale, offset, stream)
 }
 
 /// Split-half RoPE with explicit positive frequency divisors, one per head pair.
@@ -143,13 +163,14 @@ pub fn rope_with_frequencies(
     offset: usize,
     stream: &Stream,
 ) -> OperationResult<Array> {
-    rope_impl(input, 1.0, Some(frequencies), offset, stream)
+    rope_impl(input, 1.0, Some(frequencies), 1.0, offset, stream)
 }
 
 fn rope_impl(
     input: &Array,
     theta: f32,
     frequencies: Option<&Array>,
+    scale: f32,
     offset: usize,
     stream: &Stream,
 ) -> OperationResult<Array> {
@@ -168,9 +189,9 @@ fn rope_impl(
             "split-half RoPE requires an even head dimension",
         ));
     }
-    if !theta.is_finite() || theta <= 0.0 {
+    if !theta.is_finite() || theta <= 0.0 || !scale.is_finite() || scale <= 0.0 {
         return Err(OperationError::InvalidInput(
-            "RoPE theta must be finite and positive",
+            "RoPE theta and scale must be finite and positive",
         ));
     }
 
@@ -206,7 +227,7 @@ fn rope_impl(
             dims,
             false,
             base,
-            1.0,
+            scale,
             native_offset,
             frequencies.map_or(no_frequencies, Array::as_raw),
             stream.as_raw(),
@@ -298,6 +319,62 @@ pub fn grouped_query_attention_scaled(
     let mut visibility = None;
     let mask_mode = match mask {
         AttentionMask::Full => c"".as_ptr(),
+        AttentionMask::SlidingCausalSuffix {
+            prefix_tokens,
+            window_tokens,
+        } => {
+            if window_tokens == 0 || prefix_tokens.checked_add(query_tokens) != Some(kv_tokens) {
+                return Err(OperationError::InvalidInput(
+                    "invalid sliding causal suffix",
+                ));
+            }
+            let upper = causal_visibility(query_tokens, kv_tokens, prefix_tokens, stream)?;
+            if window_tokens >= kv_tokens {
+                visibility = Some(upper);
+            } else {
+                let diagonal = i32::try_from(prefix_tokens)
+                    .ok()
+                    .zip(i32::try_from(window_tokens).ok())
+                    .map(|(p, w)| p - w)
+                    .ok_or(OperationError::InvalidInput(
+                        "sliding diagonal exceeds C int",
+                    ))?;
+                let rows = i32::try_from(query_tokens)
+                    .map_err(|_| OperationError::InvalidInput("query count exceeds C int"))?;
+                let columns = i32::try_from(kv_tokens)
+                    .map_err(|_| OperationError::InvalidInput("key count exceeds C int"))?;
+                let mut old = PendingArray::new();
+                // SAFETY: dimensions/diagonal checked; output and stream are valid.
+                let status = unsafe {
+                    sys::mlx_tri(
+                        &mut old.raw,
+                        rows,
+                        columns,
+                        diagonal,
+                        DType::Bool as u32,
+                        stream.as_raw(),
+                    )
+                };
+                let old = old.finish(status)?;
+                let mut recent = PendingArray::new();
+                // SAFETY: valid Boolean input and explicit stream.
+                let status =
+                    unsafe { sys::mlx_logical_not(&mut recent.raw, old.as_raw(), stream.as_raw()) };
+                let recent = recent.finish(status)?;
+                let mut allowed = PendingArray::new();
+                // SAFETY: equal-shaped Boolean arrays and valid stream/output.
+                let status = unsafe {
+                    sys::mlx_logical_and(
+                        &mut allowed.raw,
+                        upper.as_raw(),
+                        recent.as_raw(),
+                        stream.as_raw(),
+                    )
+                };
+                visibility = Some(allowed.finish(status)?);
+            }
+            c"".as_ptr()
+        }
         AttentionMask::CausalSuffix { prefix_tokens } => {
             let expected =
                 prefix_tokens
@@ -635,15 +712,24 @@ mod tests {
                     let key_count = match mask {
                         AttentionMask::Full => kv_tokens,
                         AttentionMask::CausalSuffix { prefix_tokens } => prefix_tokens + token + 1,
+                        AttentionMask::SlidingCausalSuffix { prefix_tokens, .. } => {
+                            prefix_tokens + token + 1
+                        }
                         AttentionMask::CausalOffset { offset } => offset
                             .saturating_add(token)
                             .saturating_add(1)
                             .min(kv_tokens),
                     };
+                    let first_key = match mask {
+                        AttentionMask::SlidingCausalSuffix { window_tokens, .. } => {
+                            key_count.saturating_sub(window_tokens)
+                        }
+                        _ => 0,
+                    };
 
                     let mut scores = Vec::with_capacity(key_count);
 
-                    for key_token in 0..key_count {
+                    for key_token in first_key..key_count {
                         let key_base =
                             ((batch_index * kv_heads + kv_head) * kv_tokens + key_token) * width;
 
@@ -667,7 +753,8 @@ mod tests {
                     for dimension in 0..width {
                         let mut result = 0.0_f64;
 
-                        for (key_token, score) in scores.iter().enumerate() {
+                        for (relative_key, score) in scores.iter().enumerate() {
+                            let key_token = first_key + relative_key;
                             let value_base = ((batch_index * kv_heads + kv_head) * kv_tokens
                                 + key_token)
                                 * width;
