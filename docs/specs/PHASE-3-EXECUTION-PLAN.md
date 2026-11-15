@@ -956,3 +956,27 @@ Phi diagnostic receipts e985c969c7074d5496e7cd9da5c60e4a and
 improves checkpoint shape/policy explanation but still fails exact skill output
 and tool syntax. It is not integrated or qualified. The prior 4-bit profile and
 all Phi agent gates remain open; these observations do not narrow M3 scope.
+
+### #73 frozen Gemma 3 12B numerical comparison (2026-11-15)
+
+The native core's seven initial CPU/Metal tests passed in
+cf3aec18b6b243c98cb1e24ce901a373. The actual frozen benchmark artifact was
+re-hashed against all corpus entries in e3a96cbd689d478a904247cf9387557b.
+Add `crates/inference-infra/tests/gemma3_quantized.rs`,
+`crates/inference-infra/tests/fixtures/gemma3_12b_profile.json`, and
+`crates/inference-infra/tests/fixtures/gemma3_model/capture_real_reference.py`.
+The profile must retain the existing source and MLX revision/hash identities,
+exact tokenizer inputs, pinned oracle versions and captured reference digest.
+It stays explicitly unqualified. Store the generated full-vocabulary reference
+under the task's Codex artifact directory, not in the checkout.
+
+Run `gemma3_12b_real_quantized_native_reference` against all 262208 logits for
+two frozen prefill requests and two subsequent tokens each, with unchanged
+FR-8 absolute/relative thresholds. Assert packed 4-bit resident matrices,
+actual wrapped tensor layout/output head, measured native weight buffers,
+and bit-identical full-versus-last-only projection. No text-only success or
+small synthetic fixture substitutes for this real artifact comparison.
+If a mismatch identifies an equation/operation-order issue, fix the existing
+Gemma core or planned MLX primitive files and rerun affected tiny references.
+Daemon tool/context/restart qualification and the additional small Gemma 3
+profile remain open after a passing numerical comparison.
