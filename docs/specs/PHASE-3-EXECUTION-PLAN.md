@@ -920,3 +920,39 @@ success. Existing fixture contains both successful and failed results. Run
 `phi_real_engine_tool_proposals`, and the unchanged daemon
 `llama3_tool_stop_context_cache` with Phi, plus strict Clippy. Keep the original
 failed receipts and require all real task assertions before claiming that gate.
+
+### #73 Gemma 3 native text core (2026-11-15)
+
+The frozen 12B text artifact is already present and remains mandatory alongside
+an additional small profile. Implement its actual decoupled head width, six
+normalizations per block with (1 + weight), BF16-rounded embedding multiplier,
+approximate GELU gating, explicit query scale, local/global RoPE and mixed
+sliding/full KV. Do not route it through a Llama alias. This batch establishes
+native numerical/cache behavior; daemon registration and both real agent
+profiles remain required subsequent integration.
+
+Exact files: `crates/mlx-ffi/src/{attention.rs,ops.rs}`;
+`crates/inference-infra/src/decoder/mod.rs`;
+`crates/inference-infra/src/decoder/gemma3/{mod.rs,config.rs,weights.rs,planning.rs,model.rs}`;
+`crates/inference-infra/tests/{gemma3_config.rs,gemma3_model.rs}`;
+`crates/inference-infra/tests/fixtures/gemma3_model/{generate.py,config.json,model.safetensors,reference.json,manifest.json}`.
+Use pinned mlx-lm 0.31.2/MLX 0.32.4 as an independent offline tiny-model oracle,
+with compile disabled and explicit CPU/Metal checks. Keep production native.
+The existing frozen benchmark pins own the actual 12B source/artifact identity.
+
+Named tests: `gemma3_layer_schedule_config_override`,
+`gemma3_rejects_unsupported_equations`, `gemma3_reference_logits`,
+`gemma3_sliding_full_attention`, `gemma3_cancel_and_foreign_cache_are_atomic`,
+`gemma3_verified_loading_and_payload_bounds`,
+`gemma3_native_gelu_and_sliding_attention`. Exercise every chunk split across
+window boundaries, explicit schedule override, distinct query/head widths,
+4/8-bit resident representation metadata, wrong shapes/hashes, cache ownership,
+cancellation and output/work/weight bounds. Preserve fixed FR-8 thresholds
+(absolute <2e-2 and relative <1e-2); no relaxed near-zero denominator. Run
+strict Clippy and the affected shared native primitive regressions.
+
+Phi diagnostic receipts e985c969c7074d5496e7cd9da5c60e4a and
+1689ed097ed540fc8550e26730baed51 establish that the pinned 8-bit candidate
+improves checkpoint shape/policy explanation but still fails exact skill output
+and tool syntax. It is not integrated or qualified. The prior 4-bit profile and
+all Phi agent gates remain open; these observations do not narrow M3 scope.
