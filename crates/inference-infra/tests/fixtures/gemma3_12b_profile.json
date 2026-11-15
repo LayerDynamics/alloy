@@ -1,0 +1,104 @@
+{
+  "id": "gemma-3-12b-4bit",
+  "source": {
+    "repository": "google/gemma-3-12b-it",
+    "revision": "96b6f1eccf38110c56df3a15bffe176da04bfd80"
+  },
+  "artifact": {
+    "repository": "mlx-community/gemma-3-text-12b-it-4bit",
+    "revision": "83eda451975103fff6f11e97bf75cd0f1c61af2c",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+        "bytes": 1570
+      },
+      {
+        "path": "README.md",
+        "sha256": "e60d14424648d155cfb02a8939f9f283ba7376df5e61344deedc95c01007a86c",
+        "bytes": 1222
+      },
+      {
+        "path": "added_tokens.json",
+        "sha256": "50b2f405ba56a26d4913fd772089992252d7f942123cc0a034d96424221ba946",
+        "bytes": 35
+      },
+      {
+        "path": "config.json",
+        "sha256": "4c9fe5c1c2e72cc8c9dd0d7d7f5a863de7a273ed2d013ff7c9459707257c27b5",
+        "bytes": 929
+      },
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "sha256": "c2c27928109500639b11e312e02563039dddbffb12da5926e8819b5dfeb84a88",
+        "bytes": 5367402100
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "sha256": "7945a54eff12ef4023292933e8443090a27f85840f975e42b6a7d676c0501304",
+        "bytes": 1818630813
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "sha256": "59605bf538aa43010f2fcb575096f851ab1e635ba51787caeb4fe2cdc0f60702",
+        "bytes": 132247
+      },
+      {
+        "path": "special_tokens_map.json",
+        "sha256": "2f7b0adf4fb469770bb1490e3e35df87b1dc578246c5e7e6fc76ecf33213a397",
+        "bytes": 662
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+        "bytes": 33384568
+      },
+      {
+        "path": "tokenizer.model",
+        "sha256": "1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c",
+        "bytes": 4689074
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "bfe25c2735e395407beb78456ea9a6984a1f00d8c16fa04a8b75f2a614cf53e1",
+        "bytes": 1156999
+      }
+    ]
+  },
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "sha256": "51749369c3f3e5eac65a4891045393af5f6e02ce00ca4753ca10432ea743aeba",
+    "compile_enabled": false
+  },
+  "position_regime": "gemma3-local-global-linear-v1",
+  "prompts": [
+    "Calculate 2 + 2.",
+    "Explain blue sky."
+  ],
+  "decode_tokens": [
+    10,
+    12
+  ],
+  "qualification_status": "unqualified",
+  "prompt_tokens": [
+    [
+      50702,
+      236743,
+      236778,
+      900,
+      236743,
+      236778,
+      236761
+    ],
+    [
+      155122,
+      3730,
+      7217,
+      236761
+    ]
+  ]
+}
