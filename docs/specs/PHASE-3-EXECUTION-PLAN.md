@@ -980,3 +980,24 @@ If a mismatch identifies an equation/operation-order issue, fix the existing
 Gemma core or planned MLX primitive files and rerun affected tiny references.
 Daemon tool/context/restart qualification and the additional small Gemma 3
 profile remain open after a passing numerical comparison.
+
+### #73 smaller Gemma 3 numerical gate (2026-11-15)
+
+The frozen 12B numerical gate passed in 8a13e74f523542d1b0a1d3923d215c80:
+six vocabulary rows, maximum absolute error 3.553e-15 and relative error
+2.221e-16, with 7,985,675,264 measured resident weight-buffer bytes. These
+results establish the core, not agent support.
+
+Pin the smaller text artifact `mlx-community/gemma-3-text-4b-it-4bit` revision
+`4f665a4c50ecfe4ecdc34056ab52fe3e3c4abf9e` and retain source metadata
+`google/gemma-3-4b-it` revision `093f9f388b31de276ce2de164bdc2081324b9767`.
+Add `crates/inference-infra/tests/fixtures/gemma3_4b_profile.json` and extend
+`crates/inference-infra/tests/gemma3_quantized.rs` with
+`gemma3_4b_real_quantized_native_reference`, sharing the unchanged numerical
+assertions and allowing only the corresponding explicit artifact/reference
+inputs. Reuse the committed offline capture script; bind the output digest
+before native execution. Verify 34 layers, hidden 2560, head width 256,
+8 query heads/4 KV heads, five full-attention layers and packed-resident
+4-bit/group-64 storage. Run strict FR-8 and full/last-only identity checks.
+Both profiles remain unqualified until shared engine/daemon, agent fixtures,
+context/cache lifecycle, and budget measurements pass.
