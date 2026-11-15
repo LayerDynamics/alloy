@@ -11,9 +11,31 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[test]
 #[ignore = "requires ALLOY_GEMMA3_ARTIFACT and ALLOY_GEMMA3_REFERENCE with pinned offline capture"]
 fn gemma3_12b_real_quantized_native_reference() {
-    let artifact_env = "ALLOY_GEMMA3_ARTIFACT";
-    let reference_env = "ALLOY_GEMMA3_REFERENCE";
-    let profile_json = include_str!("fixtures/gemma3_12b_profile.json");
+    real_model(
+        include_str!("fixtures/gemma3_12b_profile.json"),
+        "ALLOY_GEMMA3_ARTIFACT",
+        "ALLOY_GEMMA3_REFERENCE",
+        (3840, 48, 16, 8),
+    );
+}
+
+#[test]
+#[ignore = "requires ALLOY_GEMMA3_SMALL_ARTIFACT and ALLOY_GEMMA3_SMALL_REFERENCE with pinned offline capture"]
+fn gemma3_4b_real_quantized_native_reference() {
+    real_model(
+        include_str!("fixtures/gemma3_4b_profile.json"),
+        "ALLOY_GEMMA3_SMALL_ARTIFACT",
+        "ALLOY_GEMMA3_SMALL_REFERENCE",
+        (2560, 34, 8, 4),
+    );
+}
+
+fn real_model(
+    profile_json: &str,
+    artifact_env: &str,
+    reference_env: &str,
+    geometry: (usize, usize, usize, usize),
+) {
     let root = PathBuf::from(std::env::var_os(artifact_env).expect("artifact"))
         .canonicalize()
         .unwrap();
@@ -62,13 +84,14 @@ fn gemma3_12b_real_quantized_native_reference() {
         },
     )
     .unwrap();
-    assert_eq!((c.hidden, c.vocabulary, c.layers), (3840, 262208, 48));
-    assert_eq!((c.head_dim, c.query_heads, c.kv_heads), (256, 16, 8));
+    assert_eq!((c.hidden, c.layers, c.query_heads, c.kv_heads), geometry);
+    assert_eq!(c.vocabulary, 262208);
+    assert_eq!(c.head_dim, 256);
     assert_eq!((c.quantization_bits, c.group_size), (4, Some(64)));
     assert_eq!(w.embedding.bits(), Some(4));
     assert!(!c.tied_embeddings && w.head.is_some());
     assert!(c.wrapped);
-    assert_eq!(c.sliding.iter().filter(|&&v| !v).count(), 8);
+    assert_eq!(c.sliding.iter().filter(|&&v| !v).count(), geometry.1 / 6);
     assert_eq!(profile["position_regime"], "gemma3-local-global-linear-v1");
     assert_eq!(reference["position_regime"], profile["position_regime"]);
     for layer in &w.layers {
