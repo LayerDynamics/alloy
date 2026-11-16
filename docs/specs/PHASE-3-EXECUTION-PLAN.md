@@ -1001,3 +1001,37 @@ before native execution. Verify 34 layers, hidden 2560, head width 256,
 4-bit/group-64 storage. Run strict FR-8 and full/last-only identity checks.
 Both profiles remain unqualified until shared engine/daemon, agent fixtures,
 context/cache lifecycle, and budget measurements pass.
+
+### #73 Gemma 3 shared engine text integration (2026-11-16)
+
+Both pinned real models pass strict native numerical comparison (receipt
+8be84d0db03a4f9abadab044363b5f7f). Wire that implementation into the existing
+engine worker and admission paths. This batch does not qualify tool/daemon
+agent behavior; keep unsupported tools explicit and all issue gates open.
+
+Exact files: `crates/engine/src/backends/qwen/{architecture.rs,backend.rs,artifact.rs,loading.rs,output.rs,gemma3_loading.rs,gemma3_text.jinja}`;
+`crates/engine/src/types/contracts.rs`; `crates/alloyd/src/service.rs`;
+`crates/engine/tests/gemma3_engine.rs`;
+`crates/inference-infra/src/decoder/gemma3/model.rs`.
+
+Implement pinned BPE Replace/ByteFallback/Fuse decoding with bounded incremental
+UTF-8 handling, preserving the existing ByteLevel contract. Validate the exact
+decoder sequence and fallback model setting, keep both EOS IDs and BOS framing,
+and reject unsupported tool mode and reserved delimiter injection. Match trained
+Gemma text rendering (system folded into first user turn, assistant as model).
+Advertise mixed sliding/full cache identity explicitly, with no prefix reuse or
+persistence claim until implemented. Count actual retained KV and allocator
+headroom, reject foreign ownership and insufficient admission, and use native
+Gemma model execution on the worker.
+
+Named tests: `gemma3_engine_render_and_decode_contract`,
+`gemma3_engine_rejects_invalid_tokenizer_and_tools`,
+`gemma3_engine_native_cache_and_cancellation`,
+`gemma3_real_4b_engine_streaming`, `gemma3_real_12b_engine_streaming`.
+Check genuine tokenizer Unicode/fallback boundaries and special tokens against
+the pinned tokenizer decoder, trained text rendering and token IDs, full model
+streaming/repeat after cancellation, cache ownership/reset and conservative
+memory rejection. Run focused CPU/Metal fixture tests, both explicitly supplied
+real artifacts, affected engine regression suites, strict Clippy and daemon
+compilation for the new cache capability variant. Real engine text success is
+not evidence of the still-required tool/agent/context/memory qualification.
