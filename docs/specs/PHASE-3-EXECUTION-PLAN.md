@@ -1035,3 +1035,9 @@ memory rejection. Run focused CPU/Metal fixture tests, both explicitly supplied
 real artifacts, affected engine regression suites, strict Clippy and daemon
 compilation for the new cache capability variant. Real engine text success is
 not evidence of the still-required tool/agent/context/memory qualification.
+
+The first integration compile (ada23ac7cd004947b2d270ab027f94e8) found
+two existing direct decoder initializers needing the explicit ByteLevel mode.
+Include `crates/engine/tests/unit/backends_qwen_output_protocol_token.rs` and
+`crates/engine/tests/unit/backends_qwen_output_structured_output.rs` in this batch;
+preserve their existing protocol assertions and rerun them.
