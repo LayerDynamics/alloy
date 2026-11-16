@@ -1099,3 +1099,15 @@ successful-result DONE, and accurate rejected-result explanation without retry.
 Run full affected parser regressions, both real native profiles, and strict
 Clippy. Daemon policy effects, session/context/restart and tier measurements
 remain subsequent mandatory gates; a Python probe never substitutes for them.
+
+The 12B offline probe ada35cf57b1c4e53b840350d4fb720aa produces standalone
+XML fenced calls, correct exact arguments and accurate rejection explanation.
+Support two explicit Gemma tool grammars: bare `<tool_call>...</tool_call>` and
+exact ` ```xml\n<tool_call>...</tool_call>\n``` ` framing (without the spaces
+shown here for readability). For fenced calls require the closing fence before
+structural completion. This is a declared protocol alternative, not extraction
+of a code block from explanatory text. Test fragmented fences, missing closing
+fences, incomplete JSON, prose prefixes and same-token non-whitespace suffixes;
+all must fail atomically unless the entire declared grammar is complete. Keep
+the prompt's bare-format preference and measure actual native behavior of both
+forms. No extra source files beyond the preceding exact batch are needed.
