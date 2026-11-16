@@ -1049,3 +1049,53 @@ and use the existing validated Gemma3Config context (32768 for the pinned
 MLX dialect) for this family only. Preserve nested/outer conflict rejection
 and all other families' explicit context checks. Extend the existing Gemma
 contract test with missing/invalid context cases and rerun both real gates.
+
+### #73 Gemma 3 native tool handoff and result framing (2026-11-16)
+
+Shared text integration is committed as 1d6f241. Both actual model engine gates
+passed (489b112e5c8f48008b35c0995776e0ef), all 618 engine regressions passed
+(d452f1889bc0456ea8cf975a1e651e40), and strict engine/native/daemon Clippy passed
+(16100b9fcd0545faadf1ce563448bcd5). No agent qualification is implied.
+
+Offline 4B probes dd4597606ecb48d29dd5767d1dd88890 and
+01274ed58eb44de6b1e54676161e38d2 emitted premature DONE and falsely claimed
+success after a rejected write. A trusted continuation instruction outside the
+untrusted tool-result wrapper corrected rejection interpretation in
+3d8e09e0a0a945e9a4d4546e4314a619. Explicit format instructions removed Markdown
+fences in fb677b5bcea747f38527a20adfaf32e0; premature text after a complete
+write proposal remains. The mandatory 12B protocol probe is separate and pending.
+
+Exact files: `crates/engine/src/backends/qwen/{architecture.rs,backend.rs,output.rs,gemma3_tools.jinja}`;
+`crates/engine/src/rendering.rs`; `crates/engine/src/slab_parser/parser.rs`;
+`crates/engine/tests/unit/slab_parser_tests.rs`;
+`crates/engine/tests/gemma3_engine.rs`;
+`crates/engine/tests/fixtures/gemma3_tool_render/{input.json,generate.py,expected.txt}`.
+
+Define one tool call per Gemma assistant turn. Its validated closing XML tag is
+a structural sequence boundary through the existing engine completion hook,
+not a synthetic EOS or stripped generated answer. Reject a non-whitespace
+suffix within the same decoded token and mixed explanatory text/call turns;
+keep proposals private until successful finalization. Other families retain
+their existing parser behavior. Exercise all UTF-8 chunk splits, malformed
+calls, suffix/prefix rejection, storage limits and atomic proposal publication.
+
+Serialize tool schemas and system instructions into the initial user turn,
+group adjacent same-role history, use trained model/user role framing, and
+append the tested trusted continuation after each tool-result group. Preserve
+argument values, result error flags, order and all history. The independent
+fixture generator transforms structured history through the pinned publisher
+chat template, rather than reading the product template. Reserve tool wrapper
+syntax in untrusted data. Bind projected growth to the actual tokenizer digest:
+space-to-metaspace replacement expands bytes by at most three; added turn
+boundaries isolate changing result groups. Charge the exact skeleton plus
+complete changing groups and added bytes without subtracting estimated tokens.
+
+Named tests: `gemma3_terminal_tool_handoff_is_atomic`,
+`gemma3_engine_tool_template_and_admitted_decoder`,
+`gemma3_engine_tool_projection_bounds`,
+`gemma3_real_4b_engine_tools`, `gemma3_real_12b_engine_tools`.
+Require native read/write proposals with exact arguments, no premature success,
+successful-result DONE, and accurate rejected-result explanation without retry.
+Run full affected parser regressions, both real native profiles, and strict
+Clippy. Daemon policy effects, session/context/restart and tier measurements
+remain subsequent mandatory gates; a Python probe never substitutes for them.
