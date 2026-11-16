@@ -1041,3 +1041,11 @@ two existing direct decoder initializers needing the explicit ByteLevel mode.
 Include `crates/engine/tests/unit/backends_qwen_output_protocol_token.rs` and
 `crates/engine/tests/unit/backends_qwen_output_structured_output.rs` in this batch;
 preserve their existing protocol assertions and rerun them.
+
+Real engine receipt efe3b02076f247eaa312462606d6352b exposed a registry
+metadata mismatch before native loading: both frozen converted Gemma configs
+omit max_position_embeddings. Add `crates/engine/src/registry.rs` to this batch
+and use the existing validated Gemma3Config context (32768 for the pinned
+MLX dialect) for this family only. Preserve nested/outer conflict rejection
+and all other families' explicit context checks. Extend the existing Gemma
+contract test with missing/invalid context cases and rerun both real gates.
