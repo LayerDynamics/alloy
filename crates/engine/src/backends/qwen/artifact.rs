@@ -56,6 +56,7 @@ struct ArtifactData {
     tokenizer: Arc<PinnedTokenizer>,
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
+    gemma_decoder: bool,
     manifest_sha256: [u8; 32],
     eos: Vec<u32>,
     source_bytes: u64,

@@ -869,6 +869,9 @@ pub enum WeightRepresentation {
 /// KV retention behavior supported by an implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheKind {
+    /// Per-layer full history and sliding windows. The representation identifies
+    /// the family layout; this does not imply full-prefix export or truncation.
+    Mixed,
     /// Retain the full admitted prefix.
     Full,
     /// Retain a bounded rolling window.

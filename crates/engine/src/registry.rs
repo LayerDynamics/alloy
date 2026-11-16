@@ -230,7 +230,7 @@ impl ArtifactRegistration {
         &self.family
     }
 
-    /// Return max_position_embeddings declared by config.json.
+    /// Return the configured context limit, including validated family defaults.
     ///
     /// This is a declared limit, not evidence of validated long-context
     /// behavior or sufficient memory for that context.
@@ -640,17 +640,25 @@ impl Registry {
         } else {
             object
         };
-        let declared_context_limit_tokens = text
-            .get("max_position_embeddings")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|&value| value > 0)
-            .ok_or_else(|| {
-                artifact_validation(
-                    &id,
-                    "max_position_embeddings must be a positive supported integer",
-                )
-            })?;
+        let declared_context_limit_tokens = if family == "gemma3" {
+            // The pinned MLX Gemma dialect permits omitted context metadata.
+            // Reuse its validated configuration instead of applying a generic
+            // fallback to unrelated families or claiming extended context.
+            inference_infra::decoder::gemma3::Gemma3Config::from_json(&config)
+                .map_err(|error| artifact_validation(&id, error.to_string()))?
+                .context
+        } else {
+            text.get("max_position_embeddings")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|&value| value > 0)
+                .ok_or_else(|| {
+                    artifact_validation(
+                        &id,
+                        "max_position_embeddings must be a positive supported integer",
+                    )
+                })?
+        };
 
         let registration = ArtifactRegistration {
             id: id.clone(),

@@ -261,6 +261,7 @@ impl<E: Engine> DaemonService<E> {
             })
             .collect();
         let caches: Vec<_> = caps.cache_modes.iter().map(|cache| match cache.kind {
+            engine::types::CacheKind::Mixed => json!({"kind":"mixed","representation":cache.representation.as_str()}),
             engine::types::CacheKind::Full => json!({"kind":"full","representation":cache.representation.as_str()}),
             engine::types::CacheKind::Rotating { window_tokens } => json!({"kind":"rotating","representation":cache.representation.as_str(),"window_tokens":window_tokens.get()}),
         }).collect();

@@ -39,6 +39,7 @@ fn decoder(parsing: bool) -> Qwen3TextDecoder {
     let tokenizer = PinnedTokenizer::from_pinned_json(source.as_bytes(), pin, 64 * 1024)
         .expect("pinned tokenizer");
     Qwen3TextDecoder {
+        gemma_decoder: false,
         tokenizer: Arc::new(tokenizer),
         special_tokens: Arc::new([0, 1, 2].into_iter().collect()),
         byte_decoder: Arc::new(bytes),

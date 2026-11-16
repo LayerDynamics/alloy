@@ -102,6 +102,9 @@ pub struct Gemma3Cache {
     layers: Vec<Option<(Array, Array)>>,
 }
 impl Gemma3Cache {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
     pub fn len(&self) -> usize {
         self.offset
     }

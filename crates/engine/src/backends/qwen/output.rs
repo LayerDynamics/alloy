@@ -24,6 +24,7 @@ pub(super) struct Qwen3TextDecoder {
     pub(super) tokenizer: Arc<PinnedTokenizer>,
     pub(super) special_tokens: Arc<BTreeSet<u32>>,
     pub(super) byte_decoder: Arc<BTreeMap<char, u8>>,
+    pub(super) gemma_decoder: bool,
     pub(super) pending: Vec<u8>,
     pub(super) max_token_bytes: usize,
     pub(super) finished: bool,
@@ -33,6 +34,83 @@ pub(super) struct Qwen3TextDecoder {
     pub(super) xml: Option<XmlToolParser<HybridToolSchema>>,
     pub(super) phi: Option<crate::slab_parser::PhiToolParser>,
     pub(super) completed_slab: Option<FrozenParserAllocation>,
+}
+
+/// The incremental implementation must match this exact decoder composition.
+/// Other Sequence/Metaspace decoders have different whitespace/fallback rules.
+pub(super) fn validate_tokenizer_decoder(
+    value: &serde_json::Value,
+    gemma: bool,
+) -> Result<(), EngineError> {
+    let bpe = value
+        .pointer("/model/type")
+        .and_then(serde_json::Value::as_str)
+        == Some("BPE");
+    let supported = if gemma {
+        value
+            .pointer("/model/byte_fallback")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && value["decoder"]
+                == serde_json::json!({"type":"Sequence","decoders":[
+                    {"type":"Replace","pattern":{"String":"▁"},"content":" "},
+                    {"type":"ByteFallback"},{"type":"Fuse"}
+                ]})
+    } else {
+        value
+            .pointer("/decoder/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("ByteLevel")
+    };
+    if !bpe || !supported {
+        return Err(EngineError::unsupported(
+            "tokenizer decoder",
+            if gemma {
+                "Gemma3 requires BPE byte fallback and Replace(▁, space)/ByteFallback/Fuse"
+            } else {
+                "this family requires the BPE/ByteLevel decoder"
+            },
+        ));
+    }
+    Ok(())
+}
+
+impl Qwen3TextDecoder {
+    fn finish_fallback_run(&mut self) -> String {
+        // ByteFallback replaces EVERY byte in a malformed run. Do not emit a
+        // valid prefix early: a later invalid byte changes the entire run.
+        let text = match std::str::from_utf8(&self.pending) {
+            Ok(text) => text.to_owned(),
+            Err(_) => "�".repeat(self.pending.len()),
+        };
+        self.pending.clear();
+        text
+    }
+
+    fn push_gemma(&mut self, spelling: &str) -> Result<String, EngineError> {
+        let byte = spelling
+            .strip_prefix("<0x")
+            .and_then(|s| s.strip_suffix('>'))
+            .filter(|s| s.len() == 2 && s.is_ascii())
+            .and_then(|s| u8::from_str_radix(s, 16).ok());
+        if let Some(byte) = byte {
+            // Reserve at most the existing admitted decoder byte allowance.
+            if self.pending.len() == self.max_token_bytes {
+                return Err(execution_error(
+                    "detokenize",
+                    "Gemma3 fallback run exceeds the pinned decoder bound",
+                ));
+            }
+            self.pending
+                .try_reserve_exact(1)
+                .map_err(|_| allocation("Gemma3 fallback bytes", Some(self.max_token_bytes)))?;
+            self.pending.push(byte);
+            return Ok(String::new());
+        }
+        let mut text = self.finish_fallback_run();
+        text.push_str(&spelling.replace('▁', " "));
+        Ok(text)
+    }
 }
 
 pub(super) struct HybridToolSchema(pub(super) Option<Arc<ToolContext>>);
@@ -137,6 +215,9 @@ impl TextDecoder for Qwen3TextDecoder {
             }
             return Ok(String::new());
         }
+        if self.gemma_decoder {
+            return self.push_gemma(&spelling);
+        }
         self.pending
             .try_reserve_exact(spelling.chars().count())
             .map_err(|_| allocation("incremental UTF-8 bytes", Some(spelling.len())))?;
@@ -172,6 +253,9 @@ impl TextDecoder for Qwen3TextDecoder {
             return Ok(String::new());
         }
         self.finished = true;
+        if self.gemma_decoder {
+            return Ok(self.finish_fallback_run());
+        }
         if !self.pending.is_empty() {
             return Err(execution_error(
                 "detokenize",

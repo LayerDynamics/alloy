@@ -183,6 +183,15 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Native Gemma 3 text adapter with mixed local/full attention.
+    /// Construction does not qualify tools or production agent behavior.
+    pub fn new_gemma3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Gemma3)
+    }
     /// Native Phi fused decoder with immutable long-factor SuScaledRoPE.
     /// Construction is not a production qualification.
     pub fn new_phi(
@@ -318,6 +327,10 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = match family {
+                BackendFamily::Gemma3 => BackendConfig::Gemma3(
+                    inference_infra::decoder::gemma3::Gemma3Config::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Gemma3 config"))?,
+                ),
                 BackendFamily::Phi => BackendConfig::Phi(
                     inference_infra::decoder::phi::PhiConfig::from_json(&config_value)
                         .map_err(|e| model_error(e, "validate Phi config"))?,
@@ -344,6 +357,12 @@ impl Qwen3Backend {
                 .iter()
                 .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
             let (decoded_bound, resident_payload_bound) = match &config {
+                BackendConfig::Gemma3(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan Gemma3 weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
                 BackendConfig::Phi(c) => {
                     let p = c
                         .weight_payload_plan()
@@ -371,20 +390,8 @@ impl Qwen3Backend {
                 &specification.directory.join("tokenizer.json"),
                 &tokenizer_bytes,
             )?;
-            if tokenizer_value
-                .pointer("/model/type")
-                .and_then(Value::as_str)
-                != Some("BPE")
-                || tokenizer_value
-                    .pointer("/decoder/type")
-                    .and_then(Value::as_str)
-                    != Some("ByteLevel")
-            {
-                return Err(EngineError::unsupported(
-                    "tokenizer",
-                    "this adapter supports the actual BPE/ByteLevel Qwen3 tokenizer contract only",
-                ));
-            }
+            let gemma_decoder = family == BackendFamily::Gemma3;
+            output::validate_tokenizer_decoder(&tokenizer_value, gemma_decoder)?;
             let tokenizer_pin = specification.files.get("tokenizer.json").ok_or_else(|| {
                 validation(
                     Some(&specification.id),
@@ -429,7 +436,9 @@ impl Qwen3Backend {
                         "tokenizer vocabulary exceeds the configured token/model bounds",
                     ));
                 }
-                if !specials.contains(&id) && !spelling.chars().all(|ch| inverse.contains_key(&ch))
+                if !gemma_decoder
+                    && !specials.contains(&id)
+                    && !spelling.chars().all(|ch| inverse.contains_key(&ch))
                 {
                     return Err(EngineError::unsupported(
                         "ByteLevel token",
@@ -454,7 +463,7 @@ impl Qwen3Backend {
             } else {
                 config_value.get("eos_token_id").cloned()
             };
-            let mut eos = if family.hybrid() {
+            let mut eos = if family.hybrid() || gemma_decoder {
                 parse_eos(
                     eos_value
                         .as_ref()
@@ -463,7 +472,7 @@ impl Qwen3Backend {
             } else {
                 parse_eos(eos_value.as_ref())?
             };
-            if family.hybrid() || family == BackendFamily::Phi {
+            if family.hybrid() || family == BackendFamily::Phi || gemma_decoder {
                 let bytes = read_metadata(
                     &specification,
                     "tokenizer_config.json",
@@ -486,6 +495,20 @@ impl Qwen3Backend {
                     eos.push(token);
                 }
             }
+            if gemma_decoder {
+                for spelling in ["<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>"] {
+                    let id = tokenizer
+                        .tokenizer()
+                        .token_to_id(spelling)
+                        .filter(|id| specials.contains(id))
+                        .ok_or_else(|| {
+                            validation(Some(&specification.id), "missing Gemma3 special token")
+                        })?;
+                    if matches!(spelling, "<eos>" | "<end_of_turn>") && !eos.contains(&id) {
+                        eos.push(id);
+                    }
+                }
+            }
             for &token in &eos {
                 if u64::from(token) >= as_u64(config.vocabulary())?
                     || tokenizer.tokenizer().id_to_token(token).is_none()
@@ -504,6 +527,7 @@ impl Qwen3Backend {
                 tokenizer,
                 special_tokens: Arc::new(specials),
                 byte_decoder: Arc::clone(&inverse),
+                gemma_decoder,
                 manifest_sha256,
                 eos,
                 source_bytes,
@@ -555,6 +579,12 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
+        if self.family == BackendFamily::Gemma3 {
+            return Err(EngineError::unsupported(
+                "Gemma3 tools",
+                "tool protocol is not implemented",
+            ));
+        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -568,6 +598,12 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        if self.family == BackendFamily::Gemma3 && self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "Gemma3 tools",
+                "tool protocol is not implemented",
+            ));
+        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -745,6 +781,7 @@ impl Qwen3Backend {
 include!("loading.rs");
 include!("hybrid_loading.rs");
 include!("phi_loading.rs");
+include!("gemma3_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn verify_retained_prefix_bytes(
@@ -859,6 +896,12 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
+            if self.family == BackendFamily::Gemma3 && tool_mode {
+                return Err(EngineError::unsupported(
+                    "Gemma3 tools",
+                    "tool protocol is not implemented",
+                ));
+            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -889,7 +932,7 @@ impl RuntimeBackend for Qwen3Backend {
                 &context,
                 &binding,
                 data.tokenizer.as_ref(),
-                &qwen3_rendering_options(),
+                &family_rendering_options(self.family),
                 limits,
             )
             .map_err(|error| match error {
@@ -1055,6 +1098,7 @@ impl RuntimeBackend for Qwen3Backend {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
             byte_decoder: Arc::clone(&data.byte_decoder),
+            gemma_decoder: data.gemma_decoder,
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
@@ -1113,6 +1157,7 @@ impl RuntimeBackend for Qwen3Backend {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
             byte_decoder: Arc::clone(&data.byte_decoder),
+            gemma_decoder: data.gemma_decoder,
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
@@ -1174,6 +1219,7 @@ impl RuntimeBackend for Qwen3Backend {
                     tokenizer: Arc::clone(&data.tokenizer),
                     special_tokens: Arc::clone(&data.special_tokens),
                     byte_decoder: Arc::clone(&data.byte_decoder),
+                    gemma_decoder: data.gemma_decoder,
                     pending: Vec::new(),
                     max_token_bytes: self.limits.max_token_bytes,
                     finished: false,
@@ -1251,13 +1297,14 @@ fn registration_for(
     let llama = family == BackendFamily::Llama3;
     let smollm = family == BackendFamily::SmolLm3;
     let phi = family == BackendFamily::Phi;
+    let gemma = family == BackendFamily::Gemma3;
     let mut representations = vec![
         WeightRepresentation::F32,
         WeightRepresentation::Affine4 {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama || smollm || hybrid || phi {
+    if llama || smollm || hybrid || phi || gemma {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
@@ -1266,7 +1313,7 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if hybrid || phi {
+            if hybrid || phi || gemma {
                 1
             } else if smollm {
                 smollm::register::IMPL_VERSION
@@ -1278,7 +1325,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if phi {
+        (if gemma {
+            &["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"][..]
+        } else if phi {
             &["Phi3ForCausalLM"][..]
         } else if hybrid {
             &["Qwen3_5ForConditionalGeneration"][..]
@@ -1294,7 +1343,9 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if phi {
+            family: if gemma {
+                "gemma3"
+            } else if phi {
                 "phi"
             } else if hybrid {
                 "qwen35"
@@ -1312,7 +1363,7 @@ fn registration_for(
             context_limit_tokens: context_limit,
             supports_streaming: true,
             supports_incremental_kv: true,
-            supports_prefix_reuse: true,
+            supports_prefix_reuse: !gemma,
             decoding_modes: vec![DecodingCapability::Greedy],
         },
     )
@@ -1329,6 +1380,27 @@ fn qwen3_rendering_options() -> RenderingOptions<'static> {
         lstrip_blocks: false,
         reserved_spellings: QWEN3_RESERVED_SPELLINGS,
     }
+}
+
+fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> {
+    let mut options = qwen3_rendering_options();
+    if family == BackendFamily::Gemma3 {
+        // These are tokenizer control delimiters, never user text boundaries.
+        options.reserved_spellings = &[
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<unk>",
+            "<start_of_",
+            "<end_of_",
+            "<image>",
+            "<image_soft_token>",
+            "<unused",
+            "<mask>",
+            "<0x",
+        ];
+    }
+    options
 }
 
 fn byte_decoder_map() -> BTreeMap<char, u8> {
@@ -1506,6 +1578,8 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
+        // Tool requests are rejected before rendering; never use another family protocol.
+        (BackendFamily::Gemma3, _) => GEMMA3_TEXT_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
         (BackendFamily::Phi, true) => PHI_TOOL_TEMPLATE,
         (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
@@ -1522,6 +1596,12 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
 }
 fn family_cache_mode(family: impl Into<BackendFamily>) -> Result<CacheMode, EngineError> {
     let family = family.into();
+    if family == BackendFamily::Gemma3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(GEMMA3_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Mixed,
+        });
+    }
     if family == BackendFamily::Phi {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new(PHI_CACHE_REPRESENTATION)?,
