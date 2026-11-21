@@ -1119,6 +1119,17 @@ number spelling using an explicit template filter. Other families' JSON and
 schema fingerprints retain their behavior. The unchanged independent fixture
 and admitted decoder gate pass in 6edf2ca2b72942039f2dc3f722dc26e7.
 
+Real native run 79f994ccd3854f829d134cad01d1e986 passed eight gates but
+failed 4B rejection handling: it retried the write. The prior successful probe
+used a name-first call envelope, while generic canonical JSON moved arguments
+first. Pinned upstream replay ec4d010b74d34956b0c19e9f53e77ffd reproduces
+that retry (599 input tokens). Changing only the envelope to name-first while
+keeping sorted arguments returns the correct rejection explanation in
+0fabb835bf20438d985def87c6e09d04 (598 tokens). Declare the name-first
+envelope in the Gemma template and independent generator; preserve the strict
+no-retry and exact-argument assertions. Print prompt hashes in real gates to
+bind subsequent observations to exact inputs. Both model sizes must be rerun.
+
 ### #73 Gemma 3 daemon qualification wiring (2026-11-21)
 
 After the native tool batch passes, wire both frozen profiles through the real

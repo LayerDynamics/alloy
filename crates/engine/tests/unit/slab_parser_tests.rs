@@ -201,3 +201,81 @@ fn failed_text_delivery_poisons_the_parser() {
     assert!(p.finish().is_err());
     assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
 }
+
+#[test]
+fn gemma3_terminal_tool_handoff_is_atomic() {
+    for input in [CALL.to_owned(), format!("```xml\n{CALL}\n```")] {
+        for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+            let (admission, p) = parser(limits());
+            let mut p = p.with_terminal_call();
+            let mut text = String::new();
+            for part in [&input[..split], &input[split..]] {
+                p.push(part, |s| {
+                    text.push_str(s);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            assert!(p.is_sequence_complete());
+            assert!(text.is_empty());
+            let batch = p.finish().unwrap();
+            assert_eq!(batch.proposal_count(), 1);
+            assert_eq!(
+                batch.proposal(0).unwrap().arguments_json,
+                r#"{"path":"résumé.txt","nested":[true,null,7]}"#
+            );
+            drop(batch);
+            assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+        }
+    }
+    for input in [
+        format!("{CALL}DONE"),
+        format!("{CALL}{CALL}"),
+        format!("explanation{CALL}"),
+        format!("```xml\n{CALL}\n"),
+        format!("```xml\n{CALL}\n``"),
+        format!("```xml\n{CALL}\n```DONE"),
+        "<tool_call>{bad}</tool_call>".into(),
+        "```xml\n<tool_call>{bad}</tool_call>\n```".into(),
+    ] {
+        for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+            let (admission, p) = parser(limits());
+            let mut p = p.with_terminal_call();
+            let result = p
+                .push(&input[..split], |_| Ok(()))
+                .and_then(|()| p.push(&input[split..], |_| Ok(())));
+            if result.is_err() {
+                assert!(!p.is_sequence_complete());
+            }
+            assert!(p.finish().is_err(), "invalid turn {input:?}, split {split}");
+            assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+        }
+    }
+    for text in [
+        "DONE",
+        "The policy rejected the write. 雪",
+        "```python\nprint(1)\n```",
+    ] {
+        let (_, p) = parser(limits());
+        let mut p = p.with_terminal_call();
+        let mut output = String::new();
+        for ch in text.chars() {
+            p.push(ch.encode_utf8(&mut [0; 4]), |s| {
+                output.push_str(s);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(!p.is_sequence_complete());
+        assert_eq!(p.finish().unwrap().proposal_count(), 0);
+        assert_eq!(output, text);
+    }
+    let mut caps = limits();
+    caps.call_bytes = 8;
+    let (admission, p) = parser(caps);
+    let mut p = p.with_terminal_call();
+    assert!(p.push(CALL, |_| Ok(())).is_err());
+    assert!(!p.is_sequence_complete());
+    assert!(p.finish().is_err());
+    assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+}

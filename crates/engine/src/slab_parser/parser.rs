@@ -20,6 +20,15 @@ use crate::{
 use std::{ops::Range, str};
 const OPEN: &[u8] = b"<tool_call>";
 const CLOSE: &[u8] = b"</tool_call>";
+const GEMMA_FENCE: &[u8] = b"```xml\n";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    Start(usize),
+    Bare,
+    Fenced,
+    ClosingFence(usize),
+    Complete,
+}
 const FORBIDDEN: &[&[u8]] = &[
     b"<|",
     b"<think>",
@@ -41,6 +50,8 @@ pub(crate) struct SlabParser {
     failed: bool,
     received: usize,
     max_output: usize,
+    handoff: Option<Handoff>,
+    text_before_call: bool,
 }
 impl SlabParser {
     pub(crate) fn new(
@@ -67,7 +78,19 @@ impl SlabParser {
             failed: false,
             received: 0,
             max_output,
+            handoff: None,
+            text_before_call: false,
         })
+    }
+    /// Gemma's one-call turn ends at the validated envelope, or at the closing
+    /// fence for its explicit standalone XML-fence alternative. Other profiles
+    /// retain the existing text/multiple-envelope behavior.
+    pub(crate) fn with_terminal_call(mut self) -> Self {
+        self.handoff = Some(Handoff::Start(0));
+        self
+    }
+    pub(crate) fn is_sequence_complete(&self) -> bool {
+        !self.failed && self.handoff == Some(Handoff::Complete)
     }
     pub(crate) fn push(
         &mut self,
@@ -98,6 +121,49 @@ impl SlabParser {
         let input = text.as_bytes();
         let mut i = 0;
         while i < input.len() {
+            match self.handoff {
+                Some(Handoff::Start(n)) => {
+                    if input[i] == GEMMA_FENCE[n] {
+                        i += 1;
+                        self.handoff = Some(if n + 1 == GEMMA_FENCE.len() {
+                            Handoff::Fenced
+                        } else {
+                            Handoff::Start(n + 1)
+                        });
+                    } else {
+                        if n != 0 {
+                            self.text_before_call = true;
+                            emit(str::from_utf8(&GEMMA_FENCE[..n]).unwrap())?;
+                        }
+                        self.handoff = Some(Handoff::Bare);
+                    }
+                    continue;
+                }
+                Some(Handoff::ClosingFence(n)) => {
+                    if n == 0 && matches!(input[i], b' ' | b'\t' | b'\r' | b'\n') {
+                        i += 1;
+                        continue;
+                    }
+                    if input[i] != b'`' {
+                        return Err(bad("expected closing Gemma tool fence"));
+                    }
+                    self.handoff = Some(if n == 2 {
+                        Handoff::Complete
+                    } else {
+                        Handoff::ClosingFence(n + 1)
+                    });
+                    i += 1;
+                    continue;
+                }
+                Some(Handoff::Complete) => {
+                    if !matches!(input[i], b' ' | b'\t' | b'\r' | b'\n') {
+                        return Err(bad("non-whitespace after terminal Gemma tool call"));
+                    }
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
             if self.inside {
                 if self.carry == 0 {
                     if input[i] == b'<' {
@@ -119,6 +185,11 @@ impl SlabParser {
                             self.carry = 0;
                             self.call = 0;
                             self.inside = false;
+                            self.handoff = match self.handoff {
+                                Some(Handoff::Fenced) => Some(Handoff::ClosingFence(0)),
+                                Some(Handoff::Bare) => Some(Handoff::Complete),
+                                other => other,
+                            };
                         }
                     } else {
                         for k in 0..self.carry {
@@ -140,6 +211,8 @@ impl SlabParser {
                     while i < input.len() && input[i] != b'<' {
                         i += 1;
                     }
+                    self.text_before_call |=
+                        text[start..i].bytes().any(|b| !b.is_ascii_whitespace());
                     emit(&text[start..i])?;
                 }
                 continue;
@@ -169,6 +242,11 @@ impl SlabParser {
                 return Err(bad("malformed or unmatched tool delimiter"));
             }
             if opening {
+                if self.handoff.is_some() && self.text_before_call {
+                    return Err(bad(
+                        "text before Gemma tool call is not a standalone call turn",
+                    ));
+                }
                 self.carry = 0;
                 self.inside = true;
                 i += 1;
@@ -179,6 +257,7 @@ impl SlabParser {
                 let w = self.allocation.workspaces();
                 let text = str::from_utf8(&w.carry[..self.carry])
                     .map_err(|_| internal("non-ASCII delimiter carry"))?;
+                self.text_before_call |= text.bytes().any(|b| !b.is_ascii_whitespace());
                 emit(text)?;
                 self.carry = 0;
             }
@@ -200,6 +279,12 @@ impl SlabParser {
     pub(crate) fn finish(self) -> Result<FrozenParserAllocation, EngineError> {
         if self.failed {
             return Err(bad("parser is poisoned"));
+        }
+        if matches!(
+            self.handoff,
+            Some(Handoff::Fenced | Handoff::ClosingFence(_) | Handoff::Start(1..))
+        ) {
+            return Err(bad("incomplete Gemma tool fence"));
         }
         if self.inside {
             return Err(bad("incomplete tool envelope"));

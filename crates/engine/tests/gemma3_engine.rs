@@ -696,6 +696,9 @@ fn real_engine(small: bool) {
     }
 }
 fn real_backend(small: bool) -> Qwen3Backend {
+    real_backend_with_context(small, 512)
+}
+fn real_backend_with_context(small: bool, context_limit: usize) -> Qwen3Backend {
     let frozen: Value = serde_json::from_str(if small {
         include_str!("../../inference-infra/tests/fixtures/gemma3_4b_profile.json")
     } else {
@@ -735,8 +738,429 @@ fn real_backend(small: bool) -> Qwen3Backend {
             files,
             template_sha256: hash(GEMMA3_TEXT_TEMPLATE.as_bytes()),
         }],
-        limits(512),
+        limits(context_limit),
         Qwen3Execution::MlxMetal,
     )
     .unwrap()
+}
+fn parser_limits() -> engine::parser_allocation::ParserAllocationLimits {
+    engine::parser_allocation::ParserAllocationLimits {
+        carry_bytes: 64,
+        call_bytes: 8192,
+        decoded_bytes: 8192,
+        depth: 64,
+        keys: 512,
+        nodes: 1024,
+        proposal_bytes: 16384,
+        calls: 8,
+    }
+}
+fn tool_fixture_context() -> ContextSnapshot {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let input: Value =
+        serde_json::from_str(include_str!("fixtures/gemma3_tool_render/input.json")).unwrap();
+    let role = |s: &str| match s {
+        "system" => MessageRole::System,
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        _ => panic!("role"),
+    };
+    let messages = input["base_messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| Message {
+            role: role(v["role"].as_str().unwrap()),
+            content: v["content"].as_str().unwrap().into(),
+        })
+        .collect();
+    let tools = input["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let f = &v["function"];
+            RenderingTool::new(
+                f["name"].as_str().unwrap().into(),
+                f["version"].as_str().unwrap().into(),
+                f["description"].as_str().unwrap().into(),
+                f["parameters"].clone(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let history = input["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| match v["kind"].as_str().unwrap() {
+            "call" => ToolHistoryBlock::AssistantCall {
+                call_id: v["call_id"].as_str().unwrap().into(),
+                tool_id: v["tool_id"].as_str().unwrap().into(),
+                arguments: v["arguments"].as_object().unwrap().clone(),
+            },
+            "result" => ToolHistoryBlock::ToolResult {
+                call_id: v["call_id"].as_str().unwrap().into(),
+                content: v["content"].as_str().unwrap().into(),
+                is_error: v["is_error"].as_bool().unwrap(),
+            },
+            "text" => ToolHistoryBlock::Text(Message {
+                role: role(v["role"].as_str().unwrap()),
+                content: v["content"].as_str().unwrap().into(),
+            }),
+            _ => panic!("history kind"),
+        })
+        .collect();
+    ContextSnapshot::new(
+        ContextSnapshotId::new("tool-template").unwrap(),
+        profile_id(),
+        messages,
+    )
+    .unwrap()
+    .with_tool_context(
+        ToolContext::new(
+            tools,
+            history,
+            ToolContextLimits {
+                max_tools: 8,
+                max_history_blocks: 16,
+                max_json_bytes: 32768,
+            },
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn gemma3_engine_tool_template_and_admitted_decoder() {
+    use engine::parser_allocation::ParserAllocation;
+    let fixture = Fixture::with_context(4096);
+    let backend = Qwen3Backend::new_gemma3(
+        vec![fixture.specification.clone()],
+        limits(4096),
+        Qwen3Execution::MlxCpu,
+    )
+    .unwrap()
+    .with_parser_allocation_limits(parser_limits())
+    .unwrap();
+    let registry = backend.registry(vec![profile(4096)]).unwrap();
+    let context = tool_fixture_context();
+    let expected_hash = *context.tool_context().unwrap().schema_hash();
+    let rendered = wait(backend.render_and_count(&registry, context)).unwrap();
+    assert_eq!(
+        rendered.text(),
+        include_str!("fixtures/gemma3_tool_render/expected.txt")
+    );
+    assert_eq!(rendered.tool_schema_hash(), Some(&expected_hash));
+    assert!(
+        backend
+            .decoder_with_parser_allocation(&registry, &profile_id(), None)
+            .is_err()
+    );
+    let caps = parser_limits();
+    let required = ParserAllocation::required_bytes(caps).unwrap();
+    let admission = AdmissionController::new(required * 2).unwrap();
+    let mut wrong = caps;
+    wrong.calls += 1;
+    let mut grant = admission
+        .reserve_grant(
+            "wrong Gemma3 slab",
+            &[ParserAllocation::required_bytes(wrong).unwrap()],
+        )
+        .unwrap();
+    let allocation = ParserAllocation::from_grant(&mut grant, wrong).unwrap();
+    assert!(
+        backend
+            .decoder_with_parser_allocation(&registry, &profile_id(), Some(allocation))
+            .is_err()
+    );
+    drop(grant);
+    let tokenizer = tokenizers::Tokenizer::from_file(fixture.root.join("tokenizer.json")).unwrap();
+    for raw in [
+        r#"<tool_call>{"name":"fs.read","arguments":{"path":"README.md","nested":[1,true]}}</tool_call>"#,
+        "```xml\n<tool_call>{\"name\":\"fs.read\",\"arguments\":{\"path\":\"README.md\",\"nested\":[1,true]}}</tool_call>\n```",
+        r#"<tool_call>{"name":"fs.read","arguments":false}</tool_call>"#,
+        r#"<tool_call>{"name":"fs.read","arguments":{}}</tool_call>suffix"#,
+    ] {
+        let mut grant = admission.reserve_grant("Gemma3 slab", &[required]).unwrap();
+        let allocation = ParserAllocation::from_grant(&mut grant, caps).unwrap();
+        let mut decoder = backend
+            .decoder_with_parser_allocation(&registry, &profile_id(), Some(allocation))
+            .unwrap();
+        let mut text = String::new();
+        assert!(!decoder.is_sequence_complete());
+        let mut failed = false;
+        let ids = tokenizer.encode(raw, false).unwrap();
+        assert_eq!(tokenizer.decode(ids.get_ids(), false).unwrap(), raw);
+        for &id in ids.get_ids() {
+            match decoder.push_blocks(id) {
+                Ok(blocks) => {
+                    for block in blocks {
+                        if let engine::types::GenerationOutputBlock::Text(t) = block {
+                            text.push_str(&t)
+                        } else {
+                            panic!("proposal published before finish")
+                        }
+                    }
+                }
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if raw.contains("false") || raw.contains("suffix") {
+            assert!(!decoder.is_sequence_complete());
+            assert!(failed || decoder.finish_blocks().is_err());
+            assert!(decoder.take_parser_proposals().is_none());
+        } else {
+            assert!(!failed);
+            assert!(decoder.is_sequence_complete());
+            for block in decoder.finish_blocks().unwrap() {
+                if let engine::types::GenerationOutputBlock::Text(t) = block {
+                    text.push_str(&t)
+                }
+            }
+            assert_eq!(text, "");
+            let batch = decoder.take_parser_proposals().unwrap();
+            assert_eq!(batch.proposal_count(), 1);
+            let call = batch.proposal(0).unwrap();
+            assert_eq!(call.name, "fs.read");
+            assert_eq!(
+                serde_json::from_str::<Value>(call.arguments_json).unwrap(),
+                json!({"path":"README.md","nested":[1,true]})
+            );
+        }
+        drop(decoder);
+        drop(grant);
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+    }
+}
+
+fn tools_context(read: bool, result: Option<(&str, bool)>) -> ContextSnapshot {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let tools = vec![
+        RenderingTool::new("fs.read".into(), "1.0.0".into(), "Read a text file.".into(), json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false})).unwrap(),
+        RenderingTool::new("fs.write".into(), "1.0.0".into(), "Write a text file.".into(), json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false})).unwrap(),
+    ];
+    let mut history = vec![];
+    if let Some((content, is_error)) = result {
+        history.push(ToolHistoryBlock::AssistantCall {
+            call_id: "call-1".into(),
+            tool_id: "fs.write".into(),
+            arguments: json!({"path":"note.txt","content":"COBALT"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        });
+        history.push(ToolHistoryBlock::ToolResult {
+            call_id: "call-1".into(),
+            content: content.into(),
+            is_error,
+        });
+    }
+    context(vec![message(MessageRole::User, if read {"Read README.md using fs.read."} else {"Use fs.write to write exactly COBALT to note.txt. After the tool succeeds reply with exactly DONE."})]).with_tool_context(
+        ToolContext::new(tools,history,ToolContextLimits {max_tools:8,max_history_blocks:16,max_json_bytes:32768}).unwrap())
+}
+#[test]
+#[ignore = "requires pinned ALLOY_GEMMA3_SMALL_ARTIFACT tokenizer"]
+fn gemma3_engine_tool_projection_bounds() {
+    let backend = real_backend_with_context(true, 4096)
+        .with_parser_allocation_limits(parser_limits())
+        .unwrap();
+    let registry = backend.registry(vec![profile(4096)]).unwrap();
+    let empty =
+        wait(backend.render_and_count(&registry, tools_context(false, Some(("", false))))).unwrap();
+    for content in [
+        "snow 雪",
+        "\u{0344}\u{0344}",
+        "\n\t\u{1}quoted \" text",
+        "ASCII",
+        "      ",
+    ] {
+        let actual =
+            wait(backend.render_and_count(&registry, tools_context(false, Some((content, false)))))
+                .unwrap();
+        let bound = backend
+            .projected_token_upper_bound(
+                &registry,
+                engine::api::ProjectedToolRender {
+                    rendered: &empty,
+                    result_count: 1,
+                    input_bytes: actual.text().len(),
+                    additional_rendered_bytes: actual.text().len() - empty.text().len(),
+                    additional_ascii_escape_bytes: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            actual.token_count() <= bound,
+            "actual={}, bound={bound}",
+            actual.token_count()
+        );
+        assert!(
+            bound < 4096,
+            "bounded small result must fit the selected profile"
+        );
+    }
+    for count in [0, 2] {
+        assert!(
+            backend
+                .projected_token_upper_bound(
+                    &registry,
+                    engine::api::ProjectedToolRender {
+                        rendered: &empty,
+                        result_count: count,
+                        input_bytes: empty.text().len(),
+                        additional_rendered_bytes: 0,
+                        additional_ascii_escape_bytes: 0
+                    }
+                )
+                .is_err()
+        );
+    }
+}
+#[test]
+#[ignore = "requires frozen ALLOY_GEMMA3_SMALL_ARTIFACT and Metal"]
+fn gemma3_real_4b_engine_tools() {
+    real_tools(true);
+}
+#[test]
+#[ignore = "requires frozen ALLOY_GEMMA3_ARTIFACT and Metal"]
+fn gemma3_real_12b_engine_tools() {
+    real_tools(false);
+}
+fn real_tools(small: bool) {
+    let backend = real_backend_with_context(small, 4096)
+        .with_parser_allocation_limits(parser_limits())
+        .unwrap();
+    let profile = ModelProfile::new(
+        profile_id(),
+        ArtifactId::new("gemma3").unwrap(),
+        4096,
+        192,
+        8,
+        GenerationOptions::greedy(192).unwrap(),
+    )
+    .unwrap();
+    let admission = AdmissionController::new(36 * 1024 * 1024 * 1024).unwrap();
+    let scheduler = Scheduler::new(8).unwrap();
+    let engine = backend
+        .into_engine(
+            vec![profile],
+            admission.clone(),
+            scheduler.clone(),
+            RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+        )
+        .unwrap();
+    let cases = [
+        ("read", true, None),
+        ("write", false, None),
+        (
+            "success",
+            false,
+            Some(("File written successfully.", false)),
+        ),
+        (
+            "denied",
+            false,
+            Some((
+                "Tool policy rejected fs.write. The requested path is outside the allowed workspace. No file was written.",
+                true,
+            )),
+        ),
+    ];
+    for (name, read, result) in cases {
+        let context = tools_context(read, result);
+        let rendered = wait(engine.render_and_count(context.clone())).unwrap();
+        eprintln!(
+            "Gemma3 small={small} {name} prompt_sha256={:x} tokens={}",
+            Sha256::digest(rendered.text().as_bytes()),
+            rendered.token_count()
+        );
+        let request = GenerationRequest::new(
+            RequestId::new(name).unwrap(),
+            profile_id(),
+            context,
+            GenerationOptions::greedy(192).unwrap(),
+        )
+        .unwrap();
+        let mut events = wait(engine.generate(request)).unwrap().into_events();
+        let mut text = String::new();
+        let mut calls = vec![];
+        let mut completed = false;
+        while let Some(event) = wait(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
+            assert!(!completed, "event after terminal");
+            match event {
+                GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
+                GenerationEvent::ToolCallBatchProposed { proposals } => {
+                    for i in 0..proposals.proposal_count() {
+                        let call = proposals.proposal(i).unwrap();
+                        calls.push((
+                            call.name.to_owned(),
+                            serde_json::from_str::<Value>(call.arguments_json).unwrap(),
+                        ));
+                    }
+                }
+                GenerationEvent::GenerationCompleted {
+                    finish_reason,
+                    usage,
+                } => {
+                    assert_eq!(finish_reason, engine::types::FinishReason::EndOfSequence);
+                    eprintln!("Gemma3 small={small} {name}: {usage:?}");
+                    completed = true;
+                }
+                other => panic!("unexpected Gemma3 tool event {other:?}"),
+            }
+        }
+        assert!(completed);
+        eprintln!("Gemma3 small={small} {name}: text={text:?}, calls={calls:?}");
+        if result.is_none() {
+            assert!(text.trim().is_empty(), "premature answer: {text:?}");
+            assert_eq!(
+                calls,
+                vec![(
+                    if read { "fs.read" } else { "fs.write" }.to_owned(),
+                    if read {
+                        json!({"path":"README.md"})
+                    } else {
+                        json!({"path":"note.txt","content":"COBALT"})
+                    }
+                )]
+            );
+        } else {
+            assert!(
+                calls.is_empty(),
+                "must not retry a completed or rejected call"
+            );
+            if name == "success" {
+                assert_eq!(text.trim(), "DONE");
+            } else {
+                let lower = text.to_lowercase();
+                assert!(
+                    lower.contains("reject")
+                        && lower.contains("outside")
+                        && lower.contains("allowed workspace")
+                        && lower.contains("no file was written"),
+                    "incorrect error interpretation: {text:?}"
+                );
+                assert!(!text.contains("DONE"));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while scheduler.is_busy().unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+    drop(engine);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while admission.snapshot().unwrap().reserved_bytes() != 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert_eq!(admission.snapshot().unwrap().active_reservations(), 0);
 }

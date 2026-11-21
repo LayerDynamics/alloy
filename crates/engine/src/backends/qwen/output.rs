@@ -177,6 +177,10 @@ impl TextDecoder for Qwen3TextDecoder {
         self.phi
             .as_ref()
             .is_some_and(|parser| parser.is_sequence_complete())
+            || self
+                .slab
+                .as_ref()
+                .is_some_and(SlabParser::is_sequence_complete)
     }
 
     fn push(&mut self, token: u32) -> Result<String, EngineError> {

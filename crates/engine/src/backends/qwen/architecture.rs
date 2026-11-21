@@ -160,3 +160,6 @@ fn phi_cache_bound(
 pub const GEMMA3_TEXT_TEMPLATE: &str = include_str!("gemma3_text.jinja");
 /// Mixed local/full KV; absolute offsets survive local eviction.
 pub const GEMMA3_CACHE_REPRESENTATION: &str = "gemma3.mlx-f32.full-and-sliding.v1";
+
+/// Gemma one-call tool turns, including bounded standalone XML fences.
+pub const GEMMA3_TOOL_TEMPLATE: &str = include_str!("gemma3_tools.jinja");

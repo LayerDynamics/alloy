@@ -512,6 +512,28 @@ fn hf_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
     String::from_utf8(output)
         .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
 }
+// Gemma's declared tool protocol uses Python's compact JSON separators while
+// retaining its number spelling. Opt in without changing other templates.
+struct CompactHuggingFaceJson;
+impl serde_json::ser::Formatter for CompactHuggingFaceJson {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        serde_json::ser::Formatter::write_f64(&mut HuggingFaceJson, writer, value)
+    }
+}
+fn hf_compact_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
+    let mut output = Vec::new();
+    serde::Serialize::serialize(
+        &value,
+        &mut serde_json::Serializer::with_formatter(&mut output, CompactHuggingFaceJson),
+    )
+    .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    String::from_utf8(output)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
+}
 fn hf_tool_value(value: minijinja::Value) -> Result<String, TemplateError> {
     let json = serde_json::to_value(&value)
         .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
@@ -595,6 +617,7 @@ pub fn render_chat(
 
     let mut environment = Environment::new();
     environment.add_filter("hf_tojson", hf_tojson);
+    environment.add_filter("hf_compact_tojson", hf_compact_tojson);
     environment.add_filter("hf_tool_value", hf_tool_value);
 
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
@@ -1185,4 +1208,86 @@ pub fn phi_projected_tool_token_upper_bound(
         .len()
         .checked_add(additional_bytes)
         .ok_or_else(|| EngineError::invalid_request("projection", "Phi byte bound overflow"))
+}
+
+/// Bound projected Gemma tool results for the frozen 4B/12B tokenizer.
+/// Space-to-metaspace replacement expands bytes by at most three. BPE with
+/// byte fallback cannot produce more tokens than normalized bytes. The pinned
+/// non-normalized, non-stripping added turn token separates unchanged groups.
+/// Charge the exact skeleton plus every entire changing group and its growth;
+/// do not subtract estimates or assume stable merges inside changed text.
+pub fn gemma3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x46, 0x67, 0xf2, 0x08, 0x95, 0x29, 0xe8, 0xe7, 0x65, 0x7c, 0xfb, 0x6d, 0x1c, 0x19, 0x91,
+        0x0a, 0xe7, 0x1f, 0xf5, 0xf2, 0x8a, 0xa7, 0xab, 0x2f, 0xf2, 0x76, 0x33, 0x30, 0xaf, 0xfa,
+        0xd7, 0x95,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Gemma3 tokenizer or empty result projection",
+        ));
+    }
+    const START: &str = "<start_of_turn>";
+    const RESULT: &str = "<tool_response>";
+    const END: &str = "</tool_response>";
+    let text = rendered.text();
+    let mut previous_group = None;
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (at, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let body = &text[at + RESULT.len()..];
+        let end = body.find(END).ok_or_else(|| {
+            EngineError::invalid_request("projection", "incomplete Gemma3 result placeholder")
+        })?;
+        if !body[..end].contains("\"content\":\"\"") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "Gemma3 result placeholder is not empty",
+            ));
+        }
+        let start = text[..at].rfind(START).ok_or_else(|| {
+            EngineError::invalid_request("projection", "missing Gemma3 result role boundary")
+        })?;
+        if !text[start..].starts_with("<start_of_turn>user\n<tool_response>") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "Gemma3 result must belong to a grouped user turn",
+            ));
+        }
+        let next = text[at + RESULT.len() + end..]
+            .find(START)
+            .map(|n| at + RESULT.len() + end + n)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "missing next Gemma3 role boundary")
+            })?;
+        if previous_group != Some(start) {
+            segment_bytes = segment_bytes.checked_add(next - start).ok_or_else(|| {
+                EngineError::invalid_request("projection", "Gemma3 segment byte overflow")
+            })?;
+            previous_group = Some(start);
+        }
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing Gemma3 result placeholders",
+        ));
+    }
+    let variable = additional_bytes
+        .checked_add(segment_bytes)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            EngineError::invalid_request("projection", "Gemma3 result bound overflow")
+        })?;
+    rendered
+        .token_count()
+        .checked_add(variable)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Gemma3 token bound overflow"))
 }

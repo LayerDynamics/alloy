@@ -579,12 +579,6 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
-        if self.family == BackendFamily::Gemma3 {
-            return Err(EngineError::unsupported(
-                "Gemma3 tools",
-                "tool protocol is not implemented",
-            ));
-        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -598,12 +592,6 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
-        if self.family == BackendFamily::Gemma3 && self.tool_call_parsing {
-            return Err(EngineError::unsupported(
-                "Gemma3 tools",
-                "tool protocol is not implemented",
-            ));
-        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -839,6 +827,14 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family == BackendFamily::Gemma3 {
+            return rendering::gemma3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
         if self.family == BackendFamily::Phi {
             return rendering::phi_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -896,12 +892,6 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
-            if self.family == BackendFamily::Gemma3 && tool_mode {
-                return Err(EngineError::unsupported(
-                    "Gemma3 tools",
-                    "tool protocol is not implemented",
-                ));
-            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -1208,10 +1198,17 @@ impl RuntimeBackend for Qwen3Backend {
                     )
                 } else {
                     (
-                        Some(crate::slab_parser::SlabParser::new(
-                            allocation,
-                            self.tool_parser_limits().max_output_bytes,
-                        )?),
+                        Some({
+                            let parser = crate::slab_parser::SlabParser::new(
+                                allocation,
+                                self.tool_parser_limits().max_output_bytes,
+                            )?;
+                            if self.family == BackendFamily::Gemma3 {
+                                parser.with_terminal_call()
+                            } else {
+                                parser
+                            }
+                        }),
                         None,
                     )
                 };
@@ -1398,6 +1395,10 @@ fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> 
             "<unused",
             "<mask>",
             "<0x",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
         ];
     }
     options
@@ -1578,8 +1579,8 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        // Tool requests are rejected before rendering; never use another family protocol.
-        (BackendFamily::Gemma3, _) => GEMMA3_TEXT_TEMPLATE,
+        (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
+        (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
         (BackendFamily::Phi, true) => PHI_TOOL_TEMPLATE,
         (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
