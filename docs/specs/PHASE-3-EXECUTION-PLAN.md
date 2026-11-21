@@ -1314,3 +1314,59 @@ Both skill colors are exact. This confirms that the candidate instruction is
 not a repair; it is discarded and no format policy is added to product code.
 Further prompt-wording variants are not the next resolving diagnostic. Strict
 checkpoint syntax/schema and exact continuation/skill outputs remain required.
+
+### #73 Native bounded checkpoint syntax constraints (2026-11-21)
+
+The real upstream model probe with flexible JSON token masks preserves all
+checkpoint facts and produces a model-selected true verifier for both Gemma
+sizes (70bb91c2cf6a4d048d13ffc713e2ae7d and
+c7481faaf80344a4826041bd701271d9). The compact variant fails its content
+assertion (215f025559a34045b51a0671e4d7a83d); it is not qualification.
+llguidance's mandatory serde_json preserve_order would change workspace JSON
+serialization. Instead of adding that dependency or its general grammar
+allocator, implement the closed checkpoint schema subset directly as a bounded
+incremental JSON recognizer. This is production token selection, not output
+repair, Python integration, or a replacement for the model fact verifier.
+
+Exact files: crates/engine/src/structured_output.rs (new),
+crates/engine/src/lib.rs, crates/engine/src/types/contracts.rs,
+crates/engine/src/runtime.rs, crates/engine/src/backends/qwen/backend.rs,
+crates/engine/src/backends/qwen/constraints.rs (new),
+crates/engine/tests/gemma3_engine.rs,
+crates/harness-core/src/context/checkpoint.rs,
+crates/harness-core/src/supervisor/compaction.rs,
+crates/harness-core/tests/compaction_runtime.rs. Tests of the recognizer live
+in its module. No dependency or template changes are planned.
+
+Support required unique ASCII object keys in any order, string values,
+arrays of strings, booleans (both true and false), and unsigned integer
+constants. Reject additional/duplicate/missing fields, invalid UTF-8,
+escapes/surrogates and trailing non-JSON text. Permit JSON whitespace. Cap
+schema at 32 fields/64-byte names, vocabulary at 1048576 entries, token pieces
+at 1024 bytes, combined raw vocabulary at 4 MiB, and response at 64 KiB.
+Use an allocation-free copyable parser state to test candidate token bytes.
+Store vocabulary in one fixed 4 MiB buffer and one 8-byte range per token;
+reserve their maximum 12 MiB plus 64 KiB fixed metadata/scratch allowance
+before construction. Add this fixed host workspace after adaptive prefill
+selection and retain its reservation until constraint destruction. Check
+cancellation during vocabulary construction and mask scanning. Unsupported
+backends and tool-context/schema combinations must fail explicitly.
+
+GenerationOptions carries an optional validated schema. Select the highest
+logit among allowed tokens, preserve stable tie ordering, execute the actual
+selected token through the native model, then advance the recognizer. EOS and
+successful flush require a complete object; an output cap cannot publish a
+partial checkpoint. Normal text generation is unchanged. Compaction requests
+the checkpoint schema and a separate boolean verification schema; strict JSON
+parsing, fact verification, transaction boundaries, exact continuation/skill
+assertions and deadlines remain unchanged.
+
+Validate parser transitions at every byte split, escaped Unicode and malformed
+input, field-order/duplicate/extra-field behavior, both verifier outcomes,
+bounded vocabulary/output rejection, mask selection and EOS, cancellation,
+and partial-output failure. Exercise the actual tiny Gemma engine through
+constrained generation, including output exhaustion and recovery. Check harness
+requests carry the right schemas and keep rollback tests. Run focused suites
+and strict Clippy, then actual release Gemma compaction/lifecycle gates for
+both pinned sizes. Passing JSON syntax alone does not qualify fact retention
+or exact continuation, and no production profile is promoted by this batch.
