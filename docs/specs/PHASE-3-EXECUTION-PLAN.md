@@ -1205,3 +1205,36 @@ unsupported mid-history system case. Run focused engine rendering/decoder
 checks, both actual release lifecycle suites, and strict affected Clippy.
 Preserve all exact answer, complete-event-history, restart and no-SSD-restore
 assertions. Any remaining model-output failure stays open for investigation.
+
+### #73 Gemma bounded 32k fixture (2026-11-21)
+
+The pinned Gemma tokenizer measures the original 32k document's complete
+retrieval prompt at 32601 tokens (receipt 3c4293bffa3a43c69fd9d6f8f024d884).
+With the validated 512 output reserve and 64 safety margin this exceeds
+32768. Preserve the frozen Phase 0 corpus unchanged. Add
+`crates/alloyd/tests/fixtures/gemma3_long_context/{generate.py,document.txt,manifest.json}`
+and update `crates/alloyd/tests/llama_real_model.rs` only for this bounded batch.
+The generator must verify the original document and frozen Gemma tokenizer
+hashes, select a complete-line prefix producing 32000..32100 tokens with the
+existing retrieval prompt and midpoint needle, and retain source/fixture hashes,
+byte length, token count and full context budget in the manifest. Selection
+happens only when generating the fixed fixture, never during inference. Default
+check mode regenerates in memory and rejects drift; explicit --write produces
+the committed fixture and manifest. A named `gemma3_long_context_fixture_integrity`
+test checks the source-prefix relationship, hashes and declared budget without
+model loading. The real test selects that fixture only for Gemma 3, verifies
+actual rendering against the recorded count, and asserts the actual profile
+budget fits before generation. Keep minimum 32000 prompt tokens, streaming,
+EOS, needle answer, memory admission, cancellation and recovery assertions.
+Run the generator check, focused integrity test, strict affected Clippy, and
+both frozen model sizes in release mode under the native host lease. Retain
+any timeout/output/memory failure as an open gate.
+
+Grouped-history lifecycle result: 4B reaches real generation but remains
+3 passed / 3 failed on exact continuation and skill output (receipt
+9a6390cb5b2f446bb02eca9416d501ba). 12B passes 5/6 including both skill tests,
+canonical history, restart and rebuild, but compaction emits fenced JSON then
+hits the unchanged 120-second deadline during retry (receipt
+0ab45556a6164ccdab74b5b13ca5bf82). No checkpoint is accepted from that failed
+run. Exact-output prefix/suffix offline probes fix skills but retain a newline
+on 4B compaction continuation; neither policy has been applied to product code.
