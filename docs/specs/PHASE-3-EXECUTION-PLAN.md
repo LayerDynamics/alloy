@@ -1255,3 +1255,34 @@ is 25669961735 bytes; do not mislabel the active-allocation peak as total
 resident memory or the larger-host long-context run as physical 8 GiB proof.
 Cancellation after streamed output and identical fresh-session recovery pass.
 Mandatory 12B execution is pending in ddf2013866e84656a9dbf500496872e6.
+
+### #73 Gemma duplicate KV reservation repair (2026-11-21)
+
+12B native long-context receipt ddf2013866e84656a9dbf500496872e6 passes
+8101-token retrieval (74.73 seconds, peak MLX active 11488525476 bytes), but
+refuses 32095-token startup: required incremental 25372775548 bytes exceeds
+21386565592 remaining from budget 29439329240. Simulated 8 GiB correctly
+refuses startup requiring 14077934400 bytes. The queued upstream diagnostic
+5bbf95f8404a45249226fd6d56d3d326 did not run after the failed lease.
+
+Source diagnosis: `Gemma3Config::step_payload_plan` deliberately includes
+three complete KV payloads for old/new/concatenation overlap. The adapter
+separately reserves two payloads in its cache allowance, then reserves all
+three again as temporary workspace. This counts five payloads, while the
+native checked transition plan requires three. Runtime correctly excludes
+reusable weights; this is an adapter KV accounting defect.
+
+Exact files: `crates/engine/src/backends/qwen/architecture.rs` and
+`crates/engine/tests/gemma3_engine.rs`. Subtract the same checked two-payload
+cache allowance from the Gemma temporary-workspace portion before admission.
+Keep the native three-payload transition bound, all attention/activation/output
+allowances, allocator padding, headroom and memory ceilings unchanged. Native
+execution and numerical/layout representations do not change. Add
+`gemma3_engine_transition_memory_is_reserved_once`: independently derive the
+three-payload transition and layer/attention/output terms for multiple
+capacities, require combined cache/workspace to cover that entire plan exactly
+plus existing overhead, and exercise admission at the exact bound and one byte
+below it. Run focused engine tests, strict engine/alloyd Clippy, then both actual
+release Gemma long-context/memory/cancellation gates. No successful admission
+alone qualifies runtime safety; retain actual peak measurement and terminal
+results. Compaction and exact-output failures remain separate open gates.
