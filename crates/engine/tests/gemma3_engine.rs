@@ -316,6 +316,46 @@ fn gemma3_engine_render_and_decode_contract() {
     assert!(!backend.registration().capabilities().supports_prefix_reuse);
 }
 #[test]
+fn gemma3_engine_grouped_history_matches_publisher_template() {
+    let fixture = Fixture::with_context(4096);
+    let backend = Qwen3Backend::new_gemma3(
+        vec![fixture.specification.clone()],
+        limits(4096),
+        Qwen3Execution::MlxCpu,
+    )
+    .unwrap();
+    let registry = backend.registry(vec![profile(4096)]).unwrap();
+    let input: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/gemma3_text_render/input.json")).unwrap();
+    let messages = input
+        .iter()
+        .map(|value| {
+            message(
+                match value["role"].as_str().unwrap() {
+                    "system" => MessageRole::System,
+                    "user" => MessageRole::User,
+                    "assistant" => MessageRole::Assistant,
+                    _ => panic!("fixture role"),
+                },
+                value["content"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let rendered = wait(backend.render_and_count(&registry, context(messages))).unwrap();
+    assert_eq!(
+        rendered.text(),
+        include_str!("fixtures/gemma3_text_render/expected.txt")
+    );
+    assert_eq!(
+        rendered.token_ids().iter().filter(|&&id| id == 96).count(),
+        1
+    );
+    assert_eq!(rendered.text().matches("<start_of_turn>user\n").count(), 2);
+    assert!(rendered.text().contains("PR-42; art:12."));
+    assert!(rendered.text().contains("COBALT\nSaved note: 雪."));
+}
+
+#[test]
 fn gemma3_engine_rejects_invalid_tokenizer_and_tools() {
     let mut fixture = Fixture::new();
     let backend = fixture.backend(Qwen3Execution::MlxCpu);
@@ -339,6 +379,7 @@ fn gemma3_engine_rejects_invalid_tokenizer_and_tools() {
         vec![message(MessageRole::Assistant, "Hi")],
         vec![
             message(MessageRole::User, "Hi"),
+            message(MessageRole::System, "Unsupported late system"),
             message(MessageRole::User, "Next"),
         ],
     ] {
