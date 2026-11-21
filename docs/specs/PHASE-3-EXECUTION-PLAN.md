@@ -1178,3 +1178,30 @@ the whole two-turn test takes 192.78 seconds including boot. Preserve the
 debug timeout as a failed observation. Use the production build for subsequent
 real lifecycle/latency gates and retain the build mode with the evidence.
 Both profiles remain unqualified pending all remaining required gates.
+
+### #73 Gemma grouped text history (2026-11-21)
+
+Actual 4B release lifecycle run bcf3bc93b980428c8f485a51f32cd00d passes
+3 tests and fails 3. The model generates a structurally correct checkpoint
+with all required facts and validates it, but continuation fails rendering.
+Skills and checkpoint summaries are deliberately untrusted `user` blocks in
+ContextBuilder; placing them next to the user's request creates consecutive
+user messages. Gemma's strict alternating text template rejects them before
+generation. Do not change their authority or discard those blocks.
+
+Exact files: `crates/engine/src/backends/qwen/gemma3_text.jinja`,
+`crates/engine/tests/gemma3_engine.rs`, and
+`crates/engine/tests/fixtures/gemma3_text_render/{input.json,generate.py,expected.txt}`.
+Group adjacent same-role user/assistant blocks with newline separators inside
+one trained Gemma turn. Preserve the existing initial system prefix, ordering,
+ordinary content trimming, EOS/BOS framing and role rejection. Continue to
+reject a leading assistant or a system message inside the turn history.
+An independent generator must group structured messages and use the pinned
+publisher template, without reading the product template. Test checkpoints,
+loaded-skill blocks, consecutive assistant blocks and exact Unicode/identifier
+preservation with `gemma3_engine_grouped_history_matches_publisher_template`.
+Replace only the now-valid consecutive-user rejection case with an actually
+unsupported mid-history system case. Run focused engine rendering/decoder
+checks, both actual release lifecycle suites, and strict affected Clippy.
+Preserve all exact answer, complete-event-history, restart and no-SSD-restore
+assertions. Any remaining model-output failure stays open for investigation.
