@@ -1238,3 +1238,20 @@ hits the unchanged 120-second deadline during retry (receipt
 0ab45556a6164ccdab74b5b13ca5bf82). No checkpoint is accepted from that failed
 run. Exact-output prefix/suffix offline probes fix skills but retain a newline
 on 4B compaction continuation; neither policy has been applied to product code.
+
+Bounded-fixture generator/integrity check df4e3caf08844956812dab67621ac073
+passes; fixture SHA-256 is
+9c249b067cf7600cdbabda90f5231b2a3ad2058835872026a1f83e32f008c8dd.
+The unchanged native rendering counts 32095 tokens, leaving 97 tokens beyond
+the required 512 output reserve and 64 margin. Strict Clippy for the changed
+daemon integration target passes in c524f5938a1648878b5f5fdb6520da25.
+Actual 4B release long-context suite cd267ed412ab4ecf94af988dd717a3d1
+passes in 217.77 seconds: simulated 8 GiB admission executes; 8101-token
+retrieval takes 23.99 seconds with peak MLX active allocation 4029708288 bytes;
+32095-token retrieval takes 130.46 seconds with peak 5994756096 bytes.
+The latter answer includes a newline, permitted by this existing retrieval
+gate but not the still-failing exact lifecycle gate. Post-run MLX free cache
+is 25669961735 bytes; do not mislabel the active-allocation peak as total
+resident memory or the larger-host long-context run as physical 8 GiB proof.
+Cancellation after streamed output and identical fresh-session recovery pass.
+Mandatory 12B execution is pending in ddf2013866e84656a9dbf500496872e6.

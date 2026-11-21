@@ -10,6 +10,39 @@ use harness_core::{HardwareTier, TelemetryClient, telemetry::TelemetryTransport}
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 struct Offline;
+
+fn gemma3_long_document() -> (String, Value) {
+    use sha2::{Digest, Sha256};
+    let source = include_str!("../../../bench/corpus/fixtures/documents/document-32k.txt");
+    let document = include_str!("fixtures/gemma3_long_context/document.txt");
+    let manifest: Value =
+        serde_json::from_str(include_str!("fixtures/gemma3_long_context/manifest.json")).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(source.as_bytes())),
+        manifest["source_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(document.as_bytes())),
+        manifest["fixture_sha256"].as_str().unwrap()
+    );
+    assert!(source.starts_with(document));
+    assert!(document.ends_with('\n'));
+    assert_eq!(document.len() as u64, manifest["fixture_bytes"]);
+    assert!((32000..=32100).contains(&manifest["prompt_tokens"].as_u64().unwrap()));
+    assert!(
+        manifest["prompt_tokens"].as_u64().unwrap()
+            + manifest["output_reserve"].as_u64().unwrap()
+            + manifest["safety_margin"].as_u64().unwrap()
+            <= manifest["context_limit"].as_u64().unwrap()
+    );
+    (document.to_owned(), manifest)
+}
+
+#[test]
+fn gemma3_long_context_fixture_integrity() {
+    gemma3_long_document();
+}
+
 impl TelemetryTransport for Offline {
     fn post_json(&self, _: &str, _: &str) -> Result<(), String> {
         Err("offline".into())
@@ -216,6 +249,7 @@ fn llama3_tool_stop_context_cache() {
 #[test]
 #[ignore = "requires pinned local Llama artifact and native Metal"]
 fn llama3_long_context_stream_cancel_memory() {
+    use engine::api::Engine;
     use engine::types::{FinishReason, GenerationEvent};
     use harness_core::{ContextBuilder, SessionStore, Supervisor};
     use std::sync::Mutex;
@@ -289,12 +323,21 @@ fn llama3_long_context_stream_cancel_memory() {
         ("document-8k.txt", "long8", 7500),
         ("document-32k.txt", "long32", 32000),
     ] {
-        let mut document = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../bench/corpus/fixtures/documents")
-                .join(document),
-        )
-        .unwrap();
+        let gemma_long = profile.starts_with("gemma-3") && session == "long32";
+        let (mut document, manifest) = if gemma_long {
+            let (document, manifest) = gemma3_long_document();
+            (document, Some(manifest))
+        } else {
+            (
+                std::fs::read_to_string(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../bench/corpus/fixtures/documents")
+                        .join(document),
+                )
+                .unwrap(),
+                None,
+            )
+        };
         let mut middle = document.len() / 2;
         while !document.is_char_boundary(middle) {
             middle += 1;
@@ -310,6 +353,21 @@ fn llama3_long_context_stream_cancel_memory() {
             ContextBuilder::build_snapshot(session, &profile, &[], Some(&prompt)).unwrap();
         let rendered = ContextBuilder::render_and_count(supervisor.engine(), snapshot).unwrap();
         assert!(rendered.token_count() >= minimum);
+        if let Some(manifest) = manifest {
+            let budget = supervisor
+                .engine()
+                .profile_context_budget(&engine::types::ModelProfileId::new(&profile).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(rendered.token_count() as u64, manifest["prompt_tokens"]);
+            assert_eq!(budget.limit as u64, manifest["context_limit"]);
+            assert_eq!(budget.output_reserve as u64, manifest["output_reserve"]);
+            assert_eq!(budget.safety_margin as u64, manifest["safety_margin"]);
+            assert!(
+                rendered.token_count() + budget.output_reserve + budget.safety_margin
+                    <= budget.limit
+            );
+        }
         let mut streamed = String::new();
         let mut ended = false;
         let start = std::time::Instant::now();
