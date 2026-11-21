@@ -4,10 +4,10 @@ mod recording_engine;
 fn real_profile() -> String {
     std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| "qwen3-4b-4bit".to_owned())
 }
-fn hybrid_rebuild_profile() -> bool {
+fn rebuild_only_profile() -> bool {
     matches!(
         real_profile().as_str(),
-        "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit"
+        "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit" | "gemma-3-4b-4bit" | "gemma-3-12b-4bit"
     )
 }
 use alloyd::BootRequest;
@@ -141,7 +141,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     );
     assert_eq!(
         caps[0]["result"]["supports_prefix_reuse"],
-        std::env::var_os("ALLOY_TEST_COLD").is_none() && !hybrid_rebuild_profile(),
+        std::env::var_os("ALLOY_TEST_COLD").is_none() && !rebuild_only_profile(),
         "{caps:?}"
     );
 }
@@ -266,7 +266,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
             .capabilities(ArtifactId::new(real_profile().as_str()).unwrap()),
     )
     .unwrap();
-    assert_eq!(caps.supports_prefix_reuse, !hybrid_rebuild_profile());
+    assert_eq!(caps.supports_prefix_reuse, !rebuild_only_profile());
     let rpc_telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
         HardwareTier::Unknown,
@@ -288,7 +288,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(
         response["result"]["supports_prefix_reuse"],
-        !hybrid_rebuild_profile(),
+        !rebuild_only_profile(),
         "{response}"
     );
     drop(service);
@@ -380,6 +380,8 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
         "<|eot_id|>",
         "<|eom_id|>",
         "<|end_of_text|>",
+        "<end_of_turn>",
+        "<eos>",
     ] {
         let bytes = format!("{base}{suffix}").into_bytes();
         if let Ok(id) = wait_future(
@@ -448,13 +450,13 @@ fn real_model_ssd_prefix_survives_process_restart() {
             .run_turn(&Mutex::new(db), "real-ssd", &prompt, 16)
             .expect("real Qwen turn");
         let metrics = supervisor.engine().runtime().tiered_kv_snapshot();
-        if hybrid_rebuild_profile() {
+        if rebuild_only_profile() {
             assert_eq!(metrics.spill_count, 0, "{metrics:?}");
             assert_eq!(metrics.restore_count, 0, "{metrics:?}");
             assert_eq!(metrics.restored_tokens, 0, "{metrics:?}");
             assert!(
                 metrics.hot_evictions > 0,
-                "hybrid must actually discard state: {metrics:?}"
+                "non-persistent cache must actually discard state: {metrics:?}"
             );
         } else if phase == "seed" {
             assert!(metrics.spill_count > 0, "{metrics:?}");
@@ -506,7 +508,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
     assert_eq!(cold["input_tokens"], restored["input_tokens"]);
     assert_eq!(
         restored["restored_tokens"].as_u64().unwrap() > 0,
-        !hybrid_rebuild_profile()
+        !rebuild_only_profile()
     );
     println!("real_ssd_restart: cold={cold}, restored={restored}");
 }
@@ -683,7 +685,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         .expect("continue after reopen");
     assert_eq!(followup.assistant_text, "COBALT");
     let after_restore = supervisor.engine().runtime().tiered_kv_snapshot();
-    if hybrid_rebuild_profile() {
+    if rebuild_only_profile() {
         assert_eq!(after_restore.restore_count, 0, "{after_restore:?}");
         assert_eq!(after_restore.spill_count, 0, "{after_restore:?}");
         assert_eq!(after_restore.restored_tokens, 0, "{after_restore:?}");

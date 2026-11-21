@@ -78,6 +78,8 @@ impl BootRequest {
                 | "llama-3.1-8b-8bit"
                 | "smollm3-3b-4bit"
                 | "phi4-mini-instruct-4bit"
+                | "gemma-3-4b-4bit"
+                | "gemma-3-12b-4bit"
                 | "ornith-1.5-9b-4bit"
                 | "qwen3.5-0.8b-4bit"
         ) {
@@ -110,6 +112,7 @@ pub fn boot_qwen3_with_context_limit(
         request.profile_id.as_str(),
         "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
     ) || is_hybrid_profile(&request.profile_id)
+        || is_gemma_profile(&request.profile_id)
     {
         return Err(RpcError::invalid_params(format!(
             "{} is not qualified for production: native agent conformance has not passed",
@@ -137,6 +140,7 @@ pub fn boot_native_for_qualification(
     let llama = request.profile_id.starts_with("llama-");
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
+    let gemma = is_gemma_profile(&request.profile_id);
     let hybrid = is_hybrid_profile(&request.profile_id);
     let ornith = request.profile_id == "ornith-1.5-9b-4bit";
     let files = pin_artifact_files(
@@ -151,7 +155,9 @@ pub fn boot_native_for_qualification(
         directory: request.artifact_dir.clone(),
         files,
         template_sha256: Sha256::digest(
-            if phi {
+            if gemma {
+                engine::backends::qwen::GEMMA3_TEXT_TEMPLATE
+            } else if phi {
                 engine::backends::qwen::PHI_TEXT_TEMPLATE
             } else if ornith {
                 engine::backends::qwen::ORNITH_TEXT_TEMPLATE
@@ -173,7 +179,9 @@ pub fn boot_native_for_qualification(
         .map_err(|error| RpcError::internal(format!("read config.json: {error}")))?;
     let config: Value = serde_json::from_slice(&config_bytes)
         .map_err(|error| RpcError::internal(format!("parse config.json: {error}")))?;
-    let context_limit = if hybrid {
+    let context_limit = if gemma {
+        gemma_context_limit(&config)?
+    } else if hybrid {
         hybrid_context_limit(&config)?
     } else {
         config
@@ -192,7 +200,9 @@ pub fn boot_native_for_qualification(
     let limits = Qwen3BackendLimits {
         max_files: 64,
         max_config_bytes: 8 * 1024 * 1024,
-        max_tokenizer_bytes: if smollm || hybrid {
+        max_tokenizer_bytes: if gemma {
+            40 * 1024 * 1024
+        } else if smollm || hybrid {
             32 * 1024 * 1024
         } else {
             16 * 1024 * 1024
@@ -204,9 +214,9 @@ pub fn boot_native_for_qualification(
         verification_chunk_bytes: 1024 * 1024,
         context_limit_tokens: context_limit,
         // Tool schemas increase prompt length; bound the actual prefill work
-        // at 32 for hybrid state and 64 for the other native tool profiles.
+        // at 32 for hybrid/mixed state and 64 for the other native tool profiles.
         // The base Qwen3 text path stays at 256 without relaxing admission.
-        prefill_chunk_tokens: NonZeroUsize::new(if hybrid {
+        prefill_chunk_tokens: NonZeroUsize::new(if hybrid || gemma {
             32
         } else if request.tools_enabled || llama || smollm || phi {
             64
@@ -226,7 +236,9 @@ pub fn boot_native_for_qualification(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = (if phi {
+    let backend = (if gemma {
+        Qwen3Backend::new_gemma3(vec![specification], limits, execution)
+    } else if phi {
         Qwen3Backend::new_phi(vec![specification], limits, execution)
     } else if ornith {
         Qwen3Backend::new_ornith(vec![specification], limits, execution)
@@ -450,10 +462,29 @@ fn is_hybrid_profile(profile: &str) -> bool {
     matches!(profile, "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit")
 }
 
+fn is_gemma_profile(profile: &str) -> bool {
+    matches!(profile, "gemma-3-4b-4bit" | "gemma-3-12b-4bit")
+}
+
 fn is_frozen_profile(profile: &str) -> bool {
     profile.starts_with("llama-")
         || matches!(profile, "smollm3-3b-4bit" | "phi4-mini-instruct-4bit")
         || is_hybrid_profile(profile)
+        || is_gemma_profile(profile)
+}
+
+fn gemma_context_limit(config: &Value) -> Result<usize, RpcError> {
+    if let Some(text) = config.get("text_config")
+        && let Some(outer) = config.get("max_position_embeddings")
+        && text.get("max_position_embeddings") != Some(outer)
+    {
+        return Err(RpcError::invalid_params(
+            "conflicting outer and text context limits",
+        ));
+    }
+    inference_infra::decoder::gemma3::Gemma3Config::from_json(config)
+        .map(|config| config.context)
+        .map_err(|error| RpcError::invalid_params(format!("Gemma3 configuration: {error}")))
 }
 
 fn hybrid_context_limit(config: &Value) -> Result<usize, RpcError> {
@@ -484,6 +515,12 @@ fn load_expected_hashes(
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
     let frozen: Option<&[u8]> = match profile_id {
+        "gemma-3-4b-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/gemma3_4b_profile.json"
+        )),
+        "gemma-3-12b-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/gemma3_12b_profile.json"
+        )),
         "phi4-mini-instruct-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/phi4_mini_profile.json"
         )),
@@ -619,6 +656,57 @@ mod llama_pins {
 #[cfg(test)]
 mod qualification_boot_tests {
     use super::*;
+    #[test]
+    fn gemma_profiles_ignore_external_pin_overrides() {
+        for profile in ["gemma-3-4b-4bit", "gemma-3-12b-4bit"] {
+            let pins =
+                load_expected_hashes(Some(Path::new("/nonexistent/untrusted.json")), profile)
+                    .unwrap();
+            assert_eq!(pins, load_expected_hashes(None, profile).unwrap());
+            assert_eq!(
+                pins["tokenizer.json"],
+                "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+            fs::write(dir.path().join("config.json"), b"{}").unwrap();
+            assert!(pin_artifact_files(dir.path(), None, profile).is_err());
+        }
+    }
+
+    #[test]
+    fn unqualified_gemma_cannot_boot_production_or_override_context() {
+        for profile in ["gemma-3-4b-4bit", "gemma-3-12b-4bit"] {
+            assert_unqualified_production_refused(profile);
+        }
+    }
+
+    #[test]
+    fn gemma_context_uses_validated_native_metadata() {
+        use serde_json::json;
+        let mut config: Value = serde_json::from_slice(include_bytes!(
+            "../../inference-infra/tests/fixtures/gemma3_model/config.json"
+        ))
+        .unwrap();
+        config
+            .as_object_mut()
+            .unwrap()
+            .remove("max_position_embeddings");
+        assert_eq!(gemma_context_limit(&config).unwrap(), 32768);
+        for invalid in [json!(0), json!(-1), json!(1.5), json!("1024")] {
+            config["max_position_embeddings"] = invalid;
+            assert!(gemma_context_limit(&config).is_err());
+        }
+        config["max_position_embeddings"] = json!(1024);
+        assert_eq!(gemma_context_limit(&config).unwrap(), 1024);
+        let mut wrapped = json!({"model_type":"gemma3", "text_config": config});
+        assert_eq!(gemma_context_limit(&wrapped).unwrap(), 1024);
+        wrapped["max_position_embeddings"] = json!(2048);
+        assert!(gemma_context_limit(&wrapped).is_err());
+        wrapped["max_position_embeddings"] = json!(1024);
+        assert_eq!(gemma_context_limit(&wrapped).unwrap(), 1024);
+    }
+
     #[test]
     fn phi_profile_ignores_external_pin_overrides() {
         let profile = "phi4-mini-instruct-4bit";

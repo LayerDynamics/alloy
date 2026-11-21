@@ -15,6 +15,7 @@ path = "src/main.rs"
 smollm = { path = "../families/smollm" }
 llama3 = { path = "../families/llama3" }
 engine = { path = "../engine" }
+inference-infra = { path = "../inference-infra" }
 harness-core = { path = "../harness-core" }
 tool-registry = { path = "../tool-registry" }
 mlx-ffi = { path = "../mlx-ffi" }

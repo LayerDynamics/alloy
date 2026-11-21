@@ -25,6 +25,8 @@ fn llama3_tool_stop_context_cache() {
             | "llama-3.1-8b-8bit"
             | "smollm3-3b-4bit"
             | "phi4-mini-instruct-4bit"
+            | "gemma-3-4b-4bit"
+            | "gemma-3-12b-4bit"
             | "ornith-1.5-9b-4bit"
             | "qwen3.5-0.8b-4bit"
     ));
@@ -115,6 +117,19 @@ fn llama3_tool_stop_context_cache() {
             .any(|e| e["params"]["event"] == "tool_result"
                 && e["params"]["body"]["is_error"] == false)
     );
+    let first_result = events
+        .iter()
+        .position(|e| e["params"]["event"] == "tool_result")
+        .unwrap();
+    assert!(
+        events[..first_result].iter().all(|e| {
+            e["params"]["event"] != "text_delta"
+                || e["params"]["body"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.trim().is_empty())
+        }),
+        "assistant must wait for the actual result before answering"
+    );
     assert!(
         events
             .iter()
@@ -131,6 +146,8 @@ fn llama3_tool_stop_context_cache() {
             "smollm3"
         } else if profile.starts_with("phi4") {
             "phi"
+        } else if profile.starts_with("gemma-3") {
+            "gemma3"
         } else {
             "llama3"
         }
@@ -148,10 +165,16 @@ fn llama3_tool_stop_context_cache() {
             "smollm3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("phi4") {
             "phi.mlx-f32.full.bhtd.su-long-fixed.v1"
+        } else if profile.starts_with("gemma-3") {
+            "gemma3.mlx-f32.full-and-sliding.v1"
         } else {
             "llama3.mlx-f32.full.bhtd.v1"
         }
     );
+    if profile.starts_with("gemma-3") {
+        assert_eq!(caps[0]["result"]["cache_modes"][0]["kind"], "mixed");
+        assert_eq!(caps[0]["result"]["supports_prefix_reuse"], false);
+    }
     let denied = rpc(
         "session.send",
         json!({"session_id":session,"content":"Now use fs.write to write forbidden.txt with content BLOCKED."}),
@@ -197,6 +220,11 @@ fn llama3_long_context_stream_cancel_memory() {
     use harness_core::{ContextBuilder, SessionStore, Supervisor};
     use std::sync::Mutex;
     let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    let context_limit = if profile.starts_with("gemma-3") {
+        32768
+    } else {
+        40960
+    };
     let root = tempfile::tempdir().unwrap();
     let request = |budget| BootRequest {
         artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
@@ -219,7 +247,7 @@ fn llama3_long_context_stream_cancel_memory() {
     // The 8 GB simulation constrains admission, not the host's physical RAM.
     let small = alloyd::boot::boot_native_for_qualification(
         request(Some(8 * 1024 * 1024 * 1024)),
-        Some(40960),
+        Some(context_limit),
     )
     .unwrap();
     let mut small_db = SessionStore::open(root.path().join("small.sqlite")).unwrap();
@@ -248,7 +276,8 @@ fn llama3_long_context_stream_cancel_memory() {
         }
     }
     drop(small_supervisor);
-    let boot = alloyd::boot::boot_native_for_qualification(request(None), Some(40960)).unwrap();
+    let boot =
+        alloyd::boot::boot_native_for_qualification(request(None), Some(context_limit)).unwrap();
     let mut db = SessionStore::open(root.path().join("long.sqlite")).unwrap();
     for session in ["long8", "long32", "cancel", "after_cancel"] {
         db.create_session(session, &profile).unwrap();

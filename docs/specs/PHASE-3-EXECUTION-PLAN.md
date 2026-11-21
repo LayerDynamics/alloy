@@ -1163,3 +1163,18 @@ raise the model limit. Run both model sizes and retain actual 8 GiB admission
 and larger-tier native memory measurements. Compile/check affected daemon
 targets and strict Clippy after implementation. These gates do not imply
 Gemma 4, Phi, SmolLM, Mistral/Ministral or full issue #53 acceptance.
+
+Daemon boot checks pass 9/9 and strict Clippy passes in
+1f499ef20bbe499585a16b6d7fda06f7; engine regressions are 620 passed,
+0 failed, 13 ignored (actual Gemma gates run separately). Actual 4B daemon
+tool qualification passes in 59f38c5a358646d9855302c9350e0b7f. That same
+debug command then fails the 12B per-turn deadline after the authorized write.
+The unchanged 12B test passes with production release optimization in
+fe06c691ffc4485bb500d8a1434de4c0: exact COBALT publication, exact DONE,
+no answer before the actual result, rejected forbidden write with zero
+execution and no retry, accurate rejection explanation and mixed-cache
+capabilities. The absolute 120-second per-user-turn deadline is unchanged;
+the whole two-turn test takes 192.78 seconds including boot. Preserve the
+debug timeout as a failed observation. Use the production build for subsequent
+real lifecycle/latency gates and retain the build mode with the evidence.
+Both profiles remain unqualified pending all remaining required gates.

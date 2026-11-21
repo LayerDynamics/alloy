@@ -45,6 +45,7 @@ dependencies = [
  "alloy-process-owner",
  "engine",
  "harness-core",
+ "inference-infra",
  "llama3",
  "mlx-ffi",
  "qwen3",
