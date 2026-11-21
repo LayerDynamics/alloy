@@ -1370,3 +1370,10 @@ requests carry the right schemas and keep rollback tests. Run focused suites
 and strict Clippy, then actual release Gemma compaction/lifecycle gates for
 both pinned sizes. Passing JSON syntax alone does not qualify fact retention
 or exact continuation, and no production profile is promoted by this batch.
+
+Implementation refinement: reserve 128 KiB metadata/scratch rather than 64 KiB
+because the pinned tokenizer API may clone one bounded 64 KiB spelling before
+rejecting an oversized transformed piece. The 12 MiB catalogue bound is
+unchanged. Add crates/harness-core/tests/support/scripted.rs to the exact test
+file set solely to record generation options for compaction-schema assertions;
+scripted events remain test-only and cannot qualify native generation.
