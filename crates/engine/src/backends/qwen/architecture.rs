@@ -79,7 +79,12 @@ impl BackendConfig {
             Self::Gemma3(c) => {
                 let p = c.step_payload_plan(chunk, capacity)
                     .map_err(|e| execution_error("plan Gemma3 step", e.to_string()))?;
-                sum(&[p.work_bytes, p.output_bytes, product(as_u64(token_bytes)?, 8)?, 16 * 1024])
+                // The native step bound already includes three complete KV
+                // payloads for transactional overlap. Two are reserved by
+                // cache_bound; charge only the remainder as workspace.
+                let workspace = p.work_bytes.checked_sub(self.cache_bound(capacity)?)
+                    .ok_or_else(|| internal("Gemma3 step bound omits reserved cache overlap"))?;
+                sum(&[workspace, p.output_bytes, product(as_u64(token_bytes)?, 8)?, 16 * 1024])
             }
             Self::Phi(c) => {
                 let p = c

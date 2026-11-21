@@ -1286,3 +1286,31 @@ below it. Run focused engine tests, strict engine/alloyd Clippy, then both actua
 release Gemma long-context/memory/cancellation gates. No successful admission
 alone qualifies runtime safety; retain actual peak measurement and terminal
 results. Compaction and exact-output failures remain separate open gates.
+
+The corrected adapter passes six focused engine checks, including independent
+geometry arithmetic around sliding-window/chunk boundaries and exact-budget
+admission versus one-byte-short refusal (64ae5bcf3cbb419fa49a121270cb01db).
+Strict engine/alloyd all-target Clippy passes (c4433e38abb5441e8934a88f9fb85f79).
+Actual 12B release suite 0836a5a6292c4e189f9c294ba310e678 passes in 547.72 s:
+8 GiB simulated startup correctly refuses (13146798912 required versus
+8589934592 available); 8101-token retrieval passes in 55.82 s with peak MLX
+active allocation 11488525476 bytes; 32095-token retrieval passes in 368.61 s
+with peak 17823136928 bytes. Cancellation after streamed output and identical
+fresh-session recovery pass. Post-long-run allocator free cache is
+20431418766 bytes, separate from the active-allocation peak and not RSS.
+The code-bearing patch only removes duplicated KV allowance; numerical model,
+context, hard ceiling, output reserve and exact-output acceptance are unchanged.
+
+Actual 4B release regression 58fadaa1e3d14088ab3fa5024a56a242 passes in
+200.45 s: simulated 8 GiB admission executes; 8101-token retrieval takes
+20.85 s with peak 4029708288 bytes; 32095-token retrieval takes 110.81 s
+with peak 5994756096 bytes. Cancellation and identical fresh-session recovery
+pass. Both native long-context suites now pass the corrected accounting.
+
+The bounded upstream format-policy diagnostic b1f007986aac49029294312cd082f030
+completed, but the candidate behavior fails: 4B emits smart quotes in the
+checkpoint, fences the verifier JSON, and retains the continuation newline.
+Both skill colors are exact. This confirms that the candidate instruction is
+not a repair; it is discarded and no format policy is added to product code.
+Further prompt-wording variants are not the next resolving diagnostic. Strict
+checkpoint syntax/schema and exact continuation/skill outputs remain required.

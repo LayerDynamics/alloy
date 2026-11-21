@@ -253,6 +253,65 @@ fn message(role: MessageRole, content: &str) -> Message {
         content: content.into(),
     }
 }
+
+#[test]
+fn gemma3_engine_transition_memory_is_reserved_once() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Qwen3Execution::MlxCpu);
+    let registry = backend
+        .registry(vec![
+            ModelProfile::new(
+                profile_id(),
+                ArtifactId::new("gemma3").unwrap(),
+                128,
+                1,
+                1,
+                GenerationOptions::greedy(1).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    // Independent arithmetic from the frozen fixture geometry: two local
+    // layers (window 4), one global layer, two KV heads of width 32, F32.
+    // Exercise both sides of the sliding-window boundary and chunk boundary.
+    for input in [1usize, 2, 3, 16, 31, 32, 33, 126] {
+        let plan = wait(backend.plan(&registry, &profile_id(), input)).unwrap();
+        let capacity = (input + 2) as u64;
+        let chunk = input.min(32) as u64;
+        let kv = (2 * capacity.min(4) + capacity) * 2 * 32 * 2 * 4;
+        let layers = chunk * (192 * 16 + 256 * 8 + (4 * 32 + 2 * 2 * 32) * 8) * 4;
+        let attention = chunk * capacity * 4 * 4 * 4;
+        let native_work = layers + attention + 32 * 16 + 3 * kv;
+        let native_output = chunk * 128 * 4 * 3;
+        let bookkeeping = (64 << 10) * 8 + (16 << 10);
+        let headroom = 64 << 20;
+        assert_eq!(plan.cache.max_cache_bytes(), 2 * kv + 2 * headroom);
+        assert_eq!(
+            plan.cache.max_cache_bytes() + plan.temporary_bytes,
+            native_work + native_output + bookkeeping + 2 * headroom,
+            "each transition buffer must be covered exactly once at capacity {capacity}"
+        );
+        let components = [
+            plan.cache.max_cache_bytes(),
+            plan.temporary_bytes,
+            plan.headroom_bytes,
+            plan.output_bytes,
+        ];
+        let total = components.iter().sum();
+        let exact = AdmissionController::new(total).unwrap();
+        let grant = exact
+            .reserve_grant("Gemma transition", &components)
+            .unwrap();
+        drop(grant);
+        assert!(
+            AdmissionController::new(total - 1)
+                .unwrap()
+                .reserve_grant("Gemma transition", &components)
+                .is_err()
+        );
+    }
+}
+
 #[test]
 fn gemma3_engine_render_and_decode_contract() {
     let fixture = Fixture::new();
