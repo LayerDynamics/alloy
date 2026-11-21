@@ -1111,3 +1111,44 @@ fences, incomplete JSON, prose prefixes and same-token non-whitespace suffixes;
 all must fail atomically unless the entire declared grammar is complete. Keep
 the prompt's bare-format preference and measure actual native behavior of both
 forms. No extra source files beyond the preceding exact batch are needed.
+
+The independent prompt comparison (37ec90488a8f46999185db3d678df931)
+exposed tool-version metadata and float spelling differences. Keep the measured
+protocol's version-free schema projection and compact Python-compatible JSON
+number spelling using an explicit template filter. Other families' JSON and
+schema fingerprints retain their behavior. The unchanged independent fixture
+and admitted decoder gate pass in 6edf2ca2b72942039f2dc3f722dc26e7.
+
+### #73 Gemma 3 daemon qualification wiring (2026-11-21)
+
+After the native tool batch passes, wire both frozen profiles through the real
+daemon qualification path. Exact files: `crates/alloyd/Cargo.toml`, `Cargo.lock`,
+`crates/alloyd/src/boot.rs`, `crates/alloyd/tests/llama_real_model.rs`, and
+`crates/alloyd/tests/compaction_real_model.rs`.
+
+Use the native Gemma factory and trained text template. Add a direct
+inference-infra dependency to reuse the validated Gemma3Config context instead
+of inventing a daemon default. Permit the actual 33 MB tokenizer within a 40 MiB
+limit, preserve pinned artifact verification without external overrides, and
+use bounded 32-token prefill chunks. Both profiles remain refused by production
+boot until the complete agent/report gates pass.
+
+Named boot tests: `gemma_profiles_ignore_external_pin_overrides`,
+`unqualified_gemma_cannot_boot_production_or_override_context`, and
+`gemma_context_uses_validated_native_metadata`. Run `llama3_tool_stop_context_cache`
+for each actual Gemma artifact: exactly one authorized COBALT file write, no
+premature answer, exact DONE, rejected forbidden write with zero execution and
+an accurate explanation, plus truthful mixed-cache capabilities. Extend the
+existing lifecycle gates to require explicit rebuild and zero SSD restoration
+for Gemma's currently non-persistent mixed cache; preserve exact output, full
+event-history, cancellation, restart and compaction assertions.
+
+For the existing long-context gate use the validated 32768-token Gemma ceiling.
+The 32k document must still produce at least 32000 actual prompt tokens and fit
+with its declared output/margin. If the supplied document exceeds that budget,
+measure and retain the rejection, then create a separately specified document
+fixture that fits the actual trained context; do not silently truncate input or
+raise the model limit. Run both model sizes and retain actual 8 GiB admission
+and larger-tier native memory measurements. Compile/check affected daemon
+targets and strict Clippy after implementation. These gates do not imply
+Gemma 4, Phi, SmolLM, Mistral/Ministral or full issue #53 acceptance.
