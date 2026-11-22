@@ -1517,3 +1517,9 @@ against eager mlx-lm on the trained artifact. Freeze the reference digest
 before running ministral3_real_quantized_native_reference. Preserve the strict
 maximum absolute and pointwise relative thresholds. Engine integration and
 agent tests follow native model execution.
+
+Adding a dense decoder variant requires updating the exhaustive cache identity
+mapping in engine/src/backends/qwen/{architecture.rs,backend.rs,loading.rs}.
+Give Ministral its own full-KV representation, keeping the adapter's declared
+family distinct from the decoder's mathematical configuration. Check the
+engine crate together with the native model checks.
