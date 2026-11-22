@@ -1778,3 +1778,26 @@ active memory, including KV update overlap.
 | 4-bit | real 36 GiB | 32,737 | 2,143,678,464 | 6,973,358,080 | 7,000,621,056 | 16,117,657,600 |
 | 8-bit | simulated 8 GiB | 513 | 3,858,100,224 | 109,903,872 | 169,148,932 | 4,137,153,028 |
 | 8-bit | real 36 GiB | 32,737 | 3,858,100,224 | 6,973,358,080 | 7,000,621,056 | 17,832,079,360 |
+
+### #96 Gemma 4 E4B verified text loading
+
+The pinned shard header and index identify 345 packed text matrices and 320
+floating tensors (including the 42 learned layer scalars). The expected
+charge for packed words and float32 scales, biases and other float tensors
+is 4,666,273,960 bytes. Shared layers contain query and output projections
+and no independent K, V or key norm. The per-layer token embedding's logical
+width is 42 × 256. The converted checkpoint also carries audio, vision and
+their input projectors.
+
+Move the parsed attention geometry in crates/inference-infra/src/decoder/gemma4.rs
+into an allocation-independent config used by the attention kernels and the
+new crates/inference-infra/src/decoder/gemma4/weights.rs. Use the existing
+verified selected-tensor loader. Derive exact shapes from dense text geometry,
+validate tied embeddings, per-layer inputs, the MLP and affine4/group64
+recipe. Reject missing and unexpected text tensors and permit only the four
+named non-text prefixes. Freeze verified input digests in
+crates/inference-infra/tests/fixtures/gemma4_e4b_profile.json. Add
+crates/inference-infra/tests/gemma4_loading.rs with gemma4_e4b_tensor_inventory
+and gemma4_e4b_verified_quantized_loading. Verify the complete immutable
+shard and the one-byte-under denial, then measure the returned text payload.
+The trainable weight buffers must stay packed. Run gemma4_attention again.
