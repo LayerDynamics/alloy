@@ -12,17 +12,21 @@ import m3_native_behavior as behavior
 
 class NativeBehaviorTests(unittest.TestCase):
     def test_shared_lifecycle_is_mandatory_for_each_pinned_profile(self):
-        active = {"gemma-4-e4b-it-4bit", "ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"}
-        for profile in behavior.SUITES.keys() - active:
-            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, "missing native behavioral inventory"):
-                behavior.inventory(profile)
-        for profile in active:
+        self.assertEqual(behavior.FAMILY_FIXTURES.keys(), behavior.SUITES.keys())
+        for profile in behavior.SUITES:
             names = [n for _, _, group in behavior.inventory(profile) for n in group]
             self.assertEqual(len(names), len(set(names)))
             kinds = {k for name in names for k in behavior.COVERAGE[name]}
-            self.assertEqual(kinds, {"tool_schema", "stops", "exact_counting", "long_context", "compaction",
+            expected = {"tool_schema", "stops", "exact_counting", "long_context", "compaction",
                                      "cached_uncached", "streaming", "cancellation", "restart",
-                                     "memory8_gi_b", "memory36_gi_b", "policy_gated_task"})
+                                     "policy_gated_task"}
+            if not profile.startswith(("gemma-3-", "phi4-")):
+                expected.update(("memory8_gi_b", "memory36_gi_b"))
+            self.assertEqual(kinds, expected, profile)
+            self.assertEqual("ministral3_native_memory_tiers" in names, profile.startswith("ministral-"))
+            self.assertEqual("gemma3_real_4b_engine_tools" in names, profile == "gemma-3-4b-4bit")
+            self.assertEqual("gemma3_real_12b_engine_tools" in names, profile == "gemma-3-12b-4bit")
+            self.assertEqual("phi_real_engine_tool_proposals" in names, profile.startswith("phi4-"))
             self.assertIn("real_model_compaction_preserves_history_and_continues", names)
             self.assertIn("llama3_tool_stop_context_cache", names)
             self.assertIn("native_validated_context_boundary", names)

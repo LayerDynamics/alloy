@@ -512,7 +512,7 @@ fn llama3_stream_cancel_recovery() {
 }
 
 #[test]
-#[ignore = "requires pinned E4B, Ornith or small Qwen3.5 and native Metal"]
+#[ignore = "requires the pinned profile checkpoint and native Metal"]
 fn native_validated_context_boundary() {
     use engine::api::Engine;
     use engine::types::ModelProfileId;
@@ -522,7 +522,7 @@ fn native_validated_context_boundary() {
 
     let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
     // Publisher-rendered chat bytes and little-endian token IDs.
-    let (lines, ledger_tokens, text_sha, ids_sha) = match profile.as_str() {
+    let (lines, padding_tokens, text_sha, ids_sha) = match profile.as_str() {
         "gemma-4-e4b-it-4bit" => (
             660,
             42,
@@ -535,7 +535,30 @@ fn native_validated_context_boundary() {
             "d39c26f5e515d28d809b4e3e2f9420e440d813a69cad7a9af357991f5c7e8625",
             "c480eec4cba2bc348f1d5d70169695400705f589ec4c943ad38ee4b94909f593",
         ),
+        "gemma-3-4b-4bit" | "gemma-3-12b-4bit" => (
+            22,
+            21,
+            "a340a1c63c01b2c52d37b6f0e3cb5a24e782319503853ea6018ebf1731fd197c",
+            "5ec31a1953f782c233a7c0f89f073645792dc2748fa5d170bf69d9fca2739f3d",
+        ),
+        "phi4-mini-instruct-4bit" => (
+            665,
+            25,
+            "3128ae4f04ae795e59a1d791d47ea9718d21943c803a95ac85c176cd3f0016a2",
+            "5fef375ea405c5ed0f8a2d9ab32b163bec60a9c26f98571acc09daaacbf2a32a",
+        ),
+        "ministral-3-3b-instruct-2512-4bit" | "ministral-3-3b-instruct-2512-8bit" => (
+            538,
+            29,
+            "6094342011ee1d2c9a858a8506f0535a3ae87aeef9accdd4238ced660a01e5aa",
+            "065053bd8112d87f6a4a07419d5164ae93430d9c6928ec21d051940e6054581c",
+        ),
         other => panic!("no pinned boundary input for {other}"),
+    };
+    let context_limit = if profile.starts_with("gemma-3-") {
+        32_768
+    } else {
+        40_960
     };
     let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
@@ -548,7 +571,7 @@ fn native_validated_context_boundary() {
             tools_enabled: true,
             tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        Some(40_960),
+        Some(context_limit),
     )
     .unwrap();
     let budget = boot
@@ -558,7 +581,7 @@ fn native_validated_context_boundary() {
         .unwrap();
     assert_eq!(
         (budget.limit, budget.output_reserve, budget.safety_margin),
-        (40960, 512, 64)
+        (context_limit, 512, 64)
     );
     let supervisor = Supervisor::new(
         recording_engine::RecordingEngine::new(boot.engine),
@@ -575,8 +598,11 @@ fn native_validated_context_boundary() {
         db.create_session(id, &profile).unwrap();
     }
     let store = Mutex::new(db);
-    let mut archive =
-        include_str!("../../../bench/corpus/fixtures/documents/document-32k.txt").to_owned();
+    let mut archive = if profile.starts_with("gemma-3-") {
+        gemma3_long_document().0
+    } else {
+        include_str!("../../../bench/corpus/fixtures/documents/document-32k.txt").to_owned()
+    };
     let mut middle = archive.len() / 2;
     while !archive.is_char_boundary(middle) {
         middle += 1;
@@ -591,14 +617,19 @@ fn native_validated_context_boundary() {
             .split_inclusive('\n')
             .take(lines),
     );
+    let padding = if profile.starts_with("ministral-") {
+        " entry"
+    } else {
+        " ledger"
+    };
     let prompt = |n| {
         format!(
             "Read this archive and retrieve the vault access code.\n{archive}\n{}\nWhat is the vault access code in the ARCHIVE RECORD? Reply with only the code.",
-            " ledger".repeat(n)
+            padding.repeat(n)
         )
     };
     for (id, excess) in [("overflow", 1), ("boundary", 0)] {
-        let message = prompt(ledger_tokens + excess);
+        let message = prompt(padding_tokens + excess);
         let snapshot = ContextBuilder::build_snapshot(id, &profile, &[], Some(&message)).unwrap();
         let render = ContextBuilder::render_and_count(supervisor.engine(), snapshot).unwrap();
         assert_eq!(

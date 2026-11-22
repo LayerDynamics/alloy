@@ -35,17 +35,30 @@ GEMMA4 = (
 )
 
 
+HYBRID = (
+    ("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),
+    ("engine", "qwen35_engine", ("qwen35_real_engine_tool_proposals",)),
+)
+MINISTRAL = (
+    ("inference-infra", "ministral3_memory", ("ministral3_native_memory_tiers",)),
+    ("alloyd", "ministral3_chat", ("ministral3_native_daemon_chat", "ministral3_publisher_tool_prompt_parity")),
+)
+FAMILY_FIXTURES = {
+    "gemma-4-e4b-it-4bit": GEMMA4,
+    "ornith-1.5-9b-4bit": HYBRID,
+    "qwen3.5-0.8b-4bit": HYBRID,
+    "gemma-3-4b-4bit": (("engine", "gemma3_engine", ("gemma3_real_4b_engine_tools",)),),
+    "gemma-3-12b-4bit": (("engine", "gemma3_engine", ("gemma3_real_12b_engine_tools",)),),
+    "phi4-mini-instruct-4bit": (("engine", "phi_engine", ("phi_real_engine_tool_proposals",)),),
+    "ministral-3-3b-instruct-2512-4bit": MINISTRAL,
+    "ministral-3-3b-instruct-2512-8bit": MINISTRAL,
+}
+
+
 def inventory(profile):
-    if profile not in SUITES:
-        raise ValueError(f"unknown profile: {profile}")
-    if profile == "gemma-4-e4b-it-4bit":
-        return SHARED + GEMMA4
-    if profile not in ("ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"):
+    if profile not in FAMILY_FIXTURES:
         raise ValueError(f"missing native behavioral inventory for {profile}")
-    return SHARED + (
-        ("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),
-        ("engine", "qwen35_engine", ("qwen35_real_engine_tool_proposals",)),
-    )
+    return SHARED + FAMILY_FIXTURES[profile]
 
 
 # Each category corresponds to assertions in the named native test. Every
@@ -65,6 +78,12 @@ COVERAGE = {
     "gemma4_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
     "qwen35_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
     "qwen35_real_engine_tool_proposals": ("tool_schema",),
+    "gemma3_real_4b_engine_tools": ("tool_schema",),
+    "gemma3_real_12b_engine_tools": ("tool_schema",),
+    "phi_real_engine_tool_proposals": ("tool_schema",),
+    "ministral3_native_daemon_chat": ("exact_counting", "streaming"),
+    "ministral3_publisher_tool_prompt_parity": ("tool_schema",),
+    "ministral3_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
 }
 
 
@@ -123,11 +142,12 @@ def inspect_profile(out, record):
     encoded = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
     dependencies = hashlib.sha256(encoded).hexdigest()
     binary = build("example", "alloyd", "m3_profile_identity", out, record)
-    path = execute([binary, record["profile"], record["artifact_directory"], "40960",
+    context = 32768 if record["profile"].startswith("gemma-3-") else 40960
+    path = execute([binary, record["profile"], record["artifact_directory"], str(context),
                     record["candidate"], dependencies], out, "profile-identity", record)
     inspected = json.loads(path.read_bytes())
     identity = inspected["identity"]
-    if inspected["profile"] != record["profile"] or inspected["context"] != 40960 or (
+    if inspected["profile"] != record["profile"] or inspected["context"] != context or (
         identity["candidate_revision"], identity["dependencies_sha256"]
     ) != (record["candidate"], dependencies):
         raise ValueError("native profile inspection did not match the requested configuration")

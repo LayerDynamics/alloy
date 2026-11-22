@@ -13,6 +13,15 @@ use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 
 const PROFILE: &str = "ministral-3-3b-instruct-2512-4bit";
+fn selected_profile() -> String {
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| PROFILE.to_owned());
+    assert!(matches!(
+        profile.as_str(),
+        PROFILE | "ministral-3-3b-instruct-2512-8bit"
+    ));
+    profile
+}
+
 const QUESTION: &str = "Calculate 2 + 2. Reply with only the result.";
 struct Offline;
 impl TelemetryTransport for Offline {
@@ -21,10 +30,10 @@ impl TelemetryTransport for Offline {
     }
 }
 
-fn request(path: PathBuf, tools_enabled: bool) -> BootRequest {
+fn request(profile: &str, path: PathBuf, tools_enabled: bool) -> BootRequest {
     BootRequest {
         artifact_dir: path,
-        profile_id: PROFILE.into(),
+        profile_id: profile.into(),
         corpus_models_json: None,
         memory_guard: MemoryGuardConfig::balanced(),
         admission_budget_override_bytes: None,
@@ -37,8 +46,7 @@ fn request(path: PathBuf, tools_enabled: bool) -> BootRequest {
 fn ministral_production_requires_qualification() {
     let missing = PathBuf::from("/nonexistent/ministral");
     for profile in [PROFILE, "ministral-3-3b-instruct-2512-8bit"] {
-        let mut request = request(missing.clone(), false);
-        request.profile_id = profile.into();
+        let request = request(profile, missing.clone(), false);
         let error = alloyd::boot::boot_native(request).err().unwrap();
         assert!(error.message.contains("not qualified"), "{error:?}");
     }
@@ -47,13 +55,15 @@ fn ministral_production_requires_qualification() {
 #[test]
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and Metal"]
 fn ministral3_native_daemon_chat() {
+    let profile = selected_profile();
     let artifact = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap());
     let boot =
-        alloyd::boot::boot_native_for_qualification(request(artifact, false), Some(2048)).unwrap();
+        alloyd::boot::boot_native_for_qualification(request(&profile, artifact, false), Some(2048))
+            .unwrap();
     let snapshot = |turns: Vec<(MessageRole, &str)>| {
         ContextSnapshot::new(
             ContextSnapshotId::new("chat").unwrap(),
-            ModelProfileId::new(PROFILE).unwrap(),
+            ModelProfileId::new(&profile).unwrap(),
             turns
                 .into_iter()
                 .map(|(role, content)| Message {
@@ -147,7 +157,7 @@ fn ministral3_native_daemon_chat() {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     };
-    let create = rpc("session.create", json!({"profile":PROFILE}));
+    let create = rpc("session.create", json!({"profile":profile}));
     let session = create[0]["result"]["session_id"].as_str().unwrap();
     for (question, expected) in [
         (QUESTION, "4"),
@@ -175,9 +185,11 @@ fn ministral3_native_daemon_chat() {
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and Metal"]
 fn ministral3_publisher_tool_prompt_parity() {
     use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let profile = selected_profile();
     let artifact = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap());
     let boot =
-        alloyd::boot::boot_native_for_qualification(request(artifact, true), Some(2048)).unwrap();
+        alloyd::boot::boot_native_for_qualification(request(&profile, artifact, true), Some(2048))
+            .unwrap();
     let tool = RenderingTool::new(
         "fs.read".into(),
         "1".into(),
@@ -227,7 +239,7 @@ fn ministral3_publisher_tool_prompt_parity() {
         .unwrap();
         let snapshot = ContextSnapshot::new(
             ContextSnapshotId::new("tool-parity").unwrap(),
-            ModelProfileId::new(PROFILE).unwrap(),
+            ModelProfileId::new(&profile).unwrap(),
             vec![
                 Message {
                     role: MessageRole::System,
