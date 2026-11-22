@@ -1,6 +1,9 @@
 //! Build the numerical sections of an M3 qualification report from real native captures.
 //! Usage: m3_numerical_report PROFILE PINNED_REFERENCE RAW_ROWS NEW_OUTPUT_DIRECTORY
-use engine::conformance::{NumericalMetrics, NumericalObservation, NumericalReference};
+use engine::conformance::{
+    FixtureKind, FixtureObservation, NumericalMetrics, NumericalObservation, NumericalReference,
+    QualificationIdentity, QualificationReport, QualificationSpec, REPORT_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -188,13 +191,53 @@ fn write(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureRun {
+    profile_id: String,
+    artifact_id: String,
+    identity: QualificationIdentity,
+    required: BTreeMap<String, FixtureKind>,
+    observed: Vec<FixtureObservation>,
+}
+
+fn qualify(sections: Sections, profile: &str, run: FixtureRun, out: &Path) -> Result<()> {
+    if run.profile_id != profile || run.artifact_id != profile {
+        return Err("behavioral and numerical profiles differ".into());
+    }
+    let spec = QualificationSpec {
+        profile_id: run.profile_id,
+        artifact_id: run.artifact_id,
+        identity: run.identity.clone(),
+        fixtures: run.required,
+        references: sections.references,
+    };
+    let report = QualificationReport {
+        version: REPORT_VERSION,
+        identity: run.identity,
+        suite_sha256: spec.sha256()?,
+        fixtures: run.observed,
+        numerical: sections.observations,
+    };
+    let verdict = spec.evaluate(&report);
+    fs::create_dir(out)?;
+    write(&out.join("spec.json"), &spec)?;
+    write(&out.join("report.json"), &report)?;
+    write(&out.join("verdict.json"), &verdict)?;
+    if !verdict.usable {
+        return Err(format!("unsupported: {}", verdict.failures.join("; ")).into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let [profile, reference, raw, out] = args.as_slice() else {
-        return Err(
-            "usage: m3_numerical_report PROFILE PINNED_REFERENCE RAW_ROWS NEW_OUTPUT_DIRECTORY"
-                .into(),
-        );
+    let (profile, reference, raw, out, fixtures) = match args.as_slice() {
+        [profile, reference, raw, out] => (profile, reference, raw, out, None),
+        [command, profile, reference, raw, fixtures, out] if command == "qualify" => {
+            (profile, reference, raw, out, Some(fixtures))
+        }
+        _ => return Err("usage: m3_numerical_report [qualify] PROFILE PINNED_REFERENCE RAW_ROWS [FIXTURE_RUN] NEW_OUTPUT_DIRECTORY".into()),
     };
     let (pin, vocabulary) = pinned(profile.to_str().ok_or("invalid profile name")?)?;
     let bytes = read(Path::new(reference), 64 << 20)?;
@@ -203,6 +246,10 @@ fn main() -> Result<()> {
     }
     let frozen = serde_json::from_slice(&bytes)?;
     let sections = Sections::load(&pin, vocabulary, frozen, Path::new(raw))?;
+    if let Some(path) = fixtures {
+        let run = serde_json::from_slice(&read(Path::new(path), 1 << 20)?)?;
+        return qualify(sections, &pin.id, run, Path::new(out));
+    }
     sections.write(Path::new(out))?;
     println!(
         "{}: {} native numerical rows passed FR-8",
@@ -239,6 +286,76 @@ mod tests {
         fs::create_dir(&path).unwrap();
         Dir(path)
     }
+    #[test]
+    fn qualification_retains_failed_and_successful_reports() {
+        let root = dir();
+        let hex = "a".repeat(64);
+        let required: BTreeMap<String, FixtureKind> = FixtureKind::REQUIRED
+            .into_iter()
+            .map(|kind| {
+                let id = serde_json::to_value(kind)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                (id, kind)
+            })
+            .collect();
+        // These are the category names emitted by the Python native runner.
+        assert!(required.contains_key("memory8_gi_b") && required.contains_key("memory36_gi_b"));
+        for passed in [false, true] {
+            let out = root.0.join(passed.to_string());
+            let run = FixtureRun {
+                profile_id: "tiny".into(),
+                artifact_id: "tiny".into(),
+                identity: QualificationIdentity {
+                    candidate_revision: "a".repeat(40),
+                    dependencies_sha256: hex.clone(),
+                    artifact_manifest_sha256: hex.clone(),
+                    family: "tiny".into(),
+                    family_version: "1.0".into(),
+                    engine_api_version: engine::api::ENGINE_API_VERSION,
+                    tokenizer_sha256: hex.clone(),
+                    template_sha256: hex.clone(),
+                    tool_protocol_sha256: hex.clone(),
+                    profile_sha256: hex.clone(),
+                },
+                observed: required
+                    .keys()
+                    .map(|id| FixtureObservation {
+                        fixture_id: id.clone(),
+                        passed: passed || id != "compaction",
+                        evidence_sha256: hex.clone(),
+                        detail: "terminal execution".into(),
+                    })
+                    .collect(),
+                required: required.clone(),
+            };
+            let mut sections = Sections::default();
+            sections.references.insert(
+                "row".into(),
+                NumericalReference {
+                    input_sha256: hex.clone(),
+                    logits: vec![1.],
+                },
+            );
+            sections.observations.push(NumericalObservation {
+                fixture_id: "row".into(),
+                input_sha256: hex.clone(),
+                logits: vec![1.],
+            });
+            assert_eq!(qualify(sections, "tiny", run, &out).is_ok(), passed);
+            let report: QualificationReport =
+                serde_json::from_slice(&fs::read(out.join("report.json")).unwrap()).unwrap();
+            let spec: QualificationSpec =
+                serde_json::from_slice(&fs::read(out.join("spec.json")).unwrap()).unwrap();
+            let saved: engine::conformance::QualificationVerdict =
+                serde_json::from_slice(&fs::read(out.join("verdict.json")).unwrap()).unwrap();
+            assert_eq!(saved.usable, passed);
+            assert_eq!(spec.evaluate(&report).failures, saved.failures);
+        }
+    }
+
     fn pin() -> Pin {
         Pin {
             id: "fixture".into(),

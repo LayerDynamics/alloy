@@ -40,7 +40,30 @@ def inventory(profile):
         raise ValueError(f"unknown profile: {profile}")
     if profile == "gemma-4-e4b-it-4bit":
         return SHARED + GEMMA4
-    return SHARED + (("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),)
+    return SHARED + (
+        ("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),
+        ("engine", "qwen35_engine", ("qwen35_real_engine_tool_proposals",)),
+    )
+
+
+# Each category corresponds to assertions in the named native test. Every
+# named test remains required even if another test covers the same category.
+COVERAGE = {
+    "llama3_tool_stop_context_cache": ("policy_gated_task", "stops"),
+    "llama3_long_context_stream_cancel_memory": ("streaming", "cancellation"),
+    "native_validated_context_boundary": ("long_context", "exact_counting"),
+    "real_model_compaction_preserves_history_and_continues": ("compaction",),
+    "real_model_ssd_prefix_survives_process_restart": ("restart",),
+    "real_model_generated_history_has_verified_canonical_bytes": ("cached_uncached",),
+    "real_skill_change_invalidates_stale_cache_and_matches_cold": ("cached_uncached",),
+    "real_rpc_skill_load_changes_next_generation": ("cached_uncached",),
+    "gemma4_daemon_text_session": ("streaming", "exact_counting"),
+    "gemma4_publisher_tool_prompt_parity": ("tool_schema",),
+    "gemma4_small_budget_generation": ("memory8_gi_b",),
+    "gemma4_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "qwen35_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "qwen35_real_engine_tool_proposals": ("tool_schema",),
+}
 
 
 def fixture_env(selected):
@@ -113,6 +136,9 @@ def inspect_profile(out, record):
 def run(args):
     with pinned_run(args, "behavior") as (out, record, selected):
         selected.update(ALLOY_REAL_MODEL=record["artifact_directory"], ALLOY_REAL_PROFILE=args.profile)
+        if args.profile in ("ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"):
+            selected.update(ALLOY_HYBRID_ARTIFACT=record["artifact_directory"],
+                            ALLOY_HYBRID_PROFILE="ornith" if args.profile.startswith("ornith-") else "upstream")
         record["fixture_environment"] = selected
         inspect_profile(out, record)
         observations = run_suite(out, record, selected, inventory(args.profile))

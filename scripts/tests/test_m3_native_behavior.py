@@ -15,6 +15,10 @@ class NativeBehaviorTests(unittest.TestCase):
         for profile in behavior.SUITES:
             names = [n for _, _, group in behavior.inventory(profile) for n in group]
             self.assertEqual(len(names), len(set(names)))
+            kinds = {k for name in names for k in behavior.COVERAGE[name]}
+            self.assertEqual(kinds, {"tool_schema", "stops", "exact_counting", "long_context", "compaction",
+                                     "cached_uncached", "streaming", "cancellation", "restart",
+                                     "memory8_gi_b", "memory36_gi_b", "policy_gated_task"})
             self.assertIn("real_model_compaction_preserves_history_and_continues", names)
             self.assertIn("llama3_tool_stop_context_cache", names)
             self.assertIn("native_validated_context_boundary", names)

@@ -8,6 +8,7 @@ import sys
 
 import m3_native_behavior
 import m3_native_numerical as native
+import m3_native_qualification
 
 
 RUNNERS = {"numerical": native.run, "behavior": m3_native_behavior.run}
@@ -51,12 +52,35 @@ def run_one(profile, scope, candidate, inputs, output):
     return result
 
 
+def qualify_profile(profile, candidate, inputs, output, runs):
+    result = {"profile": profile, "status": "failed"}
+    directory = output / (profile + "-qualification")
+    try:
+        by_scope = {r["scope"]: r for r in runs}
+        if any("receipt_sha256" not in r for r in runs):
+            raise ValueError("missing native evidence receipt")
+        m3_native_qualification.issue(profile, candidate, inputs[profile], output, by_scope)
+    except (KeyError, TypeError, *RUN_ERRORS) as error:
+        result["error"] = str(error)
+    if directory.exists() or "error" not in result:
+        try:
+            result.update(verified_receipt(directory, profile, candidate, "qualification"))
+            verdict = directory / "report/verdict.json"
+            if verdict.is_file():
+                result["verdict_sha256"] = native.sha256(verdict)
+        except RUN_ERRORS as error:
+            result["receipt_error"] = str(error)
+    if "error" in result or "receipt_error" in result:
+        result["status"] = "failed"
+    return result
+
+
 def run(candidate, inputs_path, output):
     output = output.resolve()
     if output.is_relative_to(native.ROOT):
         raise ValueError("matrix output must be a new external directory")
     output.mkdir()
-    index = {"version": 1, "candidate": candidate, "runs": [], "status": "failed"}
+    index = {"version": 1, "candidate": candidate, "runs": [], "qualifications": [], "status": "failed"}
     try:
         native.verify_candidate(candidate)
         inputs_path = inputs_path.resolve(strict=True)
@@ -66,12 +90,17 @@ def run(candidate, inputs_path, output):
         if not isinstance(inputs, dict) or inputs.keys() - native.SUITES.keys():
             raise ValueError("invalid or unexpected profiles in input inventory")
         for profile in native.SUITES:
+            runs = []
             for scope in RUNNERS:
                 result = run_one(profile, scope, candidate, inputs, output)
+                runs.append(result)
                 index["runs"].append(result)
                 print(f"{profile} {scope}: {result['status']}", flush=True)
+            qualification = qualify_profile(profile, candidate, inputs, output, runs)
+            index["qualifications"].append(qualification)
+            print(f"{profile} qualification: {qualification['status']}", flush=True)
         native.verify_candidate(candidate)
-        if all(r["status"] == "passed" for r in index["runs"]):
+        if all(r["status"] == "passed" for r in index["runs"] + index["qualifications"]):
             index["status"] = "passed"
     except RUN_ERRORS as error:
         index["error"] = str(error)

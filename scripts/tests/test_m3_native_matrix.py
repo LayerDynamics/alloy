@@ -39,6 +39,8 @@ class NativeMatrixTests(unittest.TestCase):
             self.assertEqual(index, json.loads((root / "out/index.json").read_text()))
             self.assertEqual(index["status"], "failed")
             self.assertEqual(len(index["runs"]), 2 * len(profiles))
+            self.assertEqual(len(index["qualifications"]), len(profiles))
+            self.assertTrue(all(r["status"] == "failed" for r in index["qualifications"]))
             for row in index["runs"]:
                 if row["profile"] == profiles[0]:
                     self.assertIn("profile input", row["error"])
