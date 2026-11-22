@@ -1586,3 +1586,11 @@ with its existing allow/deny, terminal response and cache gates.
 
 Initialize the new parser field in the two existing decoder test builders,
 crates/engine/tests/unit/backends_qwen_output_{protocol_token,structured_output}.rs.
+
+For real skill and checkpoint history the harness emits adjacent user-role
+records. In the planned Ministral template, serialize adjacent user records
+in one publisher user turn with a newline between records. Test equality of
+rendered bytes and IDs with the equivalent combined user input in
+ministral3_chat.rs. Keep the publisher's alternating assistant boundaries.
+Run the existing compaction_real_model integration suite with the frozen
+profile, including actual process restart, cold comparisons and event checks.
