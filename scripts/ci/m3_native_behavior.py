@@ -40,6 +40,8 @@ def inventory(profile):
         raise ValueError(f"unknown profile: {profile}")
     if profile == "gemma-4-e4b-it-4bit":
         return SHARED + GEMMA4
+    if profile not in ("ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"):
+        raise ValueError(f"missing native behavioral inventory for {profile}")
     return SHARED + (
         ("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),
         ("engine", "qwen35_engine", ("qwen35_real_engine_tool_proposals",)),
@@ -140,8 +142,9 @@ def run(args):
             selected.update(ALLOY_HYBRID_ARTIFACT=record["artifact_directory"],
                             ALLOY_HYBRID_PROFILE="ornith" if args.profile.startswith("ornith-") else "upstream")
         record["fixture_environment"] = selected
+        groups = inventory(args.profile)
         inspect_profile(out, record)
-        observations = run_suite(out, record, selected, inventory(args.profile))
+        observations = run_suite(out, record, selected, groups)
         path = out / "fixtures.json"
         write_json(path, observations)
         record["fixtures_sha256"] = sha256(path)

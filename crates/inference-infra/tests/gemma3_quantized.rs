@@ -1,4 +1,7 @@
 //! Explicit real-artifact numerical gate, not an agent/profile qualification.
+#[path = "support/numerical_capture.rs"]
+mod numerical_capture;
+
 use inference_infra::decoder::{
     gemma3::{model::MlxGemma3Model, weights::load_verified},
     loader::{CheckpointVerification, LoadOptions},
@@ -144,7 +147,8 @@ fn real_model(
                 .unwrap()
                 .into_values(),
         ];
-        for token in [10, 12] {
+        let decode_tokens = [10, 12];
+        for token in decode_tokens {
             actual.push(
                 model
                     .forward_cached(
@@ -188,6 +192,14 @@ fn real_model(
         assert_eq!(expected.len(), 3);
         for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             let actual = &actual[actual.len() - 262208..];
+            numerical_capture::record(
+                &profile,
+                case_index,
+                row,
+                &tokens,
+                &decode_tokens[..row],
+                actual,
+            );
             let expected: Vec<f64> = serde_json::from_value(expected.clone()).unwrap();
             assert_eq!(actual.len(), 262208);
             assert_eq!(actual.len(), expected.len());

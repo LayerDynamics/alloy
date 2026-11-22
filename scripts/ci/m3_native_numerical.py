@@ -16,6 +16,11 @@ SUITES = {
     "gemma-4-e4b-it-4bit": ("gemma4_e4b", "gemma4_quantized", "gemma4_native_trained_reference", "ALLOY_GEMMA4"),
     "ornith-1.5-9b-4bit": ("ornith_1_5_9b", "qwen35_quantized", "ornith_9b_quantized_native_reference", "ALLOY_ORNITH"),
     "qwen3.5-0.8b-4bit": ("qwen35_0_8b", "qwen35_quantized", "qwen35_0_8b_quantized_native_reference", "ALLOY_QWEN35_SMALL"),
+    "gemma-3-4b-4bit": ("gemma3_4b", "gemma3_quantized", "gemma3_4b_real_quantized_native_reference", "ALLOY_GEMMA3_SMALL"),
+    "gemma-3-12b-4bit": ("gemma3_12b", "gemma3_quantized", "gemma3_12b_real_quantized_native_reference", "ALLOY_GEMMA3"),
+    "phi4-mini-instruct-4bit": ("phi4_mini", "phi_quantized", "phi4mini_real_quantized_native_reference", "ALLOY_PHI"),
+    "ministral-3-3b-instruct-2512-4bit": ("ministral3", "ministral3_quantized", "ministral3_real_quantized_native_reference", "ALLOY_MINISTRAL3"),
+    "ministral-3-3b-instruct-2512-8bit": ("ministral3_8bit", "ministral3_quantized", "ministral3_real_affine8_native_reference", "ALLOY_MINISTRAL3"),
 }
 
 

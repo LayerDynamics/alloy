@@ -1,6 +1,8 @@
 //! Pinned trained-weight test of native prefill and cached decode on Metal.
 #[path = "support/ministral3.rs"]
 mod ministral3;
+#[path = "support/numerical_capture.rs"]
+mod numerical_capture;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -64,6 +66,14 @@ fn check_reference(manifest: &str, resident_bytes: usize) {
             let expected = expected.as_array().unwrap();
             assert_eq!(expected.len(), 131072);
             assert_eq!(logits.values().len(), expected.len());
+            numerical_capture::record(
+                &profile,
+                case_id,
+                step,
+                &prompt,
+                &decode[..step],
+                logits.values(),
+            );
             let (mut abs, mut rel) = (0.0_f64, 0.0_f64);
             for (&a, b) in logits.values().iter().zip(expected) {
                 let b = b.as_f64().unwrap();

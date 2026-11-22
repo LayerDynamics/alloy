@@ -12,7 +12,11 @@ import m3_native_behavior as behavior
 
 class NativeBehaviorTests(unittest.TestCase):
     def test_shared_lifecycle_is_mandatory_for_each_pinned_profile(self):
-        for profile in behavior.SUITES:
+        active = {"gemma-4-e4b-it-4bit", "ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"}
+        for profile in behavior.SUITES.keys() - active:
+            with self.subTest(profile=profile), self.assertRaisesRegex(ValueError, "missing native behavioral inventory"):
+                behavior.inventory(profile)
+        for profile in active:
             names = [n for _, _, group in behavior.inventory(profile) for n in group]
             self.assertEqual(len(names), len(set(names)))
             kinds = {k for name in names for k in behavior.COVERAGE[name]}

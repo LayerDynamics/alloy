@@ -63,6 +63,26 @@ fn pinned(profile: &str) -> Result<(Pin, usize)> {
             include_str!("../../inference-infra/tests/fixtures/qwen35_0_8b_profile.json"),
             248_320,
         ),
+        "gemma-3-4b-4bit" => (
+            include_str!("../../inference-infra/tests/fixtures/gemma3_4b_profile.json"),
+            262_208,
+        ),
+        "gemma-3-12b-4bit" => (
+            include_str!("../../inference-infra/tests/fixtures/gemma3_12b_profile.json"),
+            262_208,
+        ),
+        "phi4-mini-instruct-4bit" => (
+            include_str!("../../inference-infra/tests/fixtures/phi4_mini_profile.json"),
+            200_064,
+        ),
+        "ministral-3-3b-instruct-2512-4bit" => (
+            include_str!("../../inference-infra/tests/fixtures/ministral3_profile.json"),
+            131_072,
+        ),
+        "ministral-3-3b-instruct-2512-8bit" => (
+            include_str!("../../inference-infra/tests/fixtures/ministral3_8bit_profile.json"),
+            131_072,
+        ),
         _ => return Err(format!("no pinned numerical suite for {profile}").into()),
     };
     let pin: Pin = serde_json::from_str(manifest)?;
