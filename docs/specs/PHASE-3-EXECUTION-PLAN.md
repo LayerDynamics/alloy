@@ -1902,3 +1902,9 @@ gemma4_publisher_tool_prompt_parity in `crates/alloyd/tests/gemma4_chat.rs`.
 Run the existing real-model tool-policy and compaction fixtures using the
 Gemma 4 profile, retaining observed failures. Only a passing real task
 counts toward production support.
+
+The decoder's per-token parser slot will dispatch either Ministral or Gemma 4.
+Update the existing constructors in
+`crates/engine/tests/unit/backends_qwen_output_protocol_token.rs` and
+`crates/engine/tests/unit/backends_qwen_output_structured_output.rs` with the
+same disabled protocol state, and rerun their output regression tests.
