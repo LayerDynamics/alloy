@@ -1647,3 +1647,23 @@ Compare reopened and fresh execution before asserting the unchanged literal
 answer in real_model_compaction_preserves_history_and_continues. Keep the
 original prompt, the exact-answer assertion and the restored-prefix checks.
 This distinguishes a cache divergence from a repeated model-format failure.
+
+The 4-bit lifecycle suite passed four of five cases
+(dfc8964d2c65459daf81505338dbb6ce). Retention verified 548 executed tokens
+from a 544-token prompt. The process-restart case restored 628 of 629 input
+tokens with the exact cold answer. Replacing the loaded skill changed COBALT
+to AMBER over RPC, and a warm run restored the unchanged 534-token prefix and
+matched the cold AMBER result. The complete native generation regression suite
+passed 101 tests with one opt-in test ignored
+(82ccfc7c7ea84f8d8dbd8ebddcb093d4).
+
+The separate compaction replay on ddbd766 (54adf9270b7d44e298d2f0aa072bd536)
+failed the unchanged resumed-output assertion. The 2,163-token history plus
+576 reserved tokens exceeded the 2,578-token limit. After compaction the
+1,256-token request returned exactly COBALT, matching the cold transition.
+All checkpoint fields and previous events survived. The reopened 1,279-token
+request and cold execution both emitted the literal Markdown string
+`**COBALT**`. Independent pinned eager MLX reproduced the same five output
+IDs on all 1,279 original input IDs (1c21ac297e8f4d9dbb85a0339d2ce850).
+A diagnostic request for plain text returned COBALT; it does not replace the
+failing fixture. Keep the 4-bit agent profile unqualified.
