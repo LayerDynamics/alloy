@@ -1667,3 +1667,7 @@ request and cold execution both emitted the literal Markdown string
 IDs on all 1,279 original input IDs (1c21ac297e8f4d9dbb85a0339d2ce850).
 A diagnostic request for plain text returned COBALT; it does not replace the
 failing fixture. Keep the 4-bit agent profile unqualified.
+
+The optimized actual 4-bit renderer counted 33,875 tokens. All five warm
+samples matched token-for-token and took 16.84 to 17.28 ms, within the
+150 ms threshold (bf7c9c4cab244a2d91c513febcec43b4).
