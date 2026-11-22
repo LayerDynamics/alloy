@@ -2548,3 +2548,22 @@ Re-run long_dense_cache_matches_short_cache_after_cancel and all existing
 kv_cache CPU tests. Re-measure native_boundary_memory_estimate for each
 trained checkpoint, then run the independent trained and daemon gates under
 the Mac lease. Dependencies stay fixed.
+
+### Cold Qwen startup reservation across loading and KV allocation
+
+The Qwen loader releases its temporary checkpoint buffers before it returns
+the loaded model. The runtime allocates the new KV cache after that return.
+For long dense and routed Qwen3, reserve the larger of those two allowances
+once. Keep the resident weights, execution workspace, output, headroom and
+history separately covered. Implement this explicit opt-in in
+`crates/engine/src/family.rs`, `crates/engine/src/backends/qwen/backend.rs`
+and `crates/engine/src/runtime.rs`. Use it for both advisory estimate paths,
+admission, pressure demand and transfer of the existing atomic grant.
+In `crates/engine/tests/unit/backends_qwen_shared_rendering_wiring.rs` run
+long_cold_start_reuses_loader_scratch_for_kv on real MLX CPU. Check the
+exact admission boundary, rejection one byte below it and successful native
+generation at that boundary. Check both relative sizes of the loader and KV
+allowances in `crates/engine/tests/unit/runtime_tests.rs` with
+cold_load_charge_preserves_peak_and_residency. Re-run engine CPU pressure tests,
+native_boundary_memory_estimate for all three trained Qwen profiles and the
+original Phase 1/2 gates on the release candidate. Dependencies stay fixed.
