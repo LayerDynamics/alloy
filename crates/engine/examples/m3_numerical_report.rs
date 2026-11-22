@@ -216,6 +216,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Dir(std::path::PathBuf);
@@ -225,12 +226,16 @@ mod tests {
         }
     }
     fn dir() -> Dir {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let index = NEXT.fetch_add(1, Ordering::Relaxed);
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("alloy-numerical-{}-{stamp}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "alloy-numerical-{}-{stamp}-{index}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         Dir(path)
     }
@@ -250,7 +255,7 @@ mod tests {
             cases: vec![Case {
                 tokens: vec![1, 2],
                 decode_tokens: vec![],
-                logits: vec![1.0, 0.0],
+                logits: vec![vec![1.0, 0.0]],
             }],
         }
     }

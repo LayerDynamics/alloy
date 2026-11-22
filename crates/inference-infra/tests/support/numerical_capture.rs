@@ -29,11 +29,12 @@ pub fn record(
     let mut out = BufWriter::new(file);
     // Widen before serialization: shortest-roundtrip f32 decimals can change
     // near-zero relative error when read back into the f64 report evaluator.
+    let tokens = [prompt, executed_suffix].concat();
     let row = json!({
         "profile": profile["id"],
         "reference_sha256": profile["reference"]["sha256"],
         "case": case, "step": step,
-        "tokens": [prompt, executed_suffix].concat(),
+        "tokens": tokens,
         "logits": logits.iter().copied().map(f64::from).collect::<Vec<_>>()
     });
     serde_json::to_writer(&mut out, &row).unwrap();
