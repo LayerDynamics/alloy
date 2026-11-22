@@ -1501,3 +1501,19 @@ representation. Add tests/ministral3_loading.rs with
 ministral3_text_checkpoint_loading on the actual pinned file, exercising exact
 resident payload and one-byte-under refusal. Exercise skipped-byte integrity
 and unknown namespaces on a small artifact. No registry promotion in this batch.
+
+### #99 native Ministral decoder and trained reference
+
+Use the shared dense MLX decoder for bias-free SwiGLU, ordinary RMSNorm,
+packed tied embeddings and full transactional KV. Add a Ministral3 variant
+to decoder/config.rs carrying validated YaRN and query scale parameters.
+Wire config conversion in ministral3/config.rs and reuse the rotation code
+in ministral3/position.rs from mlx_model.rs on every full attention layer.
+Reject the ordinary flat checkpoint path in loader.rs for this nested family.
+Add fixtures/ministral3_position/capture_model.py, fixtures/ministral3_profile.json
+and ministral3_quantized.rs under inference-infra/tests. Compare every vocabulary
+logit for prefill and two cached decode steps on two tokenizer-bound prompts
+against eager mlx-lm on the trained artifact. Freeze the reference digest
+before running ministral3_real_quantized_native_reference. Preserve the strict
+maximum absolute and pointwise relative thresholds. Engine integration and
+agent tests follow native model execution.
