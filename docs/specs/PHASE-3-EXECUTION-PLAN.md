@@ -1943,3 +1943,20 @@ reply after cache rebuild (3e28a06448d84846a18033e76cc92b37). The engine
 library release suite passed 399 tests with two ignored
 (c53665579c2346ccb8dc20b5f768e2e3). Strict Clippy passed across all targets
 of engine, alloyd and inference-infra (d1391c4c05cd4f69bb446fd011638f37).
+
+### #96 Gemma 4 measured memory and sliding-window replay
+
+Share the verified E4B checkpoint loader between the frozen trained
+reference in `crates/inference-infra/tests/gemma4_quantized.rs` and the
+new isolated allocator test in `crates/inference-infra/tests/gemma4_memory.rs`
+using `crates/inference-infra/tests/support/gemma4.rs`. Run
+`gemma4_native_memory_tiers` on Metal at a simulated 8 GiB allocator limit
+with 512 prompt tokens plus one decode, and on the physical 36 GiB Mac
+with 32,736 plus one. Record native weight buffers, empty and committed
+KV, active endpoints, load and generation peaks and transient bytes above
+both endpoints. Compare actual retained lengths and backing sizes with
+the pinned full/sliding owner layout. In the smaller case compare every
+final logit and the greedy token with a single cold prefill of the same
+513 tokens. Rerun `gemma4_native_trained_reference` with the original
+independent reference. These measurements qualify the native decoder. The
+shared daemon's budget admission and conformance checks remain separate.
