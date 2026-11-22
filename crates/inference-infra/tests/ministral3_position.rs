@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 
 const CONFIG: &str = include_str!("fixtures/ministral3_position/config.json");
 const REFERENCE: &str = include_str!("fixtures/ministral3_position/reference.json");
+const LINUX_REFERENCE: &str =
+    include_str!("fixtures/ministral3_position/reference-linux-aarch64.json");
 fn config() -> MinistralConfig {
     MinistralConfig::from_json(&serde_json::from_str(CONFIG).unwrap()).unwrap()
 }
@@ -62,21 +64,43 @@ fn strict_compare(actual: &[f32], expected: &[f32], name: &str) {
 fn ministral3_pinned_geometry_and_position_contract() {
     let manifest: Value =
         serde_json::from_str(include_str!("fixtures/ministral3_position/manifest.json")).unwrap();
+    let linux_manifest: Value = serde_json::from_str(include_str!(
+        "fixtures/ministral3_position/manifest-linux-aarch64.json"
+    ))
+    .unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(CONFIG)),
         "cdd4bfa0a702d0241faaa3b80d15d481d7f8abf2659fba0958b1e7f24a28055f"
     );
+    let mac_hash = format!("{:x}", Sha256::digest(REFERENCE));
     assert_eq!(
-        format!("{:x}", Sha256::digest(REFERENCE)),
+        mac_hash,
         "785dd4df6e3efe9652fbde77535e0541bb994dd2f190f3b0bcfef4257cbed243"
     );
+    assert_eq!(manifest["files"]["reference.json"], mac_hash);
+    let linux_hash = format!("{:x}", Sha256::digest(LINUX_REFERENCE));
     assert_eq!(
-        manifest["files"]["generate.py"],
-        format!(
-            "{:x}",
-            Sha256::digest(include_str!("fixtures/ministral3_position/generate.py"))
-        )
+        linux_hash,
+        "471791928d0712c0e49814635fe048c55c06be84d4d571086f6a36147932da79"
     );
+    assert_eq!(
+        linux_manifest["files"]["reference-linux-aarch64.json"],
+        linux_hash
+    );
+    for key in ["upstream", "artifact_revision"] {
+        assert_eq!(linux_manifest[key], manifest[key]);
+    }
+    let generator_hash = format!(
+        "{:x}",
+        Sha256::digest(include_str!("fixtures/ministral3_position/generate.py"))
+    );
+    for capture in [&manifest, &linux_manifest] {
+        assert_eq!(capture["files"]["generate.py"], generator_hash);
+        assert_eq!(
+            capture["files"]["config.json"],
+            format!("{:x}", Sha256::digest(CONFIG))
+        );
+    }
     let c = config();
     assert_eq!(
         (c.hidden, c.intermediate, c.layers, c.vocabulary),
@@ -182,12 +206,20 @@ fn ministral3_rejects_unsupported_position_and_geometry() {
 
 #[test]
 fn ministral3_yarn_matches_pinned_reference() {
-    let reference: Value = serde_json::from_str(REFERENCE).unwrap();
+    // The same upstream float32 frequency graph gives different CPU divisors on Linux and macOS.
+    let source = if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        LINUX_REFERENCE
+    } else {
+        REFERENCE
+    };
+    let reference: Value = serde_json::from_str(source).unwrap();
     for (kind, name) in devices() {
         let device = Device::new(kind, 0).unwrap();
         assert!(device.is_available().unwrap());
         let stream = Stream::new(&device).unwrap();
-        for case in reference["devices"][name].as_array().unwrap() {
+        let cases = reference["devices"][name].as_array().unwrap();
+        assert_eq!(cases.len(), 10);
+        for case in cases {
             let mut c = fixture_config();
             c.yarn.mscale_all_dim = case["mscale_all_dim"].as_f64().unwrap() as f32;
             let offset = case["offset"].as_u64().unwrap() as usize;
