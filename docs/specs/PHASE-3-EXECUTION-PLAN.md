@@ -2584,3 +2584,15 @@ Keep the reference payloads external and dependencies fixed. Run
 `qwen3_dense_trained_reference` against each dense manifest and
 `qwen3_coder_trained_prefill_decode` against the routed manifest. Compare
 native outputs using the existing tolerances on the same pinned artifacts.
+
+### Retained prefix edits across the long Qwen KV update path
+
+Extend `crates/engine/tests/generation.rs` for R2. The existing
+`prefix_property_cached_equals_fresh` uses a short Qwen cache. Apply the
+same generated prefix extensions, edits, truncations, template changes and
+tokenizer changes to a real MLX CPU runtime with a 2,048-token cache in
+`long_prefix_property_cached_equals_fresh`. Compare against a separate
+fresh short-cache run with identical weights and render settings. Check
+the actual cache capacity, work performed, generated transcript and logits.
+Run both properties and `schema_property_cached_equals_fresh` using the
+default reproducible seed and seed 532026. Dependencies stay fixed.
