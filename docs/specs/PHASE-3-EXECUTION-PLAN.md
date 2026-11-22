@@ -2224,3 +2224,27 @@ both FR-8 thresholds and the terminal receipts. Run the matrix and report unit
 tests, rustfmt and strict Clippy. This batch supplies direct numerical evidence
 for the local-family exit. Each profile still needs its own behavioral inventory,
 native context and memory measurements, complete report and production admission.
+
+### #53 qualify the actual Gemma 3, Phi and Ministral behavior inventories
+
+In crates/alloyd/tests/llama_real_model.rs extend native_validated_context_boundary
+to both Gemma 3 sizes (the configured 32768 limit), Phi-4 mini and both Ministral
+precisions (40960). Use the existing bounded Gemma document for its two artifacts.
+The publisher tokenizers and templates independently produced the exact maximum
+and first rejected counts for all five (receipt 467dae5aceb3441fae565acd399130c4).
+Keep the native equality, factual recall, over-limit refusal and zero-execution
+checks. In crates/alloyd/tests/ministral3_chat.rs exercise each selected real
+profile explicitly through ministral3_native_daemon_chat and
+ministral3_publisher_tool_prompt_parity. Preserve the original 4-bit default.
+
+In scripts/ci/m3_native_behavior.py select the actual profile context limit in
+inspect_profile. Run the shared tool, compaction, restart, streaming, cache and
+context tests on each profile. Add gemma3_real_{4b,12b}_engine_tools,
+phi_real_engine_tool_proposals and the two Ministral tests plus
+ministral3_native_memory_tiers to their respective inventories. Update
+scripts/tests/test_m3_native_behavior.py to check the actual category and
+architecture assignments. Leave missing isolated allocator measurements visible
+for Gemma 3 and Phi pending the named native memory tests. Exercise the runner
+unit tests, actual metadata inspection, strict Clippy and the native matrix.
+Dependencies are the preceding pinned numerical integration and offline fixtures.
+This supplies family-specific behavioral observations for #72 and #53.
