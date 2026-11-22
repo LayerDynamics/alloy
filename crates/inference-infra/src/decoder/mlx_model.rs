@@ -882,19 +882,13 @@ impl MlxDecoderModel {
 
             let prefix = append.stage_layer(index, &key, &value)?;
 
-            let mask = if token_count == 1 {
-                AttentionMask::Full
-            } else {
-                AttentionMask::CausalSuffix {
-                    prefix_tokens: position,
-                }
-            };
-
-            let attended = attention::grouped_query_attention(
+            let attended = causal_prefill_attention(
                 &query,
                 prefix.keys(),
                 prefix.values(),
-                mask,
+                position,
+                token_count,
+                c.attention_tile_tokens(cache_spec.capacity_tokens, token_count),
                 stream,
             )?;
 
@@ -1411,6 +1405,53 @@ mod tests {
         }
     }
 
+    fn check_tiled_causal_prefill(kind: DeviceType) {
+        let stream = stream(kind);
+        let tensor = |heads: i32, tokens: i32, seed: i32| {
+            let values = (0..heads * tokens * 64)
+                .map(|i| (((i * 37 + seed) % 101) - 50) as f32 / 33.0)
+                .collect::<Vec<_>>();
+            Array::from_f32_slice(&values, &[1, heads, tokens, 64]).unwrap()
+        };
+        for (prefix, tokens) in [(0, 33), (19, 37)] {
+            let query = tensor(4, tokens, 3);
+            let keys = tensor(2, prefix + tokens, 17);
+            let values = tensor(2, prefix + tokens, 59);
+            let mask = AttentionMask::CausalSuffix {
+                prefix_tokens: prefix as usize,
+            };
+            let full =
+                attention::grouped_query_attention(&query, &keys, &values, mask, &stream).unwrap();
+            let tiled = causal_prefill_attention(
+                &query,
+                &keys,
+                &values,
+                prefix as usize,
+                tokens as usize,
+                16,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(tiled.shape(), full.shape());
+            let expected = ops::to_vec_f32(&full, &stream).unwrap();
+            let actual = ops::to_vec_f32(&tiled, &stream).unwrap();
+            for (i, (a, b)) in actual.into_iter().zip(expected).enumerate() {
+                assert!((a - b).abs() < 1e-4, "element {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_causal_prefill_cpu() {
+        check_tiled_causal_prefill(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn tiled_causal_prefill_metal() {
+        check_tiled_causal_prefill(DeviceType::Gpu);
+    }
+
     fn reference_last(model: &DecoderModel, tokens: &[u32]) -> Vec<f32> {
         model
             .forward(tokens)
@@ -1867,6 +1908,53 @@ mod measured_weight_buffer_tests {
 }
 
 // ALLOY_MEASURED_BUFFERS_V1
+
+/// Evaluate each tile before advancing, so score tensors for distinct
+/// query ranges cannot coexist in the lazy graph.
+fn causal_prefill_attention(
+    query: &Array,
+    keys: &Array,
+    values: &Array,
+    position: usize,
+    tokens: usize,
+    tile: usize,
+    stream: &Stream,
+) -> MlxDecoderResult<Array> {
+    if tokens <= tile {
+        let mask = if tokens == 1 {
+            AttentionMask::Full
+        } else {
+            AttentionMask::CausalSuffix {
+                prefix_tokens: position,
+            }
+        };
+        return Ok(attention::grouped_query_attention(
+            query, keys, values, mask, stream,
+        )?);
+    }
+
+    let q = query.shape();
+    let k = keys.shape();
+    let mut output = None;
+    for start in (0..tokens).step_by(tile) {
+        let end = (start + tile).min(tokens);
+        let queries = ops::slice(query, &[0, 0, start, 0], &[1, q[1], end, q[3]], stream)?;
+        let kv_end = [1, k[1], position + end, k[3]];
+        let keys = ops::slice(keys, &[0; 4], &kv_end, stream)?;
+        let values = ops::slice(values, &[0; 4], &kv_end, stream)?;
+        let mask = AttentionMask::CausalSuffix {
+            prefix_tokens: position + start,
+        };
+        let result = attention::grouped_query_attention(&queries, &keys, &values, mask, stream)?;
+        let joined = match output {
+            Some(previous) => ops::concatenate_axis(&previous, &result, 2, stream)?,
+            None => result,
+        };
+        joined.eval()?;
+        output = Some(joined);
+    }
+    output.ok_or_else(|| ModelError::InvalidConfig("empty attention batch").into())
+}
 
 fn apply_rope(
     input: &Array,

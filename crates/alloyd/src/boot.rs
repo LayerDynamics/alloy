@@ -329,7 +329,10 @@ fn prepare_native_profile(
         // Tool schemas increase prompt length; bound the actual prefill work
         // at 32 for hybrid/mixed state and 64 for the other native tool profiles.
         // The base Qwen3 text path stays at 256 without relaxing admission.
-        prefill_chunk_tokens: NonZeroUsize::new(if hybrid || gemma || coder {
+        prefill_chunk_tokens: NonZeroUsize::new(if coder {
+            // Short requests retain their 32-token limit in the backend plan.
+            128
+        } else if hybrid || gemma {
             32
         } else if request.tools_enabled || llama || smollm || phi || ministral {
             64

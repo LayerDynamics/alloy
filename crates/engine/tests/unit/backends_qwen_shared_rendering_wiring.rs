@@ -1095,19 +1095,26 @@ fn routed_long_prefill_bounds_chunk_and_workspace() {
     let dense = Qwen3Config::tiny_fixture();
     let mut routed = dense.clone();
     routed.family = inference_infra::decoder::config::DecoderFamily::Qwen3Moe;
+    let capacity = 32_769;
+    assert_eq!(routed.attention_tile_tokens(capacity - 1, 32), 32);
+    assert_eq!(routed.attention_tile_tokens(capacity, 128), 16);
+    assert_eq!(routed.attention_tile_tokens(capacity, 7), 7);
+    assert_eq!(dense.attention_tile_tokens(capacity, 32), 32);
     let routed = BackendConfig::Transformer(routed);
     assert_eq!(routed.chunk_limit(128, 32_768), 32);
-    let capacity = 32_769;
-    let chunk = routed.chunk_limit(128, capacity);
-    assert_eq!(chunk, 16);
+    assert_eq!(routed.chunk_limit(256, capacity), 128);
     assert_eq!(routed.chunk_limit(8, capacity), 8);
     assert_eq!(
         BackendConfig::Transformer(dense).chunk_limit(128, capacity),
         32
     );
-    assert!(
-        routed.workspace_bound(capacity, chunk, 128).unwrap()
-            < routed.workspace_bound(capacity, 32, 128).unwrap()
+    let bytes = |s, t| routed.workspace_bound(s, t, 128).unwrap();
+    assert!(bytes(capacity, 128) > bytes(capacity, 16));
+    // Both batches have the same maximum score tile, so increasing the
+    // key history by one position has exactly the same memory cost.
+    assert_eq!(
+        bytes(capacity + 1, 128) - bytes(capacity, 128),
+        bytes(capacity + 1, 16) - bytes(capacity, 16)
     );
 }
 

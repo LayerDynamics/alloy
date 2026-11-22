@@ -22,6 +22,20 @@ pub struct DecoderConfig {
 impl DecoderConfig {
     const SHORT_QWEN_CACHE_LIMIT: usize = 1024;
 
+    /// Large routed requests share one attention tile limit between the
+    /// execution graph and its memory reservation.
+    pub fn tiled_routed_prefill(&self, capacity: usize) -> bool {
+        self.family == DecoderFamily::Qwen3Moe && capacity > 32_768
+    }
+
+    pub fn attention_tile_tokens(&self, capacity: usize, tokens: usize) -> usize {
+        if self.tiled_routed_prefill(capacity) {
+            tokens.min(16)
+        } else {
+            tokens
+        }
+    }
+
     /// Limit live activations to one transformer layer. Short dense Qwen3
     /// requests can keep the lazy graph, avoiding a device wait per layer.
     /// The engine uses this same decision to reserve temporary storage.

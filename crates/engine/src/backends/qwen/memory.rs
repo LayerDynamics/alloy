@@ -253,7 +253,9 @@ fn workspace_bound(
     token_bytes: usize,
 ) -> Result<u64, EngineError> {
     let layers = as_u64(config.num_layers)?;
-    let t = as_u64(chunk_tokens.min(capacity).max(1))?;
+    let batch = chunk_tokens.min(capacity).max(1);
+    let t = as_u64(batch)?;
+    let attention_rows = as_u64(config.attention_tile_tokens(capacity, batch))?;
     let s = as_u64(capacity)?;
     let h = as_u64(config.hidden_size)?;
     let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
@@ -276,7 +278,10 @@ fn workspace_bound(
         product(12, product(t, q)?)?,
         product(12, product(t, kv)?)?,
         product(10, product(t, i)?)?,
-        product(8, product(product(as_u64(config.q_heads)?, t)?, s)?)?,
+        product(8, product(product(as_u64(config.q_heads)?, attention_rows)?, s)?)?,
+        // Tiled execution can overlap a previous prefix, its next tile and
+        // their concatenation. The two inputs together fit one batch.
+        if attention_rows < t { product(2, product(t, q)?)? } else { 0 },
         product(4, product(s, kv)?)?,
     ])?;
     sum(&[
