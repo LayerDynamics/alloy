@@ -1849,3 +1849,27 @@ Strict Clippy passed for both affected crates across all targets
 (a0470d3941aa4152a522c084823a6282). These checks cover trained decoder
 execution. Daemon chat, model-specific tools, long-context validation and
 profile qualification are outstanding.
+
+### #96 Gemma 4 native daemon text sessions
+
+After the frozen trained-decoder comparison, connect the E4B text model to
+the shared worker, memory admission and session API. Use the verified
+profile's exact text tensor layout for upload and resident payloads, count
+only independent KV owners, and include transactional overlap and the
+worker's prefill workspace. Keep cache representation and instance ownership
+distinct, with reset/rebuild across eviction. Implement in
+`crates/inference-infra/src/decoder/gemma4.rs`,
+`crates/inference-infra/src/decoder/gemma4/{model,weights}.rs`,
+`crates/engine/src/backends/qwen/{architecture,backend,loading,gemma4_loading,output}.rs`,
+`crates/engine/src/backends/qwen/gemma4_text.jinja` and
+`crates/alloyd/src/boot.rs`. Use publisher text turns, pinned control IDs and
+EOS, including the standalone system turn. Limit boot to explicit
+qualification until the real agent gates pass. Reject unsupported tool mode
+until the native Gemma 4 tool protocol is implemented.
+
+Run gemma4_e4b_memory_plan in crates/inference-infra/tests/gemma4_loading.rs,
+gemma4_native_trained_reference in crates/inference-infra/tests/gemma4_quantized.rs,
+and gemma4_daemon_text_session in crates/alloyd/tests/gemma4_chat.rs. Compare
+rendered inputs to the pinned publisher tokenizer/template and exercise a
+real two-turn Metal session. These checks supply text pipeline evidence for
+#96. Tool, long-context, profile and M3 exit checks remain required.
