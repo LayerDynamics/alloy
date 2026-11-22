@@ -185,6 +185,15 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Native routed Qwen3-Coder backend.
+    pub fn new_qwen3_coder(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen3Coder)
+    }
+
     /// Construct the native Ministral 3 text backend for qualification runs.
     pub fn new_ministral3(
         specifications: Vec<Qwen3Artifact>,
@@ -366,6 +375,11 @@ impl Qwen3Backend {
                     inference_infra::decoder::phi::PhiConfig::from_json(&config_value)
                         .map_err(|e| model_error(e, "validate Phi config"))?,
                 ),
+                BackendFamily::Qwen3Coder => BackendConfig::Transformer(
+                    inference_infra::decoder::qwen3_coder::CoderConfig::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Qwen3-Coder architecture"))?
+                        .decoder,
+                ),
                 BackendFamily::Qwen3 => BackendConfig::Transformer(parse_config(&config_value)?),
                 BackendFamily::Llama3 => BackendConfig::Transformer(
                     llama3::config::parse_config(&config_value)
@@ -411,6 +425,14 @@ impl Qwen3Backend {
                         .weight_payload_plan()
                         .map_err(|e| execution_error("plan hybrid weights", e.to_string()))?;
                     (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Transformer(_) if family == BackendFamily::Qwen3Coder => {
+                    let bytes =
+                        inference_infra::decoder::qwen3_coder::CoderConfig::weight_payload_bytes(
+                            &config_value,
+                        )
+                        .map_err(|e| model_error(e, "plan mixed expert weights"))?;
+                    (bytes, bytes)
                 }
                 BackendConfig::Transformer(c) if declares_quantization => {
                     (decoded_weight_bound(c)?, resident_bound(c)?)
@@ -1063,7 +1085,7 @@ impl RuntimeBackend for Qwen3Backend {
                 projection.additional_rendered_bytes,
             );
         }
-        if self.family.hybrid() {
+        if self.family.xml_tools() {
             return rendering::qwen35_projected_tool_token_upper_bound(
                 &data.tokenizer,
                 rendered,
@@ -1338,7 +1360,7 @@ impl RuntimeBackend for Qwen3Backend {
         allocation: Option<ParserAllocation>,
         tools: Option<Arc<crate::types::ToolContext>>,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
-        if !self.family.hybrid() || !self.tool_call_parsing {
+        if !self.family.xml_tools() || !self.tool_call_parsing {
             return self.decoder_with_parser_allocation(registry, profile, allocation);
         }
         let resolved = registry.resolve_profile(profile)?;
@@ -1387,7 +1409,7 @@ impl RuntimeBackend for Qwen3Backend {
         profile: &ModelProfileId,
         allocation: Option<ParserAllocation>,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
-        if self.family.hybrid() && self.tool_call_parsing {
+        if self.family.xml_tools() && self.tool_call_parsing {
             return Err(EngineError::invalid_request(
                 "tool schemas",
                 "use the generation-bound decoder hook",
@@ -1526,6 +1548,7 @@ fn registration_for(
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
     let hybrid = family.hybrid();
+    let coder = family == BackendFamily::Qwen3Coder;
     let llama = family == BackendFamily::Llama3;
     let smollm = family == BackendFamily::SmolLm3;
     let ministral = family == BackendFamily::Ministral3;
@@ -1537,10 +1560,13 @@ fn registration_for(
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama || smollm || hybrid || phi || gemma || ministral {
+    if llama || smollm || hybrid || phi || gemma || ministral || coder {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
+    }
+    if coder {
+        representations.retain(|r| *r != WeightRepresentation::F32);
     }
     let gemma4 = family == BackendFamily::Gemma4;
     if gemma4 {
@@ -1552,7 +1578,7 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if hybrid || phi || gemma || gemma4 || ministral {
+            if hybrid || phi || gemma || gemma4 || ministral || coder {
                 1
             } else if smollm {
                 smollm::register::IMPL_VERSION
@@ -1564,7 +1590,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if ministral {
+        (if coder {
+            &["Qwen3MoeForCausalLM"][..]
+        } else if ministral {
             &["Mistral3ForConditionalGeneration"][..]
         } else if gemma4 {
             &["Gemma4ForConditionalGeneration"][..]
@@ -1586,7 +1614,9 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if ministral {
+            family: if coder {
+                "qwen3-coder"
+            } else if ministral {
                 "ministral3"
             } else if gemma4 {
                 "gemma4"
@@ -1631,6 +1661,39 @@ fn qwen3_rendering_options() -> RenderingOptions<'static> {
 
 fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> {
     let mut options = qwen3_rendering_options();
+    if family == BackendFamily::Qwen3Coder {
+        options.trim_blocks = true;
+        options.lstrip_blocks = true;
+        options.reserved_spellings = &[
+            "<|",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<function",
+            "</function>",
+            "<parameter",
+            "</parameter",
+            "<tools>",
+            "</tools>",
+            "<name>",
+            "</name>",
+            "<description>",
+            "</description>",
+            "<IMPORTANT>",
+            "</IMPORTANT>",
+            "<required>",
+            "</required>",
+            "<enum>",
+            "</enum>",
+            "<type>",
+            "</type>",
+            "<return>",
+            "</return>",
+        ];
+    }
     if family == BackendFamily::Ministral3 {
         options.reserved_spellings = &[
             "<s>",
@@ -1888,6 +1951,8 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
+        (BackendFamily::Qwen3Coder, false) => QWEN3_CODER_TEXT_TEMPLATE,
+        (BackendFamily::Qwen3Coder, true) => QWEN3_CODER_TOOL_TEMPLATE,
         (BackendFamily::Ministral3, false) => MINISTRAL3_TEXT_TEMPLATE,
         (BackendFamily::Ministral3, true) => MINISTRAL3_TOOL_TEMPLATE,
         (BackendFamily::Gemma4, false) => GEMMA4_TEXT_TEMPLATE,
@@ -1909,6 +1974,12 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     }
 }
 fn family_cache_mode(family: BackendFamily) -> Result<CacheMode, EngineError> {
+    if family == BackendFamily::Qwen3Coder {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new("qwen3-coder.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        });
+    }
     if family == BackendFamily::Ministral3 {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,

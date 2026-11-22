@@ -2,6 +2,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackendFamily {
     Qwen3,
+    Qwen3Coder,
     Llama3,
     SmolLm3,
     Qwen35,
@@ -12,6 +13,10 @@ enum BackendFamily {
     Ministral3,
 }
 impl BackendFamily {
+    fn xml_tools(self) -> bool {
+        self.hybrid() || self == Self::Qwen3Coder
+    }
+
     fn hybrid(self) -> bool {
         matches!(self, Self::Qwen35 | Self::Ornith)
     }
@@ -22,10 +27,7 @@ fn dense_cache_mode(
     use inference_infra::decoder::config::DecoderFamily;
     match family {
         DecoderFamily::Qwen3 => family_cache_mode(BackendFamily::Qwen3),
-        DecoderFamily::Qwen3Moe => Ok(CacheMode {
-            representation: CacheRepresentationId::new("qwen3-coder.mlx-f32.full.bhtd.v1")?,
-            kind: CacheKind::Full,
-        }),
+        DecoderFamily::Qwen3Moe => family_cache_mode(BackendFamily::Qwen3Coder),
         DecoderFamily::Llama3 => family_cache_mode(BackendFamily::Llama3),
         DecoderFamily::SmolLm3 => family_cache_mode(BackendFamily::SmolLm3),
         DecoderFamily::Ministral3 { .. } => family_cache_mode(BackendFamily::Ministral3),
@@ -60,7 +62,12 @@ impl BackendConfig {
     }
     fn chunk_limit(&self, configured: usize, capacity: usize) -> usize {
         match self {
-            Self::Transformer(c) if !c.has_qk_norm() && capacity > 16_384 => configured.min(32),
+            Self::Transformer(c)
+                if c.family != inference_infra::decoder::config::DecoderFamily::Qwen3
+                    && capacity > 16_384 =>
+            {
+                configured.min(32)
+            }
             Self::Phi(_) | Self::Gemma3(_) if capacity > 16_384 => configured.min(32),
             _ => configured,
         }
@@ -216,3 +223,14 @@ pub const GEMMA4_TEXT_TEMPLATE: &str = include_str!("gemma4_text.jinja");
 
 /// Publisher Gemma 4 declarations and linked call/result history.
 pub const GEMMA4_TOOL_TEMPLATE: &str = include_str!("gemma4_tools.jinja");
+
+/// Publisher Coder chat serialization in the native history representation.
+pub const QWEN3_CODER_TEXT_TEMPLATE: &str = concat!(
+    "{% set coder_tools = false %}",
+    include_str!("qwen3_coder.jinja")
+);
+/// Coder chat serialization with the linked XML tool protocol enabled.
+pub const QWEN3_CODER_TOOL_TEMPLATE: &str = concat!(
+    "{% set coder_tools = true %}",
+    include_str!("qwen3_coder.jinja")
+);

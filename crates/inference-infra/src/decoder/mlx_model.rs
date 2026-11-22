@@ -915,8 +915,8 @@ impl MlxDecoderModel {
                 ops::rms_norm(&hidden, &layer.post_attention_layernorm, c.rms_eps, stream)?;
             let mlp_output = layer.mlp.apply(&normalized, stream)?;
             hidden = ops::residual_add(&hidden, &mlp_output, stream)?;
-            if !c.has_qk_norm() {
-                // Bound Llama's live activation graph to one layer. Evaluating
+            if project_all {
+                // Bound the decoder's live activation graph to one layer. Evaluating
                 // native arrays does not publish the staged KV transaction.
                 // The hidden output depends on both staged K/V arrays, so their
                 // upstream graphs are also evaluated before the next layer.

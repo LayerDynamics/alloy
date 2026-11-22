@@ -92,45 +92,63 @@ impl ModelFamily for Qwen3Backend {
             max_file_bytes: as_usize(data.source_bytes)?,
             max_weight_bytes: as_usize(weight_charge_limit)?,
         };
-        let result = if self.family == BackendFamily::Ministral3 {
-            inference_infra::decoder::ministral3::weights::load_verified(
+        let (model, packed_bits) = if self.family == BackendFamily::Qwen3Coder {
+            let model = MlxQwen3Model::load_qwen3_coder_verified(
                 &data.specification.directory,
-                options,
+                LoadOptions {
+                    max_weight_bytes: options.max_weight_bytes.min(as_usize(request.limits().max_resident_bytes())?),
+                    ..options
+                },
                 &verification,
+                &execution_stream,
             )
-            .and_then(|(loaded, weights)| {
-                if loaded.decoder_config()? != *config {
-                    return Err(inference_infra::decoder::model::ModelError::InvalidConfig(
-                        "Ministral verified geometry changed",
-                    ));
-                }
-                Ok(weights)
-            })
+            .map_err(|e| mlx_model_error(e, control, "load routed Qwen3-Coder model"))?;
+            if model.config() != config {
+                return Err(internal("Qwen3-Coder geometry changed after admission"));
+            }
+            (model, Some(4))
         } else {
-            load_weights_verified(config, &data.specification.directory, options, &verification)
+            let result = if self.family == BackendFamily::Ministral3 {
+                inference_infra::decoder::ministral3::weights::load_verified(
+                    &data.specification.directory,
+                    options,
+                    &verification,
+                )
+                .and_then(|(loaded, weights)| {
+                    if loaded.decoder_config()? != *config {
+                        return Err(inference_infra::decoder::model::ModelError::InvalidConfig(
+                            "Ministral verified geometry changed",
+                        ));
+                    }
+                    Ok(weights)
+                })
+            } else {
+                load_weights_verified(config, &data.specification.directory, options, &verification)
+            };
+            control.check_cancelled()?;
+            let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
+            let packed_bits = weights.embed_tokens.bits();
+            if !config.has_qk_norm() {
+                validate_llama_weight_layout(&weights)?;
+            }
+            let decoded = weight_memory(&weights)?;
+            if decoded.allocated_bytes() > weight_charge_limit {
+                return Err(EngineError::MemoryLimitExceeded {
+                    operation: "decoded MLX Qwen weight buffers",
+                    required_bytes: decoded.allocated_bytes(),
+                    available_bytes: weight_charge_limit,
+                    reason: MemoryLimitReason::BufferLimit,
+                });
+            }
+            let model = MlxQwen3Model::from_weights(
+                config.clone(),
+                weights,
+                request.limits().max_resident_bytes(),
+                execution_stream.as_ref(),
+            )
+            .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
+            (model, packed_bits)
         };
-        control.check_cancelled()?;
-        let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
-        let packed_bits = weights.embed_tokens.bits();
-        if !config.has_qk_norm() {
-            validate_llama_weight_layout(&weights)?;
-        }
-        let decoded = weight_memory(&weights)?;
-        if decoded.allocated_bytes() > weight_charge_limit {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "decoded MLX Qwen weight buffers",
-                required_bytes: decoded.allocated_bytes(),
-                available_bytes: weight_charge_limit,
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-        let model = MlxQwen3Model::from_weights(
-            config.clone(),
-            weights,
-            request.limits().max_resident_bytes(),
-            execution_stream.as_ref(),
-        )
-        .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
         control.check_cancelled()?;
         let payload = model.weight_payload_bytes();
         let measured = model
@@ -165,7 +183,7 @@ impl ModelFamily for Qwen3Backend {
             memory: BufferMemoryUsage::new(measured, payload)?,
             vocabulary: config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: product(logits_payload_bound(config)?, if config.has_qk_norm() { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
+            logits_payload_bytes: product(logits_payload_bound(config)?, if config.family == inference_infra::decoder::config::DecoderFamily::Qwen3 { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
         }))
     }
 }

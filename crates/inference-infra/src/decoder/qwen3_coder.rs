@@ -72,6 +72,25 @@ impl CoderConfig {
         })
     }
 
+    /// Resident F32 norm/affine metadata and packed U32 payload for the full
+    /// mixed-precision checkpoint. Derived from the same inventory as loading.
+    pub fn weight_payload_bytes(root: &Value) -> Result<u64, ModelError> {
+        let (_, layout, packing) = Self::inventory(root)?;
+        let mut total = 0u64;
+        for (name, tensor) in layout.tensors {
+            // inventory accepts only the validated, fixed 30B-A3B geometry.
+            total += match tensor {
+                TensorRequest::Float(shape) => 4 * shape.iter().product::<usize>() as u64,
+                TensorRequest::Matrix { rows, cols } => {
+                    let elements = rows as u64 * cols as u64;
+                    let bits = packing[&name].bits as u64;
+                    elements * bits / 8 + elements / 64 * 8
+                }
+            };
+        }
+        Ok(total)
+    }
+
     pub(super) fn inventory(root: &Value) -> Result<PackedInventory<Self>, ModelError> {
         let config = Self::from_json(root)?;
         let c = &config.decoder;

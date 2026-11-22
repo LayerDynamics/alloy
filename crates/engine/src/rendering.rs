@@ -534,6 +534,75 @@ fn hf_compact_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
     String::from_utf8(output)
         .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
 }
+// Coder's publisher template applies Python str() to call arguments. Inside
+// containers Python uses repr(), including quotes and Python boolean literals.
+fn hf_python_string(value: minijinja::Value) -> Result<String, TemplateError> {
+    fn python_repr(value: &Value, nested: bool) -> Result<String, TemplateError> {
+        Ok(match value {
+            Value::String(s) if !nested => s.clone(),
+            Value::String(s) => {
+                let quote = if s.contains('\'') && !s.contains('"') {
+                    '"'
+                } else {
+                    '\''
+                };
+                let mut out = String::from(quote);
+                for c in s.chars() {
+                    match c {
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        '\r' => out.push_str("\\r"),
+                        c if c == quote || c == '\\' => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        c if c.escape_debug().to_string().starts_with("\\u{") => {
+                            let n = c as u32;
+                            out.push_str(&if n <= 255 {
+                                format!("\\x{n:02x}")
+                            } else if n <= 65535 {
+                                format!("\\u{n:04x}")
+                            } else {
+                                format!("\\U{n:08x}")
+                            });
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push(quote);
+                out
+            }
+            Value::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|v| python_repr(v, true))
+                    .collect::<Result<Vec<_>, _>>()?;
+                format!("[{}]", items.join(", "))
+            }
+            Value::Object(items) => {
+                let items = items
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok(format!(
+                            "{}: {}",
+                            python_repr(&Value::String(k.clone()), true)?,
+                            python_repr(v, true)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, TemplateError>>()?;
+                format!("{{{}}}", items.join(", "))
+            }
+            Value::Bool(true) => "True".into(),
+            Value::Bool(false) => "False".into(),
+            Value::Null => "None".into(),
+            Value::Number(_) => hf_tojson(minijinja::Value::from_serialize(value))?,
+        })
+    }
+    let json = serde_json::to_value(value)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    python_repr(&json, false)
+}
+
 fn hf_tool_value(value: minijinja::Value) -> Result<String, TemplateError> {
     let json = serde_json::to_value(&value)
         .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
@@ -619,6 +688,7 @@ pub fn render_chat(
     environment.add_filter("hf_tojson", hf_tojson);
     environment.add_filter("hf_compact_tojson", hf_compact_tojson);
     environment.add_filter("hf_tool_value", hf_tool_value);
+    environment.add_filter("hf_python_string", hf_python_string);
     environment.add_filter(
         "gemma4_name",
         |name: String| -> Result<String, TemplateError> {
@@ -1120,7 +1190,12 @@ pub fn qwen35_projected_tool_token_upper_bound(
     additional_bytes: usize,
     ascii_escape_bytes: usize,
 ) -> Result<usize, EngineError> {
-    const PINS: [[u8; 32]; 2] = [
+    const PINS: [[u8; 32]; 3] = [
+        [
+            0xae, 0xb1, 0x33, 0x07, 0xa7, 0x1a, 0xcd, 0x8f, 0xe8, 0x18, 0x61, 0xd9, 0x4a, 0xd5,
+            0x4a, 0xb6, 0x89, 0xdf, 0x77, 0x33, 0x18, 0x80, 0x9e, 0xed, 0x3c, 0xbe, 0x79, 0x4b,
+            0x44, 0x92, 0xda, 0xe4,
+        ],
         [
             0x06, 0xb9, 0x50, 0x93, 0x52, 0xd2, 0xaf, 0x50, 0x38, 0x1a, 0xb2, 0x24, 0x7e, 0x08,
             0x3b, 0x80, 0xd3, 0x2d, 0x5c, 0x0a, 0xba, 0x91, 0xc2, 0x72, 0xca, 0x9f, 0xf7, 0x29,

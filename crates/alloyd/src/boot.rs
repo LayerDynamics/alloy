@@ -74,6 +74,7 @@ impl BootRequest {
         if !matches!(
             self.profile_id.as_str(),
             "qwen3-4b-4bit"
+                | "qwen3-coder-30b-a3b-instruct-4bit"
                 | "llama-3.1-8b-4bit"
                 | "llama-3.1-8b-8bit"
                 | "ministral-3-3b-instruct-2512-4bit"
@@ -135,7 +136,7 @@ pub fn boot_qwen3_with_context_limit(
     }
     if matches!(
         request.profile_id.as_str(),
-        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
+        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "qwen3-coder-30b-a3b-instruct-4bit"
     ) || is_ministral_profile(&request.profile_id)
         || is_hybrid_profile(&request.profile_id)
         || is_gemma_profile(&request.profile_id)
@@ -230,6 +231,7 @@ fn prepare_native_profile(
 
     let llama = request.profile_id.starts_with("llama-");
     let ministral = is_ministral_profile(&request.profile_id);
+    let coder = request.profile_id == "qwen3-coder-30b-a3b-instruct-4bit";
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
     let gemma4 = request.profile_id == "gemma-4-e4b-it-4bit";
@@ -260,6 +262,8 @@ fn prepare_native_profile(
                 engine::backends::qwen::ORNITH_TEXT_TEMPLATE
             } else if hybrid {
                 engine::backends::qwen::QWEN35_TEXT_TEMPLATE
+            } else if coder {
+                engine::backends::qwen::QWEN3_CODER_TEXT_TEMPLATE
             } else if smollm {
                 smollm::template::CHAT_TEMPLATE
             } else if llama {
@@ -321,7 +325,7 @@ fn prepare_native_profile(
         // Tool schemas increase prompt length; bound the actual prefill work
         // at 32 for hybrid/mixed state and 64 for the other native tool profiles.
         // The base Qwen3 text path stays at 256 without relaxing admission.
-        prefill_chunk_tokens: NonZeroUsize::new(if hybrid || gemma {
+        prefill_chunk_tokens: NonZeroUsize::new(if hybrid || gemma || coder {
             32
         } else if request.tools_enabled || llama || smollm || phi || ministral {
             64
@@ -353,6 +357,8 @@ fn prepare_native_profile(
         Qwen3Backend::new_ornith(vec![specification], limits, execution)
     } else if hybrid {
         Qwen3Backend::new_qwen35(vec![specification], limits, execution)
+    } else if coder {
+        Qwen3Backend::new_qwen3_coder(vec![specification], limits, execution)
     } else if smollm {
         Qwen3Backend::new_smollm3(vec![specification], limits, execution)
     } else if llama {
@@ -554,7 +560,10 @@ fn is_gemma_profile(profile: &str) -> bool {
 
 fn is_frozen_profile(profile: &str) -> bool {
     profile.starts_with("llama-")
-        || matches!(profile, "smollm3-3b-4bit" | "phi4-mini-instruct-4bit")
+        || matches!(
+            profile,
+            "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "qwen3-coder-30b-a3b-instruct-4bit"
+        )
         || is_ministral_profile(profile)
         || is_hybrid_profile(profile)
         || is_gemma_profile(profile)
@@ -619,6 +628,9 @@ fn load_expected_hashes(
         )),
         "phi4-mini-instruct-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/phi4_mini_profile.json"
+        )),
+        "qwen3-coder-30b-a3b-instruct-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/qwen3_coder_profile.json"
         )),
         "smollm3-3b-4bit" => Some(include_bytes!("../../families/smollm/fixture/profile.json")),
         "ornith-1.5-9b-4bit" => Some(include_bytes!(
@@ -870,6 +882,11 @@ mod qualification_boot_tests {
         for profile in ["ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"] {
             assert_unqualified_production_refused(profile);
         }
+    }
+
+    #[test]
+    fn unqualified_coder_cannot_boot_production() {
+        assert_unqualified_production_refused("qwen3-coder-30b-a3b-instruct-4bit");
     }
 
     #[test]

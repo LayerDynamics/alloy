@@ -259,7 +259,19 @@ fn workspace_bound(
     let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
     let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
     let i = as_u64(config.intermediate_size)?;
+    let coder = config.family == inference_infra::decoder::config::DecoderFamily::Qwen3Moe;
+    let lazy_dense = config.has_qk_norm() && !coder;
+    // Eight selected expert activations, output projections, and router
+    // probabilities/indices for the pinned 128-expert model.
+    let routed_work = if coder {
+        let expert_elements = sum(&[product(6, i)?, product(4, h)?])?;
+        let router_and_experts = sum(&[product(8, expert_elements)?, 6 * 128])?;
+        product(t, router_and_experts)?
+    } else {
+        0
+    };
     let per_layer_elements = sum(&[
+        routed_work,
         product(12, product(t, h)?)?,
         product(12, product(t, q)?)?,
         product(12, product(t, kv)?)?,
@@ -268,9 +280,9 @@ fn workspace_bound(
         product(4, product(s, kv)?)?,
     ])?;
     sum(&[
-        product(product(if config.has_qk_norm() { layers } else { 1 }, per_layer_elements)?, 4)?,
+        product(product(if lazy_dense { layers } else { 1 }, per_layer_elements)?, 4)?,
         product(product(t, h)?, 16)?,
-        product(logits_payload_bound(config)?, if config.has_qk_norm() { 1 } else { t })?,
+        product(logits_payload_bound(config)?, if lazy_dense { 1 } else { t })?,
         product(as_u64(token_bytes)?, 8)?,
         product(sum(&[layers, 64])?, 256)?,
         32,
