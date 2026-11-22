@@ -1976,7 +1976,7 @@ same terminal run (08889a302e8e4bbf83f3085cb62f2b20).
 
 The native decoder fits the short prompt but the daemon's simultaneous
 load, KV, output and workspace reservations exceeded the 8 GiB budget by
-35,708,904 bytes. In `crates/alloyd/src/boot.rs`, select a smaller actual
+35,708,904 bytes. In `crates/engine/src/backends/qwen/backend.rs`, select a smaller actual
 prefill chunk for the E4B profile when its resolved admission budget is
 at most 8 GiB. Bound vocabulary-wide workspace by running at most four
 prompt rows per native step. Keep the normal 32-row setting on larger
@@ -1986,3 +1986,6 @@ full load reservation and all runtime checks. In
 require a real short reply at 8 GiB, a memory refusal on the same input
 at 4 GiB, and a longer request whose 8 GiB estimate exceeds the budget.
 Rerun `llama3_long_context_stream_cancel_memory` with the E4B profile.
+Apply the cap when the backend receives the admission controller, after
+the daemon has verified metadata and resolved the host ceiling. This also
+exercises the same budget in direct engine users.
