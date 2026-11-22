@@ -2455,3 +2455,20 @@ the real family parser without introducing a circular dependency. Add the
 already locked sha2 dev-dependency to crates/families/llama3/Cargo.toml and
 record that dependency edge in Cargo.lock so direct Llama fixture execution
 also verifies the reference bytes. Preserve the corpus artifact manifest.
+
+### Dense Qwen3 trained reference and daemon profile selection
+
+For the frozen Qwen3-4B and 14B corpus checkpoints, add
+crates/families/qwen3/fixture/{affine4_4b_profile,affine4_14b_profile}.json.
+Pin the actual file lengths and corpus checksums, exact publisher non-thinking
+prompt tokens, two decode inputs and upstream library versions. Reuse the
+offline eager Metal capture in
+crates/inference-infra/tests/fixtures/qwen3_coder/capture_model_reference.py
+with explicit architecture checks for the three named Qwen profiles. Capture
+all six trained full-vocabulary rows and only then add each resulting digest.
+In crates/alloyd/src/boot.rs enable pinned 14B qualification construction
+and refuse ordinary production boot pending its own verified package. Keep
+the Phase 1 4B boot path and the routed Coder profile behavior intact. Test
+unqualified_qwen14b_cannot_boot_production and frozen_qwen14b_pins in the
+boot module. Dependency versions remain fixed. These steps establish real
+reference inputs and native selection for the dense Qwen M3 requirement.
