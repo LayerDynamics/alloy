@@ -75,5 +75,49 @@
   },
   "modalities": [
     "text"
-  ]
+  ],
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "prompt_tokens": [
+    [
+      50702,
+      236743,
+      236778,
+      900,
+      236743,
+      236778,
+      236761,
+      25685,
+      21485,
+      236761
+    ],
+    [
+      155122,
+      3217,
+      506,
+      7217,
+      563,
+      3730,
+      236761
+    ]
+  ],
+  "decode_tokens": [
+    3730,
+    236761
+  ],
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "source_sha256": {
+      "gemma4.py": "4671e4a63cb9849582abac566599a0a85370a46d410f4ad69d81a88788d00fd8",
+      "gemma4_text.py": "db56d5451f348decdae4058322c1447b8a4af67e81be41ad5f3ad8c4c2ecf3bb",
+      "rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a"
+    },
+    "sha256": "c228714b8d3ae93ba57d9f4fdaccf1407d440342b7fdf5b0063872403a9073cd"
+  }
 }
