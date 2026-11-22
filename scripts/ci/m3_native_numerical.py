@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run from the Mac CI host lease, e.g. mac_locked_step.py -- python3 THIS_SCRIPT --help."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -78,16 +79,17 @@ def build(kind, package, target, out, record):
     return matches[0]
 
 
-def run(args):
+@contextmanager
+def pinned_run(args, scope):
     out = args.output.resolve()
     if out == ROOT or ROOT in out.parents:
         raise ValueError("choose a new output directory outside the checkout")
     out.mkdir()  # Never mix artifacts from different invocations.
-    record = {"version": 1, "scope": "numerical", "profile": args.profile,
+    record = {"version": 1, "scope": scope, "profile": args.profile,
               "candidate": args.candidate, "commands": [], "binaries": {}, "status": "failed"}
     try:
         verify_candidate(args.candidate)
-        manifest_stem, target, name, prefix = SUITES[args.profile]
+        manifest_stem, _, _, prefix = SUITES[args.profile]
         pin = ROOT / "crates/inference-infra/tests/fixtures" / (manifest_stem + "_profile.json")
         manifest = json.loads(pin.read_bytes())
         if manifest["id"] != args.profile:
@@ -101,24 +103,10 @@ def run(args):
                       architecture=platform.machine(), cargo_lock_sha256=sha256(ROOT / "Cargo.lock"),
                       pins_sha256=sha256(ROOT / "PINS.md"))
         execute(["rustc", "-Vv"], out, "rustc-version", record)
-        binary = build("test", "inference-infra", target, out, record)
-        evaluator = build("example", "engine", "m3_numerical_report", out, record)
-        rows = out / "raw"
-        rows.mkdir()
-        env = dict(os.environ)
-        selected = {prefix + "_ARTIFACT": str(artifact), prefix + "_REFERENCE": str(reference),
-                    "ALLOY_M3_NUMERICAL_OUTPUT": str(rows)}
-        env.update(selected)
-        record["fixture_environment"] = selected
-        # Keep fixture stdout separate from libtest's named result line.
-        log = execute([binary, name, "--exact", "--ignored", "--test-threads=1", "--show-output"],
-                      out, "native-test", record, env)
-        require_single_pass(log.read_text(), name)
-        report = out / "report"
-        execute([evaluator, args.profile, reference, rows, report], out, "evaluate", record)
+        selected = {prefix + "_ARTIFACT": str(artifact), prefix + "_REFERENCE": str(reference)}
+        yield out, record, selected
         verify_candidate(args.candidate)
-        record["files"] = {str(p.relative_to(out)): sha256(p) for folder in (rows, report)
-                           for p in sorted(folder.iterdir())}
+        verify_inputs(manifest, artifact, reference)
         record["status"] = "passed"
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         record["error"] = str(error)
@@ -132,6 +120,27 @@ def run(args):
             f.flush()
             os.fsync(f.fileno())
         pending.rename(out / "receipt.json")
+
+
+def run(args):
+    with pinned_run(args, "numerical") as (out, record, selected):
+        _, target, name, _ = SUITES[args.profile]
+        binary = build("test", "inference-infra", target, out, record)
+        evaluator = build("example", "engine", "m3_numerical_report", out, record)
+        rows = out / "raw"
+        rows.mkdir()
+        env = dict(os.environ)
+        selected["ALLOY_M3_NUMERICAL_OUTPUT"] = str(rows)
+        env.update(selected)
+        record["fixture_environment"] = selected
+        # Keep fixture stdout separate from libtest's named result line.
+        log = execute([binary, name, "--exact", "--ignored", "--test-threads=1", "--show-output"],
+                      out, "native-test", record, env)
+        require_single_pass(log.read_text(), name)
+        report = out / "report"
+        execute([evaluator, args.profile, record["reference"], rows, report], out, "evaluate", record)
+        record["files"] = {str(p.relative_to(out)): sha256(p) for folder in (rows, report)
+                           for p in sorted(folder.iterdir())}
     print(f"{args.profile}: numerical qualification passed ({out / 'receipt.json'})")
 
 
