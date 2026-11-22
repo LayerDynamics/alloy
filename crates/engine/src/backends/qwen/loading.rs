@@ -183,7 +183,7 @@ impl ModelFamily for Qwen3Backend {
             memory: BufferMemoryUsage::new(measured, payload)?,
             vocabulary: config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: product(logits_payload_bound(config)?, if config.family == inference_infra::decoder::config::DecoderFamily::Qwen3 { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
+            logits_payload_bytes: product(logits_payload_bound(config)?, as_u64(self.limits.prefill_chunk_tokens.get())?)?,
         }))
     }
 }

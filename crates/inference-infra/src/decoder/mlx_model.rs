@@ -812,23 +812,14 @@ impl MlxDecoderModel {
             OutputSelection::Last => 1,
         };
         let output_elements = checked_product(output_rows, c.vocab_size, "MLX output elements")?;
-        let output_bytes = byte_count(output_elements)?;
-
-        // Account conservatively for projected output, a possible
-        // contiguous output, and the final host output payload.
-        // Llama's eager reference projects every prefill row before selecting
-        // the final logits. A single-row GEMV rounds differently from GEMM near
-        // zero; preserve the qualified graph and account for the full projection.
-        let project_all = !matches!(c.family, super::config::DecoderFamily::Qwen3);
-        let projection_bytes = if project_all {
-            byte_count(checked_product(
-                tokens.len(),
-                c.vocab_size,
-                "Llama projection",
-            )?)?
-        } else {
-            output_bytes
-        };
+        // Eager inference projects the prompt before selecting its final row.
+        // Selecting first changes quantized GEMM into GEMV and can change
+        // near-zero logits even for the same normalized hidden state.
+        let projection_bytes = byte_count(checked_product(
+            tokens.len(),
+            c.vocab_size,
+            "MLX output projection",
+        )?)?;
         let required_output = projection_bytes
             .checked_mul(3)
             .ok_or(ModelError::DimensionOverflow("MLX output payload overlap"))?;
@@ -928,19 +919,8 @@ impl MlxDecoderModel {
 
         let normalized = ops::rms_norm(&hidden, &self.weights.final_layernorm, c.rms_eps, stream)?;
 
-        let selected = match selection {
-            OutputSelection::All => normalized,
-            OutputSelection::Last if project_all => normalized,
-            OutputSelection::Last => ops::slice(
-                &normalized,
-                &[token_count - 1, 0],
-                &[token_count, c.hidden_size],
-                stream,
-            )?,
-        };
-
-        let logits = self.weights.output_head().apply(&selected, stream)?;
-        let logits = if project_all && matches!(selection, OutputSelection::Last) {
+        let logits = self.weights.output_head().apply(&normalized, stream)?;
+        let logits = if matches!(selection, OutputSelection::Last) {
             ops::slice(
                 &logits,
                 &[token_count - 1, 0],
@@ -970,7 +950,7 @@ impl MlxDecoderModel {
         }
 
         // Check actual host-vector capacity as well as requested length.
-        let actual_overlap = output_bytes
+        let actual_overlap = projection_bytes
             .checked_mul(2)
             .and_then(|bytes| {
                 byte_count(values.capacity())
@@ -1725,6 +1705,19 @@ mod tests {
             Err(MlxDecoderError::PayloadLimit { .. }),
         ));
         assert_eq!(cache.len(), before);
+
+        let prompt = [7, 12, 5];
+        let required = (prompt.len() * model.config().vocab_size * size_of::<f32>() * 3) as u64;
+        assert!(matches!(
+            model.prefill(&prompt, &mut cache, required - 1, &stream),
+            Err(MlxDecoderError::PayloadLimit { required_bytes, .. }) if required_bytes == required
+        ));
+        assert_eq!(cache.len(), before);
+        let logits = model
+            .prefill(&prompt, &mut cache, required, &stream)
+            .unwrap();
+        assert_eq!(logits.rows(), 1);
+        assert_eq!(cache.len(), before + prompt.len());
     }
 
     #[test]
