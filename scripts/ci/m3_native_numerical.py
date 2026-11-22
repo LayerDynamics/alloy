@@ -41,6 +41,12 @@ SUITES = {
                                "llama3", "quantized_loading", "llama3_4bit_8bit_load", "ALLOY_LLAMA"),
     "smollm3-3b-4bit": Suite(Path("crates/families/smollm/fixture/profile.json"),
                              "smollm", "quantized_loading", "smollm3_quantized_native_reference", "ALLOY_SMOLLM"),
+    "qwen3-4b-4bit": Suite(Path("crates/families/qwen3/fixture/affine4_4b_profile.json"),
+                           "engine", "qwen3_trained", "qwen3_dense_trained_reference", "ALLOY_QWEN3"),
+    "qwen3-14b-4bit": Suite(Path("crates/families/qwen3/fixture/affine4_14b_profile.json"),
+                            "engine", "qwen3_trained", "qwen3_dense_trained_reference", "ALLOY_QWEN3"),
+    "qwen3-coder-30b-a3b-instruct-4bit": infra("qwen3_coder", "qwen3_coder_quantized",
+                                               "qwen3_coder_trained_prefill_decode", "ALLOY_QWEN3_CODER"),
 }
 
 
@@ -53,11 +59,14 @@ def sha256(path):
 
 
 def verify_inputs(manifest, artifact, reference):
+    reference_sha = manifest.get("reference", {}).get("sha256")
+    if not isinstance(reference_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", reference_sha):
+        raise ValueError("independent reference SHA-256 is not pinned")
     for entry in manifest["artifact"]["files"]:
         path = artifact / entry["path"]
         if not path.is_file() or path.stat().st_size != entry["bytes"] or sha256(path) != entry["sha256"]:
             raise ValueError(f"artifact does not match the pinned manifest: {path}")
-    if sha256(reference) != manifest["reference"]["sha256"]:
+    if sha256(reference) != reference_sha:
         raise ValueError("reference SHA-256 differs from the pinned capture")
 
 
@@ -161,7 +170,8 @@ def pinned_run(args, scope):
                       architecture=platform.machine(), cargo_lock_sha256=sha256(ROOT / "Cargo.lock"),
                       pins_sha256=sha256(ROOT / "PINS.md"))
         execute(["rustc", "-Vv"], out, "rustc-version", record)
-        selected = {suite.prefix + "_ARTIFACT": str(artifact), suite.prefix + "_REFERENCE": str(reference)}
+        selected = {suite.prefix + "_ARTIFACT": str(artifact), suite.prefix + "_REFERENCE": str(reference),
+                    "ALLOY_REAL_PROFILE": args.profile}
         yield out, record, selected
         kernel = record["metal_library"]
         if sha256(Path(kernel["path"])) != kernel["sha256"]:

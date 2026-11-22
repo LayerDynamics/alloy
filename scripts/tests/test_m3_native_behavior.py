@@ -23,6 +23,9 @@ class NativeBehaviorTests(unittest.TestCase):
             self.assertEqual("gemma3_native_memory_tiers" in names, profile.startswith("gemma-3-"))
             self.assertEqual("phi_native_memory_tiers" in names, profile.startswith("phi4-"))
             self.assertEqual("dense_native_memory_tiers" in names, profile.startswith(("llama-", "smollm3-")))
+            self.assertEqual("qwen3_dense_native_memory_tiers" in names, profile in {"qwen3-4b-4bit", "qwen3-14b-4bit"})
+            for fixture in ("qwen3_coder_native_memory_tiers", "qwen3_coder_publisher_prompt_parity", "qwen3_coder_native_registration"):
+                self.assertEqual(fixture in names, profile == "qwen3-coder-30b-a3b-instruct-4bit")
             self.assertEqual(kinds, expected, profile)
             self.assertEqual("ministral3_native_memory_tiers" in names, profile.startswith("ministral-"))
             self.assertEqual("gemma3_real_4b_engine_tools" in names, profile == "gemma-3-4b-4bit")

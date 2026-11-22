@@ -51,6 +51,18 @@ struct NativeRow {
 
 fn pinned(profile: &str) -> Result<(Pin, usize)> {
     let (manifest, vocabulary) = match profile {
+        "qwen3-4b-4bit" => (
+            include_str!("../../families/qwen3/fixture/affine4_4b_profile.json"),
+            151_936,
+        ),
+        "qwen3-14b-4bit" => (
+            include_str!("../../families/qwen3/fixture/affine4_14b_profile.json"),
+            151_936,
+        ),
+        "qwen3-coder-30b-a3b-instruct-4bit" => (
+            include_str!("../../inference-infra/tests/fixtures/qwen3_coder_profile.json"),
+            151_936,
+        ),
         "llama-3.1-8b-4bit" => (
             include_str!("../../families/llama3/fixture/affine4_profile.json"),
             128_256,

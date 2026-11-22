@@ -13,6 +13,18 @@ spec.loader.exec_module(runner)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_qwen_numerical_selection_and_missing_reference_pin(self):
+        for profile in ["qwen3-4b-4bit", "qwen3-14b-4bit", "qwen3-coder-30b-a3b-instruct-4bit"]:
+            suite = runner.SUITES[profile]
+            expected = ("inference-infra", "qwen3_coder_trained_prefill_decode") if "coder" in profile else (
+                "engine", "qwen3_dense_trained_reference")
+            self.assertEqual((suite.package, suite.test), expected)
+            pin = json.loads((runner.ROOT / suite.manifest).read_bytes())
+            self.assertEqual(pin["id"], profile)
+            pin["reference"].pop("sha256", None)
+            with self.assertRaisesRegex(ValueError, "independent reference SHA-256"):
+                runner.verify_inputs(pin, Path("absent-weights"), Path("absent-reference"))
+
     def test_family_owned_numerical_pins(self):
         for profile, package in [("llama-3.1-8b-4bit", "llama3"), ("llama-3.1-8b-8bit", "llama3"),
                                  ("smollm3-3b-4bit", "smollm")]:

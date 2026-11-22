@@ -65,6 +65,9 @@ fn llama3_tool_stop_context_cache() {
             | "gemma-4-e4b-it-4bit"
             | "ornith-1.5-9b-4bit"
             | "qwen3.5-0.8b-4bit"
+            | "qwen3-4b-4bit"
+            | "qwen3-14b-4bit"
+            | "qwen3-coder-30b-a3b-instruct-4bit"
     ));
     let root = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_native_for_qualification(
@@ -184,10 +187,16 @@ fn llama3_tool_stop_context_cache() {
     );
     assert_eq!(events.last().unwrap()["result"]["assistant_text"], "DONE");
     let caps = rpc("models.capabilities", json!({"artifact_id":profile}));
+    let dense_qwen = matches!(profile.as_str(), "qwen3-4b-4bit" | "qwen3-14b-4bit");
+    let coder = profile == "qwen3-coder-30b-a3b-instruct-4bit";
     assert_eq!(
         caps[0]["result"]["family"],
         if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
             "qwen35"
+        } else if coder {
+            "qwen3-coder"
+        } else if dense_qwen {
+            "qwen3"
         } else if profile.starts_with("ministral-3") {
             "ministral3"
         } else if profile.starts_with("smollm") {
@@ -205,12 +214,22 @@ fn llama3_tool_stop_context_cache() {
     assert_eq!(caps[0]["result"]["backend"]["kind"], "mlx_metal");
     assert_eq!(
         caps[0]["result"]["weight_representations"],
-        json!([{"kind":if profile.ends_with("8bit") {"affine8"} else {"affine4"}, "group_size":64}])
+        if dense_qwen {
+            json!([{"kind":"f32"},{"kind":"affine4","group_size":64}])
+        } else if coder {
+            json!([{"kind":"affine4","group_size":64},{"kind":"affine8","group_size":64}])
+        } else {
+            json!([{"kind":if profile.ends_with("8bit") {"affine8"} else {"affine4"}, "group_size":64}])
+        }
     );
     assert_eq!(
         caps[0]["result"]["cache_modes"][0]["representation"],
         if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
             "qwen35.mlx-f32.full-kv-and-recurrent.v1"
+        } else if coder {
+            "qwen3-coder.mlx-f32.full.bhtd.v1"
+        } else if dense_qwen {
+            "qwen3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("ministral-3") {
             "ministral3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("smollm") {
@@ -521,18 +540,9 @@ fn llama3_stream_cancel_recovery() {
     check_cancellation_recovery(&Supervisor::new(boot.engine, telemetry), &store, &profile);
 }
 
-#[test]
-#[ignore = "requires the pinned profile checkpoint and native Metal"]
-fn native_validated_context_boundary() {
-    use engine::api::Engine;
-    use engine::types::ModelProfileId;
-    use harness_core::{ContextBuilder, HarnessError, SessionStore, Supervisor};
-    use sha2::{Digest, Sha256};
-    use std::sync::Mutex;
-
-    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+fn boundary_message(profile: &str, excess: usize) -> (String, &'static str, &'static str) {
     // Publisher-rendered chat bytes and little-endian token IDs.
-    let (lines, padding_tokens, text_sha, ids_sha) = match profile.as_str() {
+    let (lines, padding_tokens, text_sha, ids_sha) = match profile {
         "gemma-4-e4b-it-4bit" => (
             660,
             42,
@@ -575,51 +585,20 @@ fn native_validated_context_boundary() {
             "42b3913c4ae6ef8f17a115ccf831d00a8d45d5b078dd499ef51eb4efc2ccc02d",
             "49470014a7f7ab37e6d3809d885edae59292ddc3eabf82966f6fa5ed0d46116f",
         ),
+        "qwen3-4b-4bit" | "qwen3-14b-4bit" => (
+            636,
+            34,
+            "d68b3de817e64d190042f25f6565140a7f3993c9dd9dead229c42fbc760ce2ac",
+            "e87efc68c9e5b75ba52d26a02d9c46ea8c4baf544d1c4072591ffe3f74dda7e2",
+        ),
+        "qwen3-coder-30b-a3b-instruct-4bit" => (
+            636,
+            38,
+            "56d8c9e83b6ef1a1ee04cea1078a5cb2d108e5c8b4ba62423329c8b4b12f3b8b",
+            "2b3d8b4bee9969632dd979569ed9fe2cd1dd6eb1ddaf763ae5bd3849c0f1b352",
+        ),
         other => panic!("no pinned boundary input for {other}"),
     };
-    let context_limit = if profile.starts_with("gemma-3-") {
-        32_768
-    } else {
-        40_960
-    };
-    let boot = alloyd::boot::boot_native_for_qualification(
-        BootRequest {
-            artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
-            profile_id: profile.clone(),
-            corpus_models_json: None,
-            memory_guard: MemoryGuardConfig::balanced(),
-            admission_budget_override_bytes: None,
-            prefer_metal: true,
-            tools_enabled: true,
-            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
-        },
-        Some(context_limit),
-    )
-    .unwrap();
-    let budget = boot
-        .engine
-        .profile_context_budget(&ModelProfileId::new(&profile).unwrap())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (budget.limit, budget.output_reserve, budget.safety_margin),
-        (context_limit, 512, 64)
-    );
-    let supervisor = Supervisor::new(
-        recording_engine::RecordingEngine::new(boot.engine),
-        Arc::new(TelemetryClient::with_transport(
-            "test",
-            HardwareTier::Unknown,
-            "https://127.0.0.1:1",
-            Box::new(Offline),
-        )),
-    );
-    let root = tempfile::tempdir().unwrap();
-    let mut db = SessionStore::open(root.path().join("boundary.sqlite")).unwrap();
-    for id in ["overflow", "boundary"] {
-        db.create_session(id, &profile).unwrap();
-    }
-    let store = Mutex::new(db);
     let mut archive = if profile.starts_with("gemma-3-") {
         gemma3_long_document().0
     } else {
@@ -644,14 +623,107 @@ fn native_validated_context_boundary() {
     } else {
         " ledger"
     };
-    let prompt = |n| {
-        format!(
-            "Read this archive and retrieve the vault access code.\n{archive}\n{}\nWhat is the vault access code in the ARCHIVE RECORD? Reply with only the code.",
-            padding.repeat(n)
-        )
-    };
+    let message = format!(
+        "Read this archive and retrieve the vault access code.\n{archive}\n{}\nWhat is the vault access code in the ARCHIVE RECORD? Reply with only the code.",
+        padding.repeat(padding_tokens + excess)
+    );
+    (message, text_sha, ids_sha)
+}
+
+fn boundary_context_limit(profile: &str) -> usize {
+    if profile.starts_with("gemma-3-") {
+        32_768
+    } else {
+        40_960
+    }
+}
+
+fn boundary_boot(profile: &str, context_limit: usize, prefer_metal: bool) -> alloyd::BootedEngine {
+    alloyd::boot::boot_native_for_qualification(
+        BootRequest {
+            artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
+            profile_id: profile.to_owned(),
+            corpus_models_json: None,
+            memory_guard: MemoryGuardConfig::balanced(),
+            admission_budget_override_bytes: None,
+            prefer_metal,
+            tools_enabled: true,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
+        },
+        Some(context_limit),
+    )
+    .unwrap()
+}
+
+fn check_boundary_hashes(render: &engine::types::RenderedContext, text_sha: &str, ids_sha: &str) {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        format!("{:x}", Sha256::digest(render.text().as_bytes())),
+        text_sha
+    );
+    let mut hash = Sha256::new();
+    for id in render.token_ids() {
+        hash.update(id.to_le_bytes());
+    }
+    assert_eq!(format!("{:x}", hash.finalize()), ids_sha);
+}
+
+#[test]
+#[ignore = "requires a pinned native model tokenizer"]
+fn native_boundary_prompt_parity() {
+    use harness_core::ContextBuilder;
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    let limit = boundary_context_limit(&profile);
+    let boot = boundary_boot(&profile, limit, false);
+    for excess in [0, 1] {
+        let (message, text_sha, ids_sha) = boundary_message(&profile, excess);
+        let snapshot =
+            ContextBuilder::build_snapshot("boundary", &profile, &[], Some(&message)).unwrap();
+        let render = ContextBuilder::render_and_count(&boot.engine, snapshot).unwrap();
+        assert_eq!(render.token_count() + 512 + 64, limit + excess);
+        if excess == 0 {
+            check_boundary_hashes(&render, text_sha, ids_sha);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned profile checkpoint and native Metal"]
+fn native_validated_context_boundary() {
+    use engine::api::Engine;
+    use engine::types::ModelProfileId;
+    use harness_core::{ContextBuilder, HarnessError, SessionStore, Supervisor};
+    use std::sync::Mutex;
+
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    let context_limit = boundary_context_limit(&profile);
+    let boot = boundary_boot(&profile, context_limit, true);
+    let budget = boot
+        .engine
+        .profile_context_budget(&ModelProfileId::new(&profile).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (budget.limit, budget.output_reserve, budget.safety_margin),
+        (context_limit, 512, 64)
+    );
+    let supervisor = Supervisor::new(
+        recording_engine::RecordingEngine::new(boot.engine),
+        Arc::new(TelemetryClient::with_transport(
+            "test",
+            HardwareTier::Unknown,
+            "https://127.0.0.1:1",
+            Box::new(Offline),
+        )),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let mut db = SessionStore::open(root.path().join("boundary.sqlite")).unwrap();
+    for id in ["overflow", "boundary"] {
+        db.create_session(id, &profile).unwrap();
+    }
+    let store = Mutex::new(db);
     for (id, excess) in [("overflow", 1), ("boundary", 0)] {
-        let message = prompt(padding_tokens + excess);
+        let (message, text_sha, ids_sha) = boundary_message(&profile, excess);
         let snapshot = ContextBuilder::build_snapshot(id, &profile, &[], Some(&message)).unwrap();
         let render = ContextBuilder::render_and_count(supervisor.engine(), snapshot).unwrap();
         assert_eq!(
@@ -682,15 +754,7 @@ fn native_validated_context_boundary() {
             assert_eq!(requests.len(), 1);
             let actual = requests[0].0.expected_render().unwrap();
             assert_eq!(actual.token_ids(), render.token_ids());
-            assert_eq!(
-                format!("{:x}", Sha256::digest(actual.text().as_bytes())),
-                text_sha
-            );
-            let mut hash = Sha256::new();
-            for id in actual.token_ids() {
-                hash.update(id.to_le_bytes());
-            }
-            assert_eq!(format!("{:x}", hash.finalize()), ids_sha);
+            check_boundary_hashes(actual, text_sha, ids_sha);
             assert_eq!(outcome.assistant_text, "COBALT-7392");
             println!(
                 "profile={profile} context={} input_tokens={} output_reserve={} safety_margin={} answer={:?}",

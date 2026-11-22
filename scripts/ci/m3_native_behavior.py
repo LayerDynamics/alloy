@@ -44,6 +44,12 @@ MINISTRAL = (
     ("alloyd", "ministral3_chat", ("ministral3_native_daemon_chat", "ministral3_publisher_tool_prompt_parity")),
 )
 FAMILY_FIXTURES = {
+    "qwen3-4b-4bit": (("engine", "qwen3_trained", ("qwen3_dense_native_memory_tiers",)),),
+    "qwen3-14b-4bit": (("engine", "qwen3_trained", ("qwen3_dense_native_memory_tiers",)),),
+    "qwen3-coder-30b-a3b-instruct-4bit": (
+        ("inference-infra", "qwen3_coder_quantized", ("qwen3_coder_native_memory_tiers",)),
+        ("alloyd", "qwen3_coder_chat", ("qwen3_coder_publisher_prompt_parity", "qwen3_coder_native_registration")),
+    ),
     "llama-3.1-8b-4bit": (("llama3", "quantized_loading", ("dense_native_memory_tiers",)),),
     "llama-3.1-8b-8bit": (("llama3", "quantized_loading", ("dense_native_memory_tiers",)),),
     "smollm3-3b-4bit": (("smollm", "quantized_loading", ("dense_native_memory_tiers",)),),
@@ -78,6 +84,10 @@ def inventory(profile):
 COVERAGE = {
     "llama3_tool_stop_context_cache": ("policy_gated_task", "stops", "tool_schema"),
     "dense_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "qwen3_dense_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "qwen3_coder_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "qwen3_coder_publisher_prompt_parity": ("exact_counting", "tool_schema"),
+    "qwen3_coder_native_registration": (),
     "llama3_long_context_stream_cancel_memory": ("streaming", "cancellation"),
     "native_validated_context_boundary": ("long_context", "exact_counting"),
     "real_model_compaction_preserves_history_and_continues": ("compaction",),
