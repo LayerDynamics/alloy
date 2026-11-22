@@ -2248,3 +2248,23 @@ for Gemma 3 and Phi pending the named native memory tests. Exercise the runner
 unit tests, actual metadata inspection, strict Clippy and the native matrix.
 Dependencies are the preceding pinned numerical integration and offline fixtures.
 This supplies family-specific behavioral observations for #72 and #53.
+
+### #53 measure isolated native Gemma 3 and Phi allocator use
+
+Add gemma3_native_memory_tiers and phi_native_memory_tiers to the existing
+crates/inference-infra/tests/{gemma3_quantized,phi_quantized}.rs binaries.
+Use their same verified trained weights and position regimes. Factor common
+pinned-file loading and tier observations into
+crates/inference-infra/tests/support/{pinned_checkpoint,cache_memory}.rs.
+Run one named test per isolated process. Set an 8 GiB allocator guideline
+on the real 36 GiB Mac for 512 prompt tokens plus one native decode, then
+exercise 32736 plus one at the physical tier. Check the actual weight and KV
+buffers, native load and cache allocation peaks, generation high-water mark,
+settled bytes, positive transient allocation and cache length. Distinguish
+Gemma's growing retained KV from Phi's preallocated KV. Compare the measured
+peaks with each budget. A failed allocation or assertion remains a failure.
+Add those tests to their architecture inventories in scripts/ci/m3_native_behavior.py
+and check all mandatory categories in scripts/tests/test_m3_native_behavior.py.
+Use release compilation, strict Clippy, exact named Metal runs and the qualification
+runner. Dependencies are existing MLX allocator counters and checkpoint pins.
+This supplies the isolated 8/36 GiB components of the #53 and #72 profile reports.
