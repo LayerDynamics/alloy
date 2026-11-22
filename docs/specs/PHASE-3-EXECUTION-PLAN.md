@@ -2035,3 +2035,15 @@ admission and terminal CI are additional #72/#53 requirements.
 Apply the workspace formatter to the recently changed small-tier
 assignment in `crates/engine/src/backends/qwen/backend.rs` and rerun
 `cargo fmt --all -- --check`.
+
+Raw E4B, Ornith and upstream Qwen3.5 capture passed on 5765db5. Independent
+readback found a one-bit change in some exported decimal values even though
+all metrics passed (cdabc9744df0422cb4d7337a113b02f6). Preserve the exact
+IEEE values across the entire report path. Enable the pinned serde_json
+float_roundtrip feature in `crates/engine/Cargo.toml` and for the numerical
+test targets in `crates/inference-infra/Cargo.toml`. Add
+`m3_numerical_report_preserves_native_float_bits` in
+`crates/engine/examples/m3_numerical_report.rs` using the observed real
+logit. Reissue the three raw captures and report sections on the corrected
+candidate, then compare every persisted reference and observation to the
+independent frozen and raw arrays.
