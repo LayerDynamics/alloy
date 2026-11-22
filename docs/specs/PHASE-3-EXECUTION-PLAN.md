@@ -1377,3 +1377,15 @@ rejecting an oversized transformed piece. The 12 MiB catalogue bound is
 unchanged. Add crates/harness-core/tests/support/scripted.rs to the exact test
 file set solely to record generation options for compaction-schema assertions;
 scripted events remain test-only and cannot qualify native generation.
+
+Native integration correction: the daemon permits 512 KiB token spellings, so
+comparing that policy ceiling to the constraint scratch cap falsely rejects
+Gemma before generation (d2f2ffdc82bd4d27b9723197d18158f2). Add
+crates/engine/src/backends/qwen/artifact.rs to the exact file set: retain the
+actual maximum spelling length from the existing pinned-vocabulary validation
+pass and check that immutable measured bound before catalogue construction.
+Do not enlarge the constraint scratch cap or alter daemon decoder limits.
+The untrained tiny model chooses newlines; its runtime test therefore proves
+bounded exhaustion, cleanup and re-entry. Success belongs to frozen-model
+lifecycle evidence. JSON requests use the plain decoder so protocol spellings
+inside string values remain data; an explicit decoder regression covers this.
