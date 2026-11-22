@@ -2530,3 +2530,21 @@ Verify with long_dense_cache_matches_short_cache_after_cancel and the existing
 mlx_cpu_complete_forward_prefill_and_decode_match_reference. No dependency
 changes. A fitting estimate is a prerequisite for the separate Metal boundary
 generation, and a measured refusal remains a failed conformance result.
+
+### Bound transactional KV overlap on long Qwen3 requests
+
+The measured full-cache overlap alone reserves 24.29 GB for dense 4B,
+26.98 GB for dense 14B and 16.24 GB for Coder at the pinned boundary.
+In `crates/inference-infra/src/kv_cache.rs` add an append mode that
+evaluates and measures a single replacement layer before releasing the old
+backing. It may write only after the committed length. Publish length only
+after all layers and the stream complete. Preserve the existing full-version
+mode for callers that use it. Use the same checked mode selection and sizing
+in `crates/inference-infra/src/decoder/{config.rs,mlx_model.rs}` and
+`crates/engine/src/backends/qwen/cache.rs`. Verify measured buffer bounds,
+partial append rollback, preserved prefix, retry with different tokens,
+block export and restore in layerwise_append_preserves_prefix_and_bounds.
+Re-run long_dense_cache_matches_short_cache_after_cancel and all existing
+kv_cache CPU tests. Re-measure native_boundary_memory_estimate for each
+trained checkpoint, then run the independent trained and daemon gates under
+the Mac lease. Dependencies stay fixed.
