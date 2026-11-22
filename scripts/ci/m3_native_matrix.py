@@ -9,6 +9,7 @@ import sys
 import m3_native_behavior
 import m3_native_numerical as native
 import m3_native_qualification
+import m3_native_package
 
 
 RUNNERS = {"numerical": native.run, "behavior": m3_native_behavior.run}
@@ -75,7 +76,7 @@ def qualify_profile(profile, candidate, inputs, output, runs):
     return result
 
 
-def run(candidate, inputs_path, output):
+def run(candidate, inputs_path, output, package=False):
     output = output.resolve()
     if output.is_relative_to(native.ROOT):
         raise ValueError("matrix output must be a new external directory")
@@ -100,9 +101,11 @@ def run(candidate, inputs_path, output):
             index["qualifications"].append(qualification)
             print(f"{profile} qualification: {qualification['status']}", flush=True)
         native.verify_candidate(candidate)
+        if package:
+            index["package"] = m3_native_package.publish(index, output)
         if all(r["status"] == "passed" for r in index["runs"] + index["qualifications"]):
             index["status"] = "passed"
-    except RUN_ERRORS as error:
+    except (KeyError, TypeError, *RUN_ERRORS) as error:
         index["error"] = str(error)
     pending = output / "index.pending"
     m3_native_behavior.write_json(pending, index)
@@ -116,9 +119,10 @@ def main():
     parser.add_argument("--inputs", type=Path, required=True,
                         help='external JSON object keyed by profile; each value has absolute "artifact" and "reference" paths')
     parser.add_argument("--output", type=Path, required=True, help="new external directory in an existing parent")
+    parser.add_argument("--package", action="store_true", help="build a local production daemon for passing profiles under OUTPUT/package")
     args = parser.parse_args()
     try:
-        index = run(args.candidate, args.inputs, args.output)
+        index = run(args.candidate, args.inputs, args.output, args.package)
     except RUN_ERRORS as error:
         print(error, file=sys.stderr)
         return 1

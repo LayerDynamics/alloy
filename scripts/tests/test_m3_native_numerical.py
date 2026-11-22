@@ -1,4 +1,6 @@
 from hashlib import sha256
+import os
+from unittest.mock import patch
 import importlib.util
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,6 +12,18 @@ spec.loader.exec_module(runner)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_candidates_and_checkouts_have_separate_cargo_targets(self):
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {"CARGO_TARGET_DIR": tmp}):
+            root = Path(tmp)
+            a, b = "a" * 40, "b" * 40
+            t = runner.cargo_target(a, root, root / "first")
+            self.assertNotEqual(t, runner.cargo_target(b, root, root / "first"))
+            self.assertNotEqual(t, runner.cargo_target(a, root, root / "second"))
+            self.assertEqual(t, runner.cargo_target(a, root, root / "first"))
+            self.assertEqual(os.environ["CARGO_TARGET_DIR"], tmp)
+            with self.assertRaises(ValueError):
+                runner.cargo_target("../old", root)
+
     def test_only_exact_named_execution_passes(self):
         output = "running 1 test\ntest native ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n"
         runner.require_single_pass(output, "native")

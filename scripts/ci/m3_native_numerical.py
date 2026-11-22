@@ -69,17 +69,49 @@ def execute(argv, directory, label, record, env=None):
     return stdout
 
 
+def cargo_target(candidate, output_parent, checkout=None):
+    checkout = (checkout or ROOT).resolve()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate):
+        raise ValueError("invalid clean candidate for compilation")
+    base = Path(os.environ.get("CARGO_TARGET_DIR", output_parent / "native-builds")).expanduser().resolve()
+    if base.is_relative_to(checkout):
+        raise ValueError("native build root must be external to the checkout")
+    checkout_id = hashlib.sha256(os.fsencode(checkout)).hexdigest()[:16]
+    return base / "m3-native" / checkout_id / candidate
+
+
+def metal_library(artifacts, executable):
+    roots = [Path(a["out_dir"]) for a in artifacts if a.get("reason") == "build-script-executed"
+             and a["package_id"].split("#")[0].endswith("/crates/mlx-ffi")]
+    if len(roots) != 1:
+        raise ValueError("expected exactly one linked mlx-ffi build")
+    lib = roots[0] / "lib/mlx.metallib"
+    digest = sha256(lib)
+    # The static MLX loader checks these paths before its build-time default.
+    for path in (executable.parent / "mlx.metallib", executable.parent / "Resources/mlx.metallib",
+                 roots[0] / "build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib"):
+        if path.exists() and sha256(path) != digest:
+            raise ValueError(f"conflicting Metal kernels at {path}")
+    return {"path": str(lib), "sha256": digest}
+
+
 def build(kind, package, target, out, record):
     argv = ["cargo", "test", "--no-run"] if kind == "test" else ["cargo", "build"]
     argv += ["--locked", "--release", "-p", package, "--" + kind, target, "--message-format=json"]
-    log = execute(argv, out, "build-" + target, record)
+    build_dir = Path(record["cargo_target_directory"])
+    log = execute(argv, out, "build-" + target, record, {**os.environ, "CARGO_TARGET_DIR": str(build_dir)})
     with log.open() as src:
         artifacts = [json.loads(line) for line in src if line.strip()]
     matches = [Path(a["executable"]) for a in artifacts
                if a.get("reason") == "compiler-artifact" and a.get("executable")
-               and a["target"]["name"] == target and kind in a["target"]["kind"]]
+               and a["target"]["name"] == target and kind in a["target"]["kind"]
+               and Path(a["manifest_path"]).resolve().is_relative_to(ROOT)
+               and Path(a["executable"]).resolve().is_relative_to(build_dir)]
     if len(matches) != 1:
         raise ValueError(f"Cargo produced {len(matches)} executables for {target}")
+    kernels = metal_library(artifacts, matches[0])
+    if record.setdefault("metal_library", kernels) != kernels:
+        raise ValueError("Metal library changed between fixture builds")
     record["binaries"][target] = {"path": str(matches[0]), "sha256": sha256(matches[0])}
     return matches[0]
 
@@ -94,6 +126,7 @@ def pinned_run(args, scope):
               "candidate": args.candidate, "commands": [], "binaries": {}, "status": "failed"}
     try:
         verify_candidate(args.candidate)
+        record["cargo_target_directory"] = str(cargo_target(args.candidate, out.parent))
         manifest_stem, _, _, prefix = SUITES[args.profile]
         pin = ROOT / "crates/inference-infra/tests/fixtures" / (manifest_stem + "_profile.json")
         manifest = json.loads(pin.read_bytes())
@@ -110,6 +143,9 @@ def pinned_run(args, scope):
         execute(["rustc", "-Vv"], out, "rustc-version", record)
         selected = {prefix + "_ARTIFACT": str(artifact), prefix + "_REFERENCE": str(reference)}
         yield out, record, selected
+        kernel = record["metal_library"]
+        if sha256(Path(kernel["path"])) != kernel["sha256"]:
+            raise ValueError("Metal library changed during execution")
         verify_candidate(args.candidate)
         verify_inputs(manifest, artifact, reference)
         record["status"] = "passed"

@@ -7,6 +7,7 @@
 
 pub mod boot;
 pub mod metrics;
+mod qualification;
 pub mod rpc;
 pub mod server;
 pub mod service;

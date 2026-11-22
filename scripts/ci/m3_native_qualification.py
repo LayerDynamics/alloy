@@ -98,6 +98,8 @@ def issue(profile, candidate, paths, root, runs):
                 raise ValueError(f"changed numerical file: {name}")
         # Independently derive the runtime identity from the verified inputs.
         inspect_profile(out, record)
+        if any(r.get("metal_library") != record["metal_library"] for r in (numerical, behavior)):
+            raise ValueError("numerical and behavioral kernels differ from the issuing build")
         actual = checked_json(out / "profile-identity.stdout", record["profile_identity_sha256"])
         inspected = checked_json(behavior_dir / "profile-identity.stdout", behavior["profile_identity_sha256"])
         if actual != inspected or actual["profile"] != profile or actual["artifact"] != profile:

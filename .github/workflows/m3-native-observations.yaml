@@ -33,12 +33,20 @@ jobs:
           output="$parent/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           printf 'M3_OUTPUT=%s\n' "$output" >> "$GITHUB_ENV"
           export CARGO_TARGET_DIR="$parent/cargo-target"
-          python3 -B scripts/ci/m3_native_matrix.py --candidate "$GITHUB_SHA" --inputs "$M3_PROFILE_PATHS" --output "$output"
+          python3 -B scripts/ci/m3_native_matrix.py --candidate "$GITHUB_SHA" --inputs "$M3_PROFILE_PATHS" --output "$output" --package
+      - name: Preserve local package file modes
+        if: ${{ always() && env.M3_OUTPUT != '' }}
+        run: |
+          if [[ -d "$M3_OUTPUT/package" ]]; then
+            tar -czf "$M3_OUTPUT/native-package.tar.gz" -C "$M3_OUTPUT/package" .
+          fi
       - name: Archive terminal observations
         if: ${{ always() && env.M3_OUTPUT != '' }}
         uses: actions/upload-artifact@v6
         with:
           name: m3-native-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.M3_OUTPUT }}
+          path: |
+            ${{ env.M3_OUTPUT }}
+            !${{ env.M3_OUTPUT }}/package/**
           if-no-files-found: error
           retention-days: 30

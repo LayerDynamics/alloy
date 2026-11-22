@@ -148,11 +148,12 @@ def run_suite(out, record, selected, groups):
 
 
 def inspect_profile(out, record):
+    binary = build("example", "alloyd", "m3_profile_identity", out, record)
     environment = {k: record[k] for k in ("cargo_lock_sha256", "pins_sha256", "host", "architecture")}
     environment["rustc_sha256"] = sha256(out / "rustc-version.stdout")
+    environment["metal_library_sha256"] = record["metal_library"]["sha256"]
     encoded = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
     dependencies = hashlib.sha256(encoded).hexdigest()
-    binary = build("example", "alloyd", "m3_profile_identity", out, record)
     context = 32768 if record["profile"].startswith("gemma-3-") else 40960
     path = execute([binary, record["profile"], record["artifact_directory"], str(context),
                     record["candidate"], dependencies], out, "profile-identity", record)

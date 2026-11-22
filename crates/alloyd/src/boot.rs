@@ -111,6 +111,28 @@ pub fn boot_qwen3_with_context_limit(
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
     request.validate_profile()?;
+    if let Some(verified) = crate::qualification::packaged(&request.profile_id, context_override)? {
+        let (backend, profile) = prepare_native_profile(&request, Some(verified.context))?;
+        let expected = &verified.spec.identity;
+        let actual = backend
+            .qualification_identity(
+                &profile,
+                &expected.candidate_revision,
+                &expected.dependencies_sha256,
+            )
+            .map_err(|err| RpcError::invalid_params(err.to_string()))?;
+        if actual != *expected {
+            return Err(RpcError::invalid_params(
+                "native profile is not qualified for these runtime settings",
+            ));
+        }
+        let mut boot = finish_native_boot(request, backend, profile)?;
+        boot.engine = boot
+            .engine
+            .with_qualification(verified.spec, &verified.report)
+            .map_err(|err| RpcError::invalid_params(err.to_string()))?;
+        return Ok(boot);
+    }
     if matches!(
         request.profile_id.as_str(),
         "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
@@ -134,6 +156,14 @@ pub fn boot_native_for_qualification(
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
     let (backend, profile) = prepare_native_profile(&request, context_override)?;
+    finish_native_boot(request, backend, profile)
+}
+
+fn finish_native_boot(
+    request: BootRequest,
+    backend: Qwen3Backend,
+    profile: ModelProfile,
+) -> Result<BootedEngine, RpcError> {
     let (budget_bytes, ceiling, guard_config) = resolve_admission_budget(&request)?;
     maybe_apply_wired_limit(&request, &ceiling)?;
 
