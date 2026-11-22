@@ -2387,3 +2387,9 @@ trained first-layer numerical parity. Dependencies are the pinned local
 four-shard checkpoint, verified tokenizer, existing streaming reader and
 MLX CPU/Metal. The full exit requires the trained logits, registered
 runtime, behavioral suite and candidate-bound CI.
+
+In crates/inference-infra/src/decoder/config.rs give the routed decoder
+its own family identity while sharing Qwen per-head norm geometry. Reject
+this family at the dense weight constructor and loader. In the shared model
+preserve the upstream full-prompt output projection before selecting the last
+row, with corresponding checked output-byte admission.
