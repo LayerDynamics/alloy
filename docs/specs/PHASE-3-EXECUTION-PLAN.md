@@ -1560,3 +1560,26 @@ boot and requests for unsupported tools were rejected. Reference capture
 1fe9ef51025245758cc99b242bb31ae3 retain the terminal output. Strict Clippy
 for engine and alloyd, including all targets, passed
 (b79aedea615849fbbeca8ca96681fd2f).
+
+### #99 Ministral tools and long context
+
+Run `llama3_long_context_stream_cancel_memory` against the pinned 3B artifact
+with the existing full 8K/32K archive inputs, retrieval assertion, memory
+admission and post-cancellation comparison. The reference tokenizer counts fit
+the 40,960-token test limit. Record actual native counts and peak MLX usage.
+
+Implement the trained special-token protocol in
+`crates/engine/src/slab_parser/{mod.rs,ministral3.rs}`. Use the shared bounded
+JSON validator and admitted proposal storage. Cover literal text delimiters,
+sequential calls, malformed later calls, limits and missing EOS in the
+module's `ministral_protocol_*` tests. In `crates/engine/src/runtime.rs`,
+notify the decoder when the selected token is an actual EOS so the parser
+can distinguish a complete tool batch from an output limit. Integrate in
+`crates/engine/src/backends/qwen/{backend.rs,output.rs,architecture.rs,ministral3_text.jinja}`.
+Match the publisher's tool declarations, grouped assistant calls and result
+messages, verify the pinned special IDs, and bound projected tokens before
+execution in `crates/engine/src/rendering.rs`. Enable tool mode for
+qualification in `crates/alloyd/src/boot.rs`. Verify publisher tool prompt
+parity in `crates/alloyd/tests/ministral3_chat.rs` and run the actual
+`llama3_tool_stop_context_cache` in `crates/alloyd/tests/llama_real_model.rs`
+with its existing allow/deny, terminal response and cache gates.
