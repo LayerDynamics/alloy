@@ -3,10 +3,10 @@
 //! Layout per layer:
 //! [batch, kv_heads, capacity_tokens, head_dim].
 //!
-//! K/V updates are functional MLX operations. A transaction stages new
-//! arrays without replacing the committed cache. Commit requires every
-//! layer, evaluates the staged arrays, synchronizes the update stream,
-//! and only then publishes all layer handles and the new logical length.
+//! Functional K/V updates preserve all positions below the committed length.
+//! The default transaction retains both cache versions through commit. The
+//! layerwise mode replaces backing handles one layer at a time after evaluation
+//! and measurement. Only a successful all-layer commit exposes the new suffix.
 //!
 //! A transaction may provide staged prefix views for constructing the
 //! model's attention graph. The model must validate its final execution
@@ -95,8 +95,7 @@ pub struct KvPayloadPlan {
     /// Payload of all committed K/V arrays.
     pub resident_bytes: u64,
 
-    /// Conservative payload for old plus new full-cache versions during
-    /// one all-layer functional update.
+    /// Conservative payload of the live cache and its overlapping updates.
     ///
     /// Additional graph temporaries and externally retained versions
     /// require separate accounting.
@@ -365,9 +364,24 @@ impl From<MlxError> for KvCacheError {
 /// Result of an MLX cache operation.
 pub type KvCacheResult<T> = Result<T, KvCacheError>;
 
+/// Lifetime of backing arrays during a transactional suffix append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvUpdateMode {
+    /// Retain all replacement layers until commit.
+    FullVersion,
+    /// Evaluate and replace one backing layer at a time. A cancelled append
+    /// can leave unused suffix bytes, which are inaccessible until overwritten.
+    Layerwise,
+}
+
 impl KvCacheSpec {
     /// Validate dimensions and compute payload/overlap bounds.
     pub fn payload_plan(self) -> KvCacheResult<KvPayloadPlan> {
+        self.payload_plan_for(KvUpdateMode::FullVersion)
+    }
+
+    /// Compute resident and overlap payloads for the actual update strategy.
+    pub fn payload_plan_for(self, mode: KvUpdateMode) -> KvCacheResult<KvPayloadPlan> {
         if [
             self.layers,
             self.batch,
@@ -411,9 +425,15 @@ impl KvCacheSpec {
                 ))?;
         }
 
-        let overlap = resident.checked_mul(2).ok_or(KvCacheError::InvalidInput(
-            "cache overlap arithmetic overflow",
-        ))?;
+        let replacement = match mode {
+            KvUpdateMode::FullVersion => resident,
+            KvUpdateMode::Layerwise => resident / self.layers as u64,
+        };
+        let overlap = resident
+            .checked_add(replacement)
+            .ok_or(KvCacheError::InvalidInput(
+                "cache overlap arithmetic overflow",
+            ))?;
 
         Ok(KvPayloadPlan {
             resident_bytes: resident,
@@ -550,6 +570,7 @@ pub struct MlxKvCache {
     owner: MlxModelId,
     spec: KvCacheSpec,
     plan: KvPayloadPlan,
+    update_mode: KvUpdateMode,
     max_buffer_overlap_bytes: u64,
     layers: Vec<LayerKv>,
     length: usize,
@@ -572,7 +593,24 @@ impl MlxKvCache {
         max_payload_bytes: u64,
         stream: &Stream,
     ) -> KvCacheResult<Self> {
-        let plan = spec.payload_plan()?;
+        Self::new_with_mode(
+            owner,
+            spec,
+            max_payload_bytes,
+            KvUpdateMode::FullVersion,
+            stream,
+        )
+    }
+
+    /// Construct a cache whose append strategy matches the caller's reservation.
+    pub fn new_with_mode(
+        owner: &MlxModelId,
+        spec: KvCacheSpec,
+        max_payload_bytes: u64,
+        update_mode: KvUpdateMode,
+        stream: &Stream,
+    ) -> KvCacheResult<Self> {
+        let plan = spec.payload_plan_for(update_mode)?;
         if plan.update_overlap_bytes > max_payload_bytes {
             return Err(KvCacheError::PayloadLimit {
                 required_bytes: plan.update_overlap_bytes,
@@ -610,14 +648,25 @@ impl MlxKvCache {
             owner: owner.clone(),
             spec,
             plan,
+            update_mode,
             max_buffer_overlap_bytes: max_payload_bytes,
             layers,
             length: 0,
             healthy: true,
         };
-        let required = cache
-            .buffer_bytes()?
-            .checked_mul(2)
+        let resident = cache.buffer_bytes()?;
+        let replacement = match update_mode {
+            KvUpdateMode::FullVersion => resident,
+            KvUpdateMode::Layerwise => {
+                let mut largest = 0;
+                for layer in &cache.layers {
+                    largest = largest.max(measure_layer_buffers(std::iter::once(layer), 1)?);
+                }
+                largest
+            }
+        };
+        let required = resident
+            .checked_add(replacement)
             .ok_or(KvCacheError::InvalidInput("measured KV overlap overflow"))?;
         if required > max_payload_bytes {
             return Err(KvCacheError::PayloadLimit {
@@ -781,7 +830,7 @@ impl MlxKvCache {
                 layers,
             })
         })();
-        result.map_err(|error| self.failed_block_transfer(error, stream))
+        result.map_err(|error| self.failed_native_operation(error, stream))
     }
 
     /// Transactionally append a validated host block to this cache.
@@ -792,13 +841,13 @@ impl MlxKvCache {
     /// checked independently of the instance from which data was exported.
     ///
     /// All layers and values are validated before native array creation.
-    /// The existing all-layer append transaction publishes handles and
-    /// length only after successful native completion and overlap checks.
+    /// The append transaction publishes length only after successful native
+    /// completion and overlap checks.
     /// Returns the new committed length only after that publication.
     ///
     /// Call [`KvCacheSpec::block_payload_plan`] and reserve transfer payload
-    /// plus the full-cache update allowance before invoking this method.
-    /// Native failures preserve old handles/length and invalidate the cache.
+    /// plus the cache's update allowance before invoking this method.
+    /// Native failures preserve committed positions and invalidate the cache.
     pub fn restore_block(
         &mut self,
         owner: &MlxModelId,
@@ -847,10 +896,10 @@ impl MlxKvCache {
             append.commit()?;
             Ok(end)
         })();
-        result.map_err(|error| self.failed_block_transfer(error, stream))
+        result.map_err(|error| self.failed_native_operation(error, stream))
     }
 
-    fn failed_block_transfer(&mut self, error: KvCacheError, stream: &Stream) -> KvCacheError {
+    fn failed_native_operation(&mut self, error: KvCacheError, stream: &Stream) -> KvCacheError {
         let native_failure = matches!(
             error,
             KvCacheError::Mlx(_)
@@ -906,7 +955,7 @@ impl MlxKvCache {
         staged
             .try_reserve_exact(self.spec.layers)
             .map_err(|_| KvCacheError::AllocationFailed("cache transaction metadata"))?;
-        staged.resize_with(self.spec.layers, || None);
+        staged.resize_with(self.spec.layers, || LayerStage::Pending);
 
         let start = self.length;
 
@@ -923,8 +972,7 @@ impl MlxKvCache {
 
 /// An exclusive staged update spanning every cache layer.
 ///
-/// Dropping this value without commit leaves committed handles and
-/// logical length unchanged.
+/// Dropping this value preserves every committed position and the logical length.
 ///
 /// It does not interrupt or cancel native work the caller may already
 /// have scheduled using staged views.
@@ -932,10 +980,25 @@ impl MlxKvCache {
 pub struct KvAppend<'a> {
     cache: &'a mut MlxKvCache,
     stream: &'a Stream,
-    staged: Vec<Option<LayerKv>>,
+    staged: Vec<LayerStage>,
     start: usize,
     end: usize,
     tokens: usize,
+}
+
+enum LayerStage {
+    Pending,
+    Buffered(LayerKv),
+    Installed,
+}
+
+impl LayerStage {
+    fn buffered(&self) -> Option<&LayerKv> {
+        match self {
+            Self::Buffered(layer) => Some(layer),
+            _ => None,
+        }
+    }
 }
 
 impl KvAppend<'_> {
@@ -975,7 +1038,12 @@ impl KvAppend<'_> {
                 "cache layer index is out of range",
             ));
         }
-        if self.staged[layer].is_some() {
+        if !self.cache.healthy {
+            return Err(KvCacheError::InvalidInput(
+                "cannot stage into an unhealthy cache",
+            ));
+        }
+        if !matches!(self.staged[layer], LayerStage::Pending) {
             return Err(KvCacheError::InvalidInput(
                 "cache layer was already staged in this transaction",
             ));
@@ -1007,7 +1075,32 @@ impl KvAppend<'_> {
         // Prefix construction can also fail. Do it before recording this
         // layer as successfully staged.
         let prefix = prefix_view(&next, 0, self.end, self.stream)?;
-        self.staged[layer] = Some(next);
+        match self.cache.update_mode {
+            KvUpdateMode::FullVersion => self.staged[layer] = LayerStage::Buffered(next),
+            KvUpdateMode::Layerwise => {
+                // Replacing this handle cannot change an earlier position:
+                // cache_update writes exactly [start, end). The exclusive borrow
+                // hides that suffix, including on incomplete commit or cancellation.
+                let installed = (|| {
+                    next.keys.eval()?;
+                    next.values.eval()?;
+                    let live = self.cache.layers.iter().chain(std::iter::once(&next));
+                    let bytes = measure_layer_buffers(live, self.cache.layers.len() + 1)?;
+                    if bytes > self.cache.max_buffer_overlap_bytes {
+                        return Err(KvCacheError::PayloadLimit {
+                            required_bytes: bytes,
+                            limit_bytes: self.cache.max_buffer_overlap_bytes,
+                        });
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = installed {
+                    return Err(self.cache.failed_native_operation(error, self.stream));
+                }
+                self.cache.layers[layer] = next;
+                self.staged[layer] = LayerStage::Installed;
+            }
+        }
 
         Ok(prefix)
     }
@@ -1017,14 +1110,23 @@ impl KvAppend<'_> {
     /// The caller should invoke this only after the model's final logits
     /// and cancellation checks have succeeded.
     ///
-    /// Missing layers reject the transaction without changing the cache.
-    /// Native evaluation/completion errors preserve the old handles and
-    /// logical length but invalidate the cache: reconstruct it before reuse.
+    /// Missing layers leave all committed positions accessible at the old length.
+    /// Native evaluation/completion errors preserve the logical length and
+    /// invalidate the cache: reconstruct it before reuse.
     ///
     /// This method synchronizes the update stream. Runtime code remains
     /// responsible for other outstanding streams and request-local work.
-    pub fn commit(mut self) -> KvCacheResult<()> {
-        let staged_layers = self.staged.iter().filter(|layer| layer.is_some()).count();
+    pub fn commit(self) -> KvCacheResult<()> {
+        if !self.cache.healthy {
+            return Err(KvCacheError::InvalidInput(
+                "cannot commit an unhealthy cache",
+            ));
+        }
+        let staged_layers = self
+            .staged
+            .iter()
+            .filter(|layer| !matches!(layer, LayerStage::Pending))
+            .count();
 
         if staged_layers != self.cache.spec.layers {
             return Err(KvCacheError::Incomplete {
@@ -1035,7 +1137,7 @@ impl KvAppend<'_> {
 
         let mut failure = None;
 
-        for layer in self.staged.iter().flatten() {
+        for layer in self.staged.iter().filter_map(LayerStage::buffered) {
             record_native_failure(&mut failure, layer.keys.eval());
             record_native_failure(&mut failure, layer.values.eval());
         }
@@ -1046,6 +1148,10 @@ impl KvAppend<'_> {
         if let Some(error) = failure {
             self.cache.healthy = false;
             return Err(KvCacheError::Mlx(error));
+        }
+        if self.cache.update_mode == KvUpdateMode::Layerwise {
+            self.cache.length = self.end;
+            return Ok(());
         }
 
         // Evaluation completed; publication has not. Measure old/new
@@ -1059,7 +1165,10 @@ impl KvAppend<'_> {
                 "KV overlap handle count overflow",
             ))?;
         let measured = match measure_layer_buffers(
-            self.cache.layers.iter().chain(self.staged.iter().flatten()),
+            self.cache
+                .layers
+                .iter()
+                .chain(self.staged.iter().filter_map(LayerStage::buffered)),
             entries,
         ) {
             Ok(bytes) => bytes,
@@ -1077,8 +1186,8 @@ impl KvAppend<'_> {
 
         // No fallible work remains. The exclusive cache borrow prevents
         // external observation of a partially replaced layer vector.
-        for (committed, staged) in self.cache.layers.iter_mut().zip(self.staged.iter_mut()) {
-            if let Some(next) = staged.take() {
+        for (committed, staged) in self.cache.layers.iter_mut().zip(self.staged) {
+            if let LayerStage::Buffered(next) = staged {
                 *committed = next;
             }
         }
@@ -1247,6 +1356,53 @@ mod tests {
             append.stage_layer(layer, &keys, &values).expect("stage");
         }
         append.commit().expect("commit");
+    }
+
+    #[test]
+    fn layerwise_append_preserves_prefix_and_bounds() {
+        let stream = stream(DeviceType::Cpu);
+        let owner = MlxModelId::new();
+        let spec = KvCacheSpec {
+            capacity_tokens: 2048,
+            ..spec()
+        };
+        let mode = KvUpdateMode::Layerwise;
+        let plan = spec.payload_plan_for(mode).unwrap();
+        let limit = plan.update_overlap_bytes;
+        assert_eq!(limit, plan.resident_bytes + plan.resident_bytes / 2);
+        assert!(limit < spec.payload_plan().unwrap().update_overlap_bytes);
+        assert!(
+            matches!(MlxKvCache::new_with_mode(&owner, spec, limit - 1, mode, &stream),
+            Err(KvCacheError::PayloadLimit {required_bytes, ..}) if required_bytes == limit)
+        );
+        let mut cache = MlxKvCache::new_with_mode(&owner, spec, limit, mode, &stream).unwrap();
+        seed(&mut cache, &owner, &stream);
+        assert!(cache.buffer_bytes().unwrap() <= plan.resident_bytes);
+        let original = cache.export_block(&owner, 0, 1, &stream).unwrap();
+        let stale = chunk(&[90.0, 91.0, 92.0, 93.0], 1);
+        let mut partial = cache.begin_append(&owner, 1, &stream).unwrap();
+        partial.stage_layer(1, &stale, &stale).unwrap();
+        assert!(matches!(
+            partial.commit(),
+            Err(KvCacheError::Incomplete {
+                staged_layers: 1,
+                ..
+            })
+        ));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.view(&owner, 1, 0, 2, &stream).is_err());
+        assert_eq!(cache.export_block(&owner, 0, 1, &stream).unwrap(), original);
+
+        let mut retry = original.clone();
+        retry.start = 1;
+        for layer in &mut retry.layers {
+            layer.keys.fill(27.0);
+            layer.values.fill(28.0);
+        }
+        assert_eq!(cache.restore_block(&owner, &retry, &stream).unwrap(), 2);
+        assert_eq!(cache.export_block(&owner, 0, 1, &stream).unwrap(), original);
+        assert_eq!(cache.export_block(&owner, 1, 2, &stream).unwrap(), retry);
+        assert!(cache.buffer_bytes().unwrap() <= plan.resident_bytes);
     }
 
     fn run_append_suite(kind: DeviceType) {
@@ -1924,7 +2080,7 @@ mod block_transfer_tests {
         let owner = MlxModelId::new();
         let mut cache = cache(&owner, spec(), &stream);
         append_directly(&mut cache, &owner, 1, &stream);
-        let result = cache.failed_block_transfer(
+        let result = cache.failed_native_operation(
             KvCacheError::Operation(OperationError::Mlx(MlxError::Status(-1))),
             &stream,
         );

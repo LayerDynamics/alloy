@@ -20,11 +20,25 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
+    const SHORT_QWEN_CACHE_LIMIT: usize = 1024;
+
     /// Limit live activations to one transformer layer. Short dense Qwen3
     /// requests can keep the lazy graph, avoiding a device wait per layer.
     /// The engine uses this same decision to reserve temporary storage.
     pub fn evaluates_each_layer(&self, cache_capacity: usize) -> bool {
-        self.family != DecoderFamily::Qwen3 || cache_capacity > 1024
+        self.family != DecoderFamily::Qwen3 || cache_capacity > Self::SHORT_QWEN_CACHE_LIMIT
+    }
+
+    /// Long dense and routed Qwen3 decodes materialize each layer and retain
+    /// only the committed prefix plus the active layer's functional update.
+    pub fn kv_update_mode(&self, capacity: usize) -> crate::kv_cache::KvUpdateMode {
+        if capacity > Self::SHORT_QWEN_CACHE_LIMIT
+            && matches!(self.family, DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe)
+        {
+            crate::kv_cache::KvUpdateMode::Layerwise
+        } else {
+            crate::kv_cache::KvUpdateMode::FullVersion
+        }
     }
 
     /// The tiny synthetic model for `qwen3_forward_cpu`. Small enough that

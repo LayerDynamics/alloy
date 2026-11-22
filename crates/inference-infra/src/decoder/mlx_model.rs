@@ -653,7 +653,7 @@ impl MlxDecoderModel {
                 .into());
             }
 
-            Ok(MlxKvCache::new(
+            Ok(MlxKvCache::new_with_mode(
                 &self.owner,
                 KvCacheSpec {
                     layers: self.config.num_layers,
@@ -663,6 +663,7 @@ impl MlxDecoderModel {
                     head_dim: self.config.head_dim,
                 },
                 max_cache_payload_bytes,
+                self.config.kv_update_mode(capacity_tokens),
                 stream,
             )?)
         })();
