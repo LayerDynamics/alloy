@@ -2008,3 +2008,30 @@ parity and small-budget tests passed (767b25e185094c61aeadc86722f02a77).
 With the E4B terminators the canonical-history verifier published and
 looked up a state for all 22 executed tokens, including the 18-token input
 (be9fc8fe88474933a27c8103bb7f15f6).
+
+### #72 export and evaluate actual numerical observations
+
+The model-specific tests currently compare real logits but discard the
+vectors needed by the shared report. Add explicit opt-in export to
+`crates/inference-infra/tests/{gemma4_quantized,qwen35_quantized}.rs` via
+`crates/inference-infra/tests/support/numerical_capture.rs`. Capture the
+actual cumulative token IDs and native final-position logits for every
+pinned prompt/decode row. Write only to a supplied external run directory,
+refuse overwrite, and retain numerical failures. No reference values may
+supply an observation. Extend the existing `gemma4_native_trained_reference`,
+`ornith_9b_quantized_native_reference` and upstream
+`qwen35_0_8b_quantized_native_reference` runs.
+
+Add `crates/engine/examples/m3_numerical_report.rs` to read those rows
+against independently pinned reference bytes, verify exact profile,
+per-step input IDs, vocabulary and row inventory, and run the existing
+`NumericalMetrics::compare` on actual vs expected values. Produce
+machine-readable references, numerical observations and per-row metrics
+compatible with the existing qualification evaluator. Test rejected
+missing/swapped/non-finite rows and duplicate output, then execute with
+real native captures. Fixture execution, candidate identity, production
+admission and terminal CI are additional #72/#53 requirements.
+
+Apply the workspace formatter to the recently changed small-tier
+assignment in `crates/engine/src/backends/qwen/backend.rs` and rerun
+`cargo fmt --all -- --check`.
