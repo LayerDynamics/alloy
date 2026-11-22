@@ -131,3 +131,76 @@ fn qwen3_coder_trained_prefill_decode() {
         }
     }
 }
+
+#[path = "support/cache_memory.rs"]
+mod cache_memory;
+
+#[test]
+#[ignore = "requires pinned 30B-A3B weights, Metal and a physical 36 GiB Mac"]
+fn qwen3_coder_native_memory_tiers() {
+    let profile = profile();
+    cache_memory::run(&profile, |tier| {
+        let before = mlx_ffi::memory::active_memory_bytes().unwrap();
+        // The four input shards exceed 8 GiB even when the resident limit is smaller.
+        // Keep the file-read and resident-payload limits independent.
+        pinned_checkpoint::load(
+            &profile,
+            ARTIFACT,
+            24 << 30,
+            |path, mut options, verification| {
+                options.max_weight_bytes = tier.budget;
+                let result = MlxDecoderModel::load_qwen3_coder_verified(
+                    path,
+                    options,
+                    verification,
+                    &tier.stream,
+                );
+                if tier.budget < PAYLOAD {
+                    assert!(matches!(result,
+                    Err(MlxDecoderError::Model(ModelError::MemoryLimit{required,limit})) if required==PAYLOAD && limit==tier.budget));
+                    let after = mlx_ffi::memory::active_memory_bytes().unwrap();
+                    assert_eq!(before, after);
+                    println!(
+                        "native_cache_memory={}",
+                        serde_json::json!({
+                    "profile":profile["id"], "budget_bytes":tier.budget, "refused_weight_bytes":PAYLOAD,
+                    "active_before":before, "active_after":after})
+                    );
+                    return Ok::<_, MlxDecoderError>(());
+                }
+                let model = result?;
+                let peak = tier.load_peak();
+                assert_eq!(model.weight_payload_bytes(), PAYLOAD as u64);
+                let weights = model.weight_buffer_bytes()?;
+                assert!(weights >= PAYLOAD as u64);
+                let cache = model.new_cache(
+                    tier.tokens.len() + 1,
+                    (tier.budget as u64).checked_sub(weights).unwrap(),
+                    &tier.stream,
+                )?;
+                let vocabulary = model.config().vocab_size;
+                let (initial, measured) = tier.measure(
+                    peak,
+                    weights,
+                    vocabulary,
+                    cache,
+                    |tokens, cache| {
+                        model
+                            .prefill(
+                                tokens,
+                                cache,
+                                (tokens.len() * vocabulary * 4) as u64,
+                                &tier.stream,
+                            )
+                            .unwrap()
+                    },
+                    |cache| (cache.len(), cache.buffer_bytes().unwrap()),
+                );
+                let c = model.config();
+                let kv = (tier.tokens.len() + 1) * c.num_layers * c.kv_heads * c.head_dim * 2 * 4;
+                assert!(measured >= kv as u64 && initial <= measured);
+                Ok(())
+            },
+        );
+    });
+}

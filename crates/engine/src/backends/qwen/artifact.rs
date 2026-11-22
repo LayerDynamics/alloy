@@ -142,7 +142,8 @@ fn parse_json(path: &Path, bytes: &[u8]) -> Result<Value, EngineError> {
         .map_err(|e| EngineError::checkpoint_format("json", Some(path.to_owned()), e))
 }
 
-fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
+/// Validate the dense Qwen3 architecture and dimensions used by the native engine.
+pub fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
     if value.get("model_type").and_then(Value::as_str) != Some("qwen3") {
         return Err(EngineError::unsupported(
             "architecture",

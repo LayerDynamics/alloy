@@ -12,7 +12,7 @@ use mlx_ffi::memory;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-pub fn run(profile: &Value, parse: fn(&Value) -> Result<DecoderConfig, ModelError>) {
+pub fn run<E: std::fmt::Debug>(profile: &Value, parse: fn(&Value) -> Result<DecoderConfig, E>) {
     let root = PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap())
         .canonicalize()
         .unwrap();
@@ -44,9 +44,14 @@ pub fn run(profile: &Value, parse: fn(&Value) -> Result<DecoderConfig, ModelErro
             },
             &verification,
         );
-        if tier.budget == 8 << 30 && profile["id"] == "llama-3.1-8b-8bit" {
+        if tier.budget == 8 << 30
+            && matches!(
+                profile["id"].as_str(),
+                Some("llama-3.1-8b-8bit" | "qwen3-14b-4bit")
+            )
+        {
             let Err(ModelError::MemoryLimit { required, limit }) = weights else {
-                panic!("expected native 8-bit weight budget refusal");
+                panic!("expected native 8 GiB weight budget refusal");
             };
             assert!(required > limit && limit == tier.budget);
             assert_eq!(memory::active_memory_bytes().unwrap(), before);
