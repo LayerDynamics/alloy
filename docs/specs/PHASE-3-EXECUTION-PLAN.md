@@ -1881,3 +1881,24 @@ DaemonService session answered exactly 4 and then 8, streaming both replies.
 The loader, memory plan, production refusal and six trained reference rows
 passed in the same run. Strict Clippy passed across all targets in engine,
 alloyd and inference-infra (5ca3f74c52fd4c95b3f3316f658cb674).
+
+### #96 Gemma 4 trained tool output, declarations and linked results
+
+Implement the publisher's call and string delimiters as token IDs in
+`crates/engine/src/slab_parser/{mod,gemma4}.rs`. Convert the bounded call
+name and typed argument object into the existing admitted parser slab,
+validate JSON structure and duplicate keys, and publish the batch only at
+a valid end. Preserve stream text, multiple calls, Unicode, nested objects
+and arrays. Reject malformed, truncated, unsolicited-control and oversized
+output. Run gemma4_tool_fragments_and_typed_arguments and
+gemma4_tool_rejects_invalid_batches. Wire the parser, byte fallback and EOS
+in `crates/engine/src/backends/qwen/{architecture,backend,output}.rs`.
+Use `crates/engine/src/backends/qwen/gemma4_tools.jinja` for declarations,
+typed call history and linked results; validate structural spellings in raw
+values in `crates/engine/src/types/tool_context.rs`. Implement conservative
+result-token admission in `crates/engine/src/rendering.rs`. Match the frozen
+publisher tokenization for declarations and linked results in
+gemma4_publisher_tool_prompt_parity in `crates/alloyd/tests/gemma4_chat.rs`.
+Run the existing real-model tool-policy and compaction fixtures using the
+Gemma 4 profile, retaining observed failures. Only a passing real task
+counts toward production support.
