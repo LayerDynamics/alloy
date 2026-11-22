@@ -2490,3 +2490,25 @@ buffers. New named tests are qwen3_dense_trained_reference,
 qwen3_dense_native_memory_tiers and qwen3_coder_native_memory_tiers.
 Dependencies remain unchanged. The per-profile GPU runs and pinned outcomes
 are required before publishing these profiles in a passing release.
+
+### Qwen3 text and Coder in the shared qualification matrix
+
+Register the two dense profiles and the routed Coder in
+`scripts/ci/m3_native_numerical.py`, `scripts/ci/m3_native_behavior.py` and
+`crates/engine/examples/m3_numerical_report.rs`. Require the independent
+reference SHA before starting any native run, select the exact profile in
+the fixture environment and compare six complete 151936-logit rows.
+Use qwen3_dense_trained_reference, qwen3_coder_trained_prefill_decode,
+qwen3_dense_native_memory_tiers and qwen3_coder_native_memory_tiers, plus
+qwen3_coder_publisher_prompt_parity and qwen3_coder_native_registration.
+In `crates/alloyd/tests/llama_real_model.rs` extend llama3_tool_stop_context_cache
+and native_validated_context_boundary to all three profiles. Share the archive
+construction and publisher hashes with native_boundary_prompt_parity, which
+checks the actual daemon renderer at both sides of the boundary before GPU
+execution. Verify profile membership and missing-pin refusal in
+`scripts/tests/test_m3_native_behavior.py` and
+`scripts/tests/test_m3_native_numerical.py` using
+test_shared_lifecycle_is_mandatory_for_each_pinned_profile and
+test_qwen_numerical_selection_and_missing_reference_pin. Dependencies stay
+fixed. Full acceptance requires the trained outputs, policy-gated tool,
+compaction, cache, memory and exact-boundary generation for each profile.
