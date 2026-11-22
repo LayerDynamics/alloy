@@ -2199,3 +2199,28 @@ evidence, missing execution, named failures, and retained multi-kind
 observations. Exercise the engine example, the real matrix, and the property
 and report gates. Production admission separately needs a trusted deployed
 report and a matching runtime identity. No new dependencies.
+
+### #53 extend candidate-bound numerical coverage to Gemma 3, Phi and Ministral
+
+Use the five existing pinned trained checkpoints and their fixed eager references
+in crates/inference-infra/tests/{gemma3_quantized,phi_quantized,ministral3_quantized}.rs.
+Capture the actual final vocabulary vector for each prefill and each cached
+decode with the existing numerical_capture writer, preserving the original
+full-vector comparisons and cache assertions. Register both Gemma 3 sizes,
+Phi-4-mini 4-bit and both Ministral precisions in
+scripts/ci/m3_native_numerical.py and crates/engine/examples/m3_numerical_report.rs.
+The matrix should include all eight registered profiles. In
+scripts/ci/m3_native_behavior.py explicitly dispatch the existing family
+inventories so other architectures cannot inherit a hybrid fixture or receive
+a verdict from the wrong tests. In scripts/tests/test_m3_native_behavior.py
+exercise that distinction. No new dependencies.
+
+Named Metal tests are gemma3_4b_real_quantized_native_reference,
+gemma3_12b_real_quantized_native_reference, phi4mini_real_quantized_native_reference,
+ministral3_real_quantized_native_reference and ministral3_real_affine8_native_reference.
+Run each through the numerical CLI on a clean revision under the host lease.
+Check the six captured rows per profile against their full pinned vocabularies,
+both FR-8 thresholds and the terminal receipts. Run the matrix and report unit
+tests, rustfmt and strict Clippy. This batch supplies direct numerical evidence
+for the local-family exit. Each profile still needs its own behavioral inventory,
+native context and memory measurements, complete report and production admission.
