@@ -2362,3 +2362,28 @@ pinned eager reference. Named CPU test: qwen3_coder_trained_routed_layer.
 Dependencies are the existing MLX, safetensors, sha2 and reference environment.
 This maps to the trained routed layer of Qwen3-Coder. Full-model prefill/decode
 logits, tools, cache, long context and CI remain separate exit measurements.
+
+### Qwen3-Coder checkpoint and shared decoder
+
+Wire the verified 48-layer checkpoint into the shared decoder. Extend
+crates/inference-infra/src/decoder/loader.rs with optional exact packed
+tensor geometry and per-projection bits, keeping the ordinary verified
+loader contract. Validate each original rank-three weight/scale/bias
+shape before flat storage, account all bytes and keep shard authentication,
+failure and cancellation semantics. In crates/inference-infra/src/decoder/mod.rs
+and crates/inference-infra/src/decoder/qwen3_coder.rs declare the pinned
+architecture, its quantization overrides and complete tensor inventory.
+In crates/inference-infra/src/decoder/mlx_model.rs and
+crates/inference-infra/src/decoder/mlx_model/qwen3_coder.rs select the
+routed feed-forward block at each layer of the shared Q/K norm, RoPE,
+attention, residual and KV path. Include the router and every expert buffer
+in residency checks. Preserve existing dense construction and decoding.
+Use crates/inference-infra/tests/qwen3_coder_quantized.rs and
+crates/inference-infra/tests/fixtures/qwen3_coder_profile.json with
+crates/inference-infra/tests/fixtures/qwen3_coder/capture_model_reference.py.
+Named tests: qwen3_coder_verified_geometry, qwen3_coder_mixed_packing_rejected,
+qwen3_coder_trained_prefill_decode, plus existing loader regressions and
+trained first-layer numerical parity. Dependencies are the pinned local
+four-shard checkpoint, verified tokenizer, existing streaming reader and
+MLX CPU/Metal. The full exit requires the trained logits, registered
+runtime, behavioral suite and candidate-bound CI.
