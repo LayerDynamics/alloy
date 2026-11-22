@@ -189,7 +189,14 @@ pub const QWEN35_CACHE_REPRESENTATION: &str = "qwen35.mlx-f32.full-kv-and-recurr
 /// Publisher Phi role framing; tool mode has a separate protocol contract.
 pub const PHI_TEXT_TEMPLATE: &str = include_str!("phi_text.jinja");
 /// Phi function-list protocol with publisher role/end framing.
-pub const PHI_TOOL_TEMPLATE: &str = include_str!("phi_tools.jinja");
+pub const PHI_TOOL_TEMPLATE: &str = concat!(
+    "{% set error_guidance %}",
+    include_str!("phi_tool_error.txt"),
+    "{% endset %}",
+    include_str!("phi_tools.jinja")
+);
+// The header adds one leading space and trims the instruction's trailing newline.
+const PHI_TOOL_ERROR_MAX_BYTES: usize = 1 + include_str!("phi_tool_error.txt").len();
 /// Fixed long-factor SuScaledRoPE is part of persistent state identity.
 pub const PHI_CACHE_REPRESENTATION: &str = "phi.mlx-f32.full.bhtd.su-long-fixed.v1";
 

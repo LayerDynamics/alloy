@@ -1033,10 +1033,21 @@ impl RuntimeBackend for Qwen3Backend {
                 "rendered tool context identity does not match the selected Qwen profile",
             ));
         }
+        // Preflight renders empty successful results. A later failure can
+        // activate Phi's error guidance once, regardless of the batch size.
+        let header_growth = if self.family == BackendFamily::Phi {
+            PHI_TOOL_ERROR_MAX_BYTES
+        } else {
+            0
+        };
+        let additional_bytes = projection
+            .additional_rendered_bytes
+            .checked_add(header_growth)
+            .ok_or_else(|| EngineError::invalid_request("projection", "rendered byte bound overflow"))?;
         let rendered_bytes = rendered
             .text()
             .len()
-            .checked_add(projection.additional_rendered_bytes)
+            .checked_add(additional_bytes)
             .ok_or_else(|| {
                 EngineError::invalid_request("projection", "rendered byte bound overflow")
             })?;
@@ -1082,7 +1093,7 @@ impl RuntimeBackend for Qwen3Backend {
                 &data.tokenizer,
                 rendered,
                 projection.result_count,
-                projection.additional_rendered_bytes,
+                additional_bytes,
             );
         }
         if self.family.xml_tools() {

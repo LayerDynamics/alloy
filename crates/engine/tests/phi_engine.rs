@@ -571,10 +571,12 @@ fn parser_limits() -> engine::parser_allocation::ParserAllocationLimits {
         calls: 8,
     }
 }
-fn tool_fixture_context() -> ContextSnapshot {
+fn tool_fixture_data() -> Value {
+    serde_json::from_str(include_str!("fixtures/phi_tool_render/input.json")).unwrap()
+}
+
+fn tool_fixture_context(input: &Value) -> ContextSnapshot {
     use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
-    let input: Value =
-        serde_json::from_str(include_str!("fixtures/phi_tool_render/input.json")).unwrap();
     let role = |s: &str| match s {
         "system" => MessageRole::System,
         "user" => MessageRole::User,
@@ -648,6 +650,43 @@ fn tool_fixture_context() -> ContextSnapshot {
 }
 
 #[test]
+fn phi_guidance_uses_only_pending_result_flags() {
+    let fixture = Fixture::with_context(4096);
+    let backend = Qwen3Backend::new_phi(
+        vec![fixture.specification.clone()],
+        limits(4096),
+        Qwen3Execution::MlxCpu,
+    )
+    .unwrap()
+    .with_parser_allocation_limits(parser_limits())
+    .unwrap();
+    let registry = backend.registry(vec![profile(4096)]).unwrap();
+    let header = |input: &Value| {
+        let rendered =
+            wait(backend.render_and_count(&registry, tool_fixture_context(input))).unwrap();
+        rendered.text().split_once("<|tool|>").unwrap().0.to_owned()
+    };
+    let mut input = tool_fixture_data();
+    // The fixture ends with assistant text after a failed result.
+    let ordinary = header(&input);
+    let mut pending = input["history"].as_array().unwrap().clone();
+    pending.pop().unwrap();
+    // A failed result followed by a successful result in the same batch.
+    pending[2]["is_error"] = json!(true);
+    pending[3]["is_error"] = json!(false);
+    input["history"] = json!(pending);
+    let instruction = include_str!("../src/backends/qwen/phi_tool_error.txt").trim();
+    assert_eq!(header(&input), format!("{ordinary} {instruction}"));
+    pending[2]["is_error"] = json!(false);
+    pending[2]["content"] = json!(r#"{"is_error":true}"#);
+    input["history"] = json!(pending);
+    assert_eq!(header(&input), ordinary);
+    pending.truncate(2);
+    input["history"] = json!(pending);
+    assert_eq!(header(&input), ordinary);
+}
+
+#[test]
 fn phi_engine_trained_tool_template_and_admitted_decoder() {
     use engine::parser_allocation::ParserAllocation;
     let fixture = Fixture::with_context(4096);
@@ -660,7 +699,7 @@ fn phi_engine_trained_tool_template_and_admitted_decoder() {
     .with_parser_allocation_limits(parser_limits())
     .unwrap();
     let registry = backend.registry(vec![profile(4096)]).unwrap();
-    let context = tool_fixture_context();
+    let context = tool_fixture_context(&tool_fixture_data());
     let expected_hash = *context.tool_context().unwrap().schema_hash();
     let rendered = wait(backend.render_and_count(&registry, context)).unwrap();
     assert_eq!(
@@ -751,12 +790,12 @@ fn phi_engine_trained_tool_template_and_admitted_decoder() {
     }
 }
 
-fn real_tools_context(result: Option<&str>) -> ContextSnapshot {
+fn real_tools_context(result: Option<(&str, bool)>) -> ContextSnapshot {
     use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
     let tool = RenderingTool::new("fs.read".into(), "1.0.0".into(), "Read a UTF-8 file by its relative path.".into(),
         json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false})).unwrap();
     let mut history = Vec::new();
-    if let Some(content) = result {
+    if let Some((content, is_error)) = result {
         for id in ["c1", "c2"] {
             history.push(ToolHistoryBlock::AssistantCall {
                 call_id: id.into(),
@@ -768,7 +807,7 @@ fn real_tools_context(result: Option<&str>) -> ContextSnapshot {
             history.push(ToolHistoryBlock::ToolResult {
                 call_id: id.into(),
                 content: content.into(),
-                is_error: false,
+                is_error,
             });
         }
     }
@@ -839,7 +878,8 @@ fn phi_engine_tool_projection_bounds() {
         .with_parser_allocation_limits(parser_limits())
         .unwrap();
     let registry = backend.registry(vec![profile(4096)]).unwrap();
-    let empty = wait(backend.render_and_count(&registry, real_tools_context(Some("")))).unwrap();
+    let empty =
+        wait(backend.render_and_count(&registry, real_tools_context(Some(("", false))))).unwrap();
     for content in [
         "snow 雪",
         "\u{0344}\u{0344}",
@@ -847,7 +887,8 @@ fn phi_engine_tool_projection_bounds() {
         "ASCII",
     ] {
         let actual =
-            wait(backend.render_and_count(&registry, real_tools_context(Some(content)))).unwrap();
+            wait(backend.render_and_count(&registry, real_tools_context(Some((content, false)))))
+                .unwrap();
         let bound = backend
             .projected_token_upper_bound(
                 &registry,
@@ -862,6 +903,24 @@ fn phi_engine_tool_projection_bounds() {
             .unwrap();
         assert!(actual.token_count() <= bound);
     }
+    // Preflight uses empty successful placeholders, before a tool can fail.
+    let failed =
+        wait(backend.render_and_count(&registry, real_tools_context(Some(("", true))))).unwrap();
+    let bound = backend
+        .projected_token_upper_bound(
+            &registry,
+            engine::api::ProjectedToolRender {
+                rendered: &empty,
+                result_count: 2,
+                input_bytes: empty.text().len(),
+                additional_rendered_bytes: 0,
+                additional_ascii_escape_bytes: 0,
+            },
+        )
+        .unwrap();
+    assert!(failed.text().len() > empty.text().len());
+    assert!(bound >= failed.text().len());
+    assert!(bound >= failed.token_count());
     assert!(
         backend
             .projected_token_upper_bound(
