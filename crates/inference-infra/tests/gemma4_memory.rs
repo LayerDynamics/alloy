@@ -65,9 +65,9 @@ fn gemma4_native_memory_tiers() {
         assert_eq!(cache.buffer_bytes().unwrap(), 0);
         let baseline = memory::active_memory_bytes().unwrap();
         memory::reset_peak_memory().unwrap();
-        let mut parts = tokens.chunks_exact(32);
-        let last = parts.next_back().unwrap();
-        assert!(parts.remainder().is_empty());
+        let (chunks, remainder) = tokens.as_chunks::<32>();
+        assert!(remainder.is_empty());
+        let (last, parts) = chunks.split_last().unwrap();
         for part in parts {
             step(&model, &stream, &mut cache, part);
         }
