@@ -10,3 +10,4 @@ pub mod mlx_model;
 pub mod model;
 pub mod phi;
 pub mod qwen35;
+pub mod qwen3_coder;

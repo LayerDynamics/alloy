@@ -169,6 +169,34 @@ pub(crate) fn load_selected_tensor_set_verified<'a, T>(
     configure: impl FnOnce(&serde_json::Value) -> Result<(T, TensorLayout), ModelError>,
     excluded: impl Fn(&str) -> bool,
 ) -> Result<(T, LoadedTensorSet), ModelError> {
+    load_tensor_set_with_packing(
+        path,
+        options,
+        verification,
+        |value| {
+            let (metadata, layout) = configure(value)?;
+            Ok((metadata, layout, BTreeMap::new()))
+        },
+        excluded,
+    )
+}
+
+/// Native packed axes and bit width for a matrix that must be quantized.
+/// The storage presented to the reader is contiguous across all leading axes.
+pub(super) struct PackedGeometry {
+    pub leading: Vec<usize>,
+    pub bits: u8,
+}
+
+pub(super) type PackedInventory<T> = (T, TensorLayout, BTreeMap<String, PackedGeometry>);
+
+pub(super) fn load_tensor_set_with_packing<'a, T>(
+    path: &Path,
+    options: LoadOptions,
+    verification: &'a CheckpointVerification<'a>,
+    configure: impl FnOnce(&serde_json::Value) -> Result<PackedInventory<T>, ModelError>,
+    excluded: impl Fn(&str) -> bool,
+) -> Result<(T, LoadedTensorSet), ModelError> {
     let cancelled = Some(verification.cancelled);
     check_loading_cancelled(cancelled)?;
     let (supplied, root, is_directory) = resolve_source(path)?;
@@ -182,7 +210,7 @@ pub(crate) fn load_selected_tensor_set_verified<'a, T>(
     };
     let config_bytes = budget.read(&root.join("config.json"), CONFIG_BYTES_LIMIT)?;
     let data = serde_json::from_slice(&config_bytes).map_err(json_error)?;
-    let (metadata, layout) = configure(&data)?;
+    let (metadata, layout, mut packing) = configure(&data)?;
     drop(data);
     drop(config_bytes);
     if !matches!(layout.quantization_bits, 4 | 8)
@@ -212,9 +240,24 @@ pub(crate) fn load_selected_tensor_set_verified<'a, T>(
                 if *rows == 0 || *cols == 0 {
                     return Err(invalid("zero matrix dimension"));
                 }
-                inventory.matrix(name, &[*rows, *cols])?;
+                if let Some(geometry) = packing.remove(name) {
+                    let total = geometry.leading.iter().try_fold(1, |n, &d| product(n, d))?;
+                    if total != *rows
+                        || !(1..=2).contains(&geometry.leading.len())
+                        || !matches!(geometry.bits, 4 | 8)
+                        || inventory.info(name)?.dtype != Dtype::U32
+                    {
+                        return Err(invalid(format!("invalid required affine geometry: {name}")));
+                    }
+                    inventory.matrix_layout(name, &geometry.leading, *cols, geometry.bits)?;
+                } else {
+                    inventory.matrix(name, &[*rows, *cols])?;
+                }
             }
         }
+    }
+    if !packing.is_empty() {
+        return Err(invalid("packed geometry refers to unrequested matrices"));
     }
     if inventory.needed.len() != names.len()
         && names
@@ -921,6 +964,9 @@ fn load_weights_impl<'a>(
     if !matches!(config.quantization_bits, 4 | 8) {
         return Err(invalid("unsupported packed bit width"));
     }
+    if config.family == super::config::DecoderFamily::Qwen3Moe {
+        return Err(invalid("Qwen3-Coder requires its routed weight loader"));
+    }
     let cancelled = verification.map(|verification| verification.cancelled);
 
     check_loading_cancelled(cancelled)?;
@@ -1312,13 +1358,24 @@ impl Inventory<'_> {
         if shape.len() != 2 {
             return Err(invalid(format!("matrix requires rank-2 shape: {name}")));
         }
-        let (rows, cols) = (shape[0], shape[1]);
-        let pack = 32 / usize::from(self.bits);
+        self.matrix_layout(name, &shape[..1], shape[1], self.bits)
+    }
+
+    fn matrix_layout(
+        &mut self,
+        name: &str,
+        leading: &[usize],
+        cols: usize,
+        bits: u8,
+    ) -> Result<(), ModelError> {
+        check_loading_cancelled(self.cancelled)?;
+        let rows = leading.iter().try_fold(1, |n, &d| product(n, d))?;
+        let pack = 32 / usize::from(bits);
         let group_size = if self.info(name)?.dtype == Dtype::U32 {
             if rows == 0
                 || cols == 0
-                || cols % pack != 0
-                || self.info(name)?.shape != [rows, cols / pack]
+                || !cols.is_multiple_of(pack)
+                || self.info(name)?.shape.split_last() != Some((&(cols / pack), leading))
             {
                 return Err(invalid(format!("invalid packed shape: {name}")));
             }
@@ -1329,11 +1386,13 @@ impl Inventory<'_> {
             let bias_name = format!("{base}.biases");
             let scales = self.info(&scale_name)?;
             let biases = self.info(&bias_name)?;
-            if scales.shape.len() != 2 || scales.shape[0] != rows || biases.shape != scales.shape {
+            let Some((&groups, prefix)) = scales.shape.split_last() else {
+                return Err(invalid("missing affine parameter axes"));
+            };
+            if prefix != leading || biases.shape != scales.shape {
                 return Err(invalid("invalid quantization parameter shape"));
             }
-            let groups = scales.shape[1];
-            if groups == 0 || cols % groups != 0 {
+            if groups == 0 || !cols.is_multiple_of(groups) {
                 return Err(invalid("quantization groups do not divide matrix width"));
             }
             let group_size = cols / groups;
@@ -1353,7 +1412,7 @@ impl Inventory<'_> {
             Some(group_size)
         } else {
             let info = self.info(name)?;
-            if info.shape != shape {
+            if info.shape.split_last() != Some((&cols, leading)) {
                 return Err(invalid(format!("wrong tensor shape: {name}")));
             }
             validate_float_dtype(info.dtype)?;
@@ -1366,7 +1425,7 @@ impl Inventory<'_> {
                 rows,
                 cols,
                 group_size,
-                bits: self.bits,
+                bits,
             },
         );
         Ok(())
@@ -1818,6 +1877,42 @@ mod hardening_unit_tests {
                 return Err(invalid("unsupported hybrid fixture config"));
             }
             Ok(("validated-hybrid".into(), Self::layout()))
+        }
+    }
+
+    #[test]
+    fn packed_geometry_checks_original_axes_and_projection_bits() {
+        let fixture = HybridFixture::new();
+        let verify = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| false,
+        };
+        let load = |name: &str, leading, bits| {
+            load_tensor_set_with_packing(
+                &fixture.directory.0,
+                fixture.options(),
+                &verify,
+                |_| {
+                    Ok((
+                        (),
+                        HybridFixture::layout(),
+                        BTreeMap::from([(name.to_owned(), PackedGeometry { leading, bits })]),
+                    ))
+                },
+                |_| false,
+            )
+        };
+        assert!(load("proj.weight", vec![2], 4).is_ok());
+        for (name, leading, bits) in [
+            ("proj.weight", vec![2, 1], 4),
+            ("proj.weight", vec![2], 8),
+            ("norm.weight", vec![2], 4),
+            ("missing.weight", vec![2], 4),
+        ] {
+            assert!(matches!(
+                load(name, leading, bits),
+                Err(ModelError::CheckpointValidation(_))
+            ));
         }
     }
 

@@ -90,6 +90,8 @@ impl DecoderConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DecoderFamily {
     Qwen3,
+    /// Qwen3-Coder with a routed expert MLP in each transformer layer.
+    Qwen3Moe,
     Llama3,
     SmolLm3,
     /// Nested Ministral 3 text decoder with full-head YaRN and absolute query scaling.
@@ -177,7 +179,7 @@ impl DecoderConfig {
         self.rope_layers.as_ref().is_none_or(|layers| layers[layer])
     }
     pub fn has_qk_norm(&self) -> bool {
-        self.family == DecoderFamily::Qwen3
+        matches!(self.family, DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe)
     }
     pub fn norm_width(&self) -> usize {
         if self.has_qk_norm() { self.head_dim } else { 0 }

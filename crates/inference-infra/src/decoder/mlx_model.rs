@@ -326,6 +326,41 @@ impl MlxLinear {
     }
 }
 
+mod qwen3_coder;
+
+enum FeedForward {
+    Dense {
+        gate: MlxLinear,
+        up: MlxLinear,
+        down: MlxLinear,
+    },
+    Routed(Box<qwen3_coder::RoutedLayer>),
+}
+
+impl FeedForward {
+    fn apply(&self, x: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
+        match self {
+            Self::Dense { gate, up, down } => {
+                let activated =
+                    ops::swiglu(&gate.apply(x, stream)?, &up.apply(x, stream)?, stream)?;
+                down.apply(&activated, stream)
+            }
+            Self::Routed(layer) => layer.apply(x, stream),
+        }
+    }
+
+    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+        match self {
+            Self::Dense { gate, up, down } => {
+                gate.visit(visitor);
+                up.visit(visitor);
+                down.visit(visitor);
+            }
+            Self::Routed(layer) => layer.visit(visitor),
+        }
+    }
+}
+
 struct MlxLayer {
     input_layernorm: Array,
     q_proj: MlxLinear,
@@ -335,9 +370,7 @@ struct MlxLayer {
     k_norm: Option<Array>,
     o_proj: MlxLinear,
     post_attention_layernorm: Array,
-    gate_proj: MlxLinear,
-    up_proj: MlxLinear,
-    down_proj: MlxLinear,
+    mlp: FeedForward,
 }
 
 impl MlxLayer {
@@ -362,21 +395,23 @@ impl MlxLayer {
                 weights.post_attention_layernorm,
                 &[config.hidden_size],
             )?,
-            gate_proj: MlxLinear::upload(
-                weights.gate_proj,
-                config.intermediate_size,
-                config.hidden_size,
-            )?,
-            up_proj: MlxLinear::upload(
-                weights.up_proj,
-                config.intermediate_size,
-                config.hidden_size,
-            )?,
-            down_proj: MlxLinear::upload(
-                weights.down_proj,
-                config.hidden_size,
-                config.intermediate_size,
-            )?,
+            mlp: FeedForward::Dense {
+                gate: MlxLinear::upload(
+                    weights.gate_proj,
+                    config.intermediate_size,
+                    config.hidden_size,
+                )?,
+                up: MlxLinear::upload(
+                    weights.up_proj,
+                    config.intermediate_size,
+                    config.hidden_size,
+                )?,
+                down: MlxLinear::upload(
+                    weights.down_proj,
+                    config.hidden_size,
+                    config.intermediate_size,
+                )?,
+            },
         })
     }
 
@@ -393,9 +428,7 @@ impl MlxLayer {
         }
         self.o_proj.visit(visitor);
         visitor(&self.post_attention_layernorm);
-        self.gate_proj.visit(visitor);
-        self.up_proj.visit(visitor);
-        self.down_proj.visit(visitor);
+        self.mlp.visit(visitor);
     }
 }
 
@@ -503,38 +536,47 @@ impl MlxDecoderModel {
                 lm_head,
             };
 
-            let mut failure = None;
-            native.visit(|array| {
-                if let Err(error) = array.eval()
-                    && failure.is_none()
-                {
-                    failure = Some(error);
-                }
-            });
-
-            if let Some(error) = failure {
-                return Err(MlxDecoderError::Mlx(error));
-            }
-
-            let model = Self {
-                config,
-                weights: native,
-                owner: MlxModelId::new(),
-                weight_payload_bytes: payload,
-                healthy: Cell::new(true),
-            };
-            let measured = model.weight_buffer_bytes()?;
-            if measured > max_weight_payload_bytes {
-                return Err(MlxDecoderError::PayloadLimit {
-                    operation: "MLX resident weight backing buffers",
-                    required_bytes: measured,
-                    limit_bytes: max_weight_payload_bytes,
-                });
-            }
-            Ok(model)
+            Self::from_uploaded(config, native, payload, max_weight_payload_bytes)
         })();
 
         complete_stream(result, stream)
+    }
+
+    fn from_uploaded(
+        config: DecoderConfig,
+        native: MlxWeights,
+        payload: u64,
+        max_weight_payload_bytes: u64,
+    ) -> MlxDecoderResult<Self> {
+        let mut failure = None;
+        native.visit(|array| {
+            if let Err(error) = array.eval()
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        });
+
+        if let Some(error) = failure {
+            return Err(MlxDecoderError::Mlx(error));
+        }
+
+        let model = Self {
+            config,
+            weights: native,
+            owner: MlxModelId::new(),
+            weight_payload_bytes: payload,
+            healthy: Cell::new(true),
+        };
+        let measured = model.weight_buffer_bytes()?;
+        if measured > max_weight_payload_bytes {
+            return Err(MlxDecoderError::PayloadLimit {
+                operation: "MLX resident weight backing buffers",
+                required_bytes: measured,
+                limit_bytes: max_weight_payload_bytes,
+            });
+        }
+        Ok(model)
     }
 
     /// Exact architecture configuration.
@@ -776,7 +818,8 @@ impl MlxDecoderModel {
         // Llama's eager reference projects every prefill row before selecting
         // the final logits. A single-row GEMV rounds differently from GEMM near
         // zero; preserve the qualified graph and account for the full projection.
-        let projection_bytes = if !c.has_qk_norm() {
+        let project_all = !matches!(c.family, super::config::DecoderFamily::Qwen3);
+        let projection_bytes = if project_all {
             byte_count(checked_product(
                 tokens.len(),
                 c.vocab_size,
@@ -870,10 +913,7 @@ impl MlxDecoderModel {
 
             let normalized =
                 ops::rms_norm(&hidden, &layer.post_attention_layernorm, c.rms_eps, stream)?;
-            let gate = layer.gate_proj.apply(&normalized, stream)?;
-            let up = layer.up_proj.apply(&normalized, stream)?;
-            let activated = ops::swiglu(&gate, &up, stream)?;
-            let mlp_output = layer.down_proj.apply(&activated, stream)?;
+            let mlp_output = layer.mlp.apply(&normalized, stream)?;
             hidden = ops::residual_add(&hidden, &mlp_output, stream)?;
             if !c.has_qk_norm() {
                 // Bound Llama's live activation graph to one layer. Evaluating
@@ -889,7 +929,7 @@ impl MlxDecoderModel {
 
         let selected = match selection {
             OutputSelection::All => normalized,
-            OutputSelection::Last if !c.has_qk_norm() => normalized,
+            OutputSelection::Last if project_all => normalized,
             OutputSelection::Last => ops::slice(
                 &normalized,
                 &[token_count - 1, 0],
@@ -899,7 +939,7 @@ impl MlxDecoderModel {
         };
 
         let logits = self.weights.output_head().apply(&selected, stream)?;
-        let logits = if !c.has_qk_norm() && matches!(selection, OutputSelection::Last) {
+        let logits = if project_all && matches!(selection, OutputSelection::Last) {
             ops::slice(
                 &logits,
                 &[token_count - 1, 0],
@@ -1144,6 +1184,11 @@ pub(crate) fn check_matrix(
 
 fn validate_weights(c: &DecoderConfig, weights: &DecoderWeights) -> Result<u64, ModelError> {
     use super::config::DecoderFamily;
+    if c.family == DecoderFamily::Qwen3Moe {
+        return Err(ModelError::InvalidConfig(
+            "expected routed Qwen3-Coder weights",
+        ));
+    }
     if let DecoderFamily::Ministral3 { yarn, query_beta } = c.family {
         yarn.validate()
             .map_err(|_| ModelError::InvalidConfig("invalid Ministral YaRN parameters"))?;

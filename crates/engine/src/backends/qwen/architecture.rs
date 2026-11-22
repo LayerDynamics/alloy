@@ -22,6 +22,10 @@ fn dense_cache_mode(
     use inference_infra::decoder::config::DecoderFamily;
     match family {
         DecoderFamily::Qwen3 => family_cache_mode(BackendFamily::Qwen3),
+        DecoderFamily::Qwen3Moe => Ok(CacheMode {
+            representation: CacheRepresentationId::new("qwen3-coder.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        }),
         DecoderFamily::Llama3 => family_cache_mode(BackendFamily::Llama3),
         DecoderFamily::SmolLm3 => family_cache_mode(BackendFamily::SmolLm3),
         DecoderFamily::Ministral3 { .. } => family_cache_mode(BackendFamily::Ministral3),
