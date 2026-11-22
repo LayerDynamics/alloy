@@ -74,6 +74,7 @@ impl BootRequest {
         if !matches!(
             self.profile_id.as_str(),
             "qwen3-4b-4bit"
+                | "qwen3-14b-4bit"
                 | "qwen3-coder-30b-a3b-instruct-4bit"
                 | "llama-3.1-8b-4bit"
                 | "llama-3.1-8b-8bit"
@@ -136,7 +137,10 @@ pub fn boot_qwen3_with_context_limit(
     }
     if matches!(
         request.profile_id.as_str(),
-        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "qwen3-coder-30b-a3b-instruct-4bit"
+        "smollm3-3b-4bit"
+            | "phi4-mini-instruct-4bit"
+            | "qwen3-coder-30b-a3b-instruct-4bit"
+            | "qwen3-14b-4bit"
     ) || is_ministral_profile(&request.profile_id)
         || is_hybrid_profile(&request.profile_id)
         || is_gemma_profile(&request.profile_id)
@@ -562,7 +566,10 @@ fn is_frozen_profile(profile: &str) -> bool {
     profile.starts_with("llama-")
         || matches!(
             profile,
-            "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "qwen3-coder-30b-a3b-instruct-4bit"
+            "smollm3-3b-4bit"
+                | "phi4-mini-instruct-4bit"
+                | "qwen3-coder-30b-a3b-instruct-4bit"
+                | "qwen3-14b-4bit"
         )
         || is_ministral_profile(profile)
         || is_hybrid_profile(profile)
@@ -611,6 +618,9 @@ fn load_expected_hashes(
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
     let frozen: Option<&[u8]> = match profile_id {
+        "qwen3-14b-4bit" => Some(include_bytes!(
+            "../../families/qwen3/fixture/affine4_14b_profile.json"
+        )),
         "ministral-3-3b-instruct-2512-8bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/ministral3_8bit_profile.json"
         )),
@@ -881,6 +891,30 @@ mod qualification_boot_tests {
     fn unqualified_hybrids_cannot_boot_production() {
         for profile in ["ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"] {
             assert_unqualified_production_refused(profile);
+        }
+    }
+
+    #[test]
+    fn unqualified_qwen14b_cannot_boot_production() {
+        assert_unqualified_production_refused("qwen3-14b-4bit");
+    }
+
+    #[test]
+    fn frozen_qwen14b_pins() {
+        let profile = "qwen3-14b-4bit";
+        let pins = load_expected_hashes(Some(Path::new("/ignored/untrusted")), profile).unwrap();
+        let corpus: Value =
+            serde_json::from_slice(include_bytes!("../../../bench/corpus/models.json")).unwrap();
+        let expected = corpus["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == profile)
+            .unwrap();
+        let files = expected["artifact"]["files"].as_array().unwrap();
+        assert_eq!(pins.len(), files.len());
+        for file in files {
+            assert_eq!(pins[file["path"].as_str().unwrap()], file["sha256"]);
         }
     }
 

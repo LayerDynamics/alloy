@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline eager Qwen3-Coder oracle. Never imported or invoked by production inference."""
+"""Offline eager Qwen3 and Qwen3-Coder oracle. Never imported or invoked by production inference."""
 import argparse
 import hashlib
 import importlib.metadata
@@ -25,8 +25,13 @@ def capture(artifact, output, profile_path):
     mx.disable_compile()
     mx.set_default_device(mx.gpu)
     model, config = load_model(artifact, lazy=True)
-    assert config["model_type"] == "qwen3_moe"
-    assert type(model).__module__ == "mlx_lm.models.qwen3_moe"
+    architecture = {
+        "qwen3-coder-30b-a3b-instruct-4bit": "qwen3_moe",
+        "qwen3-4b-4bit": "qwen3",
+        "qwen3-14b-4bit": "qwen3",
+    }[profile["id"]]
+    assert config["model_type"] == architecture
+    assert type(model).__module__ == "mlx_lm.models." + architecture
     # Native payload retains packed U32 matrices and promotes floating metadata
     # and norms to F32. Match that declared representation in the oracle.
     model.apply(lambda a: a.astype(mx.float32) if mx.issubdtype(a.dtype, mx.floating) else a)
