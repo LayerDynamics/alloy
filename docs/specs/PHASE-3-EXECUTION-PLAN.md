@@ -2567,3 +2567,20 @@ allowances in `crates/engine/tests/unit/runtime_tests.rs` with
 cold_load_charge_preserves_peak_and_residency. Re-run engine CPU pressure tests,
 native_boundary_memory_estimate for all three trained Qwen profiles and the
 original Phase 1/2 gates on the release candidate. Dependencies stay fixed.
+
+### Pin full-vocabulary Qwen eager references
+
+For the R2 numerical gate, capture both prefill rows and the two decode rows
+per prompt using the existing offline Metal capture recipe. Verify the
+checkpoint revision, input and decode token IDs, library versions, eager
+execution and all six finite vocabulary rows for each profile. Record each
+observed reference SHA-256 in its manifest:
+
+- `crates/families/qwen3/fixture/affine4_4b_profile.json`
+- `crates/families/qwen3/fixture/affine4_14b_profile.json`
+- `crates/inference-infra/tests/fixtures/qwen3_coder_profile.json`
+
+Keep the reference payloads external and dependencies fixed. Run
+`qwen3_dense_trained_reference` against each dense manifest and
+`qwen3_coder_trained_prefill_decode` against the routed manifest. Compare
+native outputs using the existing tolerances on the same pinned artifacts.
