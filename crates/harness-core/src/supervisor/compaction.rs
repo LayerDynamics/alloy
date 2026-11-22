@@ -50,6 +50,7 @@ fn generate_checked<E: Engine>(
     snapshot: ContextSnapshot,
     id: RequestId,
     budget: ContextBudget,
+    schema: engine::structured_output::JsonOutputSchema,
     deadline: Instant,
     check: &impl Fn() -> HarnessResult<()>,
     on_started: &mut impl FnMut(&RequestId) -> HarnessResult<()>,
@@ -62,7 +63,9 @@ fn generate_checked<E: Engine>(
             "checkpoint verification request exceeds context budget".into(),
         ));
     }
-    let options = GenerationOptions::greedy(budget.output_reserve).map_err(HarnessError::from)?;
+    let options = GenerationOptions::greedy(budget.output_reserve)
+        .map_err(HarnessError::from)?
+        .with_json_schema(schema);
     let request =
         GenerationRequest::new(id.clone(), snapshot.profile_id().clone(), snapshot, options)
             .and_then(|request| request.with_expected_render(render))
@@ -235,6 +238,7 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             summary,
             id,
             budget,
+            Checkpoint::output_schema().map_err(HarnessError::from)?,
             deadline,
             check,
             on_started,
@@ -272,6 +276,11 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             verification_snapshot,
             verify_id,
             budget,
+            engine::structured_output::JsonOutputSchema::new(vec![(
+                "valid".into(),
+                engine::structured_output::JsonFieldType::Boolean,
+            )])
+            .map_err(HarnessError::from)?,
             deadline,
             check,
             on_started,

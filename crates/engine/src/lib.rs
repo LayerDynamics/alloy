@@ -36,6 +36,7 @@ pub mod residency_pin;
 pub mod residency_policy;
 pub mod runtime;
 pub mod scheduler;
+pub mod structured_output;
 /// Bounded hot KV retention and atomic safetensors persistence.
 pub mod tiered_kv;
 pub mod types;

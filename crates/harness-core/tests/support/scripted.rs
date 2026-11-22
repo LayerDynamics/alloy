@@ -17,6 +17,7 @@ pub struct ScriptedEngine {
     tokenizer: PinnedTokenizer,
     pub batches: Mutex<VecDeque<Vec<GenerationEvent>>>,
     pub contexts: Mutex<Vec<ContextSnapshot>>,
+    pub requests: Mutex<Vec<GenerationRequest>>,
     pub cancel_not_found: bool,
     pub cancel_not_found_id: Option<String>,
     pub budget: Option<engine::api::ProfileContextBudget>,
@@ -38,6 +39,7 @@ impl ScriptedEngine {
             .unwrap(),
             batches: Mutex::new(batches.into()),
             contexts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
             cancel_not_found: false,
             cancel_not_found_id: None,
             budget: Some(engine::api::ProfileContextBudget {
@@ -182,6 +184,7 @@ impl Engine for ScriptedEngine {
         Box::pin(async move { result })
     }
     fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
+        self.requests.lock().unwrap().push(request.clone());
         let events = if request.request_id().as_str().contains(":verify:") {
             let valid = self
                 .verification_results

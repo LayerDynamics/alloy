@@ -311,6 +311,37 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         Ok(None)
     }
 
+    /// Whether this backend implements the bounded JSON constraint constructor.
+    fn supports_json_output(&self) -> bool {
+        false
+    }
+
+    /// Decode constrained JSON as data, without interpreting tool syntax in strings.
+    fn json_decoder(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        Err(EngineError::unsupported(
+            "structured output",
+            "backend has no JSON text decoder",
+        ))
+    }
+
+    /// Construct request-owned JSON constraints only after workspace admission.
+    fn json_constraint(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+        _schema: crate::structured_output::JsonOutputSchema,
+        _control: &ExecutionControl,
+    ) -> Result<crate::structured_output::JsonConstraint, EngineError> {
+        Err(EngineError::unsupported(
+            "structured output",
+            "backend does not implement JSON constraints",
+        ))
+    }
+
     /// Return the actual profile EOS token IDs.
     fn eos_tokens(
         &self,
@@ -1166,6 +1197,18 @@ impl EngineRuntime for FamilyRuntime {
                 plan.prefill_chunk_tokens = decision.chunk_tokens;
                 plan.temporary_bytes = decision.workspace_bytes;
             }
+            if request.options().json_schema().is_some() {
+                if !backend.supports_json_output() {
+                    return Err(EngineError::unsupported(
+                        "structured output",
+                        "backend does not implement JSON constraints",
+                    ));
+                }
+                plan.temporary_bytes = plan
+                    .temporary_bytes
+                    .checked_add(crate::structured_output::JSON_WORKSPACE_BYTES)
+                    .ok_or_else(|| internal("structured-output workspace overflow"))?;
+            }
             validate_plan(
                 &registry,
                 request.profile_id(),
@@ -1175,8 +1218,11 @@ impl EngineRuntime for FamilyRuntime {
             )?;
             execution.check_cancelled()?;
 
-            let parser_limits =
-                backend.parser_allocation_limits(&registry, request.profile_id())?;
+            let parser_limits = if request.options().json_schema().is_some() {
+                None
+            } else {
+                backend.parser_allocation_limits(&registry, request.profile_id())?
+            };
             validate_parser_output_budget(plan.output_bytes, self.limits, parser_limits)?;
 
             let setup = Setup {
@@ -2123,6 +2169,7 @@ impl StateEntry {
 
 struct Active {
     decoder: Box<dyn TextDecoder>,
+    constraint: Option<crate::structured_output::JsonConstraint>,
     logits: Option<TokenLogits>,
     eos: Vec<u32>,
     control: ExecutionControl,
@@ -4032,13 +4079,34 @@ impl NativeState {
             .as_mut()
             .ok_or_else(|| internal("decoder construction lost its admitted startup"))?
             .take_parser(setup.parser_limits)?;
-        let decoder = setup.backend.decoder_with_tool_context(
-            &setup.registry,
-            &setup.profile,
-            parser,
-            setup.tool_context.clone(),
-        )?;
+        let decoder = if setup.options.json_schema().is_some() {
+            if parser.is_some() || setup.tool_context.is_some() {
+                return Err(internal("JSON generation cannot own a tool parser"));
+            }
+            setup
+                .backend
+                .json_decoder(&setup.registry, &setup.profile)?
+        } else {
+            setup.backend.decoder_with_tool_context(
+                &setup.registry,
+                &setup.profile,
+                parser,
+                setup.tool_context.clone(),
+            )?
+        };
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
+        let constraint = setup
+            .options
+            .json_schema()
+            .map(|schema| {
+                setup.backend.json_constraint(
+                    &setup.registry,
+                    &setup.profile,
+                    schema.clone(),
+                    &control,
+                )
+            })
+            .transpose()?;
 
         let compatibility =
             Compatibility::new(resident.model.as_ref(), cache.cache.as_ref(), context);
@@ -4113,6 +4181,7 @@ impl NativeState {
         }
         self.active = Some(Active {
             decoder,
+            constraint,
             logits: initial_logits,
             eos,
             control,
@@ -4199,14 +4268,17 @@ impl NativeState {
             .logits
             .as_ref()
             .ok_or_else(|| internal("decode has no preceding logits"))?;
-        let mut best = 0;
-        for index in 1..logits.values().len() {
-            if logits.values()[index] > logits.values()[best] {
-                best = index;
+        let token = if let Some(constraint) = &active.constraint {
+            constraint.select(logits.values(), &active.control)?
+        } else {
+            let mut best = 0;
+            for index in 1..logits.values().len() {
+                if logits.values()[index] > logits.values()[best] {
+                    best = index;
+                }
             }
-        }
-        let token =
-            u32::try_from(best).map_err(|_| internal("selected token exceeds u32 range"))?;
+            u32::try_from(best).map_err(|_| internal("selected token exceeds u32 range"))?
+        };
 
         let resident = self
             .resident
@@ -4246,6 +4318,10 @@ impl NativeState {
         }
         active.logits = Some(next);
 
+        if let Some(constraint) = &mut active.constraint {
+            constraint.consume(token)?;
+        }
+
         let end_of_sequence = active.eos.contains(&token);
         let blocks = if end_of_sequence {
             Vec::new()
@@ -4276,6 +4352,9 @@ impl NativeState {
             return Err(internal("text completion requested twice"));
         }
 
+        if let Some(constraint) = &active.constraint {
+            constraint.finish()?;
+        }
         let blocks = active.decoder.finish_blocks()?;
         active.control.check_cancelled()?;
         active.text_finished = true;

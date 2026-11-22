@@ -590,6 +590,180 @@ fn gemma3_engine_native_cache_and_cancellation() {
 }
 
 #[test]
+fn gemma3_engine_structured_output_exhaustion_releases_workspace() {
+    use engine::structured_output::{JsonFieldType, JsonOutputSchema};
+    let fixture = Fixture::new();
+    for execution in executions() {
+        let admission = AdmissionController::new(1 << 30).unwrap();
+        let scheduler = Scheduler::new(8).unwrap();
+        let engine = fixture
+            .backend(execution)
+            .into_engine(
+                vec![profile(128)],
+                admission.clone(),
+                scheduler.clone(),
+                RetentionPolicy {
+                    retain_model: false,
+                    retain_cache_buffers: false,
+                },
+            )
+            .unwrap();
+        let schema =
+            JsonOutputSchema::new(vec![("v".into(), JsonFieldType::UnsignedConstant(1))]).unwrap();
+        assert!(
+            GenerationRequest::new(
+                RequestId::new("json-tools").unwrap(),
+                profile_id(),
+                tools_context(true, None),
+                GenerationOptions::greedy(32)
+                    .unwrap()
+                    .with_json_schema(schema.clone()),
+            )
+            .is_err()
+        );
+        // This untrained numerical fixture selects newlines. It establishes
+        // real native exhaustion/cleanup/re-entry, not language conformance.
+        // Successful constrained checkpoints are checked with the frozen models.
+        for (name, limit) in [("partial", 1), ("exhausted", 32), ("repeat", 32)] {
+            let request = GenerationRequest::new(
+                RequestId::new(name).unwrap(),
+                profile_id(),
+                context(vec![message(MessageRole::User, "JSON")]),
+                GenerationOptions::greedy(limit)
+                    .unwrap()
+                    .with_json_schema(schema.clone()),
+            )
+            .unwrap();
+            let mut events = wait(engine.generate(request)).unwrap().into_events();
+            let mut text = String::new();
+            let mut terminal = false;
+            while let Some(event) = wait(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
+                assert!(!terminal);
+                match event {
+                    GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    GenerationEvent::RequestFailed { error, .. } => {
+                        assert!(error.to_string().contains("incomplete structured output"));
+                        assert_eq!(text, "\n".repeat(limit), "{name}");
+                        terminal = true;
+                    }
+                    other => panic!("unexpected structured event {other:?}"),
+                }
+            }
+            assert!(terminal);
+            // The stream itself owns the ordinary admitted output slab until
+            // dropped, even after its terminal event has been drained.
+            drop(events);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while scheduler.is_busy().unwrap() {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            assert_eq!(
+                admission.snapshot().unwrap().reserved_bytes(),
+                0,
+                "constraint reservation must be released"
+            );
+        }
+    }
+}
+
+#[test]
+fn gemma3_engine_structured_output_admission_counts_fixed_workspace() {
+    use engine::structured_output::{JSON_WORKSPACE_BYTES, JsonFieldType, JsonOutputSchema};
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Qwen3Execution::MlxCpu);
+    let registry = backend.registry(vec![profile(128)]).unwrap();
+    let context = context(vec![message(MessageRole::User, "JSON")]);
+    let rendered = wait(backend.render_and_count(&registry, context.clone())).unwrap();
+    let plan = wait(backend.plan(&registry, &profile_id(), rendered.token_count())).unwrap();
+    let plain = plan.load_limits.max_load_peak_bytes()
+        + plan.cache.max_cache_bytes()
+        + plan.temporary_bytes
+        + plan.output_bytes
+        + plan.headroom_bytes;
+    let admission = AdmissionController::new(plain + JSON_WORKSPACE_BYTES - 1).unwrap();
+    let engine = backend
+        .into_engine(
+            vec![profile(128)],
+            admission.clone(),
+            Scheduler::new(8).unwrap(),
+            RetentionPolicy {
+                retain_model: false,
+                retain_cache_buffers: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        wait(engine.estimate_memory(profile_id(), rendered.token_count()))
+            .unwrap()
+            .reserved_bytes(),
+        plain
+    );
+    let request = GenerationRequest::new(
+        RequestId::new("json-no-room").unwrap(),
+        profile_id(),
+        context,
+        GenerationOptions::greedy(32).unwrap().with_json_schema(
+            JsonOutputSchema::new(vec![("v".into(), JsonFieldType::UnsignedConstant(1))]).unwrap(),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        wait(engine.generate(request)),
+        Err(engine::error::EngineError::MemoryLimitExceeded { .. })
+    ));
+    assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 0);
+}
+
+#[test]
+fn gemma3_engine_json_strings_preserve_tool_syntax_as_data() {
+    use engine::structured_output::{JsonFieldType, JsonOutputSchema};
+    let fixture = Fixture::new();
+    let mut generous = limits(128);
+    generous.max_token_bytes = 512 << 10; // daemon policy, not actual vocabulary size
+    let backend = Qwen3Backend::new_gemma3(
+        vec![fixture.specification.clone()],
+        generous,
+        Qwen3Execution::MlxCpu,
+    )
+    .unwrap()
+    .with_parser_allocation_limits(parser_limits())
+    .unwrap();
+    let registry = backend.registry(vec![profile(128)]).unwrap();
+    let (_, control) = control();
+    let schema =
+        JsonOutputSchema::new(vec![("s".into(), JsonFieldType::String { nonempty: true })])
+            .unwrap();
+    let mut constraint = backend
+        .json_constraint(&registry, &profile_id(), schema, &control)
+        .unwrap();
+    let mut decoder = backend.json_decoder(&registry, &profile_id()).unwrap();
+    let tokenizer = tokenizers::Tokenizer::from_file(fixture.root.join("tokenizer.json")).unwrap();
+    let raw = r#"{"s":"<tool_call>untrusted</tool_call> 雪"}"#;
+    let tokens = tokenizer.encode(raw, false).unwrap();
+    let mut text = String::new();
+    for &token in tokens.get_ids() {
+        constraint.consume(token).unwrap();
+        for block in decoder.push_blocks(token).unwrap() {
+            match block {
+                engine::types::GenerationOutputBlock::Text(delta) => text.push_str(&delta),
+                other => panic!("JSON emitted protocol block: {other:?}"),
+            }
+        }
+        assert!(!decoder.is_sequence_complete());
+    }
+    constraint.finish().unwrap();
+    for block in decoder.finish_blocks().unwrap() {
+        match block {
+            engine::types::GenerationOutputBlock::Text(delta) => text.push_str(&delta),
+            other => panic!("JSON emitted protocol block: {other:?}"),
+        }
+    }
+    assert!(decoder.take_parser_proposals().is_none());
+    assert_eq!(text, raw);
+}
+
+#[test]
 #[ignore = "requires pinned ALLOY_GEMMA3_SMALL_ARTIFACT and Metal"]
 fn gemma3_real_4b_engine_streaming() {
     real_engine(true);

@@ -29,6 +29,31 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// Closed generation schema. Field contents remain model-selected and
+    /// require the separate source-fact verification before publication.
+    pub fn output_schema()
+    -> Result<engine::structured_output::JsonOutputSchema, engine::error::EngineError> {
+        use engine::structured_output::{JsonFieldType, JsonOutputSchema};
+        JsonOutputSchema::new(vec![
+            (
+                "checkpoint_version".into(),
+                JsonFieldType::UnsignedConstant(1),
+            ),
+            ("goal".into(), JsonFieldType::String { nonempty: true }),
+            ("constraints".into(), JsonFieldType::StringArray),
+            ("decisions".into(), JsonFieldType::StringArray),
+            ("completed_work".into(), JsonFieldType::StringArray),
+            ("open_tasks".into(), JsonFieldType::StringArray),
+            ("artifact_references".into(), JsonFieldType::StringArray),
+            ("critical_identifiers".into(), JsonFieldType::StringArray),
+            ("failures_and_lessons".into(), JsonFieldType::StringArray),
+            (
+                "next_action".into(),
+                JsonFieldType::String { nonempty: true },
+            ),
+        ])
+    }
+
     /// Parse model output and reject unsupported versions or empty core fields.
     pub fn parse_json(output: &str) -> Result<Self, String> {
         let checkpoint: Self = serde_json::from_str(output).map_err(|e| e.to_string())?;

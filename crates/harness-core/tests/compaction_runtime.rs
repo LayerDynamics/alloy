@@ -126,6 +126,30 @@ fn overflow_retries_bad_json_then_commits_and_continues() {
         .run_turn(&store, "s", &"new ".repeat(200), 20)
         .unwrap();
     assert_eq!(outcome.assistant_text, "continued");
+    let requests = supervisor.engine().requests.lock().unwrap();
+    let verifier_schema = engine::structured_output::JsonOutputSchema::new(vec![(
+        "valid".into(),
+        engine::structured_output::JsonFieldType::Boolean,
+    )])
+    .unwrap();
+    for request in requests.iter() {
+        let expected = if request.request_id().as_str().contains(":compact:") {
+            Some(harness_core::context::Checkpoint::output_schema().unwrap())
+        } else if request.request_id().as_str().contains(":verify:") {
+            Some(verifier_schema.clone())
+        } else {
+            None
+        };
+        assert_eq!(request.options().json_schema(), expected.as_ref());
+        assert!(request.context().tool_context().is_none());
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.options().json_schema().is_some())
+            .count(),
+        3
+    );
     let events = store.lock().unwrap().list_events("s").unwrap();
     assert_eq!(&events[..before.len()], before.as_slice());
     assert_eq!(

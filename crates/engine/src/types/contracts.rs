@@ -384,6 +384,7 @@ pub struct GenerationOptions {
     max_output_tokens: NonZeroUsize,
     decoding: DecodingMode,
     seed: Option<u64>,
+    json_schema: Option<crate::structured_output::JsonOutputSchema>,
 }
 
 impl GenerationOptions {
@@ -435,6 +436,7 @@ impl GenerationOptions {
             max_output_tokens,
             decoding,
             seed,
+            json_schema: None,
         })
     }
 
@@ -456,6 +458,17 @@ impl GenerationOptions {
     /// Return the optional sampling seed.
     pub fn seed(&self) -> Option<u64> {
         self.seed
+    }
+
+    /// Require native token selection to satisfy this validated JSON schema.
+    pub fn with_json_schema(mut self, schema: crate::structured_output::JsonOutputSchema) -> Self {
+        self.json_schema = Some(schema);
+        self
+    }
+
+    /// Optional closed-object constraint; absent for ordinary text generation.
+    pub fn json_schema(&self) -> Option<&crate::structured_output::JsonOutputSchema> {
+        self.json_schema.as_ref()
     }
 }
 
@@ -481,6 +494,13 @@ impl GenerationRequest {
             return Err(EngineError::invalid_request(
                 "profile_id",
                 "request profile does not match the context snapshot",
+            ));
+        }
+
+        if options.json_schema().is_some() && context.tool_context().is_some() {
+            return Err(EngineError::invalid_request(
+                "structured output",
+                "JSON constraints cannot be combined with a tool context",
             ));
         }
 

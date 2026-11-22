@@ -57,6 +57,7 @@ struct ArtifactData {
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
     gemma_decoder: bool,
+    max_token_spelling_bytes: usize,
     manifest_sha256: [u8; 32],
     eos: Vec<u32>,
     source_bytes: u64,

@@ -1389,3 +1389,40 @@ The untrained tiny model chooses newlines; its runtime test therefore proves
 bounded exhaustion, cleanup and re-entry. Success belongs to frozen-model
 lifecycle evidence. JSON requests use the plain decoder so protocol spellings
 inside string values remain data; an explicit decoder regression covers this.
+
+Native constraint validation: receipt b879db8bb6714dad93febce970cee8a2
+passes the tiny-model exhaustion/re-entry and one-byte-short admission checks,
+13 harness compaction/rollback checks, and strict Clippy. The actual tokenizer
+maximum correction is covered with the daemon's 512 KiB policy ceiling; JSON
+strings containing tool syntax are preserved as data. Raw schema names are
+stored as boxed strings to discard unbounded caller-provided spare capacity.
+
+Receipt 7130ba96783c4c8ab339f54d9a68721c completes successfully: 630 engine
+checks pass, 13 opt-in tests are ignored, and strict engine/harness/alloyd
+Clippy passes. The frozen Gemma3-12B release lifecycle suite passes all six
+checks in 353.14 seconds. Native checkpoint generation emits all required
+fields and facts as valid JSON (1355 input/169 output tokens); separate model
+verification returns valid:true (1404 input/6 output tokens). Continuation and
+reopened follow-up both return exactly COBALT. The fixture records initial
+1634 tokens, continued610, resumed640, original5 events and final10 events;
+original history remains intact. Canonical token history, actual process
+restart/rebuild and both exact skill-change checks pass. The existing deadline
+and exact-output assertions are unchanged. No dependency, prompt-template,
+output postprocessing or production-profile promotion was introduced.
+
+The 4B release lifecycle rerun is pending in
+0fba7626921c42b9a7ec02396d9b6f0e. Its earlier plain-answer conformance failures
+remain open until current terminal evidence resolves them. Gemma4, other
+unqualified families, formal conformance reports and candidate-bound CI remain
+separate issue53 requirements.
+
+4B terminal receipt 0fba7626921c42b9a7ec02396d9b6f0e completes with 3/6
+lifecycle checks passing (63.39 seconds). Checkpoint JSON preserves all facts
+and model verification returns true. Exact continuation still emits
+`COBALT authentication`; both skill checks still fail on `COBALT\n`. Canonical
+history, rendering and process restart/rebuild pass. The five bounded JSON
+recognizer tests and all13 compaction transaction tests pass on final code.
+The family remains unqualified on the small profile. A next resolving step is
+a pinned upstream comparison of a higher-precision small Gemma artifact
+against these exact prompts, before changing production profiles or kernels.
+The mandatory frozen12B artifact stays unchanged.

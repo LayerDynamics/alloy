@@ -23,6 +23,8 @@
 //! Affine4 residency and greedy decoding are advertised. Rotating caches,
 //! stochastic sampling and thinking mode are not.
 
+#[path = "constraints.rs"]
+mod constraints;
 #[path = "output.rs"]
 mod output;
 use self::output::Qwen3TextDecoder;
@@ -427,7 +429,9 @@ impl Qwen3Backend {
                     }
                 }
             }
+            let mut max_token_spelling_bytes = 0;
             for (spelling, id) in tokenizer.tokenizer().get_vocab(true) {
+                max_token_spelling_bytes = max_token_spelling_bytes.max(spelling.len());
                 if u64::from(id) >= as_u64(config.vocabulary())?
                     || spelling.len() > limits.max_token_bytes
                 {
@@ -528,6 +532,7 @@ impl Qwen3Backend {
                 special_tokens: Arc::new(specials),
                 byte_decoder: Arc::clone(&inverse),
                 gemma_decoder,
+                max_token_spelling_bytes,
                 manifest_sha256,
                 eos,
                 source_bytes,
@@ -772,6 +777,28 @@ include!("phi_loading.rs");
 include!("gemma3_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
+    fn supports_json_output(&self) -> bool {
+        true
+    }
+
+    fn json_constraint(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        schema: crate::structured_output::JsonOutputSchema,
+        control: &ExecutionControl,
+    ) -> Result<crate::structured_output::JsonConstraint, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
+        if data.max_token_spelling_bytes > 64 << 10 {
+            return Err(EngineError::unsupported(
+                "structured output",
+                "tokenizer spelling scratch exceeds 64 KiB",
+            ));
+        }
+        constraints::build(data, schema, control)
+    }
+
     fn verify_retained_prefix_bytes(
         &self,
         registry: &Registry,
@@ -1068,22 +1095,22 @@ impl RuntimeBackend for Qwen3Backend {
         registry: &Registry,
         profile: &ModelProfileId,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
-        let resolved = registry.resolve_profile(profile)?;
-        let data = self.data(resolved.artifact())?;
         if self.tool_call_parsing {
             return Err(EngineError::unsupported(
                 "admitted parser storage",
                 "tool generation requires the storage-backed decoder construction hook",
             ));
         }
-        let parser = if self.tool_call_parsing {
-            Some(
-                qwen3::tool_calls::ToolCallParser::new(self.tool_parser_limits())
-                    .map_err(|error| execution_error("tool call parser", error.to_string()))?,
-            )
-        } else {
-            None
-        };
+        self.json_decoder(registry, profile)
+    }
+
+    fn json_decoder(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
         Ok(Box::new(Qwen3TextDecoder {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
@@ -1092,7 +1119,7 @@ impl RuntimeBackend for Qwen3Backend {
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
-            parser,
+            parser: None,
             slab: None,
             xml: None,
             phi: None,
