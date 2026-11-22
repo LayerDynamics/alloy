@@ -288,6 +288,28 @@ mod tests {
         assert!(check().is_err());
     }
     #[test]
+    fn m3_numerical_report_preserves_native_float_bits() {
+        // Observed E4B case 0, step 0, vocabulary index 2.
+        let decimal = "-10.223902702331543";
+        let native = f64::from(decimal.parse::<f32>().unwrap());
+        let raw = dir();
+        let mut value = row();
+        value["logits"] = json!([native, 0.0]);
+        write(&raw.0.join("case-0-step-0.json"), &value).unwrap();
+        let mut frozen = reference();
+        frozen.cases[0].logits[0][0] = serde_json::from_str(decimal).unwrap();
+        let sections = Sections::load(&pin(), 2, frozen, &raw.0).unwrap();
+        assert_eq!(
+            sections.references["case-0-step-0"].logits[0].to_bits(),
+            native.to_bits()
+        );
+        assert_eq!(
+            sections.observations[0].logits[0].to_bits(),
+            native.to_bits()
+        );
+    }
+
+    #[test]
     fn m3_numerical_report_retains_failed_metrics_and_refuses_overwrite() {
         let raw = dir();
         let output = dir();
