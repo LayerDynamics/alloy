@@ -2645,3 +2645,21 @@ untiled attention on MLX CPU and Metal. Update
 check both limits and reservation scaling. Run the original trained
 numerical, memory and 40,384/40,385-token boundary checks at the existing
 deadlines. Dependencies and frozen acceptance fixtures stay fixed.
+
+### Group routed projections by expert during prefill
+
+In the pinned mlx-lm SwitchGLU, 64 or more token/expert assignments are
+sorted by expert before all three projections, then restored to token
+and route order before the weighted sum. Alloy always issues unsorted
+gathers. At 128 Coder tokens the 1,024 assignments across 128 experts
+meet the vendored Metal grouped gather kernel's dispatch conditions.
+In `crates/mlx-ffi/src/ops/routed.rs`, implement the sorted gather and
+inverse permutation on the supplied stream. Keep decode and small batches
+on the direct path. In `crates/engine/src/backends/qwen/memory.rs`, charge
+the additional activation copies and permutations used by large batches.
+Extend `routed_swiglu_matches_selected_experts` in
+`crates/mlx-ffi/tests/ops.rs` to compare routing decisions and weighted
+outputs below, at and above the sorting threshold with repeated expert
+IDs and distinguishable tokens. Run that test on CPU and Metal, the
+pinned trained layer and full-model reference, and the original Coder
+boundary on the physical host. Dependencies stay fixed.
