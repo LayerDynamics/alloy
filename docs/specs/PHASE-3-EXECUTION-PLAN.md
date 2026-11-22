@@ -2472,3 +2472,21 @@ the Phase 1 4B boot path and the routed Coder profile behavior intact. Test
 unqualified_qwen14b_cannot_boot_production and frozen_qwen14b_pins in the
 boot module. Dependency versions remain fixed. These steps establish real
 reference inputs and native selection for the dense Qwen M3 requirement.
+
+### Dense and routed Qwen3 native numerical and memory fixtures
+
+In crates/engine/src/backends/qwen/{artifact.rs,backend.rs} expose the
+existing validated dense configuration reader to the engine's trained fixture.
+In crates/engine/tests/qwen3_trained.rs compare full native logits for both
+pinned dense profiles with the immutable eager captures, including two actual
+incremental decode calls for each prompt. Reuse numerical_capture and
+pinned_checkpoint. Require the captured SHA, publisher token IDs, exact
+version/device, complete vocabulary, finite logits and the existing thresholds.
+Generalize crates/inference-infra/tests/support/dense_memory.rs to take the
+same native parser and assert the expected real 8 GiB weight-budget refusal
+for 14B. In crates/inference-infra/tests/qwen3_coder_quantized.rs add
+qwen3_coder_native_memory_tiers using the routed loader and actual MLX
+buffers. New named tests are qwen3_dense_trained_reference,
+qwen3_dense_native_memory_tiers and qwen3_coder_native_memory_tiers.
+Dependencies remain unchanged. The per-profile GPU runs and pinned outcomes
+are required before publishing these profiles in a passing release.
