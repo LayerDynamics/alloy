@@ -10,7 +10,60 @@ use crate::decoder::{
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
+pub struct WeightPayloadPlan {
+    pub payload_bytes: u64,
+    pub largest_upload_bytes: u64,
+}
+
 impl Gemma4TextConfig {
+    /// Validate the pinned packed recipe before planning memory or reading any tensor.
+    pub fn from_affine4_json(value: &Value) -> Result<Self, ModelError> {
+        let recipe = json!({"group_size":64,"bits":4,"mode":"affine"});
+        if value["quantization"] != recipe
+            || value
+                .get("quantization_config")
+                .is_some_and(|q| q != &recipe)
+            || ["quantization", "quantization_config"]
+                .iter()
+                .any(|k| value["text_config"].get(k).is_some_and(|q| q != &recipe))
+        {
+            return Err(invalid("unsupported or conflicting affine recipe"));
+        }
+        Self::from_json(value)
+    }
+
+    /// Packed U32 values and two F32 group parameters are separate uploads.
+    pub fn weight_payload_plan(&self) -> Result<WeightPayloadPlan, ModelError> {
+        let mut total = 0u128;
+        let mut largest = 0u128;
+        for request in self.affine4_layout()?.tensors.into_values() {
+            let (payload, upload) = match request {
+                TensorRequest::Matrix { rows, cols } => {
+                    if !cols.is_multiple_of(64) {
+                        return Err(invalid("unaligned affine4 matrix"));
+                    }
+                    let elements = rows as u128 * cols as u128;
+                    let packed = elements / 2;
+                    (packed + 2 * (elements / 64) * 4, packed)
+                }
+                TensorRequest::Float(shape) => {
+                    let bytes = shape
+                        .into_iter()
+                        .try_fold(4u128, |n, d| n.checked_mul(d as u128))
+                        .ok_or_else(|| invalid("float tensor overflow"))?;
+                    (bytes, bytes)
+                }
+            };
+            total += payload;
+            largest = largest.max(upload);
+        }
+        Ok(WeightPayloadPlan {
+            payload_bytes: u64::try_from(total).map_err(|_| invalid("weight payload overflow"))?,
+            largest_upload_bytes: u64::try_from(largest)
+                .map_err(|_| invalid("weight upload overflow"))?,
+        })
+    }
+
     /// Exact logical names and shapes. Affine scales and biases are collected
     /// by the shared loader. Only the cache owners have K/V parameters.
     pub fn affine4_layout(&self) -> Result<TensorLayout, ModelError> {
@@ -96,18 +149,7 @@ impl Gemma4TextConfig {
 }
 
 fn configure(value: &Value) -> Result<(Gemma4TextConfig, TensorLayout), ModelError> {
-    let recipe = json!({"group_size":64,"bits":4,"mode":"affine"});
-    if value["quantization"] != recipe
-        || value
-            .get("quantization_config")
-            .is_some_and(|q| q != &recipe)
-        || ["quantization", "quantization_config"]
-            .iter()
-            .any(|k| value["text_config"].get(k).is_some_and(|q| q != &recipe))
-    {
-        return Err(invalid("unsupported or conflicting affine recipe"));
-    }
-    let config = Gemma4TextConfig::from_json(value)?;
+    let config = Gemma4TextConfig::from_affine4_json(value)?;
     let layout = config.affine4_layout()?;
     Ok((config, layout))
 }

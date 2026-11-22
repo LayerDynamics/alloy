@@ -1,0 +1,13 @@
+{{- '<bos>' -}}
+{%- set ns = namespace(previous='') -%}
+{%- for message in messages -%}
+    {%- if message.role not in ['system', 'user', 'assistant'] -%}
+        {{- raise_exception('unsupported Gemma 4 text role') -}}
+    {%- endif -%}
+    {%- if message.role != 'assistant' or ns.previous != 'assistant' -%}
+        {{- '<|turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' -}}
+    {%- endif -%}
+    {{- message.content | trim -}}{{- '<turn|>\n' -}}
+    {%- set ns.previous = message.role -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{ '<|turn>model\n' }}{%- endif -%}

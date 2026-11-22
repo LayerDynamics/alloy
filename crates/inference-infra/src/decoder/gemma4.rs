@@ -52,6 +52,81 @@ pub struct Gemma4TextConfig {
 }
 
 impl Gemma4TextConfig {
+    pub fn context(&self) -> usize {
+        self.context
+    }
+    pub fn vocabulary(&self) -> usize {
+        self.vocabulary
+    }
+
+    /// Logical retained K/V storage. Shared consumers have no buffers of their own.
+    pub fn cache_payload(&self, end: usize) -> Result<u64, ModelError> {
+        self.cache_bytes(end, 0)
+    }
+
+    // Owner views consist of their retained prefix followed by the complete new chunk.
+    fn cache_bytes(&self, prefix: usize, chunk: usize) -> Result<u64, ModelError> {
+        let end = prefix
+            .checked_add(chunk)
+            .ok_or_else(|| invalid("position overflow"))?;
+        if end > self.context {
+            return Err(invalid("invalid cache length"));
+        }
+        let bytes = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(i, layer)| *i == layer.kv_owner)
+            .map(|(_, layer)| {
+                let old = if layer.sliding {
+                    prefix.min(self.window)
+                } else {
+                    prefix
+                };
+                (old + chunk) as u128 * 8 * self.kv_heads as u128 * layer.head_dim as u128
+            })
+            .sum::<u128>();
+        u64::try_from(bytes).map_err(|_| invalid("cache payload overflow"))
+    }
+
+    /// Upper bound for every prefill or decode ending within capacity, including
+    /// old buffers, the untrimmed attention views, and the trimmed successor.
+    pub fn cache_overlap_bound(
+        &self,
+        capacity: usize,
+        max_chunk: usize,
+    ) -> Result<u64, ModelError> {
+        if capacity == 0 || max_chunk == 0 {
+            return Err(invalid("empty cache plan"));
+        }
+        let chunk = max_chunk.min(capacity);
+        let retained = self.cache_payload(capacity)?;
+        let views = self.cache_bytes(capacity - chunk, chunk)?;
+        retained
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(views))
+            .ok_or_else(|| invalid("cache overlap overflow"))
+    }
+
+    pub fn workspace_bytes(&self, tokens: usize, end: usize) -> Result<u64, ModelError> {
+        if tokens == 0 || tokens > end || end > self.context {
+            return Err(invalid("invalid workspace length"));
+        }
+        let head_dim = self
+            .layers
+            .iter()
+            .map(|layer| layer.head_dim)
+            .max()
+            .unwrap() as u128;
+        let per_token = 6 * self.layers.len() as u128 * self.input_width as u128
+            + 8 * self.hidden as u128
+            + 4 * self.intermediate as u128
+            + 6 * self.query_heads as u128 * head_dim
+            + self.query_heads as u128 * end as u128
+            + 4 * self.vocabulary as u128;
+        u64::try_from(4 * tokens as u128 * per_token).map_err(|_| invalid("workspace overflow"))
+    }
+
     pub fn from_json(config: &Value) -> Result<Self, ModelError> {
         let c = &config["text_config"];
         if config["model_type"] != "gemma4"

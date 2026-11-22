@@ -8,6 +8,7 @@ enum BackendFamily {
     Ornith,
     Phi,
     Gemma3,
+    Gemma4,
     Ministral3,
 }
 impl BackendFamily {
@@ -31,6 +32,7 @@ enum BackendConfig {
     Transformer(Qwen3Config),
     Hybrid(inference_infra::decoder::qwen35::config::Qwen35Config),
     Phi(inference_infra::decoder::phi::PhiConfig),
+    Gemma4(inference_infra::decoder::gemma4::Gemma4TextConfig),
     Gemma3(inference_infra::decoder::gemma3::Gemma3Config),
 }
 impl BackendConfig {
@@ -40,6 +42,7 @@ impl BackendConfig {
             Self::Hybrid(c) => c.vocabulary,
             Self::Phi(c) => c.vocabulary,
             Self::Gemma3(c) => c.vocabulary,
+            Self::Gemma4(c) => c.vocabulary(),
         }
     }
     fn context(&self) -> usize {
@@ -48,6 +51,7 @@ impl BackendConfig {
             Self::Hybrid(c) => c.context,
             Self::Phi(c) => c.context,
             Self::Gemma3(c) => c.context,
+            Self::Gemma4(c) => c.context(),
         }
     }
     fn chunk_limit(&self, configured: usize, capacity: usize) -> usize {
@@ -57,11 +61,15 @@ impl BackendConfig {
             _ => configured,
         }
     }
-    fn cache_bound(&self, capacity: usize) -> Result<u64, EngineError> {
+    fn cache_bound(&self, capacity: usize, chunk: usize) -> Result<u64, EngineError> {
         match self {
             Self::Transformer(c) => cache_bound(c, capacity),
             Self::Phi(c) => phi_cache_bound(c, capacity),
-            Self::Gemma3(c) => c.cache_payload(capacity)
+            Self::Gemma4(c) => c
+                .cache_overlap_bound(capacity, chunk)
+                .map_err(|e| model_error(e, "plan Gemma 4 cache")),
+            Self::Gemma3(c) => c
+                .cache_payload(capacity)
                 .map_err(|e| execution_error("plan Gemma3 cache", e.to_string()))
                 .and_then(|bytes| product(bytes, 2)),
             Self::Hybrid(c) => c
@@ -78,15 +86,29 @@ impl BackendConfig {
     ) -> Result<u64, EngineError> {
         match self {
             Self::Transformer(c) => workspace_bound(c, capacity, chunk, token_bytes),
+            Self::Gemma4(c) => sum(&[
+                c.workspace_bytes(chunk, capacity)
+                    .map_err(|e| model_error(e, "plan Gemma 4 workspace"))?,
+                product(as_u64(token_bytes)?, 8)?,
+                16 * 1024,
+            ]),
             Self::Gemma3(c) => {
-                let p = c.step_payload_plan(chunk, capacity)
+                let p = c
+                    .step_payload_plan(chunk, capacity)
                     .map_err(|e| execution_error("plan Gemma3 step", e.to_string()))?;
                 // The native step bound already includes three complete KV
                 // payloads for transactional overlap. Two are reserved by
                 // cache_bound; charge only the remainder as workspace.
-                let workspace = p.work_bytes.checked_sub(self.cache_bound(capacity)?)
+                let workspace = p
+                    .work_bytes
+                    .checked_sub(self.cache_bound(capacity, chunk)?)
                     .ok_or_else(|| internal("Gemma3 step bound omits reserved cache overlap"))?;
-                sum(&[workspace, p.output_bytes, product(as_u64(token_bytes)?, 8)?, 16 * 1024])
+                sum(&[
+                    workspace,
+                    p.output_bytes,
+                    product(as_u64(token_bytes)?, 8)?,
+                    16 * 1024,
+                ])
             }
             Self::Phi(c) => {
                 let p = c
@@ -115,7 +137,12 @@ impl BackendConfig {
     fn largest_upload(&self) -> Result<u64, EngineError> {
         match self {
             Self::Transformer(c) => largest_upload_buffer_bound(c),
-            Self::Gemma3(c) => c.weight_payload_plan()
+            Self::Gemma4(c) => c
+                .weight_payload_plan()
+                .map(|p| p.largest_upload_bytes)
+                .map_err(|e| model_error(e, "plan Gemma 4 upload")),
+            Self::Gemma3(c) => c
+                .weight_payload_plan()
                 .map(|p| p.largest_upload_bytes)
                 .map_err(|e| execution_error("plan Gemma3 upload", e.to_string())),
             Self::Phi(c) => c
@@ -179,3 +206,6 @@ pub const MINISTRAL3_TOOL_TEMPLATE: &str = concat!(
     "{% set ministral_tools = true %}",
     include_str!("ministral3_text.jinja")
 );
+
+/// Publisher Gemma 4 text turns with thinking disabled.
+pub const GEMMA4_TEXT_TEMPLATE: &str = include_str!("gemma4_text.jinja");

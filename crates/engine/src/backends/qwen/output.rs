@@ -67,7 +67,7 @@ pub(super) fn validate_tokenizer_decoder(
         return Err(EngineError::unsupported(
             "tokenizer decoder",
             if gemma {
-                "Gemma3 requires BPE byte fallback and Replace(▁, space)/ByteFallback/Fuse"
+                "Gemma requires BPE byte fallback and Replace(▁, space)/ByteFallback/Fuse"
             } else {
                 "this family requires the BPE/ByteLevel decoder"
             },
@@ -99,12 +99,12 @@ impl Qwen3TextDecoder {
             if self.pending.len() == self.max_token_bytes {
                 return Err(execution_error(
                     "detokenize",
-                    "Gemma3 fallback run exceeds the pinned decoder bound",
+                    "Gemma fallback run exceeds the pinned decoder bound",
                 ));
             }
             self.pending
                 .try_reserve_exact(1)
-                .map_err(|_| allocation("Gemma3 fallback bytes", Some(self.max_token_bytes)))?;
+                .map_err(|_| allocation("Gemma fallback bytes", Some(self.max_token_bytes)))?;
             self.pending.push(byte);
             return Ok(String::new());
         }

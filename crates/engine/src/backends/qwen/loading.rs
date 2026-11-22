@@ -9,6 +9,9 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
+        if let BackendConfig::Gemma4(_) = &data.config {
+            return self.load_gemma4(request, data);
+        }
         if let BackendConfig::Gemma3(config) = &data.config {
             return self.load_gemma3(request, data, config);
         }

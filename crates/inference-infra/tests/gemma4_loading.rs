@@ -103,3 +103,41 @@ fn gemma4_e4b_verified_quantized_loading() {
         "gemma4_text_loading: packed_matrices={matrices} float_tensors={vectors} resident_payload_bytes={bytes}"
     );
 }
+
+#[test]
+fn gemma4_e4b_memory_plan() {
+    let mut value: Value =
+        serde_json::from_str(include_str!("fixtures/gemma4_e4b_config.json")).unwrap();
+    // Publisher geometry and the converted artifact's packing recipe are pinned separately.
+    let profile: Value =
+        serde_json::from_str(include_str!("fixtures/gemma4_e4b_profile.json")).unwrap();
+    value["quantization"] = profile["quantization"].clone();
+    let config = Gemma4TextConfig::from_affine4_json(&value).unwrap();
+    let mut conflicting_recipe = value.clone();
+    conflicting_recipe["text_config"]["quantization"] = json!({"bits": 8, "group_size": 64});
+    assert!(Gemma4TextConfig::from_affine4_json(&conflicting_recipe).is_err());
+    let weights = config.weight_payload_plan().unwrap();
+    assert_eq!(weights.payload_bytes, WEIGHT_BYTES as u64);
+    assert_eq!(weights.largest_upload_bytes, 262144 * 10752 / 2u64);
+    // Twenty sliding owners and four global owners. Eighteen consumers reuse their KV.
+    let local = 20 * 2 * 256 * 8;
+    let full = 4 * 2 * 512 * 8;
+    assert_eq!(config.cache_payload(0).unwrap(), 0);
+    assert_eq!(config.cache_payload(513).unwrap(), 512 * local + 513 * full);
+    let retained = 1024 * full + 512 * local;
+    assert_eq!(
+        config.cache_overlap_bound(1024, 32).unwrap(),
+        3 * retained + 32 * local
+    );
+    assert_eq!(
+        config.cache_overlap_bound(1, 32).unwrap(),
+        3 * (full + local)
+    );
+    assert!(config.workspace_bytes(32, 33).unwrap() > config.workspace_bytes(1, 33).unwrap());
+    assert!(config.workspace_bytes(2, 1).is_err());
+    assert!(
+        config
+            .cache_overlap_bound(config.context() + 1, 32)
+            .is_err()
+    );
+}

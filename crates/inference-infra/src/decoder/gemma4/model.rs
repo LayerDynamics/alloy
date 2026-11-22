@@ -121,6 +121,24 @@ impl Gemma4Cache {
     pub fn is_empty(&self) -> bool {
         self.offset == 0
     }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn retained_tokens(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|(k, _)| k.shape()[2])
+            .min()
+            .unwrap_or(0)
+    }
+
+    pub fn reset(&mut self) {
+        self.slots.fill(None);
+        self.offset = 0;
+    }
+
     pub fn buffer_bytes(&self) -> MlxDecoderResult<u64> {
         let arrays: Vec<_> = self
             .slots
@@ -207,6 +225,10 @@ impl Gemma4Model {
             weight_bytes,
         })
     }
+    pub fn config(&self) -> &Gemma4TextConfig {
+        &self.attention.config
+    }
+
     pub fn weight_buffer_bytes(&self) -> u64 {
         self.weight_bytes
     }
@@ -261,38 +283,15 @@ impl Gemma4Model {
         }
         // During a chunk, all consumer layers need the owner's untrimmed view.
         // Include the old cache, appended owner views and new retained storage.
-        let mut staged_bytes = 0u128;
-        for layer in c.layers.iter().take(cache.slots.len()) {
-            let old = if layer.sliding {
-                cache.offset.min(c.window)
-            } else {
-                cache.offset
-            };
-            let keep = if layer.sliding {
-                end.min(c.window)
-            } else {
-                end
-            };
-            staged_bytes += (old as u128 + t as u128 + keep as u128)
-                * 2
-                * c.kv_heads as u128
-                * layer.head_dim as u128
-                * 4;
-        }
+        let overlap = u128::from(cache.buffer_bytes()?)
+            + u128::from(c.cache_bytes(cache.offset, t)?)
+            + u128::from(c.cache_payload(end)?);
+        limit("Gemma 4 KV step overlap", overlap, cache.byte_limit)?;
         limit(
-            "Gemma 4 KV step overlap",
-            cache.buffer_bytes()? as u128 + staged_bytes,
-            cache.byte_limit,
+            "Gemma 4 step workspace",
+            c.workspace_bytes(t, end)?.into(),
+            work_limit,
         )?;
-        let head_dim = c.layers.iter().map(|l| l.head_dim).max().unwrap();
-        let per_token = 6 * c.layers.len() * c.input_width
-            + 8 * c.hidden
-            + 4 * c.intermediate
-            + 6 * c.query_heads * head_dim;
-        let work = 4
-            * t as u128
-            * (per_token as u128 + c.query_heads as u128 * end as u128 + 4 * c.vocabulary as u128);
-        limit("Gemma 4 step workspace", work, work_limit)?;
         let mut hidden = ops::scale(
             &self.embedding.embedding_lookup(tokens, stream)?,
             (c.hidden as f64).sqrt() as f32,

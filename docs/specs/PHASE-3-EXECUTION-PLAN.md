@@ -1873,3 +1873,11 @@ and gemma4_daemon_text_session in crates/alloyd/tests/gemma4_chat.rs. Compare
 rendered inputs to the pinned publisher tokenizer/template and exercise a
 real two-turn Metal session. These checks supply text pipeline evidence for
 #96. Tool, long-context, profile and M3 exit checks remain required.
+
+All six focused release tests passed on the Mac with the pinned E4B model
+(dd8e6cf6d2414922a268a5874149891f). The shared renderer reproduced all three
+publisher prompt byte and token hashes (22, 43 and 30 tokens). One
+DaemonService session answered exactly 4 and then 8, streaming both replies.
+The loader, memory plan, production refusal and six trained reference rows
+passed in the same run. Strict Clippy passed across all targets in engine,
+alloyd and inference-infra (5ca3f74c52fd4c95b3f3316f658cb674).

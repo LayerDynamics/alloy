@@ -203,6 +203,15 @@ impl Qwen3Backend {
     ) -> Result<Self, EngineError> {
         Self::new_family(specifications, limits, execution, BackendFamily::Gemma3)
     }
+    /// Gemma 4 E4B text decoder with per-layer embeddings and shared KV.
+    pub fn new_gemma4(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Gemma4)
+    }
+
     /// Native Phi fused decoder with immutable long-factor SuScaledRoPE.
     /// Construction is not a production qualification.
     pub fn new_phi(
@@ -343,6 +352,12 @@ impl Qwen3Backend {
                         .and_then(|config| config.decoder_config())
                         .map_err(|e| model_error(e, "validate Ministral architecture"))?,
                 ),
+                BackendFamily::Gemma4 => BackendConfig::Gemma4(
+                    inference_infra::decoder::gemma4::Gemma4TextConfig::from_affine4_json(
+                        &config_value,
+                    )
+                    .map_err(|e| model_error(e, "validate Gemma 4 config"))?,
+                ),
                 BackendFamily::Gemma3 => BackendConfig::Gemma3(
                     inference_infra::decoder::gemma3::Gemma3Config::from_json(&config_value)
                         .map_err(|e| model_error(e, "validate Gemma3 config"))?,
@@ -373,6 +388,12 @@ impl Qwen3Backend {
                 .iter()
                 .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
             let (decoded_bound, resident_payload_bound) = match &config {
+                BackendConfig::Gemma4(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| model_error(e, "plan Gemma 4 weights"))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
                 BackendConfig::Gemma3(c) => {
                     let p = c
                         .weight_payload_plan()
@@ -406,7 +427,7 @@ impl Qwen3Backend {
                 &specification.directory.join("tokenizer.json"),
                 &tokenizer_bytes,
             )?;
-            let gemma_decoder = family == BackendFamily::Gemma3;
+            let gemma_decoder = matches!(family, BackendFamily::Gemma3 | BackendFamily::Gemma4);
             output::validate_tokenizer_decoder(&tokenizer_value, gemma_decoder)?;
             let tokenizer_pin = specification.files.get("tokenizer.json").ok_or_else(|| {
                 validation(
@@ -556,7 +577,35 @@ impl Qwen3Backend {
                     }
                 }
             }
-            if gemma_decoder {
+            if family == BackendFamily::Gemma4 {
+                let reserved = family_rendering_options(family).reserved_spellings;
+                if eos != [1, 106, 50]
+                    || [
+                        ("<bos>", 2),
+                        ("<eos>", 1),
+                        ("<|turn>", 105),
+                        ("<turn|>", 106),
+                        ("<|tool_response>", 50),
+                    ]
+                    .into_iter()
+                    .any(|(name, id)| {
+                        tokenizer.tokenizer().token_to_id(name) != Some(id)
+                            || !specials.contains(&id)
+                    })
+                    || specials.iter().any(|id| {
+                        tokenizer
+                            .tokenizer()
+                            .id_to_token(*id)
+                            .is_none_or(|s| !reserved.iter().any(|marker| s.contains(marker)))
+                    })
+                {
+                    return Err(validation(
+                        Some(&specification.id),
+                        "unexpected Gemma 4 control tokens",
+                    ));
+                }
+            }
+            if family == BackendFamily::Gemma3 {
                 for spelling in ["<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>"] {
                     let id = tokenizer
                         .tokenizer()
@@ -641,6 +690,12 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
+        if self.family == BackendFamily::Gemma4 {
+            return Err(EngineError::unsupported(
+                "Gemma 4 tools",
+                "native tool protocol required",
+            ));
+        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -832,6 +887,7 @@ include!("loading.rs");
 include!("hybrid_loading.rs");
 include!("phi_loading.rs");
 include!("gemma3_loading.rs");
+include!("gemma4_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
     fn supports_json_output(&self) -> bool {
@@ -984,6 +1040,12 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
+            if tool_mode && self.family == BackendFamily::Gemma4 {
+                return Err(EngineError::unsupported(
+                    "Gemma 4 tool context",
+                    "native tool protocol required",
+                ));
+            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -1077,7 +1139,7 @@ impl RuntimeBackend for Qwen3Backend {
                     family_cache_mode(self.family)?,
                     capacity,
                     sum(&[
-                        data.config.cache_bound(capacity)?,
+                        data.config.cache_bound(capacity, chunk_tokens)?,
                         product(self.limits.execution_headroom_bytes, 2)?,
                     ])?,
                 )?,
@@ -1402,11 +1464,17 @@ fn registration_for(
             group_size: NonZeroUsize::new(64).unwrap(),
         });
     }
+    let gemma4 = family == BackendFamily::Gemma4;
+    if gemma4 {
+        representations = vec![WeightRepresentation::Affine4 {
+            group_size: NonZeroUsize::new(64).unwrap(),
+        }];
+    }
     FamilyRegistration::new(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if hybrid || phi || gemma || ministral {
+            if hybrid || phi || gemma || gemma4 || ministral {
                 1
             } else if smollm {
                 smollm::register::IMPL_VERSION
@@ -1420,6 +1488,8 @@ fn registration_for(
         ),
         (if ministral {
             &["Mistral3ForConditionalGeneration"][..]
+        } else if gemma4 {
+            &["Gemma4ForConditionalGeneration"][..]
         } else if gemma {
             &["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"][..]
         } else if phi {
@@ -1440,6 +1510,8 @@ fn registration_for(
             task: "text-generation".to_owned(),
             family: if ministral {
                 "ministral3"
+            } else if gemma4 {
+                "gemma4"
             } else if gemma {
                 "gemma3"
             } else if phi {
@@ -1460,7 +1532,7 @@ fn registration_for(
             context_limit_tokens: context_limit,
             supports_streaming: true,
             supports_incremental_kv: true,
-            supports_prefix_reuse: !gemma,
+            supports_prefix_reuse: !gemma && !gemma4,
             decoding_modes: vec![DecodingCapability::Greedy],
         },
     )
@@ -1510,6 +1582,34 @@ fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> 
             "[CALL_ID]",
             "[THINK]",
             "[/THINK]",
+        ];
+    }
+    if family == BackendFamily::Gemma4 {
+        options.reserved_spellings = &[
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<unk>",
+            "<mask>",
+            "<|tool>",
+            "<tool|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|\"|>",
+            "<|think|>",
+            "<|channel>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
+            "<|image>",
+            "<|audio>",
+            "<|image|>",
+            "<|audio|>",
+            "<image|>",
+            "<audio|>",
+            "<|video|>",
         ];
     }
     if family == BackendFamily::Gemma3 {
@@ -1712,6 +1812,7 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
         (BackendFamily::Ministral3, false) => MINISTRAL3_TEXT_TEMPLATE,
         (BackendFamily::Ministral3, true) => MINISTRAL3_TOOL_TEMPLATE,
+        (BackendFamily::Gemma4, _) => GEMMA4_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
@@ -1733,6 +1834,14 @@ fn family_cache_mode(family: BackendFamily) -> Result<CacheMode, EngineError> {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,
             kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::Gemma4 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(
+                "gemma4.mlx-f32.shared-full-and-sliding.v1",
+            )?,
+            kind: CacheKind::Mixed,
         });
     }
     if family == BackendFamily::Gemma3 {

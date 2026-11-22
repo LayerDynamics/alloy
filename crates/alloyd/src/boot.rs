@@ -81,6 +81,7 @@ impl BootRequest {
                 | "smollm3-3b-4bit"
                 | "phi4-mini-instruct-4bit"
                 | "gemma-3-4b-4bit"
+                | "gemma-4-e4b-it-4bit"
                 | "gemma-3-12b-4bit"
                 | "ornith-1.5-9b-4bit"
                 | "qwen3.5-0.8b-4bit"
@@ -144,6 +145,7 @@ pub fn boot_native_for_qualification(
     let ministral = is_ministral_profile(&request.profile_id);
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
+    let gemma4 = request.profile_id == "gemma-4-e4b-it-4bit";
     let gemma = is_gemma_profile(&request.profile_id);
     let hybrid = is_hybrid_profile(&request.profile_id);
     let ornith = request.profile_id == "ornith-1.5-9b-4bit";
@@ -161,6 +163,8 @@ pub fn boot_native_for_qualification(
         template_sha256: Sha256::digest(
             if ministral {
                 engine::backends::qwen::MINISTRAL3_TEXT_TEMPLATE
+            } else if gemma4 {
+                engine::backends::qwen::GEMMA4_TEXT_TEMPLATE
             } else if gemma {
                 engine::backends::qwen::GEMMA3_TEXT_TEMPLATE
             } else if phi {
@@ -189,6 +193,10 @@ pub fn boot_native_for_qualification(
         inference_infra::decoder::ministral3::MinistralConfig::from_json(&config)
             .map_err(|e| RpcError::invalid_params(e.to_string()))?
             .context
+    } else if gemma4 {
+        inference_infra::decoder::gemma4::Gemma4TextConfig::from_json(&config)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?
+            .context()
     } else if gemma {
         gemma_context_limit(&config)?
     } else if hybrid {
@@ -248,6 +256,8 @@ pub fn boot_native_for_qualification(
 
     let backend = (if ministral {
         Qwen3Backend::new_ministral3(vec![specification], limits, execution)
+    } else if gemma4 {
+        Qwen3Backend::new_gemma4(vec![specification], limits, execution)
     } else if gemma {
         Qwen3Backend::new_gemma3(vec![specification], limits, execution)
     } else if phi {
@@ -482,7 +492,10 @@ fn is_ministral_profile(profile: &str) -> bool {
 }
 
 fn is_gemma_profile(profile: &str) -> bool {
-    matches!(profile, "gemma-3-4b-4bit" | "gemma-3-12b-4bit")
+    matches!(
+        profile,
+        "gemma-3-4b-4bit" | "gemma-3-12b-4bit" | "gemma-4-e4b-it-4bit"
+    )
 }
 
 fn is_frozen_profile(profile: &str) -> bool {
@@ -540,6 +553,9 @@ fn load_expected_hashes(
         )),
         "ministral-3-3b-instruct-2512-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/ministral3_profile.json"
+        )),
+        "gemma-4-e4b-it-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/gemma4_e4b_profile.json"
         )),
         "gemma-3-4b-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/gemma3_4b_profile.json"
