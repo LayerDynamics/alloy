@@ -1960,3 +1960,14 @@ final logit and the greedy token with a single cold prefill of the same
 513 tokens. Rerun `gemma4_native_trained_reference` with the original
 independent reference. These measurements qualify the native decoder. The
 shared daemon's budget admission and conformance checks remain separate.
+
+On the pinned E4B decoder the empty cache measured zero bytes. Both tiers
+loaded 4,667,650,216 bytes of native weight buffers. At 513 tokens, the
+simulated 8 GiB run measured 59,473,920 bytes of committed KV, a
+4,822,185,136-byte allocator peak and 95,059,976 transient bytes above
+both active endpoints. Cold and cached execution chose token 900 with a
+maximum absolute logit difference of 0.001145. At 32,737 tokens on the
+36 GiB host, committed KV measured 1,114,783,744 bytes, allocator peak
+6,957,151,580 and transient bytes 1,174,716,596. The shortest owner
+retained 512 tokens on both. All six trained reference rows passed in the
+same terminal run (08889a302e8e4bbf83f3085cb62f2b20).

@@ -1,21 +1,15 @@
 //! Strict comparisons with pre-recorded independent trained Gemma 4 logits.
-use inference_infra::decoder::{
-    gemma4::model::Gemma4Model,
-    loader::{CheckpointVerification, LoadOptions},
-};
+#[path = "support/gemma4.rs"]
+mod gemma4;
 use mlx_ffi::{Device, DeviceType, Stream};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 #[test]
 #[ignore = "requires verified ALLOY_GEMMA4_ARTIFACT, ALLOY_GEMMA4_REFERENCE and Metal"]
 fn gemma4_native_trained_reference() {
-    let profile: Value =
-        serde_json::from_str(include_str!("fixtures/gemma4_e4b_profile.json")).unwrap();
-    let root = PathBuf::from(std::env::var_os("ALLOY_GEMMA4_ARTIFACT").unwrap())
-        .canonicalize()
-        .unwrap();
+    let profile = gemma4::profile();
     let reference = PathBuf::from(std::env::var_os("ALLOY_GEMMA4_REFERENCE").unwrap());
     assert!(reference.metadata().unwrap().len() < 32 << 20);
     let data = std::fs::read(reference).unwrap();
@@ -29,30 +23,8 @@ fn gemma4_native_trained_reference() {
     assert_eq!(r["versions"], profile["reference"]["versions"]);
     assert_eq!(r["device"], "gpu");
     assert_eq!(r["compile_enabled"], false);
-    let files = profile["artifact"]["files"].as_array().unwrap();
-    let pins: BTreeMap<_, _> = files
-        .iter()
-        .map(|f| {
-            let hex = f["sha256"].as_str().unwrap();
-            (
-                root.join(f["path"].as_str().unwrap()),
-                std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap()),
-            )
-        })
-        .collect();
     let stream = Stream::new(&Device::new(DeviceType::Gpu, 0).unwrap()).unwrap();
-    let options = LoadOptions {
-        max_file_bytes: files
-            .iter()
-            .map(|f| f["bytes"].as_u64().unwrap() as usize)
-            .sum(),
-        max_weight_bytes: 4_666_273_960 + 64 * 1024 * 1024,
-    };
-    let verification = CheckpointVerification {
-        sha256: &pins,
-        cancelled: &|| false,
-    };
-    let load = || Gemma4Model::load_verified(&root, options, &verification, &stream).unwrap();
+    let load = || gemma4::load(&profile, &stream);
     let mut foreign = load().new_cache(16, 64 << 20).unwrap();
     let model = load();
     let error = model
