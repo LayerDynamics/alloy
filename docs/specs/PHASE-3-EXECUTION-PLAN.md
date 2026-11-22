@@ -2682,3 +2682,23 @@ an error, completed history, and the pinned tokenizer's projection bound.
 Retain the existing successful prompt oracle. Run the trained Phi renderer,
 proposal and daemon policy tests including exactly one write, a rejected
 second write, and a model-generated explanation. Dependencies stay fixed.
+
+### Ministral position references on Linux ARM64
+
+The c01c4b6 Linux engine job stops in
+`ministral3_yarn_matches_pinned_reference`. Pinned upstream MLX 0.32.4
+and mlx-lm 0.31.2 independently yield a Linux ARM64 frequency divisor of
+2292820.0 at pair 55 where the macOS CPU yields 2292820.25. Keep the
+native operation ordering and the existing strict absolute and relative
+thresholds. In `crates/inference-infra/tests/fixtures/ministral3_position/`
+extend `generate.py` to record the ten Linux CPU cases in
+`reference-linux-aarch64.json` and `manifest-linux-aarch64.json`.
+Update the generator digest in `manifest.json`; retain the original
+macOS CPU and Metal reference bytes. In
+`crates/inference-infra/tests/ministral3_position.rs` authenticate both
+fixture sets and choose the Linux reference on Linux AArch64. Run the
+five position tests, including numerical parity, boundary/chunk equality
+and invalid inputs, followed by the Linux engine CI commands. Regenerate
+the Linux fixture independently and compare its digest. This supplies the
+platform-specific position check for #99 and the preserved Linux CI gate
+for #53. No dependency or production model changes are planned.
