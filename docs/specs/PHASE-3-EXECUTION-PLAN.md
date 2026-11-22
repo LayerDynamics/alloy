@@ -2301,3 +2301,10 @@ scripts/tests/test_m3_native_package.py for old/changed/incomplete evidence
 and catalog publication. Run a local package and normal daemon boot with real
 same-revision passing evidence, then mutate a copied report and verify refusal.
 This maps to the production admission and invalidate-on-change requirements.
+
+The native link log identifies the installed mlx-ffi out/lib/mlx.metallib.
+The MLX device loader searches alongside the executable before the configured
+build-tree path. Include that actual library in the local package, bind its
+digest in the embedded catalog and verify it on boot. Compare the daemon's
+linked build output with the numerical and behavioral build logs for each
+eligible profile. This uses the same package/qualification files and tests above.
