@@ -1801,3 +1801,12 @@ crates/inference-infra/tests/gemma4_loading.rs with gemma4_e4b_tensor_inventory
 and gemma4_e4b_verified_quantized_loading. Verify the complete immutable
 shard and the one-byte-under denial, then measure the returned text payload.
 The trainable weight buffers must stay packed. Run gemma4_attention again.
+
+Verified the entire 5,146,800,534-byte E4B shard against SHA-256
+932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff
+(f43e65856f2d4d7cae41d8507c6b36e5). The native trained loader passed the
+one-byte-under refusal and loaded 345 packed matrices plus 320 float tensors
+using exactly 4,666,273,960 payload bytes. All three attention tests passed
+again (24a9b14fd574419281522d300ef010c2), as did the independent inventory
+test (8ac3740ba9a84ca6b4d39a40e7a884ca) and strict Clippy
+(838ef380058a46a1affa0dd67644d541).

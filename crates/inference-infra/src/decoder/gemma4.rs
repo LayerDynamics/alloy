@@ -8,6 +8,8 @@ use mlx_ffi::{
 };
 use serde_json::Value;
 
+pub mod weights;
+
 fn invalid(message: &str) -> ModelError {
     ModelError::CheckpointValidation(format!("Gemma 4 text attention: {message}"))
 }
@@ -27,19 +29,27 @@ pub struct LayerAttention {
     pub sliding: bool,
 }
 
-/// Verified layer layout and precomputed divisors for global rotary positions.
-pub struct Gemma4Attention {
+/// Dense text geometry parsed before any weight allocation.
+#[derive(Debug, Clone)]
+pub struct Gemma4TextConfig {
     layers: Vec<LayerAttention>,
     query_heads: usize,
     kv_heads: usize,
     context: usize,
     window: usize,
     local_theta: f32,
-    global_frequencies: Array,
+    global_theta: f32,
+    global_dim: usize,
+    rotated_pairs: usize,
+    hidden: usize,
+    intermediate: usize,
+    vocabulary: usize,
+    input_width: usize,
+    input_vocab: usize,
 }
 
-impl Gemma4Attention {
-    pub fn from_config(config: &Value, stream: &Stream) -> MlxDecoderResult<Self> {
+impl Gemma4TextConfig {
+    pub fn from_json(config: &Value) -> Result<Self, ModelError> {
         let c = &config["text_config"];
         if config["model_type"] != "gemma4"
             || c["model_type"] != "gemma4_text"
@@ -50,7 +60,7 @@ impl Gemma4Attention {
             || !c["use_bidirectional_attention"].is_null()
             || c.get("rope_traditional").is_some_and(|v| v != false)
         {
-            return Err(invalid("unsupported attention architecture").into());
+            return Err(invalid("unsupported attention architecture"));
         }
         let count = dimension(c, "num_hidden_layers", 512)?;
         let shared = c["num_kv_shared_layers"]
@@ -71,7 +81,7 @@ impl Gemma4Attention {
             || !local_dim.is_multiple_of(2)
             || !global_dim.is_multiple_of(2)
         {
-            return Err(invalid("invalid head geometry").into());
+            return Err(invalid("invalid head geometry"));
         }
         let mut layers = Vec::with_capacity(count);
         let mut owners = [None; 2];
@@ -79,7 +89,7 @@ impl Gemma4Attention {
             let sliding = match kind.as_str() {
                 Some("sliding_attention") => true,
                 Some("full_attention") => false,
-                _ => return Err(invalid("unrecognized layer type").into()),
+                _ => return Err(invalid("unrecognized layer type")),
             };
             let owner = &mut owners[usize::from(sliding)];
             if i < count - shared {
@@ -115,7 +125,7 @@ impl Gemma4Attention {
                 })
             })
         {
-            return Err(invalid("unsupported rotary parameters").into());
+            return Err(invalid("unsupported rotary parameters"));
         }
         let local_theta = theta(local)?;
         let global_theta = theta(global)?;
@@ -124,8 +134,48 @@ impl Gemma4Attention {
             || width.fract() != 0.0
             || !(width as usize).is_multiple_of(2)
         {
-            return Err(invalid("invalid rotated width").into());
+            return Err(invalid("invalid rotated width"));
         }
+        if c["hidden_activation"] != "gelu_pytorch_tanh"
+            || c["enable_moe_block"] != false
+            || c["use_double_wide_mlp"] != false
+            || c["tie_word_embeddings"] != true
+            || config.get("tie_word_embeddings").is_some_and(|v| v != true)
+            || c["attention_dropout"].as_f64() != Some(0.0)
+        {
+            return Err(invalid("unsupported dense text configuration"));
+        }
+        Ok(Self {
+            layers,
+            query_heads,
+            kv_heads,
+            context,
+            window,
+            local_theta,
+            global_theta,
+            global_dim,
+            rotated_pairs: width as usize / 2,
+            hidden: dimension(c, "hidden_size", 65536)?,
+            intermediate: dimension(c, "intermediate_size", 1 << 20)?,
+            vocabulary: dimension(c, "vocab_size", 1 << 24)?,
+            input_width: dimension(c, "hidden_size_per_layer_input", 65536)?,
+            input_vocab: dimension(c, "vocab_size_per_layer_input", 1 << 24)?,
+        })
+    }
+}
+
+pub struct Gemma4Attention {
+    config: Gemma4TextConfig,
+    global_frequencies: Array,
+}
+
+impl Gemma4Attention {
+    pub fn from_config(config: &Value, stream: &Stream) -> MlxDecoderResult<Self> {
+        Self::new(Gemma4TextConfig::from_json(config)?, stream)
+    }
+    pub fn new(config: Gemma4TextConfig, stream: &Stream) -> MlxDecoderResult<Self> {
+        let global_dim = config.global_dim;
+        let global_theta = config.global_theta;
         // The exponents use the whole head width. Infinite divisors leave
         // the remaining split-half pairs at zero angle, including at decode.
         let divisors = attention::longrope_frequencies(
@@ -134,7 +184,7 @@ impl Gemma4Attention {
             &vec![1.0; global_dim / 2],
             stream,
         )?;
-        let pairs = width as usize / 2;
+        let pairs = config.rotated_pairs;
         let global_frequencies = if pairs == global_dim / 2 {
             divisors
         } else {
@@ -145,22 +195,18 @@ impl Gemma4Attention {
             ops::concatenate_axis(&active, &infinity, 0, stream)?
         };
         Ok(Self {
-            layers,
-            query_heads,
-            kv_heads,
-            context,
-            window,
-            local_theta,
+            config,
             global_frequencies,
         })
     }
 
     pub fn layers(&self) -> &[LayerAttention] {
-        &self.layers
+        &self.config.layers
     }
 
     fn layer(&self, index: usize) -> Result<LayerAttention, ModelError> {
-        self.layers
+        self.config
+            .layers
             .get(index)
             .copied()
             .ok_or_else(|| invalid("layer index out of bounds"))
@@ -182,12 +228,12 @@ impl Gemma4Attention {
             || shape[2] == 0
             || offset
                 .checked_add(shape[2])
-                .is_none_or(|end| end > self.context)
+                .is_none_or(|end| end > self.config.context)
         {
             return Err(invalid("invalid head layout or absolute position").into());
         }
         Ok(if layer.sliding {
-            attention::rope(input, self.local_theta, offset, stream)?
+            attention::rope(input, self.config.local_theta, offset, stream)?
         } else {
             attention::rope_with_frequencies(input, &self.global_frequencies, offset, stream)?
         })
@@ -200,7 +246,13 @@ impl Gemma4Attention {
         offset: usize,
         stream: &Stream,
     ) -> MlxDecoderResult<Array> {
-        self.rotate(self.layer(index)?, q, self.query_heads, offset, stream)
+        self.rotate(
+            self.layer(index)?,
+            q,
+            self.config.query_heads,
+            offset,
+            stream,
+        )
     }
 
     pub fn rotate_owner_keys(
@@ -214,7 +266,7 @@ impl Gemma4Attention {
         if layer.kv_owner != index {
             return Err(invalid("shared layer cannot append keys").into());
         }
-        self.rotate(layer, k, self.kv_heads, offset, stream)
+        self.rotate(layer, k, self.config.kv_heads, offset, stream)
     }
 
     /// Q and K have already been normalized and rotated. V has parameter-free RMS normalization.
@@ -233,13 +285,13 @@ impl Gemma4Attention {
         if query.len() != 4
             || key.len() != 4
             || query[0] != 1
-            || query[1] != self.query_heads
-            || key[1] != self.kv_heads
+            || query[1] != self.config.query_heads
+            || key[1] != self.config.kv_heads
             || query[3] != layer.head_dim
             || query[2] == 0
             || offset
                 .checked_add(query[2])
-                .is_none_or(|end| end > self.context)
+                .is_none_or(|end| end > self.config.context)
         {
             return Err(invalid("invalid attention input or offset").into());
         }
@@ -247,12 +299,12 @@ impl Gemma4Attention {
             .checked_sub(query[2])
             .ok_or_else(|| invalid("truncated current keys"))?;
         let mask = if layer.sliding {
-            if prefix < offset.min(self.window - 1) || prefix > offset {
+            if prefix < offset.min(self.config.window - 1) || prefix > offset {
                 return Err(invalid("invalid sliding prefix").into());
             }
             AttentionMask::SlidingCausalSuffix {
                 prefix_tokens: prefix,
-                window_tokens: self.window,
+                window_tokens: self.config.window,
             }
         } else {
             if prefix != offset {
