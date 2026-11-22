@@ -1,13 +1,10 @@
 //! Pinned trained-weight test of native prefill and cached decode on Metal.
-use inference_infra::decoder::{
-    loader::{CheckpointVerification, LoadOptions},
-    ministral3::weights::load_verified,
-    mlx_model::MlxDecoderModel,
-};
-use mlx_ffi::{Device, DeviceType, Stream};
+#[path = "support/ministral3.rs"]
+mod ministral3;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 #[test]
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and ALLOY_MINISTRAL3_REFERENCE"]
@@ -29,9 +26,6 @@ fn ministral3_real_affine8_native_reference() {
 
 fn check_reference(manifest: &str, resident_bytes: usize) {
     let profile: Value = serde_json::from_str(manifest).unwrap();
-    let root = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap())
-        .canonicalize()
-        .unwrap();
     let path = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_REFERENCE").unwrap());
     assert!(std::fs::metadata(&path).unwrap().len() < 32 << 20);
     let reference = std::fs::read(path).unwrap();
@@ -49,44 +43,7 @@ fn check_reference(manifest: &str, resident_bytes: usize) {
     assert_eq!(reference["position_regime"], profile["position_regime"]);
     assert_eq!(reference["compile_enabled"], false);
     assert_eq!(reference["device"], "gpu");
-    let pins: BTreeMap<_, _> = profile["artifact"]["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|file| {
-            let hex = file["sha256"].as_str().unwrap();
-            (
-                root.join(file["path"].as_str().unwrap()),
-                std::array::from_fn(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()),
-            )
-        })
-        .collect();
-    let (config, weights) = load_verified(
-        &root,
-        LoadOptions {
-            max_file_bytes: profile["artifact"]["files"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|f| f["bytes"].as_u64().unwrap() as usize)
-                .sum(),
-            max_weight_bytes: resident_bytes,
-        },
-        &CheckpointVerification {
-            sha256: &pins,
-            cancelled: &|| false,
-        },
-    )
-    .unwrap();
-    let stream = Stream::new(&Device::new(DeviceType::Gpu, 0).unwrap()).unwrap();
-    let model = MlxDecoderModel::from_weights(
-        config.decoder_config().unwrap(),
-        weights,
-        resident_bytes as u64,
-        &stream,
-    )
-    .unwrap();
-    assert_eq!(model.weight_buffer_bytes().unwrap(), resident_bytes as u64);
+    let (model, stream) = ministral3::load_pinned_model(&profile, resident_bytes);
     let cases = reference["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 2);
     for (case_id, case) in cases.iter().enumerate() {
