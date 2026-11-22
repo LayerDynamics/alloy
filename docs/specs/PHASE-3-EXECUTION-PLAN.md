@@ -2308,3 +2308,9 @@ build-tree path. Include that actual library in the local package, bind its
 digest in the embedded catalog and verify it on boot. Compare the daemon's
 linked build output with the numerical and behavioral build logs for each
 eligible profile. This uses the same package/qualification files and tests above.
+
+In scripts/ci/m3_native_numerical.py capture the Metal library digest when
+Cargo supplies the fixture executable, and recheck it when the scope ends.
+Extend scripts/ci/m3_native_behavior.py to include it in the dependency
+identity, and scripts/tests/test_m3_native_package.py to test kernel drift.
+This closes the interval between executing a fixture and packaging its library.
