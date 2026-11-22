@@ -2321,3 +2321,13 @@ cannot issue a usable verdict. In .github/workflows/m3-native-observations.yaml
 enable local packaging during the existing manual qualification job and archive
 a tar containing the executable, kernels and reports with file modes preserved.
 No external release is published. Run actionlint and the matrix regression suite.
+
+The same Cargo target shared by two checkouts produced an old engine rlib during
+the production boot test (6f54d46dfd614d22af3c63370c929e2e). In
+scripts/ci/m3_native_numerical.py scope fixture compilation to a dedicated target
+under the configured external build root, keyed by clean candidate and checkout
+identity. Use that target for the packaging build in scripts/ci/m3_native_package.py.
+Record the actual target in each receipt and validate its executable location and
+Cargo source manifest. Test disjoint candidates/checkouts and environment restoration
+in scripts/tests/test_m3_native_numerical.py. Rebuild the production tests in an
+independent target and use the isolated native matrix for final acceptance.
