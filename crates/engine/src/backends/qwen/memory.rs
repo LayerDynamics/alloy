@@ -267,7 +267,10 @@ fn workspace_bound(
     // probabilities/indices for the pinned 128-expert model.
     let routed_work = if coder {
         let expert_elements = sum(&[product(6, i)?, product(4, h)?])?;
-        let router_and_experts = sum(&[product(8, expert_elements)?, 6 * 128])?;
+        // Large gathers hold one reordered input and one restored projection
+        // plus the flat expert IDs, permutations and token indices.
+        let ordering = if t >= 8 { product(8, sum(&[product(2, h)?, 6])?)? } else { 0 };
+        let router_and_experts = sum(&[product(8, expert_elements)?, 6 * 128, ordering])?;
         product(t, router_and_experts)?
     } else {
         0

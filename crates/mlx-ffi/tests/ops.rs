@@ -136,9 +136,23 @@ fn quantized_matmul_smoke() {
 
 #[test]
 fn routed_swiglu_matches_selected_experts() {
+    for tokens in [2, 31, 32, 55] {
+        check_selected_experts(DeviceType::Cpu, tokens);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn routed_swiglu_matches_selected_experts_metal() {
+    for tokens in [2, 31, 32, 55] {
+        check_selected_experts(DeviceType::Gpu, tokens);
+    }
+}
+
+fn check_selected_experts(kind: DeviceType, tokens: usize) {
     use mlx_ffi::ops::{AffineExperts, SwitchGluExperts, routed_swiglu, to_vec_f32};
-    let cpu = Device::new(DeviceType::Cpu, 0).unwrap();
-    let stream = Stream::get_default(&cpu).unwrap();
+    let device = Device::new(kind, 0).unwrap();
+    let stream = Stream::get_default(&device).unwrap();
     const EXPERTS: usize = 3;
     const WIDTH: usize = 64;
     let diagonal = |offset: usize| {
@@ -168,16 +182,23 @@ fn routed_swiglu_matches_selected_experts() {
         up: bank(&up),
         down: bank(&down),
     };
-    let inputs: Vec<f32> = (0..2 * WIDTH).map(|i| (i as f32 - 62.) / 64.).collect();
-    let x = Array::from_f32_slice(&inputs, &[2, 64]).unwrap();
-    let logits = [[2.0f32, -1., 1.], [-2., 3., 1.]];
-    let router = Array::from_f32_slice(logits.as_flattened(), &[2, 3]).unwrap();
+    let inputs: Vec<f32> = (0..tokens * WIDTH)
+        .map(|i| ((i % 127) as f32 - 62.) / 64.)
+        .collect();
+    let x = Array::from_f32_slice(&inputs, &[tokens as i32, 64]).unwrap();
+    let patterns = [[2.0f32, -1., 1.], [-2., 3., 1.], [1., 2., -1.]];
+    let choices = [[0, 2], [1, 2], [1, 0]];
+    let logits = (0..tokens)
+        .map(|i| patterns[i % patterns.len()])
+        .collect::<Vec<_>>();
+    let router = Array::from_f32_slice(logits.as_flattened(), &[tokens as i32, 3]).unwrap();
     for normalize in [true, false] {
         let out = routed_swiglu(&x, &router, &banks, 2, normalize, &stream).unwrap();
-        assert_eq!(out.shape(), [2, WIDTH]);
+        assert_eq!(out.shape(), [tokens, WIDTH]);
         let values = to_vec_f32(&out, &stream).unwrap();
-        for (row, selected) in [[0, 2], [1, 2]].into_iter().enumerate() {
-            let probs = logits[row].map(f32::exp);
+        for (row, logit) in logits.iter().enumerate() {
+            let selected = choices[row % choices.len()];
+            let probs = logit.map(f32::exp);
             let sum: f32 = if normalize {
                 selected.iter().map(|&e| probs[e]).sum()
             } else {

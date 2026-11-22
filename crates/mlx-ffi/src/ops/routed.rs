@@ -51,7 +51,13 @@ impl AffineExperts<'_> {
         Ok(*width)
     }
 
-    fn project(&self, input: &Array, indices: &Array, stream: &Stream) -> OperationResult<Array> {
+    fn project(
+        &self,
+        input: &Array,
+        indices: &Array,
+        sorted: bool,
+        stream: &Stream,
+    ) -> OperationResult<Array> {
         let none = sys::mlx_array {
             ctx: std::ptr::null_mut(),
         };
@@ -79,11 +85,19 @@ impl AffineExperts<'_> {
                 bits,
                 c"affine".as_ptr(),
                 none,
-                false,
+                sorted,
                 stream.as_raw(),
             )
         })
     }
+}
+
+fn take_rows(input: &Array, rows: &Array, stream: &Stream) -> OperationResult<Array> {
+    // SAFETY: the input and index handles live through the call, and callers
+    // supply rows from a permutation of the input or its expanded routes.
+    array(|out| unsafe {
+        sys::mlx_take_axis(out, input.as_raw(), rows.as_raw(), 0, stream.as_raw())
+    })
 }
 
 /// Affine input and output projections of one routed SwiGLU layer.
@@ -168,18 +182,47 @@ pub fn routed_swiglu(
     };
     // SAFETY: expanding [tokens,hidden] at axes 1 and 2 produces the
     // [tokens,1,1,hidden] matrix batches required by gather_qmm.
-    let x = array(|out| unsafe {
-        sys::mlx_expand_dims_axes(out, input.as_raw(), [1, 2].as_ptr(), 2, s)
-    })?;
-    let g = banks.gate.project(&x, &indices, stream)?;
-    let u = banks.up.project(&x, &indices, stream)?;
+    let (x, indices, inverse) = if indices.size() >= 64 {
+        native_dimension(indices.size())?;
+        // Sort token/expert assignments by expert so the same packed matrix
+        // can serve adjacent tokens. order / k recovers each source token.
+        // SAFETY: the router indices have rank two and k is strictly positive.
+        unsafe {
+            let flat = array(|out| sys::mlx_flatten(out, indices.as_raw(), 0, 1, s))?;
+            let order = array(|out| sys::mlx_argsort_axis(out, flat.as_raw(), 0, s))?;
+            let inverse = array(|out| sys::mlx_argsort_axis(out, order.as_raw(), 0, s))?;
+            let stride = Array::from_u32_slice(&[k as u32], &[1])?;
+            let tokens =
+                array(|out| sys::mlx_floor_divide(out, order.as_raw(), stride.as_raw(), s))?;
+            let rows = take_rows(input, &tokens, stream)?;
+            let x = array(|out| sys::mlx_expand_dims(out, rows.as_raw(), 1, s))?;
+            (x, take_rows(&flat, &order, stream)?, Some(inverse))
+        }
+    } else {
+        // SAFETY: input is [tokens, hidden]; add broadcast and matrix axes.
+        let x = array(|out| unsafe {
+            sys::mlx_expand_dims_axes(out, input.as_raw(), [1, 2].as_ptr(), 2, s)
+        })?;
+        (x, indices, None)
+    };
+    let sorted = inverse.is_some();
+    let g = banks.gate.project(&x, &indices, sorted, stream)?;
+    let u = banks.up.project(&x, &indices, sorted, stream)?;
     // SAFETY: g and u have identical [tokens,k,1,mid] layouts.
     let activated = unsafe {
         let sigmoid = array(|out| sys::mlx_sigmoid(out, g.as_raw(), s))?;
         let silu = array(|out| sys::mlx_multiply(out, g.as_raw(), sigmoid.as_raw(), s))?;
         array(|out| sys::mlx_multiply(out, silu.as_raw(), u.as_raw(), s))?
     };
-    let projected = banks.down.project(&activated, &indices, stream)?;
+    let mut projected = banks.down.project(&activated, &indices, sorted, stream)?;
+    if let Some(inverse) = inverse {
+        let rows = take_rows(&projected, &inverse, stream)?;
+        let shape = [stop[0], k, 1, native_dimension(*hidden)?];
+        // SAFETY: the inverse restores exactly tokens * k rows of hidden width.
+        projected = array(|out| unsafe {
+            sys::mlx_reshape(out, rows.as_raw(), shape.as_ptr(), shape.len(), s)
+        })?;
+    }
     // SAFETY: projected is [tokens,k,1,hidden]. Each [tokens,k,1] score
     // weights one route before the expert axis is reduced.
     unsafe {
