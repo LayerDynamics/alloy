@@ -1,4 +1,6 @@
 //! Explicit real-artifact numerical gate, not an agent/profile qualification.
+#[path = "support/numerical_capture.rs"]
+mod numerical_capture;
 use inference_infra::decoder::{
     loader::{CheckpointVerification, LoadOptions},
     qwen35::{
@@ -160,7 +162,8 @@ fn check_quantized_reference(
                 .unwrap()
                 .into_values(),
         ];
-        for token in [19, 13] {
+        let decode_tokens = [19, 13];
+        for token in decode_tokens {
             actual.push(
                 model
                     .forward(&[token], &mut cache, options, &stream, &|| false)
@@ -201,6 +204,14 @@ fn check_quantized_reference(
         assert_eq!(expected.len(), 3);
         for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             let actual = &actual[actual.len() - 248320..];
+            numerical_capture::record(
+                &profile,
+                case_index,
+                row,
+                &tokens,
+                &decode_tokens[..row],
+                actual,
+            );
             let expected: Vec<f64> = serde_json::from_value(expected.clone()).unwrap();
             assert_eq!(actual.len(), 248320);
             assert_eq!(actual.len(), expected.len());

@@ -1,6 +1,8 @@
 //! Strict comparisons with pre-recorded independent trained Gemma 4 logits.
 #[path = "support/gemma4.rs"]
 mod gemma4;
+#[path = "support/numerical_capture.rs"]
+mod numerical_capture;
 use mlx_ffi::{Device, DeviceType, Stream};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -70,6 +72,7 @@ fn gemma4_native_trained_reference() {
                 .step(ids, &mut cache, 512 << 20, &stream, &mut || false)
                 .unwrap();
             assert_eq!(cache.len(), before + ids.len());
+            numerical_capture::record(&profile, i, step, &prompt, &decode[..step], logits.values());
             let exp = row.as_array().unwrap();
             assert_eq!(exp.len(), 262144);
             assert_eq!(logits.values().len(), exp.len());

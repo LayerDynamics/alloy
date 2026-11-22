@@ -850,8 +850,10 @@ impl Qwen3Backend {
         if self.family == BackendFamily::Gemma4 && admission.snapshot()?.budget_bytes() <= 8 << 30 {
             // E4B projects all prompt rows into its 262,144-token vocabulary.
             // Four rows bound this workspace during cold startup on the small tier.
-            self.limits.prefill_chunk_tokens =
-                self.limits.prefill_chunk_tokens.min(NonZeroUsize::new(4).unwrap());
+            self.limits.prefill_chunk_tokens = self
+                .limits
+                .prefill_chunk_tokens
+                .min(NonZeroUsize::new(4).unwrap());
         }
         let registry = self.registry(profiles)?;
         let generation_limits = self.limits.generation;
