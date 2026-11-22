@@ -17,6 +17,7 @@ class NativeBehaviorTests(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)))
             self.assertIn("real_model_compaction_preserves_history_and_continues", names)
             self.assertIn("llama3_tool_stop_context_cache", names)
+            self.assertIn("native_validated_context_boundary", names)
             self.assertEqual("qwen35_native_memory_tiers" in names, profile in ("ornith-1.5-9b-4bit", "qwen3.5-0.8b-4bit"))
             self.assertEqual("gemma4_native_memory_tiers" in names, profile == "gemma-4-e4b-it-4bit")
         with self.assertRaises(ValueError):

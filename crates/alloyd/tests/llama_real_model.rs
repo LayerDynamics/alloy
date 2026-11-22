@@ -510,3 +510,143 @@ fn llama3_stream_cancel_recovery() {
     ));
     check_cancellation_recovery(&Supervisor::new(boot.engine, telemetry), &store, &profile);
 }
+
+#[test]
+#[ignore = "requires pinned E4B, Ornith or small Qwen3.5 and native Metal"]
+fn native_validated_context_boundary() {
+    use engine::api::Engine;
+    use engine::types::ModelProfileId;
+    use harness_core::{ContextBuilder, HarnessError, SessionStore, Supervisor};
+    use sha2::{Digest, Sha256};
+    use std::sync::Mutex;
+
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    // Publisher-rendered chat bytes and little-endian token IDs.
+    let (lines, ledger_tokens, text_sha, ids_sha) = match profile.as_str() {
+        "gemma-4-e4b-it-4bit" => (
+            660,
+            42,
+            "0eedf262bb67cf1171840e996f7761308d6b0df4f399505cbe9952446431591b",
+            "b6c4d99312044c6eaf657b3f1351afb2821aec77e78d8feb74882f67c36c17e2",
+        ),
+        "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit" => (
+            587,
+            92,
+            "d39c26f5e515d28d809b4e3e2f9420e440d813a69cad7a9af357991f5c7e8625",
+            "c480eec4cba2bc348f1d5d70169695400705f589ec4c943ad38ee4b94909f593",
+        ),
+        other => panic!("no pinned boundary input for {other}"),
+    };
+    let boot = alloyd::boot::boot_native_for_qualification(
+        BootRequest {
+            artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
+            profile_id: profile.clone(),
+            corpus_models_json: None,
+            memory_guard: MemoryGuardConfig::balanced(),
+            admission_budget_override_bytes: None,
+            prefer_metal: true,
+            tools_enabled: true,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
+        },
+        Some(40_960),
+    )
+    .unwrap();
+    let budget = boot
+        .engine
+        .profile_context_budget(&ModelProfileId::new(&profile).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (budget.limit, budget.output_reserve, budget.safety_margin),
+        (40960, 512, 64)
+    );
+    let supervisor = Supervisor::new(
+        recording_engine::RecordingEngine::new(boot.engine),
+        Arc::new(TelemetryClient::with_transport(
+            "test",
+            HardwareTier::Unknown,
+            "https://127.0.0.1:1",
+            Box::new(Offline),
+        )),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let mut db = SessionStore::open(root.path().join("boundary.sqlite")).unwrap();
+    for id in ["overflow", "boundary"] {
+        db.create_session(id, &profile).unwrap();
+    }
+    let store = Mutex::new(db);
+    let mut archive =
+        include_str!("../../../bench/corpus/fixtures/documents/document-32k.txt").to_owned();
+    let mut middle = archive.len() / 2;
+    while !archive.is_char_boundary(middle) {
+        middle += 1;
+    }
+    archive.insert_str(
+        middle,
+        "\nARCHIVE RECORD: The vault access code is COBALT-7392.\n",
+    );
+    archive.push('\n');
+    archive.extend(
+        include_str!("../../../bench/corpus/fixtures/documents/document-8k.txt")
+            .split_inclusive('\n')
+            .take(lines),
+    );
+    let prompt = |n| {
+        format!(
+            "Read this archive and retrieve the vault access code.\n{archive}\n{}\nWhat is the vault access code in the ARCHIVE RECORD? Reply with only the code.",
+            " ledger".repeat(n)
+        )
+    };
+    for (id, excess) in [("overflow", 1), ("boundary", 0)] {
+        let message = prompt(ledger_tokens + excess);
+        let snapshot = ContextBuilder::build_snapshot(id, &profile, &[], Some(&message)).unwrap();
+        let render = ContextBuilder::render_and_count(supervisor.engine(), snapshot).unwrap();
+        assert_eq!(
+            render.token_count() + budget.output_reserve + budget.safety_margin,
+            budget.limit + excess
+        );
+        let result = supervisor.run_turn(&store, id, &message, 32);
+        let requests = supervisor.engine().requests.lock().unwrap();
+        if excess == 1 {
+            let Err(HarnessError::Invalid(reason)) = result else {
+                panic!("expected overflow: {result:?}")
+            };
+            assert!(
+                reason.contains("no completed history fits a checkpoint"),
+                "{reason}"
+            );
+            assert!(
+                requests.is_empty(),
+                "oversized fresh turn must never enter native generation"
+            );
+            println!(
+                "profile={profile} refused_tokens={} reason={reason}",
+                render.token_count()
+            );
+        } else {
+            let outcome = result.unwrap();
+            assert_eq!(outcome.input_tokens, render.token_count());
+            assert_eq!(requests.len(), 1);
+            let actual = requests[0].0.expected_render().unwrap();
+            assert_eq!(actual.token_ids(), render.token_ids());
+            assert_eq!(
+                format!("{:x}", Sha256::digest(actual.text().as_bytes())),
+                text_sha
+            );
+            let mut hash = Sha256::new();
+            for id in actual.token_ids() {
+                hash.update(id.to_le_bytes());
+            }
+            assert_eq!(format!("{:x}", hash.finalize()), ids_sha);
+            assert_eq!(outcome.assistant_text, "COBALT-7392");
+            println!(
+                "profile={profile} context={} input_tokens={} output_reserve={} safety_margin={} answer={:?}",
+                budget.limit,
+                outcome.input_tokens,
+                budget.output_reserve,
+                budget.safety_margin,
+                outcome.assistant_text
+            );
+        }
+    }
+}

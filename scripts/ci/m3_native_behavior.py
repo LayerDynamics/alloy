@@ -16,6 +16,7 @@ from m3_native_numerical import SUITES, build, execute, pinned_run, require_sing
 SHARED = (
     ("alloyd", "llama_real_model", (
         "llama3_tool_stop_context_cache", "llama3_long_context_stream_cancel_memory",
+        "native_validated_context_boundary",
     )),
     ("alloyd", "compaction_real_model", (
         "real_model_compaction_preserves_history_and_continues",
