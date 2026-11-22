@@ -1426,3 +1426,52 @@ The family remains unqualified on the small profile. A next resolving step is
 a pinned upstream comparison of a higher-precision small Gemma artifact
 against these exact prompts, before changing production profiles or kernels.
 The mandatory frozen12B artifact stays unchanged.
+
+The precision diagnostic is complete. Exact upstream replays of the unchanged
+native token inputs reject 4B8bit (0/3, receipt
+9d99da045bfa40bc8730763f31fb7292), 1B4bit (2/3,
+1a8cc6d810284ceb92b9e65720144a0d), and 1B8bit (2/3,
+39c55afa1dc14288ba8930c615012b24). The last continuation is
+`refactor COBALT authentication`, not the required exact name. These are
+diagnostic results, not native profile qualification; no profile, prompt,
+assertion or output normalization is changed. The small Gemma gate remains open.
+
+### #53 / #99 Ministral native position batch (2026-11-21)
+
+Resolve the missing native position equations first. Public metadata is pinned
+to `mistralai/Ministral-3-3B-Instruct-2512` revision
+`b35d4dfe56c142746f54dbd64f579faab2744308`, publisher BF16 variant
+`b6d637bef2393152b3da2b2fde72eecdee30557e`, and converted
+`mlx-community/Ministral-3-3B-Instruct-2512-4bit` revision
+`a962dcb09eee4169c890e544c9eb938f1113fdee`. Verified converted config SHA256 is
+`cdd4bfa0a702d0241faaa3b80d15d481d7f8abf2659fba0958b1e7f24a28055f`.
+Cards declare Apache-2.0 and conversion by mlx-vlm0.3.9; weight/tokenizer
+verification and conversion provenance remain separate loading work.
+
+Add `crates/mlx-ffi/src/attention/yarn.rs`, export through `attention.rs`,
+and add `crates/inference-infra/src/decoder/ministral3/{mod.rs,config.rs,position.rs}`
+with export from `decoder/mod.rs`. Add
+`crates/inference-infra/tests/ministral3_position.rs` and
+`tests/fixtures/ministral3_position/{config.json,generate.py,reference.json,manifest.json}`.
+These contain validated nested Mistral3/Ministral3 text geometry, native
+float32 YaRN frequency interpolation, rotary amplitude, and the absolute-position
+query scale `1 + beta * log(1 + floor(position / original_context))`.
+Preserve the pinned eager MLX arithmetic graph rather than host-libm frequency
+approximations. Reject unsupported position variants, conflicting metadata,
+nonfinite/overflowing dimensions, invalid shapes and out-of-range offsets.
+The selected profile has full attention in every layer and no sliding window;
+reject sliding configurations until their actual decoder/cache path exists.
+
+Named checks: `ministral3_pinned_geometry_and_position_contract`,
+`ministral3_rejects_unsupported_position_and_geometry`,
+`ministral3_yarn_matches_pinned_reference`,
+`ministral3_position_boundary_and_chunk_equivalence`, and
+`ministral3_position_rejects_invalid_inputs`. Independently capture pinned
+mlx-lm0.31.2/MLX0.32.4 eager references before native comparison; compare both
+FR8 limits without weakening them, and independently check scalar mathematics.
+Exercise CPU and Metal, offsets0,16383,16384,32767 and the final supported
+position, both rotary-amplitude branches, query-only scaling and grouped heads.
+This batch implements the real position operations, not complete Ministral
+support. Packed text-only loading, full decoder integration, templates/tools,
+actual artifact logits, context/cache/agent/memory gates and production
+qualification remain required follow-on work.
