@@ -1535,3 +1535,18 @@ cover these checks. Strict Clippy for engine, inference-infra and mlx-ffi
 passed, as did 61 shared infrastructure tests and five CPU/Metal position
 tests (0ac5b4705f974207891a25813272c570 and 29ecc502466945a8a38a255565cfe7f5).
 The daemon chat/tool path, long-context, agent and qualification gates remain open.
+
+### #99 daemon chat integration
+
+Extend crates/engine/src/backends/qwen/{architecture.rs,backend.rs,loading.rs}
+with Ministral registration, pinned prompt rendering, the verified text loader,
+and its own KV identity. Add ministral3_text.jinja for trained system/user/
+assistant framing, including the publisher default system message. Reject the
+pinned tokenizer's reserved delimiters in untrusted message content. Verify
+BOS and EOS token identities and the expected ByteLevel tokenizer. Enable
+the frozen profile in crates/alloyd/src/boot.rs for qualification and keep
+production gated. Exercise the daemon via crates/alloyd/tests/ministral3_chat.rs
+using real text generation and verify exact rendered token IDs. Add tests for
+unqualified production rejection and tool requests before native protocol
+integration. Tool parsing and policy execution require the trained
+[TOOL_CALLS]name[ARGS]JSON representation in a subsequent batch.
