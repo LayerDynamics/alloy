@@ -1620,3 +1620,17 @@ EOS batches, malformed/truncated input and storage bounds. Thirteen shared
 tool-rendering and Phi protocol regressions passed
 (1b707e4cb804428b8c4ba430dd2e0797). Strict Clippy passed for engine and
 alloyd on all targets (d2a5e5835c8a4bd48984afc651926b9e).
+
+### #99 Ministral bounded overflow fixture
+
+The first Ministral lifecycle run refused the first archive turn at the
+2,048-token fixture limit. No history existed to compact. Independent pinned
+tokenization (e9933eed5a374bf8b5326a6b69c9f3d4) counted 1,606 tokens on
+that first turn, 530 of them from the publisher default system content.
+With one assistant token the second input is already 2,100 tokens. Apply
+the same 2,048-token fixture budget plus those 530 tokens for this profile in
+crates/alloyd/tests/compaction_real_model.rs, for both warm and cold boots of
+real_model_compaction_preserves_history_and_continues. Assert the first actual
+render including the 512 output reserve and 64 margin fits and the second
+overflows. Keep the original messages, output requirements, checkpoint fields,
+event preservation, cache and cold-replay assertions.
