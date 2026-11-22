@@ -2331,3 +2331,21 @@ Record the actual target in each receipt and validate its executable location an
 Cargo source manifest. Test disjoint candidates/checkouts and environment restoration
 in scripts/tests/test_m3_native_numerical.py. Rebuild the production tests in an
 independent target and use the isolated native matrix for final acceptance.
+
+### Qwen3-Coder routed expert execution
+
+The pinned mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit revision
+6e302ea604ad9ab206367e2c501d1571023e7b6d specifies 128 experts, eight
+selected per token, normalized top-k probabilities, 4-bit affine expert
+banks and separate 8-bit routers. Implement the SwitchGLU forward operation
+in crates/mlx-ffi/src/ops/routed.rs and expose it in crates/mlx-ffi/src/ops.rs.
+Consume actual router logits, preserve the floating operand precision, use
+MLX argpartition and gather_qmm for all three projections, and reduce each
+token's selected outputs. Reuse the vendored MLX C API without dependencies.
+In crates/mlx-ffi/tests/ops.rs, run routed_swiglu_matches_selected_experts
+against an independent per-token scalar oracle with different expert choices,
+both normalized and unnormalized weights, and invalid top-k and bank shapes.
+Verify on a CPU stream while the Mac GPU is qualifying other profiles.
+This implements the expert computation required for the Qwen3-Coder family
+exit. Trained weight loading, decoder integration and full profile conformance
+require their own candidate-bound real checkpoint results.
