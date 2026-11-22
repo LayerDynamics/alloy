@@ -2154,3 +2154,21 @@ qwen35_qualification_identity_tracks_native_settings for both renderers
 and context / parser mode changes. Verify exact metadata on the three
 pinned artifacts; reports and production promotion still require all
 fixture and provenance checks. No new dependencies.
+
+### #53 exact 40960-token profile boundary on the three pinned models
+
+Add native_validated_context_boundary to crates/alloyd/tests/llama_real_model.rs
+and require it in scripts/ci/m3_native_behavior.py and its inventory test in
+scripts/tests/test_m3_native_behavior.py. At the same 40960-token configuration
+inspected by #72, preserve 512 output and 64 safety tokens. Exercise both
+40384-token retrieval and a fresh 40385-token input that must be refused
+before generation. Use both frozen corpus documents, an archive record in
+the middle, and a short fixed padding suffix. The publisher tokenizer/Jinja
+render independently yielded the exact two input counts for all three
+profiles (b5cf1fda3bd84072a33c1014dc8f9b7d). Pin the complete render and
+token hashes at the boundary. Verify the actual generation request used
+those tokens without truncation and returned the vault code. Preserve both
+existing 8k/32k retrieval cases and the separate overflow-compaction test.
+No change to supported product limits or model weights. Run all three
+named native boundary tests. This supplies the advertised-context measurement
+for a 40960-token #72 configuration, conditional on real retrieval.
