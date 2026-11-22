@@ -746,6 +746,65 @@ impl Qwen3Backend {
         }
     }
 
+    /// Derive identity from this adapter's checked metadata and registered profile.
+    /// The caller supplies independently verified build and environment identities.
+    pub fn qualification_identity(
+        &self,
+        profile: &ModelProfile,
+        candidate: &str,
+        dependencies_sha256: &str,
+    ) -> Result<crate::conformance::QualificationIdentity, EngineError> {
+        if !matches!(candidate.len(), 40 | 64)
+            || !candidate.bytes().all(|b| b.is_ascii_hexdigit())
+            || dependencies_sha256.len() != 64
+            || !dependencies_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(EngineError::invalid_request(
+                "qualification",
+                "invalid build identity",
+            ));
+        }
+        let registry = self.registry(vec![profile.clone()])?;
+        let resolved = registry.resolve_profile(profile.id())?;
+        let data = self.data(resolved.artifact())?;
+        let hex = |bytes: [u8; 32]| format!("{:x}", sha2::digest::Output::<Sha256>::from(bytes));
+        let allocation = self.parser_capacities.map(|p| {
+            [
+                p.carry_bytes,
+                p.call_bytes,
+                p.decoded_bytes,
+                p.depth,
+                p.keys,
+                p.nodes,
+                p.proposal_bytes,
+                p.calls,
+            ]
+        });
+        let limits = self.tool_parser_limits();
+        // The reviewed revision binds parser code as well as protocol-specific
+        // decoders. Also bind their runtime selection and actual capacity settings.
+        let protocol = serde_json::json!({
+            "contract": 1, "source": candidate, "family": resolved.family().family(),
+            "device": match self.execution { Qwen3Execution::MlxCpu => "mlx_cpu", Qwen3Execution::MlxMetal => "mlx_metal" },
+            "parsing": self.tool_call_parsing,
+            "template_sha256": hex(digest(family_template(self.family, true).as_bytes())),
+            "eos": data.eos, "allocation": allocation,
+            "limits": [limits.max_output_bytes, limits.max_call_bytes, limits.max_calls],
+        });
+        Ok(crate::conformance::QualificationIdentity {
+            candidate_revision: candidate.into(),
+            dependencies_sha256: dependencies_sha256.into(),
+            artifact_manifest_sha256: hex(data.manifest_sha256),
+            family: resolved.family().family().into(),
+            family_version: resolved.family().implementation_version().to_string(),
+            engine_api_version: crate::api::ENGINE_API_VERSION,
+            tokenizer_sha256: hex(*data.tokenizer.source_sha256()),
+            template_sha256: hex(data.specification.template_sha256),
+            tool_protocol_sha256: hex(digest(protocol.to_string().as_bytes())),
+            profile_sha256: resolved.profile().qualification_sha256(),
+        })
+    }
+
     /// Construct a registry whose family metadata matches this executable
     /// adapter, register its actual local artifacts, and add caller profiles.
     pub fn registry(&self, profiles: Vec<ModelProfile>) -> Result<Registry, EngineError> {

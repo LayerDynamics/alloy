@@ -133,6 +133,63 @@ pub fn boot_native_for_qualification(
     request: BootRequest,
     context_override: Option<usize>,
 ) -> Result<BootedEngine, RpcError> {
+    let (backend, profile) = prepare_native_profile(&request, context_override)?;
+    let (budget_bytes, ceiling, guard_config) = resolve_admission_budget(&request)?;
+    maybe_apply_wired_limit(&request, &ceiling)?;
+
+    let admission = AdmissionController::new(budget_bytes)
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    let memory_enforcer = MemoryEnforcer::new(guard_config, admission.clone());
+    let scheduler = Scheduler::new(32).map_err(|error| RpcError::internal(error.to_string()))?;
+    let engine = backend
+        .into_engine_with_memory_enforcer(
+            vec![profile],
+            admission,
+            scheduler,
+            RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: true,
+            },
+            Some(memory_enforcer.clone()),
+        )
+        .map_err(|error| RpcError::internal(format!("construct engine: {error}")))?;
+    engine
+        .runtime()
+        .configure_tiered_kv(request.tiered_kv.clone())
+        .map_err(|error| RpcError::internal(format!("configure tiered KV: {error}")))?;
+
+    Ok(BootedEngine {
+        engine,
+        profile_id: request.profile_id,
+        models_resident: 1,
+        memory_reserved: budget_bytes,
+        memory_guard_tier: guard_config.tier.as_str().to_owned(),
+        ceiling_binding: ceiling.binding.map(|binding| binding.as_str().to_owned()),
+        ceiling,
+        memory_enforcer,
+    })
+}
+
+/// Inspect the same registered profile, tokenizer and templates that daemon boot selects.
+/// The trusted runner supplies its independently verified candidate and dependency digest.
+/// This does not load weights, execute fixtures, or authorize generation.
+pub fn inspect_qualification_identity(
+    request: &BootRequest,
+    context_override: Option<usize>,
+    candidate: &str,
+    dependencies_sha256: &str,
+) -> Result<(engine::conformance::QualificationIdentity, ModelProfile), RpcError> {
+    let (backend, profile) = prepare_native_profile(request, context_override)?;
+    let identity = backend
+        .qualification_identity(&profile, candidate, dependencies_sha256)
+        .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+    Ok((identity, profile))
+}
+
+fn prepare_native_profile(
+    request: &BootRequest,
+    context_override: Option<usize>,
+) -> Result<(Qwen3Backend, ModelProfile), RpcError> {
     request.validate_profile()?;
     if !request.artifact_dir.is_dir() {
         return Err(RpcError::internal(format!(
@@ -304,40 +361,7 @@ pub fn boot_native_for_qualification(
     )
     .map_err(|error| RpcError::internal(error.to_string()))?;
 
-    let (budget_bytes, ceiling, guard_config) = resolve_admission_budget(&request)?;
-    maybe_apply_wired_limit(&request, &ceiling)?;
-
-    let admission = AdmissionController::new(budget_bytes)
-        .map_err(|error| RpcError::internal(error.to_string()))?;
-    let memory_enforcer = MemoryEnforcer::new(guard_config, admission.clone());
-    let scheduler = Scheduler::new(32).map_err(|error| RpcError::internal(error.to_string()))?;
-    let engine = backend
-        .into_engine_with_memory_enforcer(
-            vec![profile],
-            admission,
-            scheduler,
-            RetentionPolicy {
-                retain_model: true,
-                retain_cache_buffers: true,
-            },
-            Some(memory_enforcer.clone()),
-        )
-        .map_err(|error| RpcError::internal(format!("construct engine: {error}")))?;
-    engine
-        .runtime()
-        .configure_tiered_kv(request.tiered_kv.clone())
-        .map_err(|error| RpcError::internal(format!("configure tiered KV: {error}")))?;
-
-    Ok(BootedEngine {
-        engine,
-        profile_id: request.profile_id,
-        models_resident: 1,
-        memory_reserved: budget_bytes,
-        memory_guard_tier: guard_config.tier.as_str().to_owned(),
-        ceiling_binding: ceiling.binding.map(|binding| binding.as_str().to_owned()),
-        ceiling,
-        memory_enforcer,
-    })
+    Ok((backend, profile))
 }
 
 fn resolve_admission_budget(

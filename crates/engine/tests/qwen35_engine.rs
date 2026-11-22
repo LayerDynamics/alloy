@@ -978,3 +978,58 @@ fn real_tools_context(result: Option<&str>) -> ContextSnapshot {
         .unwrap(),
     )
 }
+
+#[test]
+fn qwen35_qualification_identity_tracks_native_settings() {
+    let revision = "a".repeat(40);
+    let dependencies = "b".repeat(64);
+    let mut identities = Vec::new();
+    for ornith in [false, true] {
+        let fixture = Fixture::new(ornith);
+        let backend = fixture.backend(Qwen3Execution::MlxCpu, ornith);
+        let inspect = |backend: &Qwen3Backend, context| {
+            backend
+                .qualification_identity(&profile(context), &revision, &dependencies)
+                .unwrap()
+        };
+        let selected = inspect(&backend, 128);
+        assert_eq!(selected.family, "qwen35");
+        assert_eq!(selected.profile_sha256, profile(128).qualification_sha256());
+        assert_ne!(
+            selected.profile_sha256,
+            inspect(&backend, 96).profile_sha256
+        );
+        assert!(
+            backend
+                .qualification_identity(&profile(128), "unreviewed", &dependencies)
+                .is_err()
+        );
+        let expected = fixture.specification.files["tokenizer.json"].sha256;
+        assert_eq!(
+            selected.tokenizer_sha256,
+            format!("{:x}", sha2::digest::Output::<Sha256>::from(expected))
+        );
+        let enabled = backend
+            .with_parser_allocation_limits(parser_limits())
+            .unwrap();
+        let tools = inspect(&enabled, 128);
+        assert_ne!(selected.tool_protocol_sha256, tools.tool_protocol_sha256);
+        assert_eq!(
+            selected.artifact_manifest_sha256,
+            tools.artifact_manifest_sha256
+        );
+        let mut limits = parser_limits();
+        limits.call_bytes += 1;
+        let modified = enabled.with_parser_allocation_limits(limits).unwrap();
+        assert_ne!(
+            tools.tool_protocol_sha256,
+            inspect(&modified, 128).tool_protocol_sha256
+        );
+        identities.push(tools);
+    }
+    assert_ne!(identities[0].template_sha256, identities[1].template_sha256);
+    assert_ne!(
+        identities[0].tool_protocol_sha256,
+        identities[1].tool_protocol_sha256
+    );
+}

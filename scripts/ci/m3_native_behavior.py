@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the pinned native behavioral suite under mac_locked_step.py."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -90,10 +91,29 @@ def run_suite(out, record, selected, groups):
     return observations
 
 
+def inspect_profile(out, record):
+    environment = {k: record[k] for k in ("cargo_lock_sha256", "pins_sha256", "host", "architecture")}
+    environment["rustc_sha256"] = sha256(out / "rustc-version.stdout")
+    encoded = json.dumps(environment, sort_keys=True, separators=(",", ":")).encode()
+    dependencies = hashlib.sha256(encoded).hexdigest()
+    binary = build("example", "alloyd", "m3_profile_identity", out, record)
+    path = execute([binary, record["profile"], record["artifact_directory"], "40960",
+                    record["candidate"], dependencies], out, "profile-identity", record)
+    inspected = json.loads(path.read_bytes())
+    identity = inspected["identity"]
+    if inspected["profile"] != record["profile"] or inspected["context"] != 40960 or (
+        identity["candidate_revision"], identity["dependencies_sha256"]
+    ) != (record["candidate"], dependencies):
+        raise ValueError("native profile inspection did not match the requested configuration")
+    record.update(dependency_inputs=environment, dependencies_sha256=dependencies,
+                  profile_identity=path.name, profile_identity_sha256=sha256(path))
+
+
 def run(args):
     with pinned_run(args, "behavior") as (out, record, selected):
         selected.update(ALLOY_REAL_MODEL=record["artifact_directory"], ALLOY_REAL_PROFILE=args.profile)
         record["fixture_environment"] = selected
+        inspect_profile(out, record)
         observations = run_suite(out, record, selected, inventory(args.profile))
         path = out / "fixtures.json"
         write_json(path, observations)
