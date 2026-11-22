@@ -2314,3 +2314,10 @@ Cargo supplies the fixture executable, and recheck it when the scope ends.
 Extend scripts/ci/m3_native_behavior.py to include it in the dependency
 identity, and scripts/tests/test_m3_native_package.py to test kernel drift.
 This closes the interval between executing a fixture and packaging its library.
+
+Wire the same kernel equality check into scripts/ci/m3_native_qualification.py
+before report evaluation so a mismatched numerical/behavioral observation
+cannot issue a usable verdict. In .github/workflows/m3-native-observations.yaml
+enable local packaging during the existing manual qualification job and archive
+a tar containing the executable, kernels and reports with file modes preserved.
+No external release is published. Run actionlint and the matrix regression suite.
