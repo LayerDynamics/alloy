@@ -1583,3 +1583,6 @@ qualification in `crates/alloyd/src/boot.rs`. Verify publisher tool prompt
 parity in `crates/alloyd/tests/ministral3_chat.rs` and run the actual
 `llama3_tool_stop_context_cache` in `crates/alloyd/tests/llama_real_model.rs`
 with its existing allow/deny, terminal response and cache gates.
+
+Initialize the new parser field in the two existing decoder test builders,
+crates/engine/tests/unit/backends_qwen_output_{protocol_token,structured_output}.rs.
