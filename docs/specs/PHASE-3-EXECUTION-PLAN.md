@@ -2596,3 +2596,17 @@ fresh short-cache run with identical weights and render settings. Check
 the actual cache capacity, work performed, generated transcript and logits.
 Run both properties and `schema_property_cached_equals_fresh` using the
 default reproducible seed and seed 532026. Dependencies stay fixed.
+
+### Dense Qwen3 output projection parity
+
+On 01c69d1 both dense Qwen3 profiles exceed the FR-8 relative tolerance on
+the first prefill row. Match the eager prompt-shaped output projection in
+`crates/inference-infra/src/decoder/mlx_model.rs` and select the requested
+row after projection. Charge its complete payload before touching KV.
+Update the native loader allowance in `crates/engine/src/backends/qwen/loading.rs`
+and the execution reservation in `crates/engine/src/backends/qwen/memory.rs`.
+Exercise `output_limit_failure_preserves_committed_cache` with a multi-token
+prefill and the exact bound. Run the existing CPU decoder, long-cache and
+pressure tests and the original `qwen3_dense_trained_reference` for both
+4B and 14B using the unchanged eager references and FR-8 thresholds.
+Recheck the routed Coder numerical gate. Dependencies stay fixed.
