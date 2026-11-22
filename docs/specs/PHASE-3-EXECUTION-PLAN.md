@@ -1810,3 +1810,29 @@ using exactly 4,666,273,960 payload bytes. All three attention tests passed
 again (24a9b14fd574419281522d300ef010c2), as did the independent inventory
 test (8ac3740ba9a84ca6b4d39a40e7a884ca) and strict Clippy
 (838ef380058a46a1affa0dd67644d541).
+
+### #96 Gemma 4 trained decoder and fixed numerical reference
+
+Add crates/inference-infra/tests/fixtures/gemma4_capture.py, and bind its
+two fixed text prompts, decode inputs and eager full-vocabulary outputs in
+crates/inference-infra/tests/fixtures/gemma4_e4b_profile.json before running
+the Rust decoder. Use the verified conversion, the installed pinned MLX-LM
+Gemma 4 text equations, packed matrices and F32 floating payloads. Record
+the exact package versions and upstream model source digests. The converted
+artifact omits unused K/V weights in shared layers. Only those inactive
+upstream attributes may be omitted; verify all executed parameters match
+the source inventory. No production Python dependency is introduced.
+
+Implement the native text decoder in
+crates/inference-infra/src/decoder/gemma4/model.rs and update
+crates/inference-infra/src/decoder/gemma4.rs with validated norm/softcap
+parameters. Use actual packed per-layer token embeddings, projection and
+gating, learned layer scalars, normalized Q/K/V with scale-one attention,
+owner-only transactional KV, final norm, tied head and tanh logit softcap.
+Extend crates/mlx-ffi/src/ops.rs only for missing native operations.
+Add crates/inference-infra/tests/gemma4_quantized.rs with
+gemma4_native_trained_reference. Compare two real prefills and two cached
+decode steps per prompt to all 262,144 reference logits per row under both
+existing FR-8 limits. Check cache ownership, offsets and refusal without
+state change. Daemon integration and complete agent conformance follow this
+trained decoder gate.
