@@ -2393,3 +2393,7 @@ its own family identity while sharing Qwen per-head norm geometry. Reject
 this family at the dense weight constructor and loader. In the shared model
 preserve the upstream full-prompt output projection before selecting the last
 row, with corresponding checked output-byte admission.
+
+The exhaustive shared-cache dispatch in crates/engine/src/backends/qwen/architecture.rs
+also consumes DecoderFamily. Return a distinct Qwen3-Coder full-KV representation
+from that dispatch and compile the ordinary daemon to validate the integration.
