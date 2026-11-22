@@ -1043,7 +1043,9 @@ impl RuntimeBackend for Qwen3Backend {
         let additional_bytes = projection
             .additional_rendered_bytes
             .checked_add(header_growth)
-            .ok_or_else(|| EngineError::invalid_request("projection", "rendered byte bound overflow"))?;
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "rendered byte bound overflow")
+            })?;
         let rendered_bytes = rendered
             .text()
             .len()
