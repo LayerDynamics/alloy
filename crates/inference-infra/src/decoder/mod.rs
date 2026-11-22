@@ -2,6 +2,7 @@
 pub mod config;
 pub mod fixture;
 pub mod gemma3;
+pub mod gemma4;
 pub mod hybrid;
 pub mod loader;
 pub mod ministral3;

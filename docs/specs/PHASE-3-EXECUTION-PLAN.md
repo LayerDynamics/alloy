@@ -1756,3 +1756,25 @@ gemma4_attention_masks_and_scale. Exercise malformed layouts, absolute
 offsets, unrotated channel pairs, sliding-window eviction and causality
 using real MLX arrays against independent scalar expectations. The
 scope of this batch is the attention component of #96.
+
+Gemma 4 E4B passed all three geometry, rotation and attention tests
+(824829e069e143199336aa00b25962f7). The rotation and attention outputs
+were checked on both MLX CPU and Metal. Strict Clippy passed
+(c6743e2a54574aa2b41a4907f2af5ada). Gemma 4 decoder, trained weights
+execution, daemon registration and agent qualification are still pending.
+
+The Ministral affine8 daemon passed both long-context and policy tests
+(ed121cdd67c54195ab28d0f4c4d9ddf2). It retrieved COBALT-7392 at 8,895
+and 33,925 input tokens, recovered after streamed cancellation, executed
+the allowed write and respected denial. Its 33,925-token MLX peak was
+18,601,867,588 bytes. Both trained numerical checks and both native memory
+tests passed (16fba106cada4b419891e9b5b660a3b6). Measurements below are
+bytes. Transient is the peak above the larger of pre-inference and settled
+active memory, including KV update overlap.
+
+| Quantization | Budget | Executed positions | Weights | Committed KV | Transient | Peak active |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4-bit | simulated 8 GiB | 513 | 2,143,678,464 | 109,903,872 | 170,198,804 | 2,423,781,140 |
+| 4-bit | real 36 GiB | 32,737 | 2,143,678,464 | 6,973,358,080 | 7,000,621,056 | 16,117,657,600 |
+| 8-bit | simulated 8 GiB | 513 | 3,858,100,224 | 109,903,872 | 169,148,932 | 4,137,153,028 |
+| 8-bit | real 36 GiB | 32,737 | 3,858,100,224 | 6,973,358,080 | 7,000,621,056 | 17,832,079,360 |
