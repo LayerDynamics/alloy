@@ -2172,3 +2172,30 @@ existing 8k/32k retrieval cases and the separate overflow-compaction test.
 No change to supported product limits or model weights. Run all three
 named native boundary tests. This supplies the advertised-context measurement
 for a 40960-token #72 configuration, conditional on real retrieval.
+
+### #72 assemble and evaluate complete candidate-bound native reports
+
+Extend crates/engine/examples/m3_numerical_report.rs with a qualification
+mode that constructs QualificationSpec and QualificationReport, using
+the same frozen reference/hash and actual raw rows as numerical issuance.
+Compute the suite digest and run QualificationSpec::evaluate. Persist the
+full report, spec and verdict even when a valid observation records a
+fixture failure. The usual numerical-only entry point remains supported.
+In scripts/ci/m3_native_behavior.py define the reviewed coverage mapping
+for each named fixture in the registered suites, with multiple independent
+assertions in one real test sharing its native transcript. For hybrid
+tool format include qwen35_real_engine_tool_proposals using the pinned
+artifact and the correct Ornith/upstream selection. Compare the inventory
+to the mandatory kinds in the engine evaluator. Add
+scripts/ci/m3_native_qualification.py to verify terminal fixture identities,
+executables, commands, stream digests and exact named pass/failure, and use
+the actual profile identity and pinned numerical inputs from the same
+fresh matrix directory. Call it from scripts/ci/m3_native_matrix.py on
+both success and failure. Record per-profile report/verdict hashes and
+keep a failed matrix exit for unsupported profiles. Extend
+scripts/tests/test_m3_native_{matrix,behavior}.py and add
+scripts/tests/test_m3_native_qualification.py for rejected stale/tampered
+evidence, missing execution, named failures, and retained multi-kind
+observations. Exercise the engine example, the real matrix, and the property
+and report gates. Production admission separately needs a trusted deployed
+report and a matching runtime identity. No new dependencies.
