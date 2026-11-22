@@ -133,3 +133,78 @@ fn quantized_matmul_smoke() {
         );
     }
 }
+
+#[test]
+fn routed_swiglu_matches_selected_experts() {
+    use mlx_ffi::ops::{AffineExperts, SwitchGluExperts, routed_swiglu, to_vec_f32};
+    let cpu = Device::new(DeviceType::Cpu, 0).unwrap();
+    let stream = Stream::get_default(&cpu).unwrap();
+    const EXPERTS: usize = 3;
+    const WIDTH: usize = 64;
+    let diagonal = |offset: usize| {
+        let mut packed = vec![0u32; EXPERTS * WIDTH * (WIDTH / 8)];
+        for e in 0..EXPERTS {
+            for i in 0..WIDTH {
+                packed[(e * WIDTH + i) * (WIDTH / 8) + i / 8] =
+                    ((e + offset) as u32) << (4 * (i % 8));
+            }
+        }
+        Array::from_u32_slice(&packed, &[3, 64, 8]).unwrap()
+    };
+    let gate = diagonal(1);
+    let up = diagonal(2);
+    let down = diagonal(3);
+    let scales = Array::from_f32_slice(&[1.; EXPERTS * WIDTH], &[3, 64, 1]).unwrap();
+    let bias = Array::from_f32_slice(&[0.; EXPERTS * WIDTH], &[3, 64, 1]).unwrap();
+    let bank = |packed| AffineExperts {
+        packed,
+        scales: &scales,
+        biases: &bias,
+        group_size: 64,
+        bits: 4,
+    };
+    let mut banks = SwitchGluExperts {
+        gate: bank(&gate),
+        up: bank(&up),
+        down: bank(&down),
+    };
+    let inputs: Vec<f32> = (0..2 * WIDTH).map(|i| (i as f32 - 62.) / 64.).collect();
+    let x = Array::from_f32_slice(&inputs, &[2, 64]).unwrap();
+    let logits = [[2.0f32, -1., 1.], [-2., 3., 1.]];
+    let router = Array::from_f32_slice(logits.as_flattened(), &[2, 3]).unwrap();
+    for normalize in [true, false] {
+        let out = routed_swiglu(&x, &router, &banks, 2, normalize, &stream).unwrap();
+        assert_eq!(out.shape(), [2, WIDTH]);
+        let values = to_vec_f32(&out, &stream).unwrap();
+        for (row, selected) in [[0, 2], [1, 2]].into_iter().enumerate() {
+            let probs = logits[row].map(f32::exp);
+            let sum: f32 = if normalize {
+                selected.iter().map(|&e| probs[e]).sum()
+            } else {
+                probs.iter().sum()
+            };
+            for column in 0..WIDTH {
+                let x = inputs[row * WIDTH + column];
+                let expected: f32 = selected
+                    .iter()
+                    .map(|&e| {
+                        let g = x * (e + 1) as f32;
+                        probs[e] / sum
+                            * (g / (1. + (-g).exp()))
+                            * (x * (e + 2) as f32)
+                            * (e + 3) as f32
+                    })
+                    .sum();
+                assert!(
+                    (values[row * WIDTH + column] - expected).abs() < 2e-5,
+                    "row={row}, column={column}"
+                );
+            }
+        }
+    }
+    for invalid in [0, 4] {
+        assert!(routed_swiglu(&x, &router, &banks, invalid, true, &stream).is_err());
+    }
+    banks.gate.packed = &scales;
+    assert!(routed_swiglu(&x, &router, &banks, 1, true, &stream).is_err());
+}

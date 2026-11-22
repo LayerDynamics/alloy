@@ -22,11 +22,13 @@
 
 use crate::{Array, DType, Error, Stream, bindings as sys};
 mod hybrid;
+mod routed;
 mod sequential_delta;
 pub use hybrid::{
     broadcast_to, concatenate_axis, depthwise_conv1d, exp, gated_delta_update, rms_norm_unweighted,
     scale, sigmoid, softplus,
 };
+pub use routed::{AffineExperts, SwitchGluExperts, routed_swiglu};
 use std::{
     ffi::CString,
     fmt,
