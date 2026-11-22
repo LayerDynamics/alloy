@@ -1640,3 +1640,10 @@ omitting the pinned Ministral EOS. For real_model_generated_history_has_verified
 use only the publisher's exact closing bytes `</s>` for this profile. Retain
 the byte-to-token identity check and state lookup. The independent two-process
 test already restored 628 of 629 input tokens and returned the exact cold answer.
+
+With the bounded fixture the checkpoint verified, the first continuation was
+exactly COBALT, and the reopened answer was **COBALT** including Markdown.
+Compare reopened and fresh execution before asserting the unchanged literal
+answer in real_model_compaction_preserves_history_and_continues. Keep the
+original prompt, the exact-answer assertion and the restored-prefix checks.
+This distinguishes a cache divergence from a repeated model-format failure.
