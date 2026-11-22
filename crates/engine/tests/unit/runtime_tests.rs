@@ -20,6 +20,16 @@ fn empty_native_state(retention: RetentionPolicy) -> NativeState {
 }
 
 #[test]
+fn cold_load_charge_preserves_peak_and_residency() {
+    let limits = ModelLoadLimits::new(100, 200, 300).unwrap();
+    let phased = limits.with_scratch_released_before_cache();
+    for (kv, expected) in [(0, 300), (40, 260), (100, 200), (150, 200), (u64::MAX, 200)] {
+        assert_eq!(limits.cold_load_charge(kv), 300);
+        assert_eq!(phased.cold_load_charge(kv), expected);
+    }
+}
+
+#[test]
 fn control_and_generation_proxy_can_cross_task_boundaries() {
     assert_send_sync::<FamilyRuntime>();
     assert_send::<NativeSession>();

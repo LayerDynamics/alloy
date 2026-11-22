@@ -128,6 +128,7 @@ pub struct ModelLoadLimits {
     max_source_bytes: NonZeroU64,
     max_resident_bytes: NonZeroU64,
     max_load_peak_bytes: NonZeroU64,
+    releases_scratch_before_cache: bool,
 }
 
 impl ModelLoadLimits {
@@ -155,7 +156,28 @@ impl ModelLoadLimits {
             max_source_bytes: source,
             max_resident_bytes: resident,
             max_load_peak_bytes: peak,
+            releases_scratch_before_cache: false,
         })
+    }
+
+    /// The synchronous loader has finished native work and dropped all
+    /// transient buffers when it returns. A later cache allocation can use
+    /// those same bytes from the atomic startup grant.
+    pub(crate) fn with_scratch_released_before_cache(mut self) -> Self {
+        self.releases_scratch_before_cache = true;
+        self
+    }
+
+    /// Charge for a cold load in addition to the separately reserved new KV.
+    /// Resident weights stay covered for their entire lifetime.
+    pub(crate) fn cold_load_charge(self, new_cache_bytes: u64) -> u64 {
+        let peak = self.max_load_peak_bytes();
+        if self.releases_scratch_before_cache {
+            peak.saturating_sub(new_cache_bytes)
+                .max(self.max_resident_bytes())
+        } else {
+            peak
+        }
     }
 
     /// Maximum cumulative source bytes, including checkpoint metadata.

@@ -1217,12 +1217,15 @@ impl RuntimeBackend for Qwen3Backend {
                 .chunk_limit(self.limits.prefill_chunk_tokens.get(), capacity);
             let prefill_chunk_tokens =
                 NonZeroUsize::new(chunk_tokens).expect("nonzero configured chunk");
+            let mut load_limits =
+                ModelLoadLimits::new(data.source_bytes, data.resident_bound, load_peak)?;
+            if matches!(&data.config, BackendConfig::Transformer(config)
+                if config.kv_update_mode(capacity) == inference_infra::kv_cache::KvUpdateMode::Layerwise)
+            {
+                load_limits = load_limits.with_scratch_released_before_cache();
+            }
             Ok(RuntimePlan {
-                load_limits: ModelLoadLimits::new(
-                    data.source_bytes,
-                    data.resident_bound,
-                    load_peak,
-                )?,
+                load_limits,
                 cache: CacheAllocationRequest::new(
                     family_cache_mode(self.family)?,
                     capacity,

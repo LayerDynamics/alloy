@@ -728,16 +728,11 @@ fn qwen_parser_hooks_wrong_slab_size_is_rejected_and_released() {
     assert_eq!(admission.snapshot().expect("released").reserved_bytes(), 0);
 }
 
-#[test]
-fn tool_context_reaches_the_production_qwen_renderer() {
-    use crate::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
-    let mut fixture = Fixture::new();
-    // Rendering needs more context than the tiny execution fixture. Change
-    // and re-pin the actual config; do not bypass profile/context checks.
+fn extend_context(fixture: &mut Fixture, limit: usize, output_reserve: usize) {
     let path = fixture.directory.0.join("config.json");
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("JSON");
-    config["max_position_embeddings"] = serde_json::json!(8192);
+    config["max_position_embeddings"] = serde_json::json!(limit);
     let bytes = serde_json::to_vec(&config).expect("config JSON");
     std::fs::write(&path, &bytes).expect("config write");
     fixture.specification.files.insert(
@@ -747,16 +742,23 @@ fn tool_context_reaches_the_production_qwen_renderer() {
             sha256: digest(&bytes),
         },
     );
-    fixture.limits.context_limit_tokens = 8192;
+    fixture.limits.context_limit_tokens = limit;
     fixture.profile = ModelProfile::new(
         fixture.context.profile_id().clone(),
         fixture.specification.id.clone(),
-        8192,
-        4,
+        limit,
+        output_reserve,
         8,
         GenerationOptions::greedy(4).expect("options"),
     )
     .expect("profile");
+}
+
+#[test]
+fn tool_context_reaches_the_production_qwen_renderer() {
+    use crate::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let mut fixture = Fixture::new();
+    extend_context(&mut fixture, 8192, 4);
     let metadata = RenderingTool::new(
         "fs.read".into(),
         "1.0.0".into(),
@@ -1086,6 +1088,97 @@ fn execute_engine_path_with_pressure(
         QWEN3_MLX_CACHE_REPRESENTATION
     );
     assert!(!caps.supports_prefix_reuse);
+}
+
+#[test]
+fn long_cold_start_reuses_loader_scratch_for_kv() {
+    let mut fixture = executable_fixture();
+    extend_context(&mut fixture, 2048, 1024);
+    for pooled in [false, true] {
+        let backend = Qwen3Backend::new_with_execution(
+            vec![fixture.specification.clone()],
+            fixture.limits.clone(),
+            Qwen3Execution::MlxCpu,
+        )
+        .unwrap();
+        let registry = backend.registry(vec![fixture.profile.clone()]).unwrap();
+        let rendered =
+            block_on(backend.render_and_count(&registry, fixture.context.clone())).unwrap();
+        let profile = fixture.context.profile_id().clone();
+        let plan = block_on(backend.plan(&registry, &profile, rendered.token_count())).unwrap();
+        let load = plan.load_limits.max_load_peak_bytes();
+        let resident = plan.load_limits.max_resident_bytes();
+        let kv = plan.cache.max_cache_bytes();
+        let fixed = plan.output_bytes + plan.temporary_bytes + plan.headroom_bytes;
+        let required = fixed + load.max(resident + kv);
+        assert!(required < fixed + load + kv);
+        let admission = AdmissionController::new(required).unwrap();
+        let runtime = FamilyRuntime::new(
+            vec![Arc::new(backend)],
+            admission.clone(),
+            fixture.limits.generation,
+            RetentionPolicy {
+                retain_model: true,
+                retain_cache_buffers: false,
+            },
+        )
+        .unwrap();
+        let runtime = if pooled {
+            runtime.with_model_pool(None).unwrap()
+        } else {
+            runtime
+        };
+        let policy = crate::pressure::PressurePolicy::new(crate::pressure::PressureOptions {
+            allocator_ceiling_bytes: None,
+            allow_allocator_cache_clear: false,
+            allow_idle_state_release: false,
+            allow_idle_model_unload: false,
+            max_reclamation_actions: 0,
+        })
+        .unwrap();
+        let engine = EngineCore::new(
+            registry,
+            Scheduler::new(8).unwrap(),
+            runtime.with_pressure_policy(policy),
+        );
+        let request = |id| {
+            crate::types::GenerationRequest::new(
+                crate::types::RequestId::new(id).unwrap(),
+                profile.clone(),
+                fixture.context.clone(),
+                GenerationOptions::greedy(4).unwrap(),
+            )
+            .unwrap()
+        };
+        let one = admission.reserve("other owner", 1).unwrap();
+        let estimate =
+            block_on(engine.estimate_memory(profile.clone(), rendered.token_count())).unwrap();
+        assert_eq!(estimate.reserved_bytes(), required);
+        assert!(!estimate.fits());
+        assert!(matches!(
+            block_on(engine.generate(request("below"))),
+            Err(EngineError::MemoryLimitExceeded { .. })
+        ));
+        assert_eq!(admission.snapshot().unwrap().reserved_bytes(), 1);
+        drop(one);
+        let mut events = block_on(engine.generate(request("at-limit")))
+            .unwrap()
+            .into_events();
+        let mut text = String::new();
+        let mut completed = false;
+        while let Some(event) = block_on(std::future::poll_fn(|cx| events.as_mut().poll_next(cx))) {
+            match event {
+                crate::types::GenerationEvent::TextDelta { text: delta } => text.push_str(&delta),
+                crate::types::GenerationEvent::GenerationCompleted { usage, .. } => {
+                    assert_eq!(usage.output_tokens, 4);
+                    completed = true;
+                }
+                other => panic!("unexpected native event: {other:?}"),
+            }
+        }
+        assert!(completed);
+        assert_eq!(text, "!!!!");
+    }
 }
 
 #[test]

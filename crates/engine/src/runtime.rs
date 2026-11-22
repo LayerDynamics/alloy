@@ -1115,7 +1115,7 @@ impl EngineRuntime for FamilyRuntime {
                 0
             } else {
                 plan.load_limits
-                    .max_load_peak_bytes()
+                    .cold_load_charge(plan.cache.max_cache_bytes())
                     .checked_sub(plan.load_limits.max_resident_bytes())
                     .ok_or_else(|| internal("invalid loader overlap bounds"))?
             };
@@ -2583,7 +2583,7 @@ impl NativeState {
             0
         } else {
             plan.load_limits
-                .max_load_peak_bytes()
+                .cold_load_charge(plan.cache.max_cache_bytes())
                 .checked_sub(plan.load_limits.max_resident_bytes())
                 .ok_or_else(|| internal("invalid loader overlap bounds"))?
         };
@@ -3232,30 +3232,9 @@ impl NativeState {
             && resident
                 .and_then(|resident| resident.cache.as_ref())
                 .is_some_and(|cache| cache_matches(cache, &setup.plan));
-        let weights = if residency.reusable_model {
-            0
-        } else {
-            setup.plan.load_limits.max_load_peak_bytes()
-        };
-        let cache = if same_cache {
-            0
-        } else {
-            setup.plan.cache.max_cache_bytes()
-        };
-        let history = if retains_contents(self.retention) {
-            token_storage_bytes(setup.plan.cache.capacity_tokens())?
-        } else {
-            0
-        };
-        // Same conservative full-startup ledger forecast as the existing
-        // estimate, without crediting reservations before their guards die.
-        let ledger = add(
-            add(add(weights, cache)?, history)?,
-            add(
-                add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?,
-                setup.plan.output_bytes,
-            )?,
-        )?;
+        let components =
+            incremental_startup_components(&setup.plan, self.retention, &residency, same_cache)?;
+        let ledger = components.into_iter().try_fold(0, add)?;
         let policy = setup
             .pressure_policy
             .ok_or_else(|| internal("pressure policy missing"))?;
@@ -3870,15 +3849,21 @@ impl NativeState {
         };
 
         if self.resident.is_none() {
-            let peak = setup.plan.load_limits.max_load_peak_bytes();
+            let limits = setup.plan.load_limits;
             let mut weights = {
                 let grant = &mut self
                     .pending
                     .as_mut()
                     .ok_or_else(|| internal("admitted startup grant disappeared"))?
                     .grant;
+                // No KV allocation exists on a cold load. Its unpartitioned
+                // grant remains exclusively owned until load() returns.
+                if grant.remaining_bytes() < limits.max_load_peak_bytes() {
+                    return Err(internal("startup grant does not cover the loader peak"));
+                }
+                let charge = limits.cold_load_charge(setup.plan.cache.max_cache_bytes());
                 grant
-                    .take("model loading peak", peak)?
+                    .take("model loading peak", charge)?
                     .ok_or_else(|| internal("startup grant missing model loading peak"))?
             };
             let model = setup.backend.load(ModelLoadRequest::new(
@@ -5005,7 +4990,8 @@ fn incremental_startup_components(
     let weights = if residency.reusable_model {
         0
     } else {
-        plan.load_limits.max_load_peak_bytes()
+        plan.load_limits
+            .cold_load_charge(plan.cache.max_cache_bytes())
     };
     let cache = if same_cache {
         0
