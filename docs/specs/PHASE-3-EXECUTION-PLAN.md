@@ -2131,3 +2131,26 @@ Linux CLI job in .github/workflows/ci.yaml. Verify ci_partition_test.rb,
 runner tests, YAML structure and real three-profile local execution.
 No new dependency. Hosted terminal CI and the other M3 families still
 require their own exits.
+
+### #72 derive qualification identity from production profile construction
+
+Factor native backend and ModelProfile preparation out of
+crates/alloyd/src/boot.rs and reuse it for identity inspection. Use the
+actual verified tokenizer, consumed artifact manifest, selected text/tool
+templates, registered family version and profile settings. Implement the
+identity constructor in crates/engine/src/backends/qwen/backend.rs.
+Bind the tool parser to its reviewed source revision, family, advertised
+template, configured parsing mode and allocation limits. Include the
+backend execution device. No Python reconstruction of the Rust identities.
+Add crates/alloyd/examples/m3_profile_identity.rs for the trusted runner
+to inspect the selected native Metal tool-enabled configuration without
+changing production eligibility. Extend scripts/ci/m3_native_behavior.py
+to build and execute it at the shared long-context fixture's configured
+40960 tokens, preserving the exact context/output/margin, output file hash
+and environment digest (Cargo.lock, PINS.md, rustc, host OS/architecture).
+This is the observed configuration, not a claim that the entire context
+has passed retrieval. In crates/engine/tests/qwen35_engine.rs, add
+qwen35_qualification_identity_tracks_native_settings for both renderers
+and context / parser mode changes. Verify exact metadata on the three
+pinned artifacts; reports and production promotion still require all
+fixture and provenance checks. No new dependencies.
