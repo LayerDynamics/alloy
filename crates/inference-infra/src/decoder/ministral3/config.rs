@@ -216,3 +216,31 @@ impl MinistralConfig {
         self.kv_heads * self.head_dim
     }
 }
+
+impl MinistralConfig {
+    /// Geometry consumed by the full-attention native decoder after text-only loading.
+    pub fn decoder_config(&self) -> Result<crate::decoder::config::DecoderConfig, ModelError> {
+        use crate::decoder::config::{DecoderConfig, DecoderFamily};
+        self.validate()?;
+        Ok(DecoderConfig {
+            family: DecoderFamily::Ministral3 {
+                yarn: self.yarn,
+                query_beta: self.query_scaling_beta,
+            },
+            hidden_size: self.hidden,
+            intermediate_size: self.intermediate,
+            vocab_size: self.vocabulary,
+            num_layers: self.layers,
+            q_heads: self.query_heads,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            rms_eps: self.epsilon,
+            rope_theta: self.yarn.theta,
+            rope_scaling: None,
+            rope_layers: None,
+            max_context: self.context,
+            quantization_bits: self.quantization_bits,
+            tie_embeddings: self.tied_embeddings,
+        })
+    }
+}

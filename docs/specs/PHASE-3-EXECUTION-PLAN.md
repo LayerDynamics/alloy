@@ -1523,3 +1523,15 @@ mapping in engine/src/backends/qwen/{architecture.rs,backend.rs,loading.rs}.
 Give Ministral its own full-KV representation, keeping the adapter's declared
 family distinct from the decoder's mathematical configuration. Check the
 engine crate together with the native model checks.
+
+The real Ministral checkpoint passed native text loading and numerical
+comparison. Its verified 2,745,210,934-byte shard produced 183 packed matrices
+and 53 norms totaling 2,143,678,464 resident bytes. The one-byte-under budget
+was refused. The trained prefill and four subsequent cached decode steps on
+two prompts matched all 786,432 reference logits with maximum absolute error
+1.78e-15 and maximum pointwise relative error 2.23e-16 or lower. Local
+receipts 82e69b378b134433baf7596432a26e6e and 03b9838872fa4fe3b871c537dbcf62be
+cover these checks. Strict Clippy for engine, inference-infra and mlx-ffi
+passed, as did 61 shared infrastructure tests and five CPU/Metal position
+tests (0ac5b4705f974207891a25813272c570 and 29ecc502466945a8a38a255565cfe7f5).
+The daemon chat/tool path, long-context, agent and qualification gates remain open.

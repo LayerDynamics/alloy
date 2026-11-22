@@ -832,15 +832,17 @@ impl MlxDecoderModel {
             let key = ops::transpose(&key, &[0, 2, 1, 3], stream)?;
             let value = ops::transpose(&value, &[0, 2, 1, 3], stream)?;
 
-            let query = if c.uses_rope(index) {
-                apply_rope(&query, c, position, stream)?
-            } else {
-                query
-            };
-            let key = if c.uses_rope(index) {
-                apply_rope(&key, c, position, stream)?
-            } else {
-                key
+            let (query, key) = match c.family {
+                super::config::DecoderFamily::Ministral3 { yarn, query_beta } => {
+                    super::ministral3::position::rotate_query_key(
+                        &query, &key, &yarn, query_beta, position, stream,
+                    )?
+                }
+                _ if c.uses_rope(index) => (
+                    apply_rope(&query, c, position, stream)?,
+                    apply_rope(&key, c, position, stream)?,
+                ),
+                _ => (query, key),
             };
 
             let prefix = append.stage_layer(index, &key, &value)?;
@@ -1142,6 +1144,22 @@ pub(crate) fn check_matrix(
 
 fn validate_weights(c: &DecoderConfig, weights: &DecoderWeights) -> Result<u64, ModelError> {
     use super::config::DecoderFamily;
+    if let DecoderFamily::Ministral3 { yarn, query_beta } = c.family {
+        yarn.validate()
+            .map_err(|_| ModelError::InvalidConfig("invalid Ministral YaRN parameters"))?;
+        if c.head_dim != yarn.dimensions
+            || c.rope_theta != yarn.theta
+            || c.rope_scaling.is_some()
+            || c.max_context > 1 << 24
+            || c.max_context < yarn.original_context
+            || !query_beta.is_finite()
+            || query_beta < 0.0
+        {
+            return Err(ModelError::InvalidConfig(
+                "inconsistent Ministral position contract",
+            ));
+        }
+    }
     if match (&c.family, &c.rope_layers) {
         (DecoderFamily::SmolLm3, Some(layers)) => layers.len() != c.num_layers,
         (DecoderFamily::SmolLm3, None) => true,

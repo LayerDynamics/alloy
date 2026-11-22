@@ -1622,8 +1622,7 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
         (BackendFamily::SmolLm3, true) => smollm::template::TOOL_CHAT_TEMPLATE,
     }
 }
-fn family_cache_mode(family: impl Into<BackendFamily>) -> Result<CacheMode, EngineError> {
-    let family = family.into();
+fn family_cache_mode(family: BackendFamily) -> Result<CacheMode, EngineError> {
     if family == BackendFamily::Gemma3 {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new(GEMMA3_CACHE_REPRESENTATION)?,

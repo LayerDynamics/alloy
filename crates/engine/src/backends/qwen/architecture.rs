@@ -14,14 +14,18 @@ impl BackendFamily {
         matches!(self, Self::Qwen35 | Self::Ornith)
     }
 }
-impl From<inference_infra::decoder::config::DecoderFamily> for BackendFamily {
-    fn from(value: inference_infra::decoder::config::DecoderFamily) -> Self {
-        use inference_infra::decoder::config::DecoderFamily as F;
-        match value {
-            F::Qwen3 => Self::Qwen3,
-            F::Llama3 => Self::Llama3,
-            F::SmolLm3 => Self::SmolLm3,
-        }
+fn dense_cache_mode(
+    family: inference_infra::decoder::config::DecoderFamily,
+) -> Result<CacheMode, EngineError> {
+    use inference_infra::decoder::config::DecoderFamily;
+    match family {
+        DecoderFamily::Qwen3 => family_cache_mode(BackendFamily::Qwen3),
+        DecoderFamily::Llama3 => family_cache_mode(BackendFamily::Llama3),
+        DecoderFamily::SmolLm3 => family_cache_mode(BackendFamily::SmolLm3),
+        DecoderFamily::Ministral3 { .. } => Ok(CacheMode {
+            representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        }),
     }
 }
 

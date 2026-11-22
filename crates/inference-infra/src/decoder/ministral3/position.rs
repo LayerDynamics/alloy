@@ -31,8 +31,26 @@ pub fn apply_position(
     {
         return Err(invalid("invalid Ministral position input or absolute offset").into());
     }
-    let frequencies = attention::yarn_frequencies(&config.yarn, stream)?;
-    let amplitude = config.yarn.rotary_amplitude();
+    rotate_query_key(
+        query,
+        key,
+        &config.yarn,
+        config.query_scaling_beta,
+        offset,
+        stream,
+    )
+}
+
+pub(crate) fn rotate_query_key(
+    query: &Array,
+    key: &Array,
+    yarn: &attention::YarnParameters,
+    query_beta: f32,
+    offset: usize,
+    stream: &Stream,
+) -> MlxDecoderResult<(Array, Array)> {
+    let frequencies = attention::yarn_frequencies(yarn, stream)?;
+    let amplitude = yarn.rotary_amplitude();
     let rotate = |input: &Array| -> MlxDecoderResult<Array> {
         let scaled = if amplitude == 1.0 {
             input.clone()
@@ -48,12 +66,7 @@ pub fn apply_position(
     };
     let query = rotate(query)?;
     let key = rotate(key)?;
-    let query = attention::position_query_scale(
-        &query,
-        offset,
-        config.yarn.original_context,
-        config.query_scaling_beta,
-        stream,
-    )?;
+    let query =
+        attention::position_query_scale(&query, offset, yarn.original_context, query_beta, stream)?;
     Ok((query, key))
 }

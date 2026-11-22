@@ -87,11 +87,16 @@ impl DecoderConfig {
 }
 
 /// Dense architectures with different attention semantics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DecoderFamily {
     Qwen3,
     Llama3,
     SmolLm3,
+    /// Nested Ministral 3 text decoder with full-head YaRN and absolute query scaling.
+    Ministral3 {
+        yarn: mlx_ffi::attention::YarnParameters,
+        query_beta: f32,
+    },
 }
 
 /// Parse the publisher's 0=NoPE/1=RoPE schedule, with explicit overrides taking

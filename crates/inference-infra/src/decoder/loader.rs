@@ -156,6 +156,19 @@ pub fn load_tensor_set_verified<'a, T>(
     verification: &'a CheckpointVerification<'a>,
     configure: impl FnOnce(&serde_json::Value) -> Result<(T, TensorLayout), ModelError>,
 ) -> Result<(T, LoadedTensorSet), ModelError> {
+    load_selected_tensor_set_verified(path, options, verification, configure, |_| false)
+}
+
+/// Stream and authenticate the entire checkpoint while retaining only the
+/// requested tensors. Each extra name must belong to an explicitly excluded
+/// namespace defined by the family adapter.
+pub(crate) fn load_selected_tensor_set_verified<'a, T>(
+    path: &Path,
+    options: LoadOptions,
+    verification: &'a CheckpointVerification<'a>,
+    configure: impl FnOnce(&serde_json::Value) -> Result<(T, TensorLayout), ModelError>,
+    excluded: impl Fn(&str) -> bool,
+) -> Result<(T, LoadedTensorSet), ModelError> {
     let cancelled = Some(verification.cancelled);
     check_loading_cancelled(cancelled)?;
     let (supplied, root, is_directory) = resolve_source(path)?;
@@ -203,7 +216,11 @@ pub fn load_tensor_set_verified<'a, T>(
             }
         }
     }
-    if inventory.needed.len() != names.len() {
+    if inventory.needed.len() != names.len()
+        && names
+            .keys()
+            .any(|name| !inventory.needed.contains(name) && !excluded(name))
+    {
         return Err(invalid("unsupported tensors in family checkpoint"));
     }
     let Inventory {
@@ -893,6 +910,14 @@ fn load_weights_impl<'a>(
     options: LoadOptions,
     verification: Option<&'a CheckpointVerification<'a>>,
 ) -> Result<DecoderWeights, ModelError> {
+    if matches!(
+        config.family,
+        super::config::DecoderFamily::Ministral3 { .. }
+    ) {
+        return Err(invalid(
+            "Ministral requires its verified nested text loader",
+        ));
+    }
     if !matches!(config.quantization_bits, 4 | 8) {
         return Err(invalid("unsupported packed bit width"));
     }
@@ -1794,6 +1819,46 @@ mod hardening_unit_tests {
             }
             Ok(("validated-hybrid".into(), Self::layout()))
         }
+    }
+
+    #[test]
+    fn selected_tensor_set_authenticates_excluded_bytes() {
+        let fixture = HybridFixture::new();
+        let verification = CheckpointVerification {
+            sha256: &fixture.pins,
+            cancelled: &|| false,
+        };
+        let load = |exclude: bool| {
+            load_selected_tensor_set_verified(
+                &fixture.directory.0,
+                fixture.options(),
+                &verification,
+                |_| {
+                    let mut layout = HybridFixture::layout();
+                    layout.tensors.remove("conv.weight");
+                    Ok(((), layout))
+                },
+                |name| exclude && name == "conv.weight",
+            )
+        };
+        assert!(matches!(
+            load(false),
+            Err(ModelError::CheckpointValidation(_))
+        ));
+        let (_, tensors) = load(true).unwrap();
+        assert_eq!(tensors.len(), 2);
+        assert!(!tensors.contains_key("conv.weight"));
+        let path = fixture.directory.0.join("model.safetensors");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+        let start = header["conv.weight"]["data_offsets"][0].as_u64().unwrap() as usize;
+        bytes[8 + header_len + start] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            load(true),
+            Err(ModelError::CheckpointValidation(_))
+        ));
     }
 
     #[test]

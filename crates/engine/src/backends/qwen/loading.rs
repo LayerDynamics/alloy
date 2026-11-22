@@ -206,7 +206,7 @@ impl Qwen3Loaded {
         &self,
         cache: &'a mut dyn FamilyCache,
     ) -> Result<&'a mut Qwen3NativeCache, EngineError> {
-        if cache.owner() != &self.instance || cache.mode() != &family_cache_mode(self.model.config().family)? {
+        if cache.owner() != &self.instance || cache.mode() != &dense_cache_mode(self.model.config().family)? {
             return Err(EngineError::invalid_request(
                 "cache",
                 "cache belongs to another model or representation",
@@ -240,7 +240,7 @@ impl AutoregressiveModel for Qwen3Loaded {
         control: &ExecutionControl,
     ) -> Result<Box<dyn FamilyCache>, EngineError> {
         control.check_cancelled()?;
-        if request.mode() != &family_cache_mode(self.model.config().family)? {
+        if request.mode() != &dense_cache_mode(self.model.config().family)? {
             return Err(EngineError::unsupported(
                 "cache mode",
                 "only full MLX float32 KV is implemented",
