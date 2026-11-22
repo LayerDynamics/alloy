@@ -825,6 +825,7 @@ impl TestEnvironment {
             discard_policy(),
             false,
             engine::backends::Qwen3Execution::MlxCpu,
+            Qwen3Config::tiny_fixture(),
         )
     }
 
@@ -836,7 +837,15 @@ impl TestEnvironment {
         retention: RetentionPolicy,
         execution: engine::backends::Qwen3Execution,
     ) -> Self {
-        Self::build(4, 8, false, retention, true, execution)
+        Self::build(
+            4,
+            8,
+            false,
+            retention,
+            true,
+            execution,
+            Qwen3Config::tiny_fixture(),
+        )
     }
 
     fn build(
@@ -846,11 +855,11 @@ impl TestEnvironment {
         retention: RetentionPolicy,
         prefix_fixture: bool,
         execution: engine::backends::Qwen3Execution,
+        mut config: Qwen3Config,
     ) -> Self {
         assert!(!prefix_fixture || !eos_is_zero);
 
         let directory = TestDirectory::new();
-        let mut config = Qwen3Config::tiny_fixture();
         config.vocab_size = 258;
         config.tie_embeddings = false;
 
@@ -1010,6 +1019,10 @@ impl TestEnvironment {
         let selected_profile = profile_id();
         let plan = block_on(backend.plan(&registry, &selected_profile, rendered.token_count()))
             .expect("plan");
+
+        if prefix_fixture {
+            assert_eq!(plan.cache.capacity_tokens(), config.max_context);
+        }
 
         let admission = AdmissionController::new(BUDGET_BYTES).expect("admission");
         let scheduler = Scheduler::new(64).expect("scheduler");
@@ -1604,43 +1617,64 @@ proptest::proptest! {
     #![proptest_config(cache_property_config(12))]
     #[test]
     fn prefix_property_cached_equals_fresh(suffix in "[a-z]{1,4}", change in 0u8..5) {
-        let warm = TestEnvironment::prefix(retained_policy());
-        let completed = completed_context(&warm, "property-seed", "property-base");
-        let old_ids = warm.render(completed.clone()).token_ids().to_vec();
-        let original = &completed.messages()[0].content;
-        let body = match change {
-            0 => format!("{original}{suffix}"),
-            1 => format!("j{}", &original[1..]),
-            2 => "hel".to_owned(),
-            _ => original.clone(),
-        };
-        if change == 3 {
-            warm.select_rendering(RENDER_TEST_B);
-        } else if change == 4 {
-            warm.select_rendering(RENDER_TEST_TOKENIZER_B);
-        }
-        let next = context("property-next", profile_id(), &body);
-        let rendered = warm.render(next.clone());
-        let actual = warm.run("property-warm", next.clone());
-        let warm_work = warm.work("property-warm");
-        if change == 0 {
-            assert!(rendered.token_ids().starts_with(&old_ids));
-            assert_eq!(warm_work.prefill_tokens, rendered.token_ids()[old_ids.len()..]);
-        } else {
-            assert_eq!(warm_work.prefill_tokens, rendered.token_ids());
-        }
-        let cold = TestEnvironment::prefix(discard_policy());
-        if change == 3 {
-            cold.select_rendering(RENDER_TEST_B);
-        } else if change == 4 {
-            cold.select_rendering(RENDER_TEST_TOKENIZER_B);
-        }
-        let reference = cold.run("property-cold", next);
-        let cold_work = cold.work("property-cold");
-        assert_eq!(cold_work.prefill_tokens, rendered.token_ids());
-        assert_matches_cold(&actual, &warm_work, &reference, &cold_work);
-        cold.wait_unreserved();
+        check_prefix_edit(TestEnvironment::prefix(retained_policy()), &suffix, change);
     }
+
+    #[test]
+    fn long_prefix_property_cached_equals_fresh(suffix in "[a-z]{1,4}", change in 0u8..5) {
+        let mut config = Qwen3Config::tiny_fixture();
+        config.max_context = 2048;
+        assert_eq!(
+            config.kv_update_mode(config.max_context),
+            inference_infra::kv_cache::KvUpdateMode::Layerwise
+        );
+        let warm = TestEnvironment::build(
+            4, 8, false, retained_policy(), true,
+            engine::backends::Qwen3Execution::MlxCpu, config,
+        );
+        check_prefix_edit(warm, &suffix, change);
+    }
+}
+
+fn check_prefix_edit(warm: TestEnvironment, suffix: &str, change: u8) {
+    let completed = completed_context(&warm, "property-seed", "property-base");
+    let old_ids = warm.render(completed.clone()).token_ids().to_vec();
+    let original = &completed.messages()[0].content;
+    let body = match change {
+        0 => format!("{original}{suffix}"),
+        1 => format!("j{}", &original[1..]),
+        2 => "hel".to_owned(),
+        _ => original.clone(),
+    };
+    if change == 3 {
+        warm.select_rendering(RENDER_TEST_B);
+    } else if change == 4 {
+        warm.select_rendering(RENDER_TEST_TOKENIZER_B);
+    }
+    let next = context("property-next", profile_id(), &body);
+    let rendered = warm.render(next.clone());
+    let actual = warm.run("property-warm", next.clone());
+    let warm_work = warm.work("property-warm");
+    if change == 0 {
+        assert!(rendered.token_ids().starts_with(&old_ids));
+        assert_eq!(
+            warm_work.prefill_tokens,
+            rendered.token_ids()[old_ids.len()..]
+        );
+    } else {
+        assert_eq!(warm_work.prefill_tokens, rendered.token_ids());
+    }
+    let cold = TestEnvironment::prefix(discard_policy());
+    if change == 3 {
+        cold.select_rendering(RENDER_TEST_B);
+    } else if change == 4 {
+        cold.select_rendering(RENDER_TEST_TOKENIZER_B);
+    }
+    let reference = cold.run("property-cold", next);
+    let cold_work = cold.work("property-cold");
+    assert_eq!(cold_work.prefill_tokens, rendered.token_ids());
+    assert_matches_cold(&actual, &warm_work, &reference, &cold_work);
+    cold.wait_unreserved();
 }
 
 proptest::proptest! {
