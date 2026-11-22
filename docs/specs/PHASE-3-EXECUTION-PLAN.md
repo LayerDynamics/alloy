@@ -2105,3 +2105,9 @@ Register this mandatory fixture for both profiles in scripts/ci/m3_native_behavi
 and extend scripts/tests/test_m3_native_behavior.py inventory checks.
 Re-run both named native reference tests after sharing the loader. No new
 dependencies. These are #95 and #72 memory observations for the #53 exit.
+
+Expose the separately measured full-KV and recurrent backing bytes through
+Qwen35Cache::component_buffer_bytes in crates/inference-infra/src/decoder/qwen35/model.rs.
+Keep buffer_bytes as the checked sum used by existing admission callers.
+Allocator padding can change after an update, so subtraction of initial KV
+from final aggregate bytes would not measure recurrent storage accurately.
