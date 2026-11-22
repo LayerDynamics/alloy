@@ -19,9 +19,9 @@ class NativeBehaviorTests(unittest.TestCase):
             kinds = {k for name in names for k in behavior.COVERAGE[name]}
             expected = {"tool_schema", "stops", "exact_counting", "long_context", "compaction",
                                      "cached_uncached", "streaming", "cancellation", "restart",
-                                     "policy_gated_task"}
-            if not profile.startswith(("gemma-3-", "phi4-")):
-                expected.update(("memory8_gi_b", "memory36_gi_b"))
+                                     "policy_gated_task", "memory8_gi_b", "memory36_gi_b"}
+            self.assertEqual("gemma3_native_memory_tiers" in names, profile.startswith("gemma-3-"))
+            self.assertEqual("phi_native_memory_tiers" in names, profile.startswith("phi4-"))
             self.assertEqual(kinds, expected, profile)
             self.assertEqual("ministral3_native_memory_tiers" in names, profile.startswith("ministral-"))
             self.assertEqual("gemma3_real_4b_engine_tools" in names, profile == "gemma-3-4b-4bit")

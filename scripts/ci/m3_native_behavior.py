@@ -47,9 +47,18 @@ FAMILY_FIXTURES = {
     "gemma-4-e4b-it-4bit": GEMMA4,
     "ornith-1.5-9b-4bit": HYBRID,
     "qwen3.5-0.8b-4bit": HYBRID,
-    "gemma-3-4b-4bit": (("engine", "gemma3_engine", ("gemma3_real_4b_engine_tools",)),),
-    "gemma-3-12b-4bit": (("engine", "gemma3_engine", ("gemma3_real_12b_engine_tools",)),),
-    "phi4-mini-instruct-4bit": (("engine", "phi_engine", ("phi_real_engine_tool_proposals",)),),
+    "gemma-3-4b-4bit": (
+        ("engine", "gemma3_engine", ("gemma3_real_4b_engine_tools",)),
+        ("inference-infra", "gemma3_quantized", ("gemma3_native_memory_tiers",)),
+    ),
+    "gemma-3-12b-4bit": (
+        ("engine", "gemma3_engine", ("gemma3_real_12b_engine_tools",)),
+        ("inference-infra", "gemma3_quantized", ("gemma3_native_memory_tiers",)),
+    ),
+    "phi4-mini-instruct-4bit": (
+        ("engine", "phi_engine", ("phi_real_engine_tool_proposals",)),
+        ("inference-infra", "phi_quantized", ("phi_native_memory_tiers",)),
+    ),
     "ministral-3-3b-instruct-2512-4bit": MINISTRAL,
     "ministral-3-3b-instruct-2512-8bit": MINISTRAL,
 }
@@ -83,6 +92,8 @@ COVERAGE = {
     "phi_real_engine_tool_proposals": ("tool_schema",),
     "ministral3_native_daemon_chat": ("exact_counting", "streaming"),
     "ministral3_publisher_tool_prompt_parity": ("tool_schema",),
+    "gemma3_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
+    "phi_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
     "ministral3_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
 }
 
