@@ -2512,3 +2512,21 @@ test_shared_lifecycle_is_mandatory_for_each_pinned_profile and
 test_qwen_numerical_selection_and_missing_reference_pin. Dependencies stay
 fixed. Full acceptance requires the trained outputs, policy-gated tool,
 compaction, cache, memory and exact-boundary generation for each profile.
+
+### Dense Qwen3 long-context admission and activation lifetime
+
+Measure the actual daemon estimate at the 40,384-token input boundary with
+native_boundary_memory_estimate in `crates/alloyd/tests/llama_real_model.rs`.
+Share the existing test executor from `crates/alloyd/tests/live_metrics.rs` in
+`crates/alloyd/tests/support/block_on.rs`. Record weights, transactional KV,
+temporary storage, output, headroom and the effective ceiling for each model.
+In `crates/inference-infra/src/decoder/config.rs` and
+`crates/inference-infra/src/decoder/mlx_model.rs` bound the live graph by
+evaluating each completed transformer layer for long dense Qwen3 caches.
+Preserve short-request evaluation, last-row projection and transactional KV.
+Use the same graph policy in `crates/engine/src/backends/qwen/memory.rs` and
+the long-context chunk cap in `crates/engine/src/backends/qwen/architecture.rs`.
+Verify with long_dense_cache_matches_short_cache_after_cancel and the existing
+mlx_cpu_complete_forward_prefill_and_decode_match_reference. No dependency
+changes. A fitting estimate is a prerequisite for the separate Metal boundary
+generation, and a measured refusal remains a failed conformance result.
