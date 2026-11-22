@@ -1908,3 +1908,10 @@ Update the existing constructors in
 `crates/engine/tests/unit/backends_qwen_output_protocol_token.rs` and
 `crates/engine/tests/unit/backends_qwen_output_structured_output.rs` with the
 same disabled protocol state, and rerun their output regression tests.
+
+For the two real harnesses, add the exact pinned E4B ID and its declared
+family/mixed cache representation in `crates/alloyd/tests/llama_real_model.rs`
+(llama3_tool_stop_context_cache) and its reset/rebuild semantics in
+`crates/alloyd/tests/compaction_real_model.rs`
+(real_model_compaction_preserves_history_and_continues). Apply the same
+tool, state and event assertions as the other mixed-cache profiles.
