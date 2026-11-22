@@ -27,6 +27,9 @@ use crate::{
 };
 use std::{os::raw::c_int, ptr};
 
+mod yarn;
+pub use yarn::{YarnParameters, position_query_scale, yarn_frequencies};
+
 /// Attention visibility for a supplied Q/K/V sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionMask {

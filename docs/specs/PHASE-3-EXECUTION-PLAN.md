@@ -1475,3 +1475,29 @@ This batch implements the real position operations, not complete Ministral
 support. Packed text-only loading, full decoder integration, templates/tools,
 actual artifact logits, context/cache/agent/memory gates and production
 qualification remain required follow-on work.
+
+Position evidence: pinned upstream capture d59a2bab1669412eaae4cbd3183436b8
+completed on CPU and Metal. Native receipt7cc6d968b4544f95a401ccccf840cdee
+passes all five position/geometry tests in20.43seconds: each of20reference
+cases has maximum absolute and pointwise-relative error exactly0. All splits
+reproduce Q/K tensors exactly across the16384boundary and through the final
+supported position. Independent scalar rotation/query-scale checks and invalid
+geometry/offset rejection pass. Public-field documentation was added after
+this run; strictClippy remains pending. This evidence does not qualify the
+complete trained model. The subsequent user-requested Cargo cleanup does not
+change product source or these retained terminal results.
+
+### #99 verified Ministral text loader
+
+The pinned 830-entry shard index has 602 language tensors, 218 vision tensors
+and 10 projector tensors. Add weights.rs under the existing ministral3 decoder
+and export it in mod.rs. Reuse DecoderWeights and LayerWeights for owned
+packed data. Extend decoder/loader.rs with a crate-private variant of the
+verified tensor-set loader that accepts an explicit excluded-name predicate.
+The existing entry point retains exact inventory checking. Ministral permits
+only the two known non-text namespaces, streams every byte through the trusted
+shard hash, rejects unknown text tensors and enforces the declared affine
+representation. Add tests/ministral3_loading.rs with
+ministral3_text_checkpoint_loading on the actual pinned file, exercising exact
+resident payload and one-byte-under refusal. Exercise skipped-byte integrity
+and unknown namespaces on a small artifact. No registry promotion in this batch.
