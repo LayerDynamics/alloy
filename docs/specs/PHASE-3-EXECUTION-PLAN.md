@@ -1915,3 +1915,14 @@ family/mixed cache representation in `crates/alloyd/tests/llama_real_model.rs`
 `crates/alloyd/tests/compaction_real_model.rs`
 (real_model_compaction_preserves_history_and_continues). Apply the same
 tool, state and event assertions as the other mixed-cache profiles.
+
+The real E4B model stopped immediately after a rejected tool result on the
+716-token request, in both Alloy and the independent greedy reference
+(1e7308d68b764568ad5aa91e07cfcd56, 51632c9fb0ea41f4ae3de278937e37ea).
+Changing the result content to a typed object also produced immediate EOS.
+Supplying the agent's general result-reporting and no-retry instruction in
+the trusted system turn produced an accurate rejection explanation upstream
+(a6cfa0d3742e4a9289fb954a4e86f6e4). Apply that contract to every Gemma 4
+turn with advertised tools in the planned gemma4_tools.jinja, preserve the
+caller's system text and freeze publisher render parity with the same system
+content. Keep the actual write, deny and model-reply requirements intact.
