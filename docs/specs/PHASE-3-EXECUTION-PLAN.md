@@ -2088,3 +2088,20 @@ evidence digests and inventory through the Python unit tests. Run native
 suites on the pinned Mac artifacts. This supplies traceable per-test
 observations for the #53 compaction/family/Ornith exits; boot admission
 still requires a complete trusted spec for the actual validated profile.
+
+### #95 hybrid memory measurements for both pinned profiles
+
+In crates/inference-infra/tests/support/qwen35.rs share the existing verified
+checkpoint loader from crates/inference-infra/tests/qwen35_quantized.rs.
+Add crates/inference-infra/tests/qwen35_memory.rs and its
+qwen35_native_memory_tiers test. On Ornith and the independent small Qwen3.5,
+measure real weights, full KV and recurrent state at 512 prompt tokens with
+an 8 GiB MLX ceiling and 32736 prompt tokens on the physical 36 GiB Mac.
+Include a real decode, finite logits, context length, allocator peaks and
+transient memory; assert physical RAM and budget. Bound new-cache and forward
+allocations with checked model plans. Daemon admission/refusal and retrieval
+remain separately measured by llama3_long_context_stream_cancel_memory.
+Register this mandatory fixture for both profiles in scripts/ci/m3_native_behavior.py
+and extend scripts/tests/test_m3_native_behavior.py inventory checks.
+Re-run both named native reference tests after sharing the loader. No new
+dependencies. These are #95 and #72 memory observations for the #53 exit.
