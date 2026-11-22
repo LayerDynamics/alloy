@@ -145,7 +145,17 @@ fn llama3_tool_stop_context_cache() {
             .filter(|e| e["params"]["event"] == name)
             .count()
     };
-    assert_eq!(matching(&events, "tool_requested"), 1);
+    let proposals: Vec<_> = events
+        .iter()
+        .filter(|e| e["params"]["event"] == "tool_requested")
+        .map(|e| &e["params"]["body"])
+        .collect();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0]["tool_id"], "fs.write");
+    assert_eq!(
+        proposals[0]["arguments"],
+        json!({"path":"marker.txt","content":"COBALT"})
+    );
     assert_eq!(matching(&events, "tool_call_started"), 1);
     assert!(
         events
@@ -552,6 +562,18 @@ fn native_validated_context_boundary() {
             29,
             "6094342011ee1d2c9a858a8506f0535a3ae87aeef9accdd4238ced660a01e5aa",
             "065053bd8112d87f6a4a07419d5164ae93430d9c6928ec21d051940e6054581c",
+        ),
+        "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit" => (
+            653,
+            38,
+            "5f93c485c402ef82875d84d57fbd56cf8a179101121828845eb060bd24c18ed1",
+            "89098b6e1d42b4ea5d950e06715da31ef2bc0ccefd508ad7d982538420b7cb82",
+        ),
+        "smollm3-3b-4bit" => (
+            648,
+            48,
+            "42b3913c4ae6ef8f17a115ccf831d00a8d45d5b078dd499ef51eb4efc2ccc02d",
+            "49470014a7f7ab37e6d3809d885edae59292ddc3eabf82966f6fa5ed0d46116f",
         ),
         other => panic!("no pinned boundary input for {other}"),
     };

@@ -44,6 +44,9 @@ MINISTRAL = (
     ("alloyd", "ministral3_chat", ("ministral3_native_daemon_chat", "ministral3_publisher_tool_prompt_parity")),
 )
 FAMILY_FIXTURES = {
+    "llama-3.1-8b-4bit": (("llama3", "quantized_loading", ("dense_native_memory_tiers",)),),
+    "llama-3.1-8b-8bit": (("llama3", "quantized_loading", ("dense_native_memory_tiers",)),),
+    "smollm3-3b-4bit": (("smollm", "quantized_loading", ("dense_native_memory_tiers",)),),
     "gemma-4-e4b-it-4bit": GEMMA4,
     "ornith-1.5-9b-4bit": HYBRID,
     "qwen3.5-0.8b-4bit": HYBRID,
@@ -73,7 +76,8 @@ def inventory(profile):
 # Each category corresponds to assertions in the named native test. Every
 # named test remains required even if another test covers the same category.
 COVERAGE = {
-    "llama3_tool_stop_context_cache": ("policy_gated_task", "stops"),
+    "llama3_tool_stop_context_cache": ("policy_gated_task", "stops", "tool_schema"),
+    "dense_native_memory_tiers": ("memory8_gi_b", "memory36_gi_b"),
     "llama3_long_context_stream_cancel_memory": ("streaming", "cancellation"),
     "native_validated_context_boundary": ("long_context", "exact_counting"),
     "real_model_compaction_preserves_history_and_continues": ("compaction",),

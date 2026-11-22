@@ -1,3 +1,5 @@
+#[path = "../../../inference-infra/tests/support/numerical_capture.rs"]
+mod numerical_capture;
 use mlx_ffi::{Device, DeviceType, Stream};
 use smollm::{
     config::parse_config,
@@ -69,25 +71,11 @@ fn smollm3_quantized_native_reference() {
     let mut relative = 0f64;
     let mut squared_error = 0f64;
     let mut squared_reference = 0f64;
-    const PROMPTS: [&[u32]; 2] = [
-        &[
-            128011, 9125, 198, 2675, 527, 264, 11190, 15592, 18328, 7086, 4487, 337, 11237, 11,
-            16572, 555, 473, 36368, 19109, 13, 27857, 287, 14904, 25, 611, 2201, 5978, 771, 128012,
-            198, 128011, 882, 198, 3923, 374, 220, 17, 489, 220, 17, 30, 128012, 198, 128011,
-            78191, 198, 128002, 271, 128003, 198,
-        ],
-        &[
-            128011, 9125, 198, 2675, 527, 264, 11190, 15592, 18328, 7086, 4487, 337, 11237, 11,
-            16572, 555, 473, 36368, 19109, 13, 27857, 287, 14904, 25, 611, 2201, 5978, 771, 128012,
-            198, 128011, 882, 198, 849, 21435, 3249, 279, 13180, 374, 6437, 13, 128012, 198,
-            128011, 78191, 198, 128002, 271, 128003, 198,
-        ],
-    ];
     for (case_index, case) in reference["cases"].as_array().unwrap().iter().enumerate() {
         let tokens: Vec<u32> = serde_json::from_value(case["tokens"].clone()).unwrap();
         let decode: Vec<u32> = serde_json::from_value(case["decode_tokens"].clone()).unwrap();
-        assert_eq!(tokens, PROMPTS[case_index]);
-        assert_eq!(decode, [19, 13]);
+        assert_eq!(case["tokens"], profile["prompt_tokens"][case_index]);
+        assert_eq!(case["decode_tokens"], profile["decode_tokens"]);
         assert_eq!(case["logits"].as_array().unwrap().len(), 3);
         let mut cache = model
             .new_cache(tokens.len() + decode.len(), 1024 * 1024 * 1024, &stream)
@@ -101,7 +89,7 @@ fn smollm3_quantized_native_reference() {
             )
             .unwrap();
         let mut rows = vec![first.into_values()];
-        for token in decode {
+        for &token in &decode {
             rows.push(
                 model
                     .decode(
@@ -119,6 +107,7 @@ fn smollm3_quantized_native_reference() {
             .zip(case["logits"].as_array().unwrap())
             .enumerate()
         {
+            numerical_capture::record(&profile, case_index, row, &tokens, &decode[..row], actual);
             let mut row_abs = 0f64;
             let mut row_rel = 0f64;
             let mut worst = (0usize, 0f64, 0f64);
@@ -152,4 +141,16 @@ fn smollm3_quantized_native_reference() {
     );
     assert!(absolute < 0.02, "absolute logit error {absolute}");
     assert!(relative < 0.01, "relative logit error {relative}");
+}
+
+#[path = "../../../inference-infra/tests/support/dense_memory.rs"]
+mod dense_memory;
+
+#[test]
+#[ignore = "requires pinned profile weights, Metal and a physical 36 GiB Mac"]
+fn dense_native_memory_tiers() {
+    let profile: serde_json::Value =
+        serde_json::from_str(include_str!("../fixture/profile.json")).unwrap();
+    assert_eq!(profile["id"], std::env::var("ALLOY_REAL_PROFILE").unwrap());
+    dense_memory::run(&profile, parse_config);
 }

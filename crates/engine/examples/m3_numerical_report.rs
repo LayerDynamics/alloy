@@ -51,6 +51,18 @@ struct NativeRow {
 
 fn pinned(profile: &str) -> Result<(Pin, usize)> {
     let (manifest, vocabulary) = match profile {
+        "llama-3.1-8b-4bit" => (
+            include_str!("../../families/llama3/fixture/affine4_profile.json"),
+            128_256,
+        ),
+        "llama-3.1-8b-8bit" => (
+            include_str!("../../families/llama3/fixture/affine8_profile.json"),
+            128_256,
+        ),
+        "smollm3-3b-4bit" => (
+            include_str!("../../families/smollm/fixture/profile.json"),
+            128_256,
+        ),
         "gemma-4-e4b-it-4bit" => (
             include_str!("../../inference-infra/tests/fixtures/gemma4_e4b_profile.json"),
             262_144,

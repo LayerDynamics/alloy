@@ -22,6 +22,7 @@ class NativeBehaviorTests(unittest.TestCase):
                                      "policy_gated_task", "memory8_gi_b", "memory36_gi_b"}
             self.assertEqual("gemma3_native_memory_tiers" in names, profile.startswith("gemma-3-"))
             self.assertEqual("phi_native_memory_tiers" in names, profile.startswith("phi4-"))
+            self.assertEqual("dense_native_memory_tiers" in names, profile.startswith(("llama-", "smollm3-")))
             self.assertEqual(kinds, expected, profile)
             self.assertEqual("ministral3_native_memory_tiers" in names, profile.startswith("ministral-"))
             self.assertEqual("gemma3_real_4b_engine_tools" in names, profile == "gemma-3-4b-4bit")

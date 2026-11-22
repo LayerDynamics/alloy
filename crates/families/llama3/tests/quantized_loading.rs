@@ -1,3 +1,5 @@
+#[path = "../../../inference-infra/tests/support/numerical_capture.rs"]
+mod numerical_capture;
 use llama3::{
     config::parse_config,
     loader::{CheckpointVerification, LoadOptions, load_weights_verified},
@@ -9,10 +11,9 @@ use mlx_ffi::{Device, DeviceType, Stream};
 fn llama3_4bit_8bit_load() {
     let root =
         std::path::PathBuf::from(std::env::var_os("ALLOY_LLAMA_ARTIFACT").expect("artifact"));
-    let reference: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(std::env::var_os("ALLOY_LLAMA_REFERENCE").expect("reference")).unwrap(),
-    )
-    .unwrap();
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(std::env::var_os("ALLOY_LLAMA_REFERENCE").unwrap()).unwrap();
+    let reference: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let config = parse_config(
         &serde_json::from_slice(&std::fs::read(root.join("config.json")).unwrap()).unwrap(),
     )
@@ -25,10 +26,25 @@ fn llama3_4bit_8bit_load() {
         .iter()
         .find(|p| p["id"] == reference["profile"])
         .expect("frozen profile");
-    assert!(matches!(
-        profile["id"].as_str().unwrap(),
-        "llama-3.1-8b-4bit" | "llama-3.1-8b-8bit"
-    ));
+    let pin = llama_pin(profile["id"].as_str().unwrap());
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        pin["reference"]["sha256"]
+    );
+    assert_eq!(pin["artifact"]["revision"], profile["artifact"]["revision"]);
+    for (f, original) in pin["artifact"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(profile["artifact"]["files"].as_array().unwrap())
+    {
+        assert_eq!(f["path"], original["path"]);
+        assert_eq!(f["sha256"], original["sha256"]);
+    }
+    assert_eq!(
+        pin["artifact"]["files"].as_array().unwrap().len(),
+        profile["artifact"]["files"].as_array().unwrap().len()
+    );
     assert_eq!(reference["artifact_sha256"], profile["artifact"]["sha256"]);
     assert_eq!(reference["compile_enabled"], false);
     for (package, version) in [("mlx", "0.32.4"), ("mlx-lm", "0.31.2"), ("numpy", "2.4.2")] {
@@ -71,22 +87,11 @@ fn llama3_4bit_8bit_load() {
     let mut relative = 0f64;
     let mut squared_error = 0f64;
     let mut squared_reference = 0f64;
-    const PROMPTS: [&[u32]; 2] = [
-        &[
-            128000, 128006, 882, 128007, 271, 3923, 374, 220, 17, 489, 220, 17, 30, 128009, 128006,
-            78191, 128007, 271,
-        ],
-        &[
-            128000, 128006, 9125, 128007, 271, 16533, 3613, 285, 989, 13, 128009, 128006, 882,
-            128007, 271, 849, 21435, 3249, 279, 13180, 374, 6437, 13, 128009, 128006, 78191,
-            128007, 271,
-        ],
-    ];
     for (case_index, case) in reference["cases"].as_array().unwrap().iter().enumerate() {
         let tokens: Vec<u32> = serde_json::from_value(case["tokens"].clone()).unwrap();
         let decode: Vec<u32> = serde_json::from_value(case["decode_tokens"].clone()).unwrap();
-        assert_eq!(tokens, PROMPTS[case_index]);
-        assert_eq!(decode, [19, 13]);
+        assert_eq!(case["tokens"], pin["prompt_tokens"][case_index]);
+        assert_eq!(case["decode_tokens"], pin["decode_tokens"]);
         assert_eq!(case["logits"].as_array().unwrap().len(), 3);
         let mut cache = model
             .new_cache(tokens.len() + decode.len(), 1024 * 1024 * 1024, &stream)
@@ -100,7 +105,7 @@ fn llama3_4bit_8bit_load() {
             )
             .unwrap();
         let mut rows = vec![first.into_values()];
-        for token in decode {
+        for &token in &decode {
             rows.push(
                 model
                     .decode(
@@ -118,6 +123,7 @@ fn llama3_4bit_8bit_load() {
             .zip(case["logits"].as_array().unwrap())
             .enumerate()
         {
+            numerical_capture::record(&pin, case_index, row, &tokens, &decode[..row], actual);
             let mut row_abs = 0f64;
             let mut row_rel = 0f64;
             let mut worst = (0usize, 0f64, 0f64);
@@ -151,4 +157,23 @@ fn llama3_4bit_8bit_load() {
     );
     assert!(absolute < 0.02, "absolute logit error {absolute}");
     assert!(relative < 0.01, "relative logit error {relative}");
+}
+
+fn llama_pin(profile: &str) -> serde_json::Value {
+    serde_json::from_str(match profile {
+        "llama-3.1-8b-4bit" => include_str!("../fixture/affine4_profile.json"),
+        "llama-3.1-8b-8bit" => include_str!("../fixture/affine8_profile.json"),
+        other => panic!("unknown pinned Llama profile {other}"),
+    })
+    .unwrap()
+}
+
+#[path = "../../../inference-infra/tests/support/dense_memory.rs"]
+mod dense_memory;
+
+#[test]
+#[ignore = "requires pinned profile weights, Metal and a physical 36 GiB Mac"]
+fn dense_native_memory_tiers() {
+    let profile = llama_pin(&std::env::var("ALLOY_REAL_PROFILE").unwrap());
+    dense_memory::run(&profile, parse_config);
 }

@@ -1,5 +1,6 @@
 from hashlib import sha256
 import os
+import json
 from unittest.mock import patch
 import importlib.util
 from pathlib import Path
@@ -12,6 +13,15 @@ spec.loader.exec_module(runner)
 
 
 class NativeEvidenceTests(unittest.TestCase):
+    def test_family_owned_numerical_pins(self):
+        for profile, package in [("llama-3.1-8b-4bit", "llama3"), ("llama-3.1-8b-8bit", "llama3"),
+                                 ("smollm3-3b-4bit", "smollm")]:
+            suite = runner.SUITES[profile]
+            pin = json.loads((runner.ROOT / suite.manifest).read_bytes())
+            self.assertEqual((suite.package, suite.target, pin["id"]), (package, "quantized_loading", profile))
+            self.assertEqual(len(pin["prompt_tokens"]), 2)
+            self.assertEqual(pin["decode_tokens"], [19, 13])
+
     def test_candidates_and_checkouts_have_separate_cargo_targets(self):
         with TemporaryDirectory() as tmp, patch.dict(os.environ, {"CARGO_TARGET_DIR": tmp}):
             root = Path(tmp)

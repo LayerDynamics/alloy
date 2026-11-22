@@ -10,17 +10,37 @@ import platform
 import re
 import subprocess
 import sys
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
+class Suite(NamedTuple):
+    manifest: Path
+    package: str
+    target: str
+    test: str
+    prefix: str
+
+
+def infra(stem, target, test, prefix):
+    return Suite(Path("crates/inference-infra/tests/fixtures") / (stem + "_profile.json"),
+                 "inference-infra", target, test, prefix)
+
+
 SUITES = {
-    "gemma-4-e4b-it-4bit": ("gemma4_e4b", "gemma4_quantized", "gemma4_native_trained_reference", "ALLOY_GEMMA4"),
-    "ornith-1.5-9b-4bit": ("ornith_1_5_9b", "qwen35_quantized", "ornith_9b_quantized_native_reference", "ALLOY_ORNITH"),
-    "qwen3.5-0.8b-4bit": ("qwen35_0_8b", "qwen35_quantized", "qwen35_0_8b_quantized_native_reference", "ALLOY_QWEN35_SMALL"),
-    "gemma-3-4b-4bit": ("gemma3_4b", "gemma3_quantized", "gemma3_4b_real_quantized_native_reference", "ALLOY_GEMMA3_SMALL"),
-    "gemma-3-12b-4bit": ("gemma3_12b", "gemma3_quantized", "gemma3_12b_real_quantized_native_reference", "ALLOY_GEMMA3"),
-    "phi4-mini-instruct-4bit": ("phi4_mini", "phi_quantized", "phi4mini_real_quantized_native_reference", "ALLOY_PHI"),
-    "ministral-3-3b-instruct-2512-4bit": ("ministral3", "ministral3_quantized", "ministral3_real_quantized_native_reference", "ALLOY_MINISTRAL3"),
-    "ministral-3-3b-instruct-2512-8bit": ("ministral3_8bit", "ministral3_quantized", "ministral3_real_affine8_native_reference", "ALLOY_MINISTRAL3"),
+    "gemma-4-e4b-it-4bit": infra("gemma4_e4b", "gemma4_quantized", "gemma4_native_trained_reference", "ALLOY_GEMMA4"),
+    "ornith-1.5-9b-4bit": infra("ornith_1_5_9b", "qwen35_quantized", "ornith_9b_quantized_native_reference", "ALLOY_ORNITH"),
+    "qwen3.5-0.8b-4bit": infra("qwen35_0_8b", "qwen35_quantized", "qwen35_0_8b_quantized_native_reference", "ALLOY_QWEN35_SMALL"),
+    "gemma-3-4b-4bit": infra("gemma3_4b", "gemma3_quantized", "gemma3_4b_real_quantized_native_reference", "ALLOY_GEMMA3_SMALL"),
+    "gemma-3-12b-4bit": infra("gemma3_12b", "gemma3_quantized", "gemma3_12b_real_quantized_native_reference", "ALLOY_GEMMA3"),
+    "phi4-mini-instruct-4bit": infra("phi4_mini", "phi_quantized", "phi4mini_real_quantized_native_reference", "ALLOY_PHI"),
+    "ministral-3-3b-instruct-2512-4bit": infra("ministral3", "ministral3_quantized", "ministral3_real_quantized_native_reference", "ALLOY_MINISTRAL3"),
+    "ministral-3-3b-instruct-2512-8bit": infra("ministral3_8bit", "ministral3_quantized", "ministral3_real_affine8_native_reference", "ALLOY_MINISTRAL3"),
+    "llama-3.1-8b-4bit": Suite(Path("crates/families/llama3/fixture/affine4_profile.json"),
+                               "llama3", "quantized_loading", "llama3_4bit_8bit_load", "ALLOY_LLAMA"),
+    "llama-3.1-8b-8bit": Suite(Path("crates/families/llama3/fixture/affine8_profile.json"),
+                               "llama3", "quantized_loading", "llama3_4bit_8bit_load", "ALLOY_LLAMA"),
+    "smollm3-3b-4bit": Suite(Path("crates/families/smollm/fixture/profile.json"),
+                             "smollm", "quantized_loading", "smollm3_quantized_native_reference", "ALLOY_SMOLLM"),
 }
 
 
@@ -127,8 +147,8 @@ def pinned_run(args, scope):
     try:
         verify_candidate(args.candidate)
         record["cargo_target_directory"] = str(cargo_target(args.candidate, out.parent))
-        manifest_stem, _, _, prefix = SUITES[args.profile]
-        pin = ROOT / "crates/inference-infra/tests/fixtures" / (manifest_stem + "_profile.json")
+        suite = SUITES[args.profile]
+        pin = ROOT / suite.manifest
         manifest = json.loads(pin.read_bytes())
         if manifest["id"] != args.profile:
             raise ValueError("wrong pinned profile")
@@ -141,7 +161,7 @@ def pinned_run(args, scope):
                       architecture=platform.machine(), cargo_lock_sha256=sha256(ROOT / "Cargo.lock"),
                       pins_sha256=sha256(ROOT / "PINS.md"))
         execute(["rustc", "-Vv"], out, "rustc-version", record)
-        selected = {prefix + "_ARTIFACT": str(artifact), prefix + "_REFERENCE": str(reference)}
+        selected = {suite.prefix + "_ARTIFACT": str(artifact), suite.prefix + "_REFERENCE": str(reference)}
         yield out, record, selected
         kernel = record["metal_library"]
         if sha256(Path(kernel["path"])) != kernel["sha256"]:
@@ -165,8 +185,9 @@ def pinned_run(args, scope):
 
 def run(args):
     with pinned_run(args, "numerical") as (out, record, selected):
-        _, target, name, _ = SUITES[args.profile]
-        binary = build("test", "inference-infra", target, out, record)
+        suite = SUITES[args.profile]
+        name = suite.test
+        binary = build("test", suite.package, suite.target, out, record)
         evaluator = build("example", "engine", "m3_numerical_report", out, record)
         rows = out / "raw"
         rows.mkdir()

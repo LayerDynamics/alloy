@@ -107,7 +107,8 @@ def issue(profile, candidate, paths, root, runs):
         required, observed = fixture_rows(behavior_dir, behavior, profile)
         if (behavior["status"] == "passed") != all(row["passed"] for row in observed):
             raise ValueError("behavioral receipt status differs from terminal fixtures")
-        _, target, name, _ = SUITES[profile]
+        suite = SUITES[profile]
+        target, name = suite.target, suite.test
         native_commands = [c for c in numerical["commands"] if c.get("stdout") == "native-test.stdout"]
         if len(native_commands) != 1:
             raise ValueError("no unique native reference execution")
