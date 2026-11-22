@@ -2268,3 +2268,36 @@ and check all mandatory categories in scripts/tests/test_m3_native_behavior.py.
 Use release compilation, strict Clippy, exact named Metal runs and the qualification
 runner. Dependencies are existing MLX allocator counters and checkpoint pins.
 This supplies the isolated 8/36 GiB components of the #53 and #72 profile reports.
+
+### #72 consume fresh profile qualifications in a locally packaged production daemon
+
+In scripts/ci/m3_native_matrix.py add an optional local package output to the
+same invocation that executes the clean-candidate suites. In
+scripts/ci/m3_native_package.py assemble a new relocatable local package for
+eligible profiles only. Check the current source, dependency inputs, successful
+run and qualification receipts, report digests and native identity. Copy the
+matched spec/report bytes and record the validated context and runtime host
+model/OS build in a small catalog. Build the daemon from the same clean source
+with the catalog SHA-256 and source revision compiled in. Atomically publish
+the local package on success. Keep the matrix's overall failing exit if any
+required suite failed. No network distribution, installation or signing.
+
+In crates/alloyd/src/{boot,qualification}.rs and crates/alloyd/src/lib.rs use
+the embedded trust digest on ordinary production boot, verify the catalog and
+both packaged files before deserialization, match the actual loaded backend
+identity, then require and evaluate the spec/report in the engine registry.
+Use the validated context when none is requested. A different requested
+context, render/parser mode, host, candidate, missing entry, mutated bytes or
+failed observations must refuse. Unspecialized developer builds retain their
+previous baseline profile policy. In crates/engine/src/api.rs add a bounded
+pre-use method that installs a requirement and report only on an unshared
+registry and makes a failed installation unusable. Preserve the experimental
+qualification entry point for collecting new evidence. No runtime environment
+variable, arbitrary report argument or saved pass flag can grant eligibility.
+No new dependency. Named tests: packaged_files_require_build_digest,
+packaged_profile_rejects_changed_context_and_host, the existing
+m3_profile_conformance guards and production boot refusals,
+scripts/tests/test_m3_native_package.py for old/changed/incomplete evidence
+and catalog publication. Run a local package and normal daemon boot with real
+same-revision passing evidence, then mutate a copied report and verify refusal.
+This maps to the production admission and invalidate-on-change requirements.
