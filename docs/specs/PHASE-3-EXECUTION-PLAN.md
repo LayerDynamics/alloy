@@ -1634,3 +1634,9 @@ real_model_compaction_preserves_history_and_continues. Assert the first actual
 render including the 512 output reserve and 64 margin fits and the second
 overflows. Keep the original messages, output requirements, checkpoint fields,
 event preservation, cache and cold-replay assertions.
+
+The generated-history fixture in the same file tried nine possible endings,
+omitting the pinned Ministral EOS. For real_model_generated_history_has_verified_canonical_bytes
+use only the publisher's exact closing bytes `</s>` for this profile. Retain
+the byte-to-token identity check and state lookup. The independent two-process
+test already restored 628 of 629 input tokens and returned the exact cold answer.
