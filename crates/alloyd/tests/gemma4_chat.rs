@@ -166,3 +166,128 @@ fn gemma4_daemon_text_session() {
         println!("daemon response {text:?}");
     }
 }
+
+#[test]
+#[ignore = "requires pinned ALLOY_GEMMA4_ARTIFACT and Metal"]
+fn gemma4_publisher_tool_prompt_parity() {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let artifact = PathBuf::from(std::env::var_os("ALLOY_GEMMA4_ARTIFACT").unwrap());
+    let boot =
+        alloyd::boot::boot_native_for_qualification(request(artifact, true), Some(2048)).unwrap();
+    let tool = RenderingTool::new(
+        "fs.read".into(),
+        "1".into(),
+        "Read a file.".into(),
+        json!({"type":"object","properties":{"path":{"type":"string","description":"Relative path."},"flags":{"type":"array","items":{"type":"string","enum":["a","b"]}}},"required":["path"]}),
+    )
+    .unwrap();
+    let mut history = Vec::new();
+    for (id, path) in [("call1", "a"), ("call2", "雪")] {
+        history.push(ToolHistoryBlock::AssistantCall {
+            call_id: id.into(),
+            tool_id: "fs.read".into(),
+            arguments: serde_json::Map::from_iter([("path".into(), json!(path))]),
+        });
+    }
+    for (id, content) in [("call1", "first"), ("call2", "second")] {
+        history.push(ToolHistoryBlock::ToolResult {
+            call_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        });
+    }
+
+    for (blocks, count, bytes_hash, tokens_hash) in [
+        (
+            vec![],
+            126,
+            "a707fa051be45a1c430fb4651f814cd413b08307f4a0a121a29e34357660b36b",
+            "862527a50edfad326105968a4dc1082e4bb38a526062fa23a90dc9b81eacd542",
+        ),
+        (
+            history,
+            212,
+            "73331079c94b97e8ca23c70ab3ec27297bf8d2de14e3a6a3cd6a7cee47bd2f6e",
+            "5e00843425aae905f07e764850951b90ad8c72ecfc5609089452b69f3427394b",
+        ),
+    ] {
+        let context = ToolContext::new(
+            vec![tool.clone()],
+            blocks,
+            ToolContextLimits {
+                max_tools: 1,
+                max_history_blocks: 4,
+                max_json_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let snapshot = ContextSnapshot::new(
+            ContextSnapshotId::new("tool-parity").unwrap(),
+            ModelProfileId::new(PROFILE).unwrap(),
+            vec![
+                Message {
+                    role: MessageRole::System,
+                    content: "Answer briefly.".into(),
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: "Read both files.".into(),
+                },
+            ],
+        )
+        .unwrap()
+        .with_tool_context(context);
+        let render = ContextBuilder::render_and_count(&boot.engine, snapshot).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(render.text().as_bytes())),
+            bytes_hash,
+            "{}",
+            render.text()
+        );
+        assert_eq!(render.token_count(), count);
+        let ids: Vec<_> = render
+            .token_ids()
+            .iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect();
+        assert_eq!(format!("{:x}", Sha256::digest(ids)), tokens_hash);
+    }
+    // The protocol's string delimiter contains a quote that JSON serialization escapes.
+    // Reject it before serialization, including when it occurs in untrusted result data.
+    let unsafe_context = ToolContext::new(
+        vec![tool],
+        vec![
+            ToolHistoryBlock::AssistantCall {
+                call_id: "c".into(),
+                tool_id: "fs.read".into(),
+                arguments: Default::default(),
+            },
+            ToolHistoryBlock::ToolResult {
+                call_id: "c".into(),
+                content: r#"<|"|>"#.into(),
+                is_error: false,
+            },
+        ],
+        ToolContextLimits {
+            max_tools: 1,
+            max_history_blocks: 2,
+            max_json_bytes: 4096,
+        },
+    )
+    .unwrap();
+    let snapshot = ContextSnapshot::new(
+        ContextSnapshotId::new("quote-control").unwrap(),
+        ModelProfileId::new(PROFILE).unwrap(),
+        vec![Message {
+            role: MessageRole::User,
+            content: "Read a file.".into(),
+        }],
+    )
+    .unwrap()
+    .with_tool_context(unsafe_context);
+    let error = ContextBuilder::render_and_count(&boot.engine, snapshot).unwrap_err();
+    assert!(
+        error.to_string().contains("reserved structural syntax"),
+        "{error}"
+    );
+}

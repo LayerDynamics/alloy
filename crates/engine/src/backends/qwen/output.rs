@@ -20,6 +20,55 @@ use std::{
     sync::Arc,
 };
 
+use crate::slab_parser::{
+    gemma4::Gemma4ToolParser,
+    ministral3::{Fragment, MinistralToolParser},
+};
+
+pub(super) enum TokenProtocol {
+    Ministral(MinistralToolParser),
+    Gemma4 {
+        parser: Gemma4ToolParser,
+        eos: Option<u32>,
+    },
+}
+impl TokenProtocol {
+    fn push(&mut self, value: Fragment<'_>) -> Result<bool, EngineError> {
+        match self {
+            Self::Ministral(p) => p.push(value),
+            Self::Gemma4 { parser, eos: None } => parser.push(value),
+            Self::Gemma4 { eos: Some(_), .. } => Err(internal("fragment after Gemma 4 EOS")),
+        }
+    }
+    fn observe_eos(&mut self, id: u32) -> Result<(), EngineError> {
+        match self {
+            Self::Ministral(p) => {
+                p.push(Fragment::Special(id))?;
+            }
+            // A final Gemma byte-fallback run precedes EOS. finish() flushes
+            // it before applying the sampled control token.
+            Self::Gemma4 { eos, .. } => {
+                if eos.replace(id).is_some() {
+                    return Err(internal("duplicate Gemma 4 EOS"));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn finish(self, tail: &str) -> Result<(FrozenParserAllocation, bool), EngineError> {
+        match self {
+            Self::Ministral(p) => Ok((p.finish()?, true)),
+            Self::Gemma4 { mut parser, eos } => {
+                let visible = !tail.is_empty() && parser.push(Fragment::Text(tail))?;
+                if let Some(id) = eos {
+                    parser.push(Fragment::Special(id))?;
+                }
+                Ok((parser.finish()?, visible))
+            }
+        }
+    }
+}
+
 pub(super) struct Qwen3TextDecoder {
     pub(super) tokenizer: Arc<PinnedTokenizer>,
     pub(super) special_tokens: Arc<BTreeSet<u32>>,
@@ -32,7 +81,7 @@ pub(super) struct Qwen3TextDecoder {
     pub(super) parser: Option<ToolCallParser>,
     pub(super) slab: Option<SlabParser>,
     pub(super) xml: Option<XmlToolParser<HybridToolSchema>>,
-    pub(super) ministral: Option<crate::slab_parser::ministral3::MinistralToolParser>,
+    pub(super) token_protocol: Option<TokenProtocol>,
     pub(super) phi: Option<crate::slab_parser::PhiToolParser>,
     pub(super) completed_slab: Option<FrozenParserAllocation>,
 }
@@ -271,28 +320,32 @@ impl TextDecoder for Qwen3TextDecoder {
     }
 
     fn observe_eos(&mut self, token: u32) -> Result<(), EngineError> {
-        if let Some(parser) = self.ministral.as_mut() {
-            parser.push(crate::slab_parser::ministral3::Fragment::Special(token))?;
+        if let Some(parser) = self.token_protocol.as_mut() {
+            parser.observe_eos(token)?;
         }
         Ok(())
     }
 
     fn push_blocks(&mut self, token: u32) -> Result<Vec<GenerationOutputBlock>, EngineError> {
-        use crate::slab_parser::ministral3::Fragment;
-        if let Some(parser) = &mut self.ministral
-            && self.special_tokens.contains(&token)
-        {
-            if self.finished || !self.pending.is_empty() {
+        if self.token_protocol.is_some() && self.special_tokens.contains(&token) {
+            if self.finished || (!self.gemma_decoder && !self.pending.is_empty()) {
                 return Err(execution_error(
                     "detokenize",
-                    "unexpected Ministral token boundary",
+                    "unexpected protocol token boundary",
                 ));
             }
+            let pending = self.finish_fallback_run();
+            let parser = self.token_protocol.as_mut().expect("checked above");
+            let visible = !pending.is_empty() && parser.push(Fragment::Text(&pending))?;
             parser.push(Fragment::Special(token))?;
-            return Ok(Vec::new());
+            return Ok(if visible {
+                text_blocks(pending)
+            } else {
+                Vec::new()
+            });
         }
         let text = self.push(token)?;
-        if let Some(parser) = &mut self.ministral {
+        if let Some(parser) = &mut self.token_protocol {
             return Ok(if parser.push(Fragment::Text(&text))? {
                 text_blocks(text)
             } else {
@@ -338,9 +391,14 @@ impl TextDecoder for Qwen3TextDecoder {
 
     fn finish_blocks(&mut self) -> Result<Vec<GenerationOutputBlock>, EngineError> {
         let tail = self.finish()?;
-        if let Some(parser) = self.ministral.take() {
-            self.completed_slab = Some(parser.finish()?);
-            return Ok(text_blocks(tail));
+        if let Some(parser) = self.token_protocol.take() {
+            let (batch, visible) = parser.finish(&tail)?;
+            self.completed_slab = Some(batch);
+            return Ok(if visible {
+                text_blocks(tail)
+            } else {
+                Vec::new()
+            });
         }
         if let Some(mut parser) = self.phi.take() {
             let mut emitted = String::new();

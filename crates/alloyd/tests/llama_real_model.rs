@@ -62,6 +62,7 @@ fn llama3_tool_stop_context_cache() {
             | "phi4-mini-instruct-4bit"
             | "gemma-3-4b-4bit"
             | "gemma-3-12b-4bit"
+            | "gemma-4-e4b-it-4bit"
             | "ornith-1.5-9b-4bit"
             | "qwen3.5-0.8b-4bit"
     ));
@@ -183,6 +184,8 @@ fn llama3_tool_stop_context_cache() {
             "smollm3"
         } else if profile.starts_with("phi4") {
             "phi"
+        } else if profile.starts_with("gemma-4") {
+            "gemma4"
         } else if profile.starts_with("gemma-3") {
             "gemma3"
         } else {
@@ -204,13 +207,15 @@ fn llama3_tool_stop_context_cache() {
             "smollm3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("phi4") {
             "phi.mlx-f32.full.bhtd.su-long-fixed.v1"
+        } else if profile.starts_with("gemma-4") {
+            "gemma4.mlx-f32.shared-full-and-sliding.v1"
         } else if profile.starts_with("gemma-3") {
             "gemma3.mlx-f32.full-and-sliding.v1"
         } else {
             "llama3.mlx-f32.full.bhtd.v1"
         }
     );
-    if profile.starts_with("gemma-3") {
+    if profile.starts_with("gemma-") {
         assert_eq!(caps[0]["result"]["cache_modes"][0]["kind"], "mixed");
         assert_eq!(caps[0]["result"]["supports_prefix_reuse"], false);
     }

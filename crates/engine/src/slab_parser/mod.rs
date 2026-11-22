@@ -3,6 +3,7 @@
 //! The bounded recursive control flow is capped at 128 levels; heap scratch,
 //! keys, nodes, pending bytes, and retained proposals reside in the slab.
 
+pub(crate) mod gemma4;
 pub(crate) mod ministral3;
 mod parser;
 mod phi;

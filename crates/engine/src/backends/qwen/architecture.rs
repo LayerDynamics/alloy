@@ -209,3 +209,6 @@ pub const MINISTRAL3_TOOL_TEMPLATE: &str = concat!(
 
 /// Publisher Gemma 4 text turns with thinking disabled.
 pub const GEMMA4_TEXT_TEMPLATE: &str = include_str!("gemma4_text.jinja");
+
+/// Publisher Gemma 4 declarations and linked call/result history.
+pub const GEMMA4_TOOL_TEMPLATE: &str = include_str!("gemma4_tools.jinja");

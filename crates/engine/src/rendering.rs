@@ -619,6 +619,22 @@ pub fn render_chat(
     environment.add_filter("hf_tojson", hf_tojson);
     environment.add_filter("hf_compact_tojson", hf_compact_tojson);
     environment.add_filter("hf_tool_value", hf_tool_value);
+    environment.add_filter(
+        "gemma4_name",
+        |name: String| -> Result<String, TemplateError> {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "._-".contains(c))
+            {
+                return Err(TemplateError::new(
+                    TemplateErrorKind::InvalidOperation,
+                    "invalid bare Gemma tool identifier",
+                ));
+            }
+            Ok(name)
+        },
+    );
 
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
 
@@ -1317,4 +1333,57 @@ pub(crate) fn ministral3_projected_tool_token_upper_bound(
         .len()
         .checked_add(additional_bytes)
         .ok_or_else(|| EngineError::invalid_request("projection", "Ministral byte bound overflow"))
+}
+
+/// In this pinned BPE the normalizer replaces each ASCII space with a three-byte
+/// marker. The two quote controls isolate the changed span from all other groups.
+pub(crate) fn gemma4_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    results: usize,
+    additional: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        204, 141, 58, 12, 227, 100, 102, 204, 193, 39, 139, 249, 135, 223, 95, 113, 219, 23, 25,
+        185, 202, 107, 65, 24, 38, 79, 69, 203, 98, 123, 254, 15,
+    ];
+    if tokenizer.source_sha256() != &PIN || results == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "expected pinned Gemma 4 tokenizer and result placeholders",
+        ));
+    }
+    let mut bytes = additional;
+    let mut count = 0;
+    for (at, _) in rendered
+        .text()
+        .rmatch_indices("<|tool_response>response:")
+        .take(results)
+    {
+        let (body, _) = rendered.text()[at..]
+            .split_once("<tool_response|>")
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "incomplete Gemma 4 result")
+            })?;
+        if !body.contains(r#",content:<|"|><|"|>,is_error:"#) {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "expected empty Gemma 4 result",
+            ));
+        }
+        bytes = bytes
+            .checked_add(body.len())
+            .ok_or_else(|| internal("Gemma 4 result size overflow"))?;
+        count += 1;
+    }
+    if count != results {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing Gemma 4 result placeholders",
+        ));
+    }
+    bytes
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(rendered.token_count()))
+        .ok_or_else(|| internal("Gemma 4 token bound overflow"))
 }

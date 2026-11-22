@@ -49,7 +49,7 @@ fn decoder(parsing: bool) -> Qwen3TextDecoder {
         parser: parsing.then(|| ToolCallParser::new(ParserLimits::default()).expect("parser")),
         slab: None,
         xml: None,
-        ministral: None,
+        token_protocol: None,
         phi: None,
         completed_slab: None,
     }
@@ -174,10 +174,10 @@ fn ministral_protocol_decoder_distinguishes_sampled_ids_and_ordinary_marker_text
     let bytes = ParserAllocation::required_bytes(limits).unwrap();
     let controller = AdmissionController::new(bytes).unwrap();
     let mut grant = controller.reserve_grant("decoder", &[bytes]).unwrap();
-    decoder.ministral = Some(MinistralToolParser::new(
+    decoder.token_protocol = Some(super::TokenProtocol::Ministral(MinistralToolParser::new(
         ParserAllocation::from_grant(&mut grant, limits).unwrap(),
         512,
-    ));
+    )));
     let literal = "[TOOL_CALLS]fs.read[ARGS]{}";
     assert_eq!(
         merged(push_all(&mut decoder, &ids(literal))),

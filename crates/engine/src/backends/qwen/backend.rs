@@ -586,6 +586,9 @@ impl Qwen3Backend {
                         ("<|turn>", 105),
                         ("<turn|>", 106),
                         ("<|tool_response>", 50),
+                        ("<|tool_call>", 48),
+                        ("<tool_call|>", 49),
+                        (r#"<|"|>"#, 52),
                     ]
                     .into_iter()
                     .any(|(name, id)| {
@@ -690,12 +693,6 @@ impl Qwen3Backend {
         mut self,
         limits: ParserAllocationLimits,
     ) -> Result<Self, EngineError> {
-        if self.family == BackendFamily::Gemma4 {
-            return Err(EngineError::unsupported(
-                "Gemma 4 tools",
-                "native tool protocol required",
-            ));
-        }
         ParserAllocation::required_bytes(limits).map_err(|error| {
             EngineError::invalid_request("parser_allocation_limits", error.to_string())
         })?;
@@ -967,6 +964,14 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family == BackendFamily::Gemma4 {
+            return rendering::gemma4_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
         if self.family == BackendFamily::Ministral3 {
             return rendering::ministral3_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -1040,12 +1045,6 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
-            if tool_mode && self.family == BackendFamily::Gemma4 {
-                return Err(EngineError::unsupported(
-                    "Gemma 4 tool context",
-                    "native tool protocol required",
-                ));
-            }
             if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
@@ -1249,7 +1248,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser: None,
             slab: None,
             xml: None,
-            ministral: None,
+            token_protocol: None,
             phi: None,
             completed_slab: None,
         }))
@@ -1309,7 +1308,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser: None,
             slab: None,
             xml: Some(xml),
-            ministral: None,
+            token_protocol: None,
             phi: None,
             completed_slab: None,
         })
@@ -1342,12 +1341,24 @@ impl RuntimeBackend for Qwen3Backend {
                 }
                 let data = self.data(resolved.artifact())?;
                 let max_output = self.tool_parser_limits().max_output_bytes;
-                let (slab, phi, ministral) = match self.family {
+                let (slab, phi, token_protocol) = match self.family {
+                    BackendFamily::Gemma4 => (
+                        None,
+                        None,
+                        Some(output::TokenProtocol::Gemma4 {
+                            parser: crate::slab_parser::gemma4::Gemma4ToolParser::new(
+                                allocation, max_output,
+                            ),
+                            eos: None,
+                        }),
+                    ),
                     BackendFamily::Ministral3 => (
                         None,
                         None,
-                        Some(crate::slab_parser::ministral3::MinistralToolParser::new(
-                            allocation, max_output,
+                        Some(output::TokenProtocol::Ministral(
+                            crate::slab_parser::ministral3::MinistralToolParser::new(
+                                allocation, max_output,
+                            ),
                         )),
                     ),
                     BackendFamily::Phi => (
@@ -1380,7 +1391,7 @@ impl RuntimeBackend for Qwen3Backend {
                     slab,
                     xml: None,
                     phi,
-                    ministral,
+                    token_protocol,
                     completed_slab: None,
                 })
             }
@@ -1812,7 +1823,8 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
         (BackendFamily::Ministral3, false) => MINISTRAL3_TEXT_TEMPLATE,
         (BackendFamily::Ministral3, true) => MINISTRAL3_TOOL_TEMPLATE,
-        (BackendFamily::Gemma4, _) => GEMMA4_TEXT_TEMPLATE,
+        (BackendFamily::Gemma4, false) => GEMMA4_TEXT_TEMPLATE,
+        (BackendFamily::Gemma4, true) => GEMMA4_TOOL_TEMPLATE,
         (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,

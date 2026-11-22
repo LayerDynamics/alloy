@@ -230,6 +230,38 @@ impl ToolContext {
     }
     /// Reject reserved control syntax in all model-facing data before rendering.
     pub(crate) fn validate_spellings(&self, reserved: &[&str]) -> Result<(), EngineError> {
+        // Serialized JSON escapes quotes inside strings. Check original keys
+        // and values too, including protocols whose delimiters contain quotes.
+        fn has_marker(value: &Value, reserved: &[&str]) -> bool {
+            let marked = |text: &str| reserved.iter().any(|marker| text.contains(marker));
+            match value {
+                Value::String(s) => marked(s),
+                Value::Object(o) => o.iter().any(|(k, v)| marked(k) || has_marker(v, reserved)),
+                Value::Array(a) => a.iter().any(|v| has_marker(v, reserved)),
+                _ => false,
+            }
+        }
+        for block in &self.history {
+            let invalid_data = match block {
+                ToolHistoryBlock::AssistantCall { arguments, .. } => {
+                    arguments.iter().any(|(k, v)| {
+                        reserved.iter().any(|m| k.contains(m)) || has_marker(v, reserved)
+                    })
+                }
+                ToolHistoryBlock::ToolResult { content, .. } => {
+                    reserved.iter().any(|m| content.contains(m))
+                }
+                ToolHistoryBlock::Text(message) => {
+                    reserved.iter().any(|m| message.content.contains(m))
+                }
+            };
+            if invalid_data {
+                return Err(invalid(
+                    "tool_context",
+                    "data contains reserved structural syntax",
+                ));
+            }
+        }
         for value in self
             .tools
             .iter()
@@ -237,7 +269,7 @@ impl ToolContext {
             .chain(self.history.iter().map(history_value))
         {
             let text = serialize(&value)?;
-            if reserved.iter().any(|token| text.contains(token)) {
+            if has_marker(&value, reserved) || reserved.iter().any(|token| text.contains(token)) {
                 return Err(invalid(
                     "tool_context",
                     "data contains reserved structural syntax",
@@ -248,15 +280,29 @@ impl ToolContext {
     }
     /// Values are separate role-bearing messages, never injected into system content.
     pub(crate) fn messages(&self) -> Vec<Value> {
+        let mut names = BTreeMap::new();
         self.history
             .iter()
             .map(|block| {
                 let mut value = history_value(block);
                 if let ToolHistoryBlock::AssistantCall {
-                    tool_id, arguments, ..
+                    call_id,
+                    tool_id,
+                    arguments,
                 } = block
                 {
+                    names.insert(call_id.as_str(), tool_id.as_str());
                     value["call"] = canonical(json!({"name":tool_id, "arguments":arguments}));
+                } else if let ToolHistoryBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } = block
+                    && let Some(name) = names.get(call_id.as_str())
+                {
+                    value["tool_name"] = json!(name);
+                    value["result"] =
+                        json!({"call_id":call_id,"content":content,"is_error":is_error});
                 }
                 value
             })

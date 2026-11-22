@@ -7,7 +7,11 @@ fn real_profile() -> String {
 fn rebuild_only_profile() -> bool {
     matches!(
         real_profile().as_str(),
-        "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit" | "gemma-3-4b-4bit" | "gemma-3-12b-4bit"
+        "ornith-1.5-9b-4bit"
+            | "qwen3.5-0.8b-4bit"
+            | "gemma-3-4b-4bit"
+            | "gemma-3-12b-4bit"
+            | "gemma-4-e4b-it-4bit"
     )
 }
 use alloyd::BootRequest;

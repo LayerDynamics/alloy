@@ -1926,3 +1926,20 @@ the trusted system turn produced an accurate rejection explanation upstream
 turn with advertised tools in the planned gemma4_tools.jinja, preserve the
 caller's system text and freeze publisher render parity with the same system
 content. Keep the actual write, deny and model-reply requirements intact.
+
+The native daemon created `marker.txt` with the requested `COBALT` content
+in one authorized call, returned the linked result and answered `DONE`.
+For a denied write it recorded `ArgumentsNotAllowed`, executed zero calls
+and generated “The operation was rejected by local policy.”
+(7d6f4c3238ae4720a7c07c6044a258d3). All three daemon chat tests passed,
+including publisher prompt parity and production-profile refusal
+(7974af10d5d04606baaa0818c3340a1d).
+
+The real model retrieved `COBALT-7392` at 8,101 and 32,601 prompt tokens
+and recovered after streamed cancellation. Simulated 8 GiB daemon startup
+refused admission (48caa12df9264432ba50e638a4852241). The compaction test
+reopened the session, retained the original five events and matched the cold
+reply after cache rebuild (3e28a06448d84846a18033e76cc92b37). The engine
+library release suite passed 399 tests with two ignored
+(c53665579c2346ccb8dc20b5f768e2e3). Strict Clippy passed across all targets
+of engine, alloyd and inference-infra (d1391c4c05cd4f69bb446fd011638f37).
