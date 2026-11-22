@@ -2397,3 +2397,27 @@ row, with corresponding checked output-byte admission.
 The exhaustive shared-cache dispatch in crates/engine/src/backends/qwen/architecture.rs
 also consumes DecoderFamily. Return a distinct Qwen3-Coder full-KV representation
 from that dispatch and compile the ordinary daemon to validate the integration.
+
+### Expose the routed model through the ordinary qualification pipeline
+
+In crates/engine/src/backends/qwen/{architecture.rs,backend.rs,loading.rs,memory.rs}
+register Qwen3MoeForCausalLM with its own full KV identity, mixed affine
+weights and pinned tokenizer. Route model construction through the verified
+MoE loader and retain shared generation, cancellation and cache ownership.
+In crates/inference-infra/src/decoder/{qwen3_coder.rs,mlx_model.rs} compute
+weight byte charges from each packed projection, and evaluate routed activations
+per layer so admission can account for one layer's routed intermediates and
+all prompt logits. Store the Coder publisher template adapted to canonical
+linked history in crates/engine/src/backends/qwen/qwen3_coder.jinja. Use the
+same schema-aware function/parameter parser used by Ornith, account for the
+Coder tokenizer's grouped results in crates/engine/src/rendering.rs and
+keep tool-free and tool-enabled profile identities distinct. In
+crates/alloyd/src/boot.rs add the exact frozen profile and select it in both
+qualification inspection and package-bound boot. Keep production closed
+until the model's own report passes. Test qwen3_coder_publisher_prompt_parity,
+qwen3_coder_native_registration and unqualified_coder_cannot_boot_production
+in crates/alloyd/tests/qwen3_coder_chat.rs and the existing boot test module.
+Use the publisher Jinja and pinned tokenizer as the independent prompt oracle,
+including linked calls/results. Dependencies are unchanged. Exit coverage:
+actual registered decoder, tool serialization, admission and qualification
+for Qwen3-Coder; trained Metal and long-session measurements still required.
