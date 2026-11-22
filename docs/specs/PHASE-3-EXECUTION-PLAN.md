@@ -2421,3 +2421,29 @@ Use the publisher Jinja and pinned tokenizer as the independent prompt oracle,
 including linked calls/results. Dependencies are unchanged. Exit coverage:
 actual registered decoder, tool serialization, admission and qualification
 for Qwen3-Coder; trained Metal and long-session measurements still required.
+
+### Llama and SmolLM in the native evidence matrix
+
+Extend the existing pinned Llama 4/8-bit and SmolLM3 4-bit reference tests
+in crates/families/{llama3,smollm}/tests/quantized_loading.rs to emit actual
+full-vocabulary prefill/decode rows with the shared numerical_capture helper.
+In crates/families/llama3/fixture/{affine4_profile,affine8_profile}.json pin
+the corpus file identities and original eager references. Add the exact
+prompt/decode sequences to crates/families/smollm/fixture/profile.json.
+Use scripts/ci/{m3_native_numerical,m3_native_behavior,m3_native_qualification}.py
+and crates/engine/examples/m3_numerical_report.rs to select the owning Rust
+package, file manifest, reference and vocabulary. Keep a single native test
+execution per profile and require all six rows from that execution.
+
+Use crates/alloyd/tests/llama_real_model.rs for independently tokenized
+40,384/40,385-token boundaries and its existing policy-gated tool-schema
+assertions. Add crates/inference-infra/tests/dense_memory.rs using the
+shared physical-memory fixture for both precisions and SmolLM3. Test real
+8 GiB fit or pre-upload refusal and measured long prefill/decode at 36 GiB.
+Named checks are llama3_4bit_8bit_load, smollm3_quantized_native_reference,
+dense_native_memory_tiers, native_validated_context_boundary and
+llama3_tool_stop_context_cache. Cover fixed package/manifest selection in
+scripts/tests/test_m3_native_numerical.py and inventory assertions in
+scripts/tests/test_m3_native_behavior.py. No new third-party dependency.
+Exit evidence requires trained numerical, tool, context, cache and memory
+observations on the reviewed revision for each of the three profiles.
