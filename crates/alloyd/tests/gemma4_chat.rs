@@ -42,6 +42,59 @@ fn gemma4_production_requires_qualification() {
 
 #[test]
 #[ignore = "requires pinned ALLOY_GEMMA4_ARTIFACT and Metal"]
+fn gemma4_small_budget_generation() {
+    use engine::error::EngineError;
+    use harness_core::{HarnessError, SessionStore, Supervisor};
+    use std::sync::Mutex;
+
+    let artifact = PathBuf::from(std::env::var_os("ALLOY_GEMMA4_ARTIFACT").unwrap());
+    let long = " amber".repeat(16_000);
+    for (budget, prompt, should_fit) in [
+        (4_u64 << 30, QUESTION, false),
+        (8 << 30, long.as_str(), false),
+        (8 << 30, QUESTION, true),
+    ] {
+        let mut req = request(artifact.clone(), false);
+        req.admission_budget_override_bytes = Some(budget);
+        let boot = alloyd::boot::boot_native_for_qualification(req, Some(40_960)).unwrap();
+        let telemetry = Arc::new(TelemetryClient::with_transport(
+            "test",
+            HardwareTier::Unknown,
+            "https://127.0.0.1:1",
+            Box::new(Offline),
+        ));
+        let supervisor = Supervisor::new(boot.engine, telemetry);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = SessionStore::open(dir.path().join("sessions.sqlite")).unwrap();
+        db.create_session("budget", PROFILE).unwrap();
+        let result = supervisor.run_turn(&Mutex::new(db), "budget", prompt, 8);
+        if should_fit {
+            let outcome = result.unwrap();
+            assert_eq!(outcome.assistant_text, "4");
+            println!(
+                "budget={budget} input_tokens={} answer=4",
+                outcome.input_tokens
+            );
+        } else {
+            let Err(HarnessError::EngineFailure(EngineError::MemoryLimitExceeded {
+                operation,
+                required_bytes,
+                available_bytes,
+                ..
+            })) = result
+            else {
+                panic!("expected a typed memory refusal: {result:?}")
+            };
+            assert_eq!(operation, "generation startup");
+            assert_eq!(available_bytes, budget);
+            assert!(required_bytes > available_bytes);
+            println!("budget={budget} refused_required_bytes={required_bytes}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires pinned ALLOY_GEMMA4_ARTIFACT and Metal"]
 fn gemma4_daemon_text_session() {
     let artifact = PathBuf::from(std::env::var_os("ALLOY_GEMMA4_ARTIFACT").unwrap());
     let boot =

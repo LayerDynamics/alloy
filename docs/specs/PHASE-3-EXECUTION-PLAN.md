@@ -1999,3 +1999,12 @@ three actual EOS spellings to `real_model_generated_history_has_verified_canonic
 Retain failure reasons per candidate. Require successful publication and
 lookup through the existing exact decode and re-encode checks, then rerun
 the whole fixture set.
+
+The 22-token question returned exactly 4 with an 8 GiB daemon admission
+budget. At 4 GiB the same question required 8,566,156,032 bytes and was
+refused before generation. A longer prompt at 8 GiB required 10,139,852,364
+bytes and was also refused. The two-turn, production-guard, publisher tool
+parity and small-budget tests passed (767b25e185094c61aeadc86722f02a77).
+With the E4B terminators the canonical-history verifier published and
+looked up a state for all 22 executed tokens, including the 18-token input
+(be9fc8fe88474933a27c8103bb7f15f6).

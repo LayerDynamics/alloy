@@ -840,13 +840,19 @@ impl Qwen3Backend {
     /// Like [`Self::into_engine`], attaching a live memory enforcer for
     /// prefill admit-line / adaptive chunk shrink (M5–M6).
     pub fn into_engine_with_memory_enforcer(
-        self,
+        mut self,
         profiles: Vec<ModelProfile>,
         admission: AdmissionController,
         scheduler: Scheduler,
         retention: RetentionPolicy,
         memory_enforcer: Option<crate::memory_enforcer::MemoryEnforcer>,
     ) -> Result<EngineCore<FamilyRuntime>, EngineError> {
+        if self.family == BackendFamily::Gemma4 && admission.snapshot()?.budget_bytes() <= 8 << 30 {
+            // E4B projects all prompt rows into its 262,144-token vocabulary.
+            // Four rows bound this workspace during cold startup on the small tier.
+            self.limits.prefill_chunk_tokens =
+                self.limits.prefill_chunk_tokens.min(NonZeroUsize::new(4).unwrap());
+        }
         let registry = self.registry(profiles)?;
         let generation_limits = self.limits.generation;
         let backend: Arc<dyn RuntimeBackend> = Arc::new(self);

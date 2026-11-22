@@ -376,7 +376,10 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     assert!(!result.assistant_text.is_empty());
     let base = format!("{}{}", rendered.text(), result.assistant_text);
     let mut published = None;
-    let suffixes: &[&str] = if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
+    let mut rejected = Vec::new();
+    let suffixes: &[&str] = if real_profile() == "gemma-4-e4b-it-4bit" {
+        &["<turn|>", "<eos>", "<|tool_response>", ""]
+    } else if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
         &["</s>"]
     } else {
         &[
@@ -393,17 +396,21 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     };
     for suffix in suffixes {
         let bytes = format!("{base}{suffix}").into_bytes();
-        if let Ok(id) = wait_future(
+        match wait_future(
             supervisor
                 .engine()
                 .runtime()
                 .retain_session_state(result.request_id.clone(), bytes),
         ) {
-            published = Some(id);
-            break;
+            Ok(id) => {
+                published = Some(id);
+                break;
+            }
+            Err(error) => rejected.push((suffix, error.to_string())),
         }
     }
-    let id = published.expect("actual generated history has no verified canonical byte roundtrip");
+    let id = published
+        .unwrap_or_else(|| panic!("generated history failed byte roundtrip: {rejected:?}"));
     let state = wait_future(supervisor.engine().runtime().lookup_session_state(id))
         .unwrap()
         .unwrap();
