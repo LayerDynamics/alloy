@@ -2047,3 +2047,20 @@ test targets in `crates/inference-infra/Cargo.toml`. Add
 logit. Reissue the three raw captures and report sections on the corrected
 candidate, then compare every persisted reference and observation to the
 independent frozen and raw arrays.
+
+### #72 reproducible native numerical runner
+
+Add `scripts/ci/m3_native_numerical.py` as the entry point for the verified
+E4B, Ornith and upstream Qwen3.5 numerical suites. Require the candidate
+commit, its clean checkout, profile, artifact directory, reference and a
+new external output directory. Verify every manifest file size and hash.
+Build the exact release test and report binaries through Cargo's JSON
+artifact output, record their hashes and run the named ignored test under
+the existing Mac CI lease. Reject zero-test or skipped runs. Verify the
+captured observations with the Rust report evaluator and save the
+candidate, pins, raw logs, output hashes and terminal status even on
+failure. This issues numerical evidence for #72; behavioral fixture
+results are required to construct a complete QualificationReport.
+In `scripts/tests/test_m3_native_numerical.py`, test rejection of wrong
+artifact bytes and missing/filtered execution. Exercise the normal runner
+against all three pinned models on the Mac.
