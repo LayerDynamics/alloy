@@ -2624,3 +2624,24 @@ dense Qwen in `routed_long_prefill_bounds_chunk_and_workspace`.
 Re-run `native_boundary_memory_estimate` and `native_validated_context_boundary`
 with the pinned trained Coder artifact. Preserve the original prompt hashes,
 output checks, model identity, and memory policy. No dependency changes.
+
+### Separate routed prefill batches from causal attention tiles
+
+On dfab5b9 the trained 40,384-token request passed memory admission but
+expired during prefill after 600 seconds. Sixteen tokens per forward pass
+requires 2,524 passes through every routed layer. In
+`crates/alloyd/src/boot.rs` and `crates/engine/src/backends/qwen/architecture.rs`,
+allow up to 128 tokens per routed batch above 32,768 cache positions,
+retaining the existing daemon chunk size for shorter requests. In
+`crates/inference-infra/src/decoder/config.rs` and
+`crates/inference-infra/src/decoder/mlx_model.rs`, bound each attention
+tile to 16 queries at these capacities. Evaluate tiles against their
+exact causal prefixes and concatenate in token order. In
+`crates/engine/src/backends/qwen/memory.rs`, charge routing, projections
+and assembled attention output for the entire batch, and attention scores
+for the largest live tile. Test a cached, uneven multi-head batch against
+untiled attention on MLX CPU and Metal. Update
+`crates/engine/tests/unit/backends_qwen_shared_rendering_wiring.rs` to
+check both limits and reservation scaling. Run the original trained
+numerical, memory and 40,384/40,385-token boundary checks at the existing
+deadlines. Dependencies and frozen acceptance fixtures stay fixed.
