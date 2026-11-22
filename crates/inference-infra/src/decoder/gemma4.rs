@@ -8,6 +8,7 @@ use mlx_ffi::{
 };
 use serde_json::Value;
 
+pub mod model;
 pub mod weights;
 
 fn invalid(message: &str) -> ModelError {
@@ -41,6 +42,8 @@ pub struct Gemma4TextConfig {
     global_theta: f32,
     global_dim: usize,
     rotated_pairs: usize,
+    epsilon: f32,
+    softcap: f32,
     hidden: usize,
     intermediate: usize,
     vocabulary: usize,
@@ -145,6 +148,13 @@ impl Gemma4TextConfig {
         {
             return Err(invalid("unsupported dense text configuration"));
         }
+        let positive = |name: &str| {
+            c[name]
+                .as_f64()
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .ok_or_else(|| invalid(name))
+        };
         Ok(Self {
             layers,
             query_heads,
@@ -155,6 +165,8 @@ impl Gemma4TextConfig {
             global_theta,
             global_dim,
             rotated_pairs: width as usize / 2,
+            epsilon: positive("rms_norm_eps")?,
+            softcap: positive("final_logit_softcapping")?,
             hidden: dimension(c, "hidden_size", 65536)?,
             intermediate: dimension(c, "intermediate_size", 1 << 20)?,
             vocabulary: dimension(c, "vocab_size", 1 << 24)?,

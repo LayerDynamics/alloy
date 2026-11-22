@@ -439,6 +439,32 @@ pub fn silu(input: &Array, stream: &Stream) -> OperationResult<Array> {
     multiply(input, &sigmoid, stream)
 }
 
+/// Apply a positive logit soft cap in the trained order: divide, tanh, multiply.
+pub fn logit_softcap(input: &Array, cap: f32, stream: &Stream) -> OperationResult<Array> {
+    require_f32(input)?;
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(OperationError::InvalidInput(
+            "logit softcap must be finite and positive",
+        ));
+    }
+    let scalar = Array::from_f32(cap)?;
+    let mut divided = PendingArray::new();
+    // SAFETY: the scalar broadcasts to input on the supplied stream.
+    let status = unsafe {
+        sys::mlx_divide(
+            &mut divided.raw,
+            input.as_raw(),
+            scalar.as_raw(),
+            stream.as_raw(),
+        )
+    };
+    let divided = divided.finish(status)?;
+    let mut out = PendingArray::new();
+    // SAFETY: borrowed input, owned output and valid stream.
+    let status = unsafe { sys::mlx_tanh(&mut out.raw, divided.as_raw(), stream.as_raw()) };
+    scale(&out.finish(status)?, cap, stream)
+}
+
 /// Tanh-approximate GELU, using the upstream eager float32 operation order.
 pub fn gelu_approx(input: &Array, stream: &Stream) -> OperationResult<Array> {
     require_f32(input)?;

@@ -1836,3 +1836,16 @@ decode steps per prompt to all 262,144 reference logits per row under both
 existing FR-8 limits. Check cache ownership, offsets and refusal without
 state change. Daemon integration and complete agent conformance follow this
 trained decoder gate.
+
+Gemma 4's independently captured six eager rows were frozen at 3c82e62
+before native execution (1ff0187aabe74e688e97ab5b0b541885). The trained
+Metal decoder passed for all 1,572,864 logits, including four cached
+decodes. Across the six rows, maximum absolute error was 3.553e-15 and
+maximum pointwise relative error was 2.221e-16. The evaluated native weight
+buffers occupied 4,667,650,216 bytes. The same test exercised cancellation
+during the layer loop, retry, workspace and capacity refusals, and rejection
+of another model instance's cache (c1098ab5f28c432787779944173b6137).
+Strict Clippy passed for both affected crates across all targets
+(a0470d3941aa4152a522c084823a6282). These checks cover trained decoder
+execution. Daemon chat, model-specific tools, long-context validation and
+profile qualification are outstanding.
