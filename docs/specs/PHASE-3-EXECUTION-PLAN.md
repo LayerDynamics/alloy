@@ -1989,3 +1989,13 @@ Rerun `llama3_long_context_stream_cancel_memory` with the E4B profile.
 Apply the cap when the backend receives the admission controller, after
 the daemon has verified metadata and resolved the host ceiling. This also
 exercises the same budget in direct engine users.
+
+The full E4B lifecycle run passed compaction, warm rendering, independent
+process restart and both skill changes. The canonical-history fixture
+failed (810173e83f6d44c6b3e8e02b3615b2ab). Its list of suffix candidates
+omits Gemma 4's publisher turn terminator. In
+`crates/alloyd/tests/compaction_real_model.rs`, supply the pinned model's
+three actual EOS spellings to `real_model_generated_history_has_verified_canonical_bytes`.
+Retain failure reasons per candidate. Require successful publication and
+lookup through the existing exact decode and re-encode checks, then rerun
+the whole fixture set.
