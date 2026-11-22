@@ -49,6 +49,7 @@ fn decoder(parsing: bool) -> Qwen3TextDecoder {
         parser: parsing.then(|| ToolCallParser::new(ParserLimits::default()).expect("parser")),
         slab: None,
         xml: None,
+        ministral: None,
         phi: None,
         completed_slab: None,
     }
@@ -148,4 +149,51 @@ fn disabled_parser_keeps_text_only_behavior() {
         vec![GenerationOutputBlock::Text("<tool_call>".to_owned())],
     );
     assert!(decoder.finish_blocks().expect("finish").is_empty());
+}
+
+#[test]
+fn ministral_protocol_decoder_distinguishes_sampled_ids_and_ordinary_marker_text() {
+    use crate::{
+        admission::AdmissionController,
+        parser_allocation::{ParserAllocation, ParserAllocationLimits},
+        slab_parser::ministral3::{self, MinistralToolParser},
+    };
+
+    let mut decoder = decoder(false);
+    decoder.special_tokens = Arc::new([ministral3::EOS, ministral3::CALL, ministral3::ARGS].into());
+    let limits = ParserAllocationLimits {
+        carry_bytes: 1,
+        call_bytes: 128,
+        decoded_bytes: 128,
+        depth: 4,
+        keys: 8,
+        nodes: 16,
+        proposal_bytes: 128,
+        calls: 2,
+    };
+    let bytes = ParserAllocation::required_bytes(limits).unwrap();
+    let controller = AdmissionController::new(bytes).unwrap();
+    let mut grant = controller.reserve_grant("decoder", &[bytes]).unwrap();
+    decoder.ministral = Some(MinistralToolParser::new(
+        ParserAllocation::from_grant(&mut grant, limits).unwrap(),
+        512,
+    ));
+    let literal = "[TOOL_CALLS]fs.read[ARGS]{}";
+    assert_eq!(
+        merged(push_all(&mut decoder, &ids(literal))),
+        vec![GenerationOutputBlock::Text(literal.into())]
+    );
+    let mut tokens = vec![ministral3::CALL];
+    tokens.extend(ids("fs.read"));
+    tokens.push(ministral3::ARGS);
+    tokens.extend(ids("{}"));
+    assert!(push_all(&mut decoder, &tokens).is_empty());
+    assert!(decoder.take_parser_proposals().is_none());
+    decoder.observe_eos(ministral3::EOS).unwrap();
+    assert!(decoder.take_parser_proposals().is_none());
+    assert!(decoder.finish_blocks().unwrap().is_empty());
+    let calls = decoder.take_parser_proposals().unwrap();
+    assert_eq!(calls.proposal_count(), 1);
+    let proposal = calls.proposal(0).unwrap();
+    assert_eq!((proposal.name, proposal.arguments_json), ("fs.read", "{}"));
 }

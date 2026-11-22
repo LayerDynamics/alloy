@@ -173,3 +173,9 @@ pub const GEMMA3_TOOL_TEMPLATE: &str = include_str!("gemma3_tools.jinja");
 
 /// Trained Ministral chat boundaries for a text-only conversation.
 pub const MINISTRAL3_TEXT_TEMPLATE: &str = include_str!("ministral3_text.jinja");
+
+/// Distinct tool rendering identity for Ministral's trained protocol.
+pub const MINISTRAL3_TOOL_TEMPLATE: &str = concat!(
+    "{% set ministral_tools = true %}",
+    include_str!("ministral3_text.jinja")
+);

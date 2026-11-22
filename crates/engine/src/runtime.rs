@@ -139,6 +139,11 @@ pub trait TextDecoder {
         false
     }
 
+    /// Notify a protocol decoder of an actual sampled EOS before finishing.
+    fn observe_eos(&mut self, _token: u32) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     /// Decode one generated token without corrupting incremental state.
     fn push(&mut self, token: u32) -> Result<String, EngineError>;
 
@@ -4324,6 +4329,7 @@ impl NativeState {
 
         let end_of_sequence = active.eos.contains(&token);
         let blocks = if end_of_sequence {
+            active.decoder.observe_eos(token)?;
             Vec::new()
         } else {
             active.decoder.push_blocks(token)?

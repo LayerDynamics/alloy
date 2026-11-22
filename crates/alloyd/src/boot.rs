@@ -140,11 +140,6 @@ pub fn boot_native_for_qualification(
 
     let llama = request.profile_id.starts_with("llama-");
     let ministral = request.profile_id == "ministral-3-3b-instruct-2512-4bit";
-    if ministral && request.tools_enabled {
-        return Err(RpcError::invalid_params(
-            "Ministral native tool parsing is unavailable",
-        ));
-    }
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
     let gemma = is_gemma_profile(&request.profile_id);

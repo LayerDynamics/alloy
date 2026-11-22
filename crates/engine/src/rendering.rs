@@ -1291,3 +1291,30 @@ pub fn gemma3_projected_tool_token_upper_bound(
         .checked_add(variable)
         .ok_or_else(|| EngineError::invalid_request("projection", "Gemma3 token bound overflow"))
 }
+
+/// Bound the complete Ministral prompt plus the escaped growth of result bodies.
+/// The verified Tekken BPE has no normalizer or prefix insertion, and its
+/// ByteLevel postprocessor changes offsets only. Each byte yields at most one ID.
+pub(crate) fn ministral3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x28, 0x6a, 0xca, 0xd9, 0xb0, 0xe2, 0x7f, 0xce, 0x77, 0x8a, 0xc4, 0x29, 0x76, 0x35, 0x36,
+        0xac, 0xcf, 0x61, 0x8c, 0xcb, 0x6e, 0xd7, 0x29, 0x63, 0xb6, 0xf9, 0x46, 0x85, 0xe5, 0x31,
+        0xc5, 0xc7,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Ministral tokenizer or empty projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Ministral byte bound overflow"))
+}

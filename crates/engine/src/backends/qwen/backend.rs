@@ -520,6 +520,12 @@ impl Qwen3Backend {
                         ("</s>", 2),
                         ("[INST]", 3),
                         ("[/INST]", 4),
+                        ("[AVAILABLE_TOOLS]", 5),
+                        ("[/AVAILABLE_TOOLS]", 6),
+                        ("[TOOL_RESULTS]", 7),
+                        ("[/TOOL_RESULTS]", 8),
+                        ("[TOOL_CALLS]", crate::slab_parser::ministral3::CALL),
+                        ("[ARGS]", crate::slab_parser::ministral3::ARGS),
                         ("[SYSTEM_PROMPT]", 17),
                         ("[/SYSTEM_PROMPT]", 18),
                     ]
@@ -648,12 +654,6 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
-        if self.family == BackendFamily::Ministral3 && self.tool_call_parsing {
-            return Err(EngineError::unsupported(
-                "Ministral tool parser",
-                "native tool-call protocol is required",
-            ));
-        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -911,6 +911,14 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
+        if self.family == BackendFamily::Ministral3 {
+            return rendering::ministral3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
         if self.family == BackendFamily::Gemma3 {
             return rendering::gemma3_projected_tool_token_upper_bound(
                 &data.tokenizer,
@@ -976,7 +984,7 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
-            if tool_mode && (!self.tool_call_parsing || self.family == BackendFamily::Ministral3) {
+            if tool_mode && !self.tool_call_parsing {
                 return Err(EngineError::unsupported(
                     "tool context",
                     "enable tool-call parsing before rendering tool context",
@@ -1179,6 +1187,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser: None,
             slab: None,
             xml: None,
+            ministral: None,
             phi: None,
             completed_slab: None,
         }))
@@ -1238,6 +1247,7 @@ impl RuntimeBackend for Qwen3Backend {
             parser: None,
             slab: None,
             xml: Some(xml),
+            ministral: None,
             phi: None,
             completed_slab: None,
         })
@@ -1269,32 +1279,32 @@ impl RuntimeBackend for Qwen3Backend {
                     ));
                 }
                 let data = self.data(resolved.artifact())?;
-                let (slab, phi) = if self.family == BackendFamily::Phi {
-                    (
+                let max_output = self.tool_parser_limits().max_output_bytes;
+                let (slab, phi, ministral) = match self.family {
+                    BackendFamily::Ministral3 => (
+                        None,
+                        None,
+                        Some(crate::slab_parser::ministral3::MinistralToolParser::new(
+                            allocation, max_output,
+                        )),
+                    ),
+                    BackendFamily::Phi => (
                         None,
                         Some(
-                            crate::slab_parser::PhiToolParser::new(
-                                allocation,
-                                self.tool_parser_limits().max_output_bytes,
-                            )?
-                            .with_terminal_list(),
+                            crate::slab_parser::PhiToolParser::new(allocation, max_output)?
+                                .with_terminal_list(),
                         ),
-                    )
-                } else {
-                    (
-                        Some({
-                            let parser = crate::slab_parser::SlabParser::new(
-                                allocation,
-                                self.tool_parser_limits().max_output_bytes,
-                            )?;
-                            if self.family == BackendFamily::Gemma3 {
-                                parser.with_terminal_call()
-                            } else {
-                                parser
-                            }
-                        }),
                         None,
-                    )
+                    ),
+                    _ => {
+                        let parser = crate::slab_parser::SlabParser::new(allocation, max_output)?;
+                        let parser = if self.family == BackendFamily::Gemma3 {
+                            parser.with_terminal_call()
+                        } else {
+                            parser
+                        };
+                        (Some(parser), None, None)
+                    }
                 };
                 output::box_slab_decoder(Qwen3TextDecoder {
                     tokenizer: Arc::clone(&data.tokenizer),
@@ -1308,6 +1318,7 @@ impl RuntimeBackend for Qwen3Backend {
                     slab,
                     xml: None,
                     phi,
+                    ministral,
                     completed_slab: None,
                 })
             }
@@ -1699,7 +1710,8 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        (BackendFamily::Ministral3, _) => MINISTRAL3_TEXT_TEMPLATE,
+        (BackendFamily::Ministral3, false) => MINISTRAL3_TEXT_TEMPLATE,
+        (BackendFamily::Ministral3, true) => MINISTRAL3_TOOL_TEMPLATE,
         (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,

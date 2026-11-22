@@ -46,11 +46,6 @@ fn ministral_production_requires_qualification() {
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and Metal"]
 fn ministral3_native_daemon_chat() {
     let artifact = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap());
-    let error =
-        alloyd::boot::boot_native_for_qualification(request(artifact.clone(), true), Some(2048))
-            .err()
-            .unwrap();
-    assert!(error.message.contains("tool parsing"), "{error:?}");
     let boot =
         alloyd::boot::boot_native_for_qualification(request(artifact, false), Some(2048)).unwrap();
     let snapshot = |turns: Vec<(MessageRole, &str)>| {
@@ -106,6 +101,17 @@ fn ministral3_native_daemon_chat() {
             ContextBuilder::render_and_count(&boot.engine, snapshot(vec![(User, marker)])).is_err()
         );
     }
+    let records = ContextBuilder::render_and_count(
+        &boot.engine,
+        snapshot(vec![(User, "Saved context."), (User, QUESTION)]),
+    )
+    .unwrap();
+    let combined = format!("Saved context.\n{QUESTION}");
+    let single =
+        ContextBuilder::render_and_count(&boot.engine, snapshot(vec![(User, combined.as_str())]))
+            .unwrap();
+    assert_eq!(records.text(), single.text());
+    assert_eq!(records.token_ids(), single.token_ids());
     let root = tempfile::tempdir().unwrap();
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "test",
@@ -160,5 +166,92 @@ fn ministral3_native_daemon_chat() {
             .collect();
         assert_eq!(text, expected, "{events:?}");
         println!("daemon response {text:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and Metal"]
+fn ministral3_publisher_tool_prompt_parity() {
+    use engine::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    let artifact = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap());
+    let boot =
+        alloyd::boot::boot_native_for_qualification(request(artifact, true), Some(2048)).unwrap();
+    let tool = RenderingTool::new(
+        "fs.read".into(),
+        "1".into(),
+        "Read a file.".into(),
+        json!({"type":"object"}),
+    )
+    .unwrap();
+    let mut history = Vec::new();
+    for (id, path) in [("call1", "a"), ("call2", "雪")] {
+        history.push(ToolHistoryBlock::AssistantCall {
+            call_id: id.into(),
+            tool_id: "fs.read".into(),
+            arguments: serde_json::Map::from_iter([("path".into(), json!(path))]),
+        });
+    }
+    for (id, content) in [("call1", "first"), ("call2", "second")] {
+        history.push(ToolHistoryBlock::ToolResult {
+            call_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        });
+    }
+
+    for (blocks, count, bytes_hash, tokens_hash) in [
+        (
+            vec![],
+            55,
+            "5e8e092413687f3ba2b65dcd5fd49fc48a42aa5df54b45a05159e049c9b14d0d",
+            "ee03f023769d1caa319aa5047204ec2c488570347ef7e8c5a8cc77cdbef615ef",
+        ),
+        (
+            history,
+            112,
+            "fe9be537616aa87cb13bee76c760336f29d9d709ba799c9ea30bede61a7f67bc",
+            "e92c699fe47030505fe61dbde56938e53b46238fcb30b932bc6909fa7ab9237b",
+        ),
+    ] {
+        let context = ToolContext::new(
+            vec![tool.clone()],
+            blocks,
+            ToolContextLimits {
+                max_tools: 1,
+                max_history_blocks: 4,
+                max_json_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let snapshot = ContextSnapshot::new(
+            ContextSnapshotId::new("tool-parity").unwrap(),
+            ModelProfileId::new(PROFILE).unwrap(),
+            vec![
+                Message {
+                    role: MessageRole::System,
+                    content: "Answer briefly.".into(),
+                },
+                Message {
+                    role: MessageRole::User,
+                    content: "Read both files.".into(),
+                },
+            ],
+        )
+        .unwrap()
+        .with_tool_context(context);
+        let render = ContextBuilder::render_and_count(&boot.engine, snapshot).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(render.text().as_bytes())),
+            bytes_hash,
+            "{}",
+            render.text()
+        );
+        assert_eq!(render.token_count(), count);
+        let ids: Vec<_> = render
+            .token_ids()
+            .iter()
+            .flat_map(|id| id.to_le_bytes())
+            .collect();
+        assert_eq!(format!("{:x}", Sha256::digest(ids)), tokens_hash);
     }
 }

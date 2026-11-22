@@ -10,11 +10,27 @@
     {%- set turns = messages -%}
 {%- endif -%}
 {{- '[/SYSTEM_PROMPT]' -}}
+{%- if ministral_tools is defined and tools|length > 0 -%}
+    {{- '[AVAILABLE_TOOLS]' ~ (tools|hf_tojson) ~ '[/AVAILABLE_TOOLS]' -}}
+{%- endif -%}
+{%- set ns = namespace(expect_user=true) -%}
 {%- for message in turns -%}
-    {%- if loop.index0 % 2 == 0 and message.role == 'user' -%}
-        {{- '[INST]' ~ message.content ~ '[/INST]' -}}
-    {%- elif loop.index0 % 2 == 1 and message.role == 'assistant' -%}
+    {%- if message.kind == 'call' -%}
+        {{- '[TOOL_CALLS]' ~ message.call.name ~ '[ARGS]' ~ (message.call.arguments|hf_tojson) -}}
+        {%- if loop.last or turns[loop.index].kind != 'call' -%}{{- '</s>' -}}{%- endif -%}
+    {%- elif message.kind == 'result' -%}
+        {{- '[TOOL_RESULTS]' ~ message.content ~ '[/TOOL_RESULTS]' -}}
+    {%- elif ns.expect_user and message.role == 'user' -%}
+        {%- if loop.first or turns[loop.index0 - 1].role != 'user' -%}{{- '[INST]' -}}
+        {%- else -%}{{- '\n' -}}{%- endif -%}
+        {{- message.content -}}
+        {%- if loop.last or turns[loop.index].role != 'user' -%}
+            {{- '[/INST]' -}}
+            {%- set ns.expect_user = false -%}
+        {%- endif -%}
+    {%- elif not ns.expect_user and message.role == 'assistant' -%}
         {{- message.content ~ '</s>' -}}
+        {%- set ns.expect_user = true -%}
     {%- else -%}
         {{- raise_exception('Ministral chat requires alternating user and assistant turns') -}}
     {%- endif -%}

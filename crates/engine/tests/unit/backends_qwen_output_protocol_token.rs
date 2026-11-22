@@ -32,6 +32,7 @@ fn decoder() -> Qwen3TextDecoder {
         parser: None,
         slab: None,
         xml: None,
+        ministral: None,
         phi: None,
         completed_slab: None,
     }

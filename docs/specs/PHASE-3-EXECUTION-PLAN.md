@@ -1594,3 +1594,29 @@ rendered bytes and IDs with the equivalent combined user input in
 ministral3_chat.rs. Keep the publisher's alternating assistant boundaries.
 Run the existing compaction_real_model integration suite with the frozen
 profile, including actual process restart, cold comparisons and event checks.
+
+Native long-context receipt 19113f5801b940e995edc043dbe8f08a passed on
+the text integration from 6dcbe4a. The 8 GiB simulated admission executed.
+At 8,895 and 33,925 tokens the daemon streamed the complete archive code
+COBALT-7392 and stopped at EOS. Prefill plus generation took 44.09 and 208.97
+seconds, with MLX peaks of 6,214,250,496 and 16,885,970,772 bytes. Cancellation
+after the first text delta returned a cancellation error. A fresh session
+then matched the baseline response exactly.
+
+Ministral tool qualification passed its real allow/deny daemon test in
+71.22 seconds (a19670dd824f426e9a5eaaeab0b63819). A sampled control ID
+started one fs.write call. The daemon wrote the six bytes COBALT into
+marker.txt, then the model returned exactly DONE. On the following turn the
+daemon rejected forbidden.txt before execution and the model reported the
+rejection. The file was absent. Both final answers reached EOS.
+
+Reference capture 8aa83d48e47a40a9883136d1a65d4342 and native run
+70a4dd03f5724676840bd8dfb4bd5475 establish byte and token equality for the
+55-token declaration prompt and the 112-token history with two calls and two
+results. The native run also passed both ordinary chat cases and production
+refusal. Four parser/decoder regressions passed (4d62657d024c4d3bab113e34a0df01e5),
+including ordinary text with marker spellings, sampled control IDs, complete
+EOS batches, malformed/truncated input and storage bounds. Thirteen shared
+tool-rendering and Phi protocol regressions passed
+(1b707e4cb804428b8c4ba430dd2e0797). Strict Clippy passed for engine and
+alloyd on all targets (d2a5e5835c8a4bd48984afc651926b9e).

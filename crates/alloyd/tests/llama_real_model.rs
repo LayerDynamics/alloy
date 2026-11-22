@@ -56,6 +56,7 @@ fn llama3_tool_stop_context_cache() {
         profile.as_str(),
         "llama-3.1-8b-4bit"
             | "llama-3.1-8b-8bit"
+            | "ministral-3-3b-instruct-2512-4bit"
             | "smollm3-3b-4bit"
             | "phi4-mini-instruct-4bit"
             | "gemma-3-4b-4bit"
@@ -175,6 +176,8 @@ fn llama3_tool_stop_context_cache() {
         caps[0]["result"]["family"],
         if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
             "qwen35"
+        } else if profile.starts_with("ministral-3") {
+            "ministral3"
         } else if profile.starts_with("smollm") {
             "smollm3"
         } else if profile.starts_with("phi4") {
@@ -194,6 +197,8 @@ fn llama3_tool_stop_context_cache() {
         caps[0]["result"]["cache_modes"][0]["representation"],
         if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
             "qwen35.mlx-f32.full-kv-and-recurrent.v1"
+        } else if profile.starts_with("ministral-3") {
+            "ministral3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("smollm") {
             "smollm3.mlx-f32.full.bhtd.v1"
         } else if profile.starts_with("phi4") {
