@@ -9,38 +9,55 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[test]
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT"]
 fn ministral3_text_checkpoint_loading() {
+    check_loading(
+        include_str!("fixtures/ministral3_profile.json"),
+        4,
+        2_143_678_464,
+    );
+}
+
+#[test]
+#[ignore = "requires pinned 8-bit ALLOY_MINISTRAL3_ARTIFACT"]
+fn ministral3_affine8_checkpoint_loading() {
+    check_loading(
+        include_str!("fixtures/ministral3_8bit_profile.json"),
+        8,
+        3_858_100_224,
+    );
+}
+
+fn check_loading(manifest: &str, bits: u8, resident_bytes: usize) {
+    let profile: serde_json::Value = serde_json::from_str(manifest).unwrap();
     let root =
         PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").expect("pinned artifact"))
             .canonicalize()
             .unwrap();
-    let pins: BTreeMap<_, _> = [
-        (
-            "config.json",
-            "cdd4bfa0a702d0241faaa3b80d15d481d7f8abf2659fba0958b1e7f24a28055f",
-        ),
-        (
-            "model.safetensors.index.json",
-            "22e571d413d8aa4e5f81f5ae678aa8b4f5b1d67598a67c08b31182075592ec93",
-        ),
-        (
-            "model.safetensors",
-            "69a68c0a961a64bb1145a697a83cf6cec45220d425c77a6c0a3568924078c3b4",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, hex)| {
-        let digest =
-            std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap());
-        (root.join(name), digest)
-    })
-    .collect();
+    let files = profile["artifact"]["files"].as_array().unwrap();
+    let pins: BTreeMap<_, _> = files
+        .iter()
+        .map(|file| {
+            let hex = file["sha256"].as_str().unwrap();
+            let digest =
+                std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap());
+            (root.join(file["path"].as_str().unwrap()), digest)
+        })
+        .collect();
     let verification = CheckpointVerification {
         sha256: &pins,
         cancelled: &|| false,
     };
     let options = LoadOptions {
-        max_file_bytes: 2_745_210_934 + 74_906 + 1_988,
-        max_weight_bytes: 2_143_678_464,
+        max_file_bytes: files
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f["path"].as_str(),
+                    Some("config.json" | "model.safetensors" | "model.safetensors.index.json")
+                )
+            })
+            .map(|f| f["bytes"].as_u64().unwrap() as usize)
+            .sum(),
+        max_weight_bytes: resident_bytes,
     };
     assert!(
         matches!(load_verified(&root,LoadOptions {max_weight_bytes:options.max_weight_bytes-1,..options},&verification),Err(ModelError::MemoryLimit{required,limit}) if required == options.max_weight_bytes && limit == required-1)
@@ -67,7 +84,7 @@ fn ministral3_text_checkpoint_loading() {
     assert!(
         matrices
             .iter()
-            .all(|m| m.bits() == Some(4) && m.affine4_group_size() == Some(64))
+            .all(|m| m.bits() == Some(bits) && m.affine4_group_size() == Some(64))
     );
     let bytes = norms * 4 + matrices.iter().map(|m| m.resident_bytes()).sum::<usize>();
     assert_eq!(bytes, options.max_weight_bytes);

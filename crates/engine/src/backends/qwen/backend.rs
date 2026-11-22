@@ -1397,7 +1397,7 @@ fn registration_for(
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama || smollm || hybrid || phi || gemma {
+    if llama || smollm || hybrid || phi || gemma || ministral {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });

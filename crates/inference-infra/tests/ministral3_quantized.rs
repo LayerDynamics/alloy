@@ -12,8 +12,23 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[test]
 #[ignore = "requires pinned ALLOY_MINISTRAL3_ARTIFACT and ALLOY_MINISTRAL3_REFERENCE"]
 fn ministral3_real_quantized_native_reference() {
-    let profile: Value =
-        serde_json::from_str(include_str!("fixtures/ministral3_profile.json")).unwrap();
+    check_reference(
+        include_str!("fixtures/ministral3_profile.json"),
+        2_143_678_464,
+    );
+}
+
+#[test]
+#[ignore = "requires pinned 8-bit ALLOY_MINISTRAL3_ARTIFACT and ALLOY_MINISTRAL3_REFERENCE"]
+fn ministral3_real_affine8_native_reference() {
+    check_reference(
+        include_str!("fixtures/ministral3_8bit_profile.json"),
+        3_858_100_224,
+    );
+}
+
+fn check_reference(manifest: &str, resident_bytes: usize) {
+    let profile: Value = serde_json::from_str(manifest).unwrap();
     let root = PathBuf::from(std::env::var_os("ALLOY_MINISTRAL3_ARTIFACT").unwrap())
         .canonicalize()
         .unwrap();
@@ -49,8 +64,13 @@ fn ministral3_real_quantized_native_reference() {
     let (config, weights) = load_verified(
         &root,
         LoadOptions {
-            max_file_bytes: 3 << 30,
-            max_weight_bytes: 2_143_678_464,
+            max_file_bytes: profile["artifact"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["bytes"].as_u64().unwrap() as usize)
+                .sum(),
+            max_weight_bytes: resident_bytes,
         },
         &CheckpointVerification {
             sha256: &pins,
@@ -62,11 +82,11 @@ fn ministral3_real_quantized_native_reference() {
     let model = MlxDecoderModel::from_weights(
         config.decoder_config().unwrap(),
         weights,
-        2_143_678_464,
+        resident_bytes as u64,
         &stream,
     )
     .unwrap();
-    assert_eq!(model.weight_buffer_bytes().unwrap(), 2_143_678_464);
+    assert_eq!(model.weight_buffer_bytes().unwrap(), resident_bytes as u64);
     let cases = reference["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 2);
     for (case_id, case) in cases.iter().enumerate() {

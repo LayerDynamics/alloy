@@ -1694,3 +1694,12 @@ crates/alloyd/tests/ministral3_chat.rs. Include the 8-bit profile in the
 existing compaction and policy fixtures in
 crates/alloyd/tests/{llama_real_model.rs,compaction_real_model.rs}. Measure
 the unchanged native tool, lifecycle, long-context, memory and latency gates.
+
+The independent eager 8-bit reference (061985dd04c0416fa44f3ea5377500a7)
+was frozen at f6ce3ca. Native loader and numerical tests passed
+(1d241f22087e408a968d2101cce063c7). The 183 packed matrices and 53 norms
+occupy 3,858,100,224 resident bytes, with refusal one byte below that amount.
+The two trained prompts matched six full vocabulary vectors (786,432 logits)
+at prefill and cached decode. Strict Clippy passed on all three affected
+crates (7e221749aac0475380ad6ac3e3f8de84). Both Ministral profiles remain
+behind the production qualification check (6ca1672f03ee4d4eafa453a3e732c290).

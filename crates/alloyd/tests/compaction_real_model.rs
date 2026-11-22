@@ -372,7 +372,7 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     assert!(!result.assistant_text.is_empty());
     let base = format!("{}{}", rendered.text(), result.assistant_text);
     let mut published = None;
-    let suffixes: &[&str] = if real_profile() == "ministral-3-3b-instruct-2512-4bit" {
+    let suffixes: &[&str] = if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
         &["</s>"]
     } else {
         &[
@@ -522,7 +522,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
 #[ignore = "requires local pinned model and native MLX"]
 fn real_model_compaction_preserves_history_and_continues() {
     // The pinned Ministral default system adds 530 tokens to the same archive.
-    let context_limit = if real_profile() == "ministral-3-3b-instruct-2512-4bit" {
+    let context_limit = if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
         2048 + 530
     } else {
         2048

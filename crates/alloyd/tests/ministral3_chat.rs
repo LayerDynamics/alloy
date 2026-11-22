@@ -36,10 +36,12 @@ fn request(path: PathBuf, tools_enabled: bool) -> BootRequest {
 #[test]
 fn ministral_production_requires_qualification() {
     let missing = PathBuf::from("/nonexistent/ministral");
-    let error = alloyd::boot::boot_native(request(missing, false))
-        .err()
-        .unwrap();
-    assert!(error.message.contains("not qualified"), "{error:?}");
+    for profile in [PROFILE, "ministral-3-3b-instruct-2512-8bit"] {
+        let mut request = request(missing.clone(), false);
+        request.profile_id = profile.into();
+        let error = alloyd::boot::boot_native(request).err().unwrap();
+        assert!(error.message.contains("not qualified"), "{error:?}");
+    }
 }
 
 #[test]

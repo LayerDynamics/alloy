@@ -77,6 +77,7 @@ impl BootRequest {
                 | "llama-3.1-8b-4bit"
                 | "llama-3.1-8b-8bit"
                 | "ministral-3-3b-instruct-2512-4bit"
+                | "ministral-3-3b-instruct-2512-8bit"
                 | "smollm3-3b-4bit"
                 | "phi4-mini-instruct-4bit"
                 | "gemma-3-4b-4bit"
@@ -111,8 +112,9 @@ pub fn boot_qwen3_with_context_limit(
     request.validate_profile()?;
     if matches!(
         request.profile_id.as_str(),
-        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "ministral-3-3b-instruct-2512-4bit"
-    ) || is_hybrid_profile(&request.profile_id)
+        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
+    ) || is_ministral_profile(&request.profile_id)
+        || is_hybrid_profile(&request.profile_id)
         || is_gemma_profile(&request.profile_id)
     {
         return Err(RpcError::invalid_params(format!(
@@ -139,7 +141,7 @@ pub fn boot_native_for_qualification(
     }
 
     let llama = request.profile_id.starts_with("llama-");
-    let ministral = request.profile_id == "ministral-3-3b-instruct-2512-4bit";
+    let ministral = is_ministral_profile(&request.profile_id);
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
     let gemma = is_gemma_profile(&request.profile_id);
@@ -472,16 +474,21 @@ fn is_hybrid_profile(profile: &str) -> bool {
     matches!(profile, "ornith-1.5-9b-4bit" | "qwen3.5-0.8b-4bit")
 }
 
+fn is_ministral_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        "ministral-3-3b-instruct-2512-4bit" | "ministral-3-3b-instruct-2512-8bit"
+    )
+}
+
 fn is_gemma_profile(profile: &str) -> bool {
     matches!(profile, "gemma-3-4b-4bit" | "gemma-3-12b-4bit")
 }
 
 fn is_frozen_profile(profile: &str) -> bool {
     profile.starts_with("llama-")
-        || matches!(
-            profile,
-            "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "ministral-3-3b-instruct-2512-4bit"
-        )
+        || matches!(profile, "smollm3-3b-4bit" | "phi4-mini-instruct-4bit")
+        || is_ministral_profile(profile)
         || is_hybrid_profile(profile)
         || is_gemma_profile(profile)
 }
@@ -528,6 +535,9 @@ fn load_expected_hashes(
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
     let frozen: Option<&[u8]> = match profile_id {
+        "ministral-3-3b-instruct-2512-8bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/ministral3_8bit_profile.json"
+        )),
         "ministral-3-3b-instruct-2512-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/ministral3_profile.json"
         )),

@@ -57,6 +57,7 @@ fn llama3_tool_stop_context_cache() {
         "llama-3.1-8b-4bit"
             | "llama-3.1-8b-8bit"
             | "ministral-3-3b-instruct-2512-4bit"
+            | "ministral-3-3b-instruct-2512-8bit"
             | "smollm3-3b-4bit"
             | "phi4-mini-instruct-4bit"
             | "gemma-3-4b-4bit"
