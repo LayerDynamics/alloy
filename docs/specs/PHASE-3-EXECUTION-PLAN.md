@@ -2111,3 +2111,23 @@ Qwen35Cache::component_buffer_bytes in crates/inference-infra/src/decoder/qwen35
 Keep buffer_bytes as the checked sum used by existing admission callers.
 Allocator padding can change after an update, so subtraction of initial KV
 from final aggregate bytes would not measure recurrent storage accurately.
+
+### #53 reproducible CI execution of the implemented native suites
+
+Add scripts/ci/m3_native_matrix.py to run both native evidence producers
+for every currently registered pinned numerical suite (Gemma 4, Ornith and
+small Qwen3.5). Take paths from one external JSON inventory, bind every run
+to the requested exact Git commit, continue independent executions on
+individual input or fixture failures and exit nonzero on any failure.
+Write an external index with the status and SHA-256 of each terminal receipt.
+A matrix pass covers its listed suites only. No production admission occurs.
+Use this same entry point in .github/workflows/m3-native-observations.yaml
+on explicit dispatch, with an exact checkout and the existing Mac lease.
+Retain logs and index on failure. The runner operator supplies the path
+inventory outside the checkout. Add scripts/tests/test_m3_native_matrix.py
+for complete inventory, mismatched/missing receipts and cross-profile
+failure isolation. Add the native Python regression tests to the existing
+Linux CLI job in .github/workflows/ci.yaml. Verify ci_partition_test.rb,
+runner tests, YAML structure and real three-profile local execution.
+No new dependency. Hosted terminal CI and the other M3 families still
+require their own exits.
