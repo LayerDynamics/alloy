@@ -2663,3 +2663,22 @@ outputs below, at and above the sorting threshold with repeated expert
 IDs and distinguishable tokens. Run that test on CPU and Metal, the
 pinned trained layer and full-model reference, and the original Coder
 boundary on the physical host. Dependencies stay fixed.
+
+### Phi explanation after a failed tool result
+
+On a607d68 the real policy denied the second write but Phi attributed it to
+the user's earlier request. Pinned replay f51b1562711c4861917953c0cefb8cb5
+reproduces the wrong explanation on identical input and the correct one
+with a system instruction about failed results. Apply this instruction
+only while responding to a trailing batch containing a typed failed result.
+In `crates/engine/src/backends/qwen/phi_tools.jinja` use the existing typed
+message projection. Define the instruction in
+`crates/engine/src/backends/qwen/phi_tool_error.txt` and include its bytes
+in the compiled template identity in `crates/engine/src/backends/qwen/architecture.rs`.
+In `crates/engine/src/backends/qwen/backend.rs` reserve its possible growth
+before admitting new tool results. In `crates/engine/tests/phi_engine.rs`
+exercise true and false result flags, mixed batches, plain text resembling
+an error, completed history, and the pinned tokenizer's projection bound.
+Retain the existing successful prompt oracle. Run the trained Phi renderer,
+proposal and daemon policy tests including exactly one write, a rejected
+second write, and a model-generated explanation. Dependencies stay fixed.
