@@ -132,6 +132,7 @@
     13
   ],
   "reference": {
+    "sha256": "bec6465a5075eedcc8ff2e5d1c8066ada0438ea602f75b7664101dd384a61186",
     "versions": {
       "mlx": "0.32.4",
       "mlx-lm": "0.31.2",
