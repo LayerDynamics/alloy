@@ -2610,3 +2610,17 @@ prefill and the exact bound. Run the existing CPU decoder, long-cache and
 pressure tests and the original `qwen3_dense_trained_reference` for both
 4B and 14B using the unchanged eager references and FR-8 thresholds.
 Recheck the routed Coder numerical gate. Dependencies stay fixed.
+
+### Qwen3-Coder long prefill on the 36 GB Mac
+
+The standalone 40,384-token Coder request on a4284cf required
+29,368,166,328 bytes while 29,354,722,000 bytes were available. In
+`crates/engine/src/backends/qwen/architecture.rs`, cap native routed
+Qwen3 prefill at 16 tokens per chunk above 32,768 tokens of cache capacity.
+Use the runtime's existing shared chunk selection for both execution and
+workspace admission. In `crates/engine/tests/unit/backends_qwen_shared_rendering_wiring.rs`
+verify the smaller configured limit, the exact transition and ordinary
+dense Qwen in `routed_long_prefill_bounds_chunk_and_workspace`.
+Re-run `native_boundary_memory_estimate` and `native_validated_context_boundary`
+with the pinned trained Coder artifact. Preserve the original prompt hashes,
+output checks, model identity, and memory policy. No dependency changes.
