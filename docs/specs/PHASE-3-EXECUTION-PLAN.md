@@ -1671,3 +1671,26 @@ failing fixture. Keep the 4-bit agent profile unqualified.
 The optimized actual 4-bit renderer counted 33,875 tokens. All five warm
 samples matched token-for-token and took 16.84 to 17.28 ms, within the
 150 ms threshold (bf7c9c4cab244a2d91c513febcec43b4).
+
+### #99 Ministral 3B affine8 qualification
+
+Keep the failed affine4 result. The same publisher's 8-bit conversion at
+mlx-community/Ministral-3-3B-Instruct-2512-8bit revision
+79ebb6ee5067d20a89765e54f43449cadccb66ff passed an independent diagnostic on
+the unchanged 1,279-token input and five other captured prompts
+(94faf1ecd5bd472882e6ccb1fd009b6e). Inputs verified against remote object IDs,
+including the 4,468,021,687-byte shard (313a3182e7444249aa32c5393ccdea20).
+This diagnostic has no native qualification status.
+
+Add crates/inference-infra/tests/fixtures/ministral3_8bit_profile.json, freeze
+the existing capture_model.py output digest before running native inference,
+and parameterize the trained numerical and resident-byte checks in
+crates/inference-infra/tests/{ministral3_quantized.rs,ministral3_loading.rs}.
+Run ministral3_real_affine8_native_reference and ministral3_affine8_checkpoint_loading
+against the verified shard. Update crates/engine/src/backends/qwen/backend.rs
+to register the implemented affine8 representation and crates/alloyd/src/boot.rs
+to pin both profiles in qualification mode. Test both production refusals in
+crates/alloyd/tests/ministral3_chat.rs. Include the 8-bit profile in the
+existing compaction and policy fixtures in
+crates/alloyd/tests/{llama_real_model.rs,compaction_real_model.rs}. Measure
+the unchanged native tool, lifecycle, long-context, memory and latency gates.
