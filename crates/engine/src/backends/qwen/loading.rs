@@ -85,18 +85,27 @@ impl ModelFamily for Qwen3Backend {
             sha256: &data.checksums,
             cancelled: &cancelled,
         };
-        let result = load_weights_verified(
-            config,
-            &data.specification.directory,
-            LoadOptions {
-                // Enforce the source limit used by the workspace plan even
-                // when a caller offers a larger grant. Mutated files must
-                // not expand metadata beyond that bound before hash failure.
-                max_file_bytes: as_usize(data.source_bytes)?,
-                max_weight_bytes: as_usize(weight_charge_limit)?,
-            },
-            &verification,
-        );
+        let options = LoadOptions {
+            max_file_bytes: as_usize(data.source_bytes)?,
+            max_weight_bytes: as_usize(weight_charge_limit)?,
+        };
+        let result = if self.family == BackendFamily::Ministral3 {
+            inference_infra::decoder::ministral3::weights::load_verified(
+                &data.specification.directory,
+                options,
+                &verification,
+            )
+            .and_then(|(loaded, weights)| {
+                if loaded.decoder_config()? != *config {
+                    return Err(inference_infra::decoder::model::ModelError::InvalidConfig(
+                        "Ministral verified geometry changed",
+                    ));
+                }
+                Ok(weights)
+            })
+        } else {
+            load_weights_verified(config, &data.specification.directory, options, &verification)
+        };
         control.check_cancelled()?;
         let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
         let packed_bits = weights.embed_tokens.bits();

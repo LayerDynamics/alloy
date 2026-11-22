@@ -76,6 +76,7 @@ impl BootRequest {
             "qwen3-4b-4bit"
                 | "llama-3.1-8b-4bit"
                 | "llama-3.1-8b-8bit"
+                | "ministral-3-3b-instruct-2512-4bit"
                 | "smollm3-3b-4bit"
                 | "phi4-mini-instruct-4bit"
                 | "gemma-3-4b-4bit"
@@ -110,7 +111,7 @@ pub fn boot_qwen3_with_context_limit(
     request.validate_profile()?;
     if matches!(
         request.profile_id.as_str(),
-        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit"
+        "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "ministral-3-3b-instruct-2512-4bit"
     ) || is_hybrid_profile(&request.profile_id)
         || is_gemma_profile(&request.profile_id)
     {
@@ -138,6 +139,12 @@ pub fn boot_native_for_qualification(
     }
 
     let llama = request.profile_id.starts_with("llama-");
+    let ministral = request.profile_id == "ministral-3-3b-instruct-2512-4bit";
+    if ministral && request.tools_enabled {
+        return Err(RpcError::invalid_params(
+            "Ministral native tool parsing is unavailable",
+        ));
+    }
     let smollm = request.profile_id == "smollm3-3b-4bit";
     let phi = request.profile_id == "phi4-mini-instruct-4bit";
     let gemma = is_gemma_profile(&request.profile_id);
@@ -155,7 +162,9 @@ pub fn boot_native_for_qualification(
         directory: request.artifact_dir.clone(),
         files,
         template_sha256: Sha256::digest(
-            if gemma {
+            if ministral {
+                engine::backends::qwen::MINISTRAL3_TEXT_TEMPLATE
+            } else if gemma {
                 engine::backends::qwen::GEMMA3_TEXT_TEMPLATE
             } else if phi {
                 engine::backends::qwen::PHI_TEXT_TEMPLATE
@@ -179,7 +188,11 @@ pub fn boot_native_for_qualification(
         .map_err(|error| RpcError::internal(format!("read config.json: {error}")))?;
     let config: Value = serde_json::from_slice(&config_bytes)
         .map_err(|error| RpcError::internal(format!("parse config.json: {error}")))?;
-    let context_limit = if gemma {
+    let context_limit = if ministral {
+        inference_infra::decoder::ministral3::MinistralConfig::from_json(&config)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?
+            .context
+    } else if gemma {
         gemma_context_limit(&config)?
     } else if hybrid {
         hybrid_context_limit(&config)?
@@ -202,7 +215,7 @@ pub fn boot_native_for_qualification(
         max_config_bytes: 8 * 1024 * 1024,
         max_tokenizer_bytes: if gemma {
             40 * 1024 * 1024
-        } else if smollm || hybrid {
+        } else if smollm || hybrid || ministral {
             32 * 1024 * 1024
         } else {
             16 * 1024 * 1024
@@ -218,7 +231,7 @@ pub fn boot_native_for_qualification(
         // The base Qwen3 text path stays at 256 without relaxing admission.
         prefill_chunk_tokens: NonZeroUsize::new(if hybrid || gemma {
             32
-        } else if request.tools_enabled || llama || smollm || phi {
+        } else if request.tools_enabled || llama || smollm || phi || ministral {
             64
         } else {
             256
@@ -236,7 +249,9 @@ pub fn boot_native_for_qualification(
         Qwen3Execution::MlxCpu
     };
 
-    let backend = (if gemma {
+    let backend = (if ministral {
+        Qwen3Backend::new_ministral3(vec![specification], limits, execution)
+    } else if gemma {
         Qwen3Backend::new_gemma3(vec![specification], limits, execution)
     } else if phi {
         Qwen3Backend::new_phi(vec![specification], limits, execution)
@@ -468,7 +483,10 @@ fn is_gemma_profile(profile: &str) -> bool {
 
 fn is_frozen_profile(profile: &str) -> bool {
     profile.starts_with("llama-")
-        || matches!(profile, "smollm3-3b-4bit" | "phi4-mini-instruct-4bit")
+        || matches!(
+            profile,
+            "smollm3-3b-4bit" | "phi4-mini-instruct-4bit" | "ministral-3-3b-instruct-2512-4bit"
+        )
         || is_hybrid_profile(profile)
         || is_gemma_profile(profile)
 }
@@ -515,6 +533,9 @@ fn load_expected_hashes(
     profile_id: &str,
 ) -> Result<BTreeMap<String, String>, RpcError> {
     let frozen: Option<&[u8]> = match profile_id {
+        "ministral-3-3b-instruct-2512-4bit" => Some(include_bytes!(
+            "../../inference-infra/tests/fixtures/ministral3_profile.json"
+        )),
         "gemma-3-4b-4bit" => Some(include_bytes!(
             "../../inference-infra/tests/fixtures/gemma3_4b_profile.json"
         )),

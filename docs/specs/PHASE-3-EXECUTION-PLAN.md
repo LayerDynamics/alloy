@@ -1550,3 +1550,13 @@ using real text generation and verify exact rendered token IDs. Add tests for
 unqualified production rejection and tool requests before native protocol
 integration. Tool parsing and policy execution require the trained
 [TOOL_CALLS]name[ARGS]JSON representation in a subsequent batch.
+
+The pinned Ministral daemon run passed both tests in 37.57 seconds. Rendered
+bytes and every token ID matched the publisher on the 548-token default-system
+prompt and 27-token explicit history. One SQLite-backed RPC session streamed
+exactly `4` and then `8`. Reserved input delimiters, unqualified production
+boot and requests for unsupported tools were rejected. Reference capture
+8441ede3badb4e5f9f540e0f9535b522 and native test
+1fe9ef51025245758cc99b242bb31ae3 retain the terminal output. Strict Clippy
+for engine and alloyd, including all targets, passed
+(b79aedea615849fbbeca8ca96681fd2f).

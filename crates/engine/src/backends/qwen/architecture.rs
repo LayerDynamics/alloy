@@ -8,6 +8,7 @@ enum BackendFamily {
     Ornith,
     Phi,
     Gemma3,
+    Ministral3,
 }
 impl BackendFamily {
     fn hybrid(self) -> bool {
@@ -22,10 +23,7 @@ fn dense_cache_mode(
         DecoderFamily::Qwen3 => family_cache_mode(BackendFamily::Qwen3),
         DecoderFamily::Llama3 => family_cache_mode(BackendFamily::Llama3),
         DecoderFamily::SmolLm3 => family_cache_mode(BackendFamily::SmolLm3),
-        DecoderFamily::Ministral3 { .. } => Ok(CacheMode {
-            representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,
-            kind: CacheKind::Full,
-        }),
+        DecoderFamily::Ministral3 { .. } => family_cache_mode(BackendFamily::Ministral3),
     }
 }
 
@@ -172,3 +170,6 @@ pub const GEMMA3_CACHE_REPRESENTATION: &str = "gemma3.mlx-f32.full-and-sliding.v
 
 /// Gemma one-call tool turns, including bounded standalone XML fences.
 pub const GEMMA3_TOOL_TEMPLATE: &str = include_str!("gemma3_tools.jinja");
+
+/// Trained Ministral chat boundaries for a text-only conversation.
+pub const MINISTRAL3_TEXT_TEMPLATE: &str = include_str!("ministral3_text.jinja");

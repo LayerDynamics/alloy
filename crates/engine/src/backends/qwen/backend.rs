@@ -185,6 +185,15 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Construct the native Ministral 3 text backend for qualification runs.
+    pub fn new_ministral3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Ministral3)
+    }
+
     /// Native Gemma 3 text adapter with mixed local/full attention.
     /// Construction does not qualify tools or production agent behavior.
     pub fn new_gemma3(
@@ -329,6 +338,11 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = match family {
+                BackendFamily::Ministral3 => BackendConfig::Transformer(
+                    inference_infra::decoder::ministral3::MinistralConfig::from_json(&config_value)
+                        .and_then(|config| config.decoder_config())
+                        .map_err(|e| model_error(e, "validate Ministral architecture"))?,
+                ),
                 BackendFamily::Gemma3 => BackendConfig::Gemma3(
                     inference_infra::decoder::gemma3::Gemma3Config::from_json(&config_value)
                         .map_err(|e| model_error(e, "validate Gemma3 config"))?,
@@ -499,6 +513,43 @@ impl Qwen3Backend {
                     eos.push(token);
                 }
             }
+            if family == BackendFamily::Ministral3 {
+                if eos != [2]
+                    || [
+                        ("<s>", 1),
+                        ("</s>", 2),
+                        ("[INST]", 3),
+                        ("[/INST]", 4),
+                        ("[SYSTEM_PROMPT]", 17),
+                        ("[/SYSTEM_PROMPT]", 18),
+                    ]
+                    .into_iter()
+                    .any(|(name, id)| {
+                        tokenizer.tokenizer().token_to_id(name) != Some(id)
+                            || !specials.contains(&id)
+                    })
+                {
+                    return Err(validation(
+                        Some(&specification.id),
+                        "unexpected Ministral control tokens",
+                    ));
+                }
+                let reserved = family_rendering_options(family).reserved_spellings;
+                for id in &specials {
+                    let spelling = tokenizer.tokenizer().id_to_token(*id).ok_or_else(|| {
+                        validation(
+                            Some(&specification.id),
+                            "missing Ministral control spelling",
+                        )
+                    })?;
+                    if !reserved.iter().any(|pattern| spelling.contains(pattern)) {
+                        return Err(validation(
+                            Some(&specification.id),
+                            "unprotected Ministral control token",
+                        ));
+                    }
+                }
+            }
             if gemma_decoder {
                 for spelling in ["<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>"] {
                     let id = tokenizer
@@ -597,6 +648,12 @@ impl Qwen3Backend {
     }
 
     fn selected_parser_capacities(&self) -> Result<Option<ParserAllocationLimits>, EngineError> {
+        if self.family == BackendFamily::Ministral3 && self.tool_call_parsing {
+            return Err(EngineError::unsupported(
+                "Ministral tool parser",
+                "native tool-call protocol is required",
+            ));
+        }
         match (self.tool_call_parsing, self.parser_capacities) {
             (false, None) => Ok(None),
             (true, Some(limits)) => Ok(Some(limits)),
@@ -919,7 +976,7 @@ impl RuntimeBackend for Qwen3Backend {
             let data = self.data(resolved.artifact())?;
             let profile = resolved.profile();
             let tool_mode = context.tool_context().is_some();
-            if tool_mode && !self.tool_call_parsing {
+            if tool_mode && (!self.tool_call_parsing || self.family == BackendFamily::Ministral3) {
                 return Err(EngineError::unsupported(
                     "tool context",
                     "enable tool-call parsing before rendering tool context",
@@ -1320,6 +1377,7 @@ fn registration_for(
     let hybrid = family.hybrid();
     let llama = family == BackendFamily::Llama3;
     let smollm = family == BackendFamily::SmolLm3;
+    let ministral = family == BackendFamily::Ministral3;
     let phi = family == BackendFamily::Phi;
     let gemma = family == BackendFamily::Gemma3;
     let mut representations = vec![
@@ -1337,7 +1395,7 @@ fn registration_for(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if hybrid || phi || gemma {
+            if hybrid || phi || gemma || ministral {
                 1
             } else if smollm {
                 smollm::register::IMPL_VERSION
@@ -1349,7 +1407,9 @@ fn registration_for(
             5,
             0,
         ),
-        (if gemma {
+        (if ministral {
+            &["Mistral3ForConditionalGeneration"][..]
+        } else if gemma {
             &["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"][..]
         } else if phi {
             &["Phi3ForCausalLM"][..]
@@ -1367,7 +1427,9 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if gemma {
+            family: if ministral {
+                "ministral3"
+            } else if gemma {
                 "gemma3"
             } else if phi {
                 "phi"
@@ -1408,6 +1470,37 @@ fn qwen3_rendering_options() -> RenderingOptions<'static> {
 
 fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> {
     let mut options = qwen3_rendering_options();
+    if family == BackendFamily::Ministral3 {
+        options.reserved_spellings = &[
+            "<s>",
+            "</s>",
+            "<unk>",
+            "<pad>",
+            "<SPECIAL_",
+            "[INST]",
+            "[/INST]",
+            "[AVAILABLE_TOOLS]",
+            "[/AVAILABLE_TOOLS]",
+            "[TOOL_RESULTS]",
+            "[/TOOL_RESULTS]",
+            "[TOOL_CALLS]",
+            "[IMG]",
+            "[IMG_BREAK]",
+            "[IMG_END]",
+            "[PREFIX]",
+            "[MIDDLE]",
+            "[SUFFIX]",
+            "[SYSTEM_PROMPT]",
+            "[/SYSTEM_PROMPT]",
+            "[TOOL_CONTENT]",
+            "[AUDIO]",
+            "[BEGIN_AUDIO]",
+            "[ARGS]",
+            "[CALL_ID]",
+            "[THINK]",
+            "[/THINK]",
+        ];
+    }
     if family == BackendFamily::Gemma3 {
         // These are tokenizer control delimiters, never user text boundaries.
         options.reserved_spellings = &[
@@ -1606,6 +1699,7 @@ mod dense_weight_planning_regressions;
 
 fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
+        (BackendFamily::Ministral3, _) => MINISTRAL3_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
         (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
         (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
@@ -1623,6 +1717,12 @@ fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     }
 }
 fn family_cache_mode(family: BackendFamily) -> Result<CacheMode, EngineError> {
+    if family == BackendFamily::Ministral3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        });
+    }
     if family == BackendFamily::Gemma3 {
         return Ok(CacheMode {
             representation: CacheRepresentationId::new(GEMMA3_CACHE_REPRESENTATION)?,
