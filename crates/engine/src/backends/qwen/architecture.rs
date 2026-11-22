@@ -62,13 +62,9 @@ impl BackendConfig {
     }
     fn chunk_limit(&self, configured: usize, capacity: usize) -> usize {
         match self {
-            Self::Transformer(c)
-                if c.family != inference_infra::decoder::config::DecoderFamily::Qwen3
-                    && capacity > 16_384 =>
-            {
+            Self::Transformer(_) | Self::Phi(_) | Self::Gemma3(_) if capacity > 16_384 => {
                 configured.min(32)
             }
-            Self::Phi(_) | Self::Gemma3(_) if capacity > 16_384 => configured.min(32),
             _ => configured,
         }
     }

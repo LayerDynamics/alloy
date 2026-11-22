@@ -915,7 +915,7 @@ impl MlxDecoderModel {
                 ops::rms_norm(&hidden, &layer.post_attention_layernorm, c.rms_eps, stream)?;
             let mlp_output = layer.mlp.apply(&normalized, stream)?;
             hidden = ops::residual_add(&hidden, &mlp_output, stream)?;
-            if project_all {
+            if c.evaluates_each_layer(cache_spec.capacity_tokens) {
                 // Bound the decoder's live activation graph to one layer. Evaluating
                 // native arrays does not publish the staged KV transaction.
                 // The hidden output depends on both staged K/V arrays, so their
@@ -1626,6 +1626,35 @@ mod tests {
         for (index, expected) in expected.iter().enumerate() {
             assert_close(actual.row(index).expect("row"), expected);
         }
+    }
+
+    #[test]
+    fn long_dense_cache_matches_short_cache_after_cancel() {
+        let stream = stream(DeviceType::Cpu);
+        let mut config = DecoderConfig::tiny_fixture();
+        config.max_context = 2048;
+        assert!(!config.evaluates_each_layer(16));
+        assert!(config.evaluates_each_layer(2048));
+        let (model, reference) = models(config, &stream);
+        let mut short = model.new_cache(16, CACHE, &stream).unwrap();
+        let mut long = model.new_cache(2048, CACHE, &stream).unwrap();
+        let prompt = [3, 41, 7];
+        let short_row = model.prefill(&prompt, &mut short, LOGITS, &stream).unwrap();
+        let mut checks = 0;
+        let cancelled = model.prefill_cancellable(&prompt, &mut long, LOGITS, &stream, || {
+            checks += 1;
+            checks == 3 // after evaluating the first layer, before publishing the append
+        });
+        assert!(matches!(cancelled, Err(MlxDecoderError::Cancelled)));
+        assert_eq!(long.len(), 0);
+        assert!(long.is_healthy());
+        let long_row = model.prefill(&prompt, &mut long, LOGITS, &stream).unwrap();
+        assert_close(long_row.last_row(), short_row.last_row());
+        assert_close(long_row.last_row(), &reference_last(&reference, &prompt));
+        let long_decode = model.decode(12, &mut long, LOGITS, &stream).unwrap();
+        let short_decode = model.decode(12, &mut short, LOGITS, &stream).unwrap();
+        assert_close(long_decode.last_row(), short_decode.last_row());
+        assert_eq!(long.len(), 4);
     }
 
     #[test]

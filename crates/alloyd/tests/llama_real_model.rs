@@ -1,4 +1,6 @@
 //! Real shared native conformance. Run each frozen profile with ALLOY_REAL_MODEL/PROFILE.
+#[path = "support/block_on.rs"]
+mod executor;
 #[path = "support/recording_engine.rs"]
 mod recording_engine;
 use alloyd::{BootRequest, DaemonService, RpcRequest};
@@ -685,6 +687,31 @@ fn native_boundary_prompt_parity() {
             check_boundary_hashes(&render, text_sha, ids_sha);
         }
     }
+}
+
+#[test]
+#[ignore = "requires the pinned profile and physical host memory policy"]
+fn native_boundary_memory_estimate() {
+    use engine::{api::Engine, types::ModelProfileId};
+    let profile = std::env::var("ALLOY_REAL_PROFILE").unwrap();
+    let limit = boundary_context_limit(&profile);
+    let boot = boundary_boot(&profile, limit, true);
+    let input_tokens = limit - 512 - 64;
+    let estimate = executor::block_on(
+        boot.engine
+            .estimate_memory(ModelProfileId::new(&profile).unwrap(), input_tokens),
+    )
+    .unwrap();
+    println!(
+        "profile={profile} boundary_input={input_tokens} required={} available={} breakdown={:?}",
+        estimate.reserved_bytes(),
+        estimate.available_bytes(),
+        estimate.breakdown()
+    );
+    assert!(
+        estimate.fits(),
+        "advertised boundary exceeds the actual admission budget"
+    );
 }
 
 #[test]

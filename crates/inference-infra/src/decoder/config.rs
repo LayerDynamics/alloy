@@ -20,6 +20,13 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
+    /// Limit live activations to one transformer layer. Short dense Qwen3
+    /// requests can keep the lazy graph, avoiding a device wait per layer.
+    /// The engine uses this same decision to reserve temporary storage.
+    pub fn evaluates_each_layer(&self, cache_capacity: usize) -> bool {
+        self.family != DecoderFamily::Qwen3 || cache_capacity > 1024
+    }
+
     /// The tiny synthetic model for `qwen3_forward_cpu`. Small enough that
     /// an independent numpy implementation (fixture/gen_reference.py)
     /// is the source of truth for its reference logits.

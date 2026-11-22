@@ -1,5 +1,9 @@
 //! Metrics RPC reads remain responsive and cannot advance enforcement or ownership.
 
+#[path = "support/block_on.rs"]
+mod executor;
+use executor::block_on;
+
 use alloyd::{DaemonService, LiveEngineMetrics, MetricsSource, RpcRequest};
 use engine::admission::AdmissionController;
 use engine::api::{EngineCore, EngineFuture};
@@ -19,10 +23,8 @@ use engine::types::{
 };
 use harness_core::{HardwareTier, TelemetryClient};
 use serde_json::{Value, json};
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
@@ -195,24 +197,6 @@ impl MemoryObservationSource for ObservationGate {
             mlx_active_bytes: GIB,
             mlx_pool_bytes: 0,
         })
-    }
-}
-
-struct ThreadWake(thread::Thread);
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
     }
 }
 
