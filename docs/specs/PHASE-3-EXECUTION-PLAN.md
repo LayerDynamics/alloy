@@ -2349,3 +2349,16 @@ Verify on a CPU stream while the Mac GPU is qualifying other profiles.
 This implements the expert computation required for the Qwen3-Coder family
 exit. Trained weight loading, decoder integration and full profile conformance
 require their own candidate-bound real checkpoint results.
+
+Verify the routed kernel on the trained first layer before wiring the decoder.
+Add crates/inference-infra/tests/fixtures/qwen3_coder/capture_routed_reference.py
+and crates/inference-infra/tests/qwen3_coder_routed.rs. The reference recipe
+uses the pinned mlx-lm Qwen3MoeSparseMoeBlock, the exact configuration and first
+shard, and the shared decoder's packed weights with F32 floating metadata.
+Exercise one decode-sized input and a prefill that crosses the publisher's
+sorted routing threshold. Independently read the original 8-bit router and
+4-bit expert banks in Rust, then compare every hidden output element with the
+pinned eager reference. Named CPU test: qwen3_coder_trained_routed_layer.
+Dependencies are the existing MLX, safetensors, sha2 and reference environment.
+This maps to the trained routed layer of Qwen3-Coder. Full-model prefill/decode
+logits, tools, cache, long context and CI remain separate exit measurements.
