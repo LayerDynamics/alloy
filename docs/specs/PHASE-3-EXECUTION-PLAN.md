@@ -2064,3 +2064,27 @@ results are required to construct a complete QualificationReport.
 In `scripts/tests/test_m3_native_numerical.py`, test rejection of wrong
 artifact bytes and missing/filtered execution. Exercise the normal runner
 against all three pinned models on the Mac.
+
+### #72 native behavioral observations for the shared pipeline
+
+Add scripts/ci/m3_native_behavior.py and scripts/tests/test_m3_native_behavior.py.
+Reuse the numerical runner's pinned profile, build, exact libtest execution,
+log digest and candidate checks from scripts/ci/m3_native_numerical.py.
+Extract common pinned-run setup and terminal receipt writing there. On
+Gemma 4 E4B, Ornith 1.5 9B and upstream Qwen3.5 run the named native
+llama3_tool_stop_context_cache, llama3_long_context_stream_cancel_memory,
+real_model_compaction_preserves_history_and_continues,
+real_model_ssd_prefix_survives_process_restart,
+real_model_generated_history_has_verified_canonical_bytes,
+real_skill_change_invalidates_stale_cache_and_matches_cold and
+real_rpc_skill_load_changes_next_generation fixtures. Include E4B's
+gemma4_daemon_text_session, gemma4_publisher_tool_prompt_parity,
+gemma4_small_budget_generation and gemma4_native_memory_tiers. Use the
+existing release Cargo build and Mac host lease. Bind each observation
+to the exact test binary, profile, pinned inputs, source and terminal
+logs. Scrub inherited test overrides, retain failed observations and run
+the remaining independent fixtures. Exercise failed/skipped execution,
+evidence digests and inventory through the Python unit tests. Run native
+suites on the pinned Mac artifacts. This supplies traceable per-test
+observations for the #53 compaction/family/Ornith exits; boot admission
+still requires a complete trusted spec for the actual validated profile.
