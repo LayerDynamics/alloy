@@ -372,17 +372,22 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     assert!(!result.assistant_text.is_empty());
     let base = format!("{}{}", rendered.text(), result.assistant_text);
     let mut published = None;
-    for suffix in [
-        "",
-        "<|end|>",
-        "<|im_end|>",
-        "<|endoftext|>",
-        "<|eot_id|>",
-        "<|eom_id|>",
-        "<|end_of_text|>",
-        "<end_of_turn>",
-        "<eos>",
-    ] {
+    let suffixes: &[&str] = if real_profile() == "ministral-3-3b-instruct-2512-4bit" {
+        &["</s>"]
+    } else {
+        &[
+            "",
+            "<|end|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<|end_of_text|>",
+            "<end_of_turn>",
+            "<eos>",
+        ]
+    };
+    for suffix in suffixes {
         let bytes = format!("{base}{suffix}").into_bytes();
         if let Ok(id) = wait_future(
             supervisor
@@ -516,6 +521,12 @@ fn real_model_ssd_prefix_survives_process_restart() {
 #[test]
 #[ignore = "requires local pinned model and native MLX"]
 fn real_model_compaction_preserves_history_and_continues() {
+    // The pinned Ministral default system adds 530 tokens to the same archive.
+    let context_limit = if real_profile() == "ministral-3-3b-instruct-2512-4bit" {
+        2048 + 530
+    } else {
+        2048
+    };
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let dir = tempfile::tempdir().unwrap();
     let boot = alloyd::boot::boot_native_for_qualification(
@@ -538,7 +549,7 @@ fn real_model_compaction_preserves_history_and_continues() {
                 HotCacheLimit::Bytes(0),
             ),
         },
-        Some(2048),
+        Some(context_limit),
     )
     .expect("boot real Qwen");
     let mut db = SessionStore::open(dir.path().join("sessions.sqlite")).unwrap();
@@ -557,6 +568,22 @@ fn real_model_compaction_preserves_history_and_continues() {
     let supervisor = Supervisor::new(
         recording_engine::RecordingEngine::new(boot.engine),
         telemetry,
+    );
+    let profile = engine::types::ModelProfileId::new(&boot.profile_id).unwrap();
+    let budget = supervisor
+        .engine()
+        .profile_context_budget(&profile)
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.limit, context_limit);
+    let first =
+        ContextBuilder::build_snapshot("initial", &boot.profile_id, &[], Some(&old)).unwrap();
+    let initial_tokens = ContextBuilder::render_and_count(supervisor.engine(), first)
+        .unwrap()
+        .token_count();
+    assert!(
+        initial_tokens + budget.output_reserve + budget.safety_margin <= budget.limit,
+        "first turn must fit before any history can be compacted: {initial_tokens} input tokens"
     );
     let initial = supervisor
         .run_turn(&store, "real-compact", &old, 64)
@@ -585,7 +612,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         .unwrap()
         .token_count();
     assert!(
-        tokens + 512 + 64 > 2048,
+        tokens + budget.output_reserve + budget.safety_margin > budget.limit,
         "fixture must overflow, got {tokens}"
     );
     let result = supervisor
@@ -683,7 +710,6 @@ fn real_model_compaction_preserves_history_and_continues() {
             32,
         )
         .expect("continue after reopen");
-    assert_eq!(followup.assistant_text, "COBALT");
     let after_restore = supervisor.engine().runtime().tiered_kv_snapshot();
     if rebuild_only_profile() {
         assert_eq!(after_restore.restore_count, 0, "{after_restore:?}");
@@ -714,7 +740,7 @@ fn real_model_compaction_preserves_history_and_continues() {
             tools_enabled: true,
             tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        Some(2048),
+        Some(context_limit),
     )
     .expect("boot cold baseline");
     let cold_render =
@@ -779,6 +805,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         after_restore.restore_count,
         cold.assistant_text,
     );
+    assert_eq!(followup.assistant_text, "COBALT");
 }
 
 #[test]
