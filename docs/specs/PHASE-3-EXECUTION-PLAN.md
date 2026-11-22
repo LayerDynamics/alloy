@@ -1703,3 +1703,31 @@ The two trained prompts matched six full vocabulary vectors (786,432 logits)
 at prefill and cached decode. Strict Clippy passed on all three affected
 crates (7e221749aac0475380ad6ac3e3f8de84). Both Ministral profiles remain
 behind the production qualification check (6ca1672f03ee4d4eafa453a3e732c290).
+
+The affine8 native lifecycle suite at 24ea5de passed overflow, canonical
+history, process restart and optimized rendering. The overflow case preserved
+the five original events, reopened ten events and matched cold replay with the
+literal answer COBALT. The skill RPC returned Cobalt and then AMBER. The
+first response also failed the cache-invalidation test's exact assertion
+(0d15cdcc617d4d6296439f49b8e3ab60). Independent eager execution of the
+same 641 and 662 token inputs returned the identical strings with EOS
+(1f03af326eaa487188d234c31715deda). Keep both failed assertions.
+
+### #99 native memory measurements for both Ministral representations
+
+Add crates/inference-infra/tests/ministral3_memory.rs with the single ignored
+Metal test ministral3_native_memory_tiers. Factor the pinned text-model loader
+from crates/inference-infra/tests/ministral3_quantized.rs into
+crates/inference-infra/tests/support/ministral3.rs. Retain both existing
+trained-reference tests. Use the same verified weights, stream and decoder
+as the numerical gate. In an isolated test process measure unique evaluated
+weight buffers, actual provisioned KV buffers, and the MLX active-byte peak
+above the synchronized weights-and-cache baseline during prefill and decode.
+That increment includes temporary KV update overlap. Check the committed KV
+size and synchronized active memory again after execution. Retain the native
+allocator peak and its configured guideline separately from the byte budget.
+Exercise a bounded 512-token prefill at the simulated 8 GiB budget and a
+32,736-token prefill at the actual 36 GiB host budget with the daemon's chunk
+sizes. Decode one more token using each live cache. The independent daemon
+tests continue to cover admission, retrieval quality and policy. Record
+actual positions and measured bytes for each tier and quantization.
