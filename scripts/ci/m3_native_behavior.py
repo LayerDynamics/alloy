@@ -36,7 +36,9 @@ GEMMA4 = (
 def inventory(profile):
     if profile not in SUITES:
         raise ValueError(f"unknown profile: {profile}")
-    return SHARED + GEMMA4 if profile == "gemma-4-e4b-it-4bit" else SHARED
+    if profile == "gemma-4-e4b-it-4bit":
+        return SHARED + GEMMA4
+    return SHARED + (("inference-infra", "qwen35_memory", ("qwen35_native_memory_tiers",)),)
 
 
 def fixture_env(selected):

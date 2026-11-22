@@ -109,16 +109,21 @@ impl Qwen35Cache {
     }
     /// Evaluated unique backing bytes of current full and recurrent buffers.
     pub fn buffer_bytes(&self) -> MlxDecoderResult<u64> {
+        let (full, recurrent) = self.component_buffer_bytes()?;
+        add(full, recurrent)
+    }
+    /// Evaluated full-attention KV and linear-attention state buffers, respectively.
+    pub fn component_buffer_bytes(&self) -> MlxDecoderResult<(u64, u64)> {
         let arrays: Vec<_> = self
             .linear
             .iter()
             .flatten()
             .flat_map(|s| [s.convolution(), s.recurrent()])
             .collect();
-        add(
+        Ok((
             self.full.buffer_bytes()?,
             memory::array_buffer_bytes(&arrays)? as u64,
-        )
+        ))
     }
 }
 fn validate_weights(c: &Qwen35Config, w: &Qwen35Weights) -> MlxDecoderResult<u64> {

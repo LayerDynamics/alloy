@@ -1,17 +1,16 @@
 //! Explicit real-artifact numerical gate, not an agent/profile qualification.
 #[path = "support/numerical_capture.rs"]
 mod numerical_capture;
-use inference_infra::decoder::{
-    loader::{CheckpointVerification, LoadOptions},
-    qwen35::{
-        model::{ForwardOptions, MlxQwen35Model},
-        weights::{AttentionWeights, load_verified},
-    },
+#[path = "support/qwen35.rs"]
+mod qwen35;
+use inference_infra::decoder::qwen35::{
+    model::{ForwardOptions, MlxQwen35Model},
+    weights::AttentionWeights,
 };
 use mlx_ffi::{Device, DeviceType, Stream};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 #[test]
 #[ignore = "requires ALLOY_ORNITH_ARTIFACT and ALLOY_ORNITH_REFERENCE with pinned offline capture"]
@@ -41,9 +40,6 @@ fn check_quantized_reference(
     profile_json: &str,
     (hidden, layers, value_heads, tied): (usize, usize, usize, bool),
 ) {
-    let root = PathBuf::from(std::env::var_os(artifact_env).expect("artifact"))
-        .canonicalize()
-        .unwrap();
     let reference_path = PathBuf::from(std::env::var_os(reference_env).expect("reference"));
     assert!(std::fs::metadata(&reference_path).unwrap().len() < 64 * 1024 * 1024);
     let bytes = std::fs::read(reference_path).unwrap();
@@ -64,31 +60,7 @@ fn check_quantized_reference(
     assert_eq!(reference["compile_enabled"], false);
     assert_eq!(reference["device"], "gpu");
     assert_eq!(reference["versions"], profile["reference"]["versions"]);
-    let pins: BTreeMap<_, _> = profile["artifact"]["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|file| {
-            let hex = file["sha256"].as_str().unwrap();
-            let mut hash = [0; 32];
-            for (i, b) in hash.iter_mut().enumerate() {
-                *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-            }
-            (root.join(file["path"].as_str().unwrap()), hash)
-        })
-        .collect();
-    let (c, w) = load_verified(
-        &root,
-        LoadOptions {
-            max_file_bytes: 8 * 1024 * 1024 * 1024,
-            max_weight_bytes: 8 * 1024 * 1024 * 1024,
-        },
-        &CheckpointVerification {
-            sha256: &pins,
-            cancelled: &|| false,
-        },
-    )
-    .unwrap();
+    let (c, w) = qwen35::load(&profile, artifact_env);
     assert_eq!(
         (c.hidden, c.vocabulary, c.linear_layers.len()),
         (hidden, 248320, layers)
