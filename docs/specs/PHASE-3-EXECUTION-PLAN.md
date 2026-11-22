@@ -1731,3 +1731,28 @@ Exercise a bounded 512-token prefill at the simulated 8 GiB budget and a
 sizes. Decode one more token using each live cache. The independent daemon
 tests continue to cover admission, retrieval quality and policy. Record
 actual positions and measured bytes for each tier and quantization.
+
+### #96 Gemma 4 E4B attention geometry and native position operations
+
+The publisher is google/gemma-4-E4B-it at
+4ecc2ba63bcac23ba4a767fc87025b1450f84c9c (Apache-2.0). The MLX conversion
+is mlx-community/gemma-4-e4b-it-4bit at
+475b9088d29754a3379866cf5aeb6b41acd313c2. The verified configuration has
+42 dense text layers. The first 24 own KV. Each of the final 18 reuses
+the last preceding owner of its own attention type. Sliding layers use
+256-wide heads, a 512-position causal window and full rotation. Global
+layers use 512-wide heads and rotate one quarter of their channels as
+split-half pairs, with exponents divided by the entire head width. Both
+execute attention with scale 1.0. Full model qualification also needs the
+per-layer embeddings, trained normalization, loader, decoder and agent path.
+
+Implement the layer-to-owner mapping and text attention kernels in
+crates/inference-infra/src/decoder/gemma4.rs and expose the module from
+crates/inference-infra/src/decoder/mod.rs. Read the verified publisher
+configuration in crates/inference-infra/tests/fixtures/gemma4_e4b_config.json.
+Use crates/inference-infra/tests/gemma4_attention.rs for
+gemma4_shared_kv_sliding_full, gemma4_partial_rotation and
+gemma4_attention_masks_and_scale. Exercise malformed layouts, absolute
+offsets, unrotated channel pairs, sliding-window eviction and causality
+using real MLX arrays against independent scalar expectations. The
+scope of this batch is the attention component of #96.
