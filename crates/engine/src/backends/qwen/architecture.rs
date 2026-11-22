@@ -62,6 +62,14 @@ impl BackendConfig {
     }
     fn chunk_limit(&self, configured: usize, capacity: usize) -> usize {
         match self {
+            // At the Coder profile's longest contexts, each query token adds
+            // both full-history attention scores and routed expert activations.
+            Self::Transformer(c)
+                if c.family == inference_infra::decoder::config::DecoderFamily::Qwen3Moe
+                    && capacity > 32_768 =>
+            {
+                configured.min(16)
+            }
             Self::Transformer(_) | Self::Phi(_) | Self::Gemma3(_) if capacity > 16_384 => {
                 configured.min(32)
             }

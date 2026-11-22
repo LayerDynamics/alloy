@@ -1091,6 +1091,27 @@ fn execute_engine_path_with_pressure(
 }
 
 #[test]
+fn routed_long_prefill_bounds_chunk_and_workspace() {
+    let dense = Qwen3Config::tiny_fixture();
+    let mut routed = dense.clone();
+    routed.family = inference_infra::decoder::config::DecoderFamily::Qwen3Moe;
+    let routed = BackendConfig::Transformer(routed);
+    assert_eq!(routed.chunk_limit(128, 32_768), 32);
+    let capacity = 32_769;
+    let chunk = routed.chunk_limit(128, capacity);
+    assert_eq!(chunk, 16);
+    assert_eq!(routed.chunk_limit(8, capacity), 8);
+    assert_eq!(
+        BackendConfig::Transformer(dense).chunk_limit(128, capacity),
+        32
+    );
+    assert!(
+        routed.workspace_bound(capacity, chunk, 128).unwrap()
+            < routed.workspace_bound(capacity, 32, 128).unwrap()
+    );
+}
+
+#[test]
 fn long_cold_start_reuses_loader_scratch_for_kv() {
     let mut fixture = executable_fixture();
     extend_context(&mut fixture, 2048, 1024);
