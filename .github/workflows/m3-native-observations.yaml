@@ -1,0 +1,44 @@
+name: M3 native observations
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile_paths:
+        description: Absolute path on the Mac runner to the pinned profile path inventory
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  observations:
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: recursive
+          clean: false
+      - name: Run native numerical and behavioral fixtures
+        shell: python3 scripts/ci/mac_locked_step.py {0}
+        env:
+          M3_PROFILE_PATHS: ${{ inputs.profile_paths }}
+        run: |
+          set -euo pipefail
+          parent="$HOME/.codex/artifacts/alloy/m3-native-ci"
+          mkdir -p "$parent"
+          output="$parent/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'M3_OUTPUT=%s\n' "$output" >> "$GITHUB_ENV"
+          export CARGO_TARGET_DIR="$parent/cargo-target"
+          python3 -B scripts/ci/m3_native_matrix.py --candidate "$GITHUB_SHA" --inputs "$M3_PROFILE_PATHS" --output "$output"
+      - name: Archive terminal observations
+        if: ${{ always() && env.M3_OUTPUT != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: m3-native-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.M3_OUTPUT }}
+          if-no-files-found: error
+          retention-days: 30

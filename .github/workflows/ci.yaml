@@ -25,6 +25,8 @@ jobs:
           persist-credentials: false
       - name: Plugin collector output lifecycle
         run: python3 -B -m unittest discover -s scripts/tests -p test_plugin_acceptance_output.py
+      - name: M3 native evidence runner regressions
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_m3_native*.py'
       - name: CI shard and required-check invariants
         run: ruby scripts/tests/ci_partition_test.rb
       - name: Host lock regression
