@@ -2447,3 +2447,11 @@ scripts/tests/test_m3_native_numerical.py and inventory assertions in
 scripts/tests/test_m3_native_behavior.py. No new third-party dependency.
 Exit evidence requires trained numerical, tool, context, cache and memory
 observations on the reviewed revision for each of the three profiles.
+
+The family parsers live in the owning crates. Place the common dense memory
+exercise in crates/inference-infra/tests/support/dense_memory.rs and invoke it
+from each existing quantized_loading integration target, so the test uses
+the real family parser without introducing a circular dependency. Add the
+already locked sha2 dev-dependency to crates/families/llama3/Cargo.toml and
+record that dependency edge in Cargo.lock so direct Llama fixture execution
+also verifies the reference bytes. Preserve the corpus artifact manifest.
