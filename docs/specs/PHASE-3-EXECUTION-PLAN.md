@@ -2721,3 +2721,23 @@ Keep the original macOS CPU and Metal data, independent NumPy check,
 pointwise thresholds and dependency pins. Reproduce both new captures
 twice, run the focused tests on Linux and macOS, then run every command
 from the Linux engine and native CI job.
+
+### Qwen3.5 Linux CPU and measured layerwise cache bounds
+
+The full Linux job on 91db584 exposed three Qwen3.5 comparisons against
+macOS CPU logits and a layerwise cache fixture that budgets zero allocator
+padding. Refactor the tiny capture in
+`crates/inference-infra/tests/fixtures/qwen35_model/generate.py` to replay the
+verified frozen checkpoint on Linux ARM64, recording full logits, four decode
+steps and all seven split suffixes in `reference-linux-aarch64.json`. Select
+and authenticate that file in `crates/inference-infra/tests/qwen35_model.rs`.
+Reproduce the Linux capture twice and run all five model tests. Preserve
+the macOS reference, trained capture path and strict pointwise checks.
+
+In the layerwise unit test in `crates/inference-infra/src/kv_cache.rs`,
+provide room for real buffer padding while keeping the successful limit
+strictly below the full-version minimum. Check the planned rejection,
+measured resident bounds, prefix preservation and incomplete/retried append.
+Exercise the test alongside other allocator users on Linux and macOS.
+Run all Linux engine job commands on the committed revision. Dependencies
+and production cache admission stay fixed.
