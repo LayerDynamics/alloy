@@ -2702,3 +2702,22 @@ and invalid inputs, followed by the Linux engine CI commands. Regenerate
 the Linux fixture independently and compare its digest. This supplies the
 platform-specific position check for #99 and the preserved Linux CI gate
 for #53. No dependency or production model changes are planned.
+
+### Phi and SmolLM3 on Linux ARM64
+
+The first divergent Phi operation is the packed QKV projection. Separate
+float32 multiply and add reproduce the unoptimized Linux kernel exactly.
+Fused multiply-add reproduces the pinned upstream Linux kernel exactly.
+Configure debug Linux ARM64 MLX C++ compilation in
+`crates/mlx-ffi/build.rs` to preserve upstream kernel arithmetic. In
+`crates/inference-infra/tests/fixtures/phi_model/generate.py` capture full
+and cached logits on the pinned Linux CPU from the verified existing
+checkpoint. Write `reference-linux-aarch64.json` beside the generator and
+select and authenticate it in `crates/inference-infra/tests/phi_model.rs`.
+In `crates/families/smollm/fixture/gen_reference.py` capture Linux eager
+logits in `reference_logits-linux-aarch64.json`; select them in
+`crates/families/smollm/tests/numerical.rs` and check both oracle shapes.
+Keep the original macOS CPU and Metal data, independent NumPy check,
+pointwise thresholds and dependency pins. Reproduce both new captures
+twice, run the focused tests on Linux and macOS, then run every command
+from the Linux engine and native CI job.
