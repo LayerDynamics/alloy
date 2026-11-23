@@ -27,10 +27,24 @@ fn smollm3_reference_logits() {
         .unwrap();
     let references: serde_json::Value =
         serde_json::from_str(include_str!("../fixture/reference_logits.json")).unwrap();
-    let expected: Vec<Vec<f64>> =
-        serde_json::from_value(references["mlx_eager_float32"].clone()).unwrap();
     let independent: Vec<Vec<f64>> =
         serde_json::from_value(references["numpy_float64"].clone()).unwrap();
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let references: serde_json::Value = {
+        use sha2::{Digest, Sha256};
+        let bytes = include_bytes!("../fixture/reference_logits-linux-aarch64.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            "7c6b593fff803b9bbf898577a1c3507a08c7180d72a5c79b01f5dae6bd7c278a"
+        );
+        serde_json::from_slice(bytes).unwrap()
+    };
+    let expected: Vec<Vec<f64>> =
+        serde_json::from_value(references["mlx_eager_float32"].clone()).unwrap();
+    for rows in [&expected, &independent] {
+        assert_eq!(rows.len(), TOKENS.len());
+        assert!(rows.iter().all(|row| row.len() == actual.vocabulary_size()));
+    }
     // The independent float64 oracle checks the architecture; FR8 compares
     // native float32 against the pinned upstream eager float32 implementation.
     for (&a, b) in actual

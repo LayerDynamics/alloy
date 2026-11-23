@@ -63,13 +63,20 @@ fn streams() -> Vec<(&'static str, Stream)> {
         .collect()
 }
 fn reference() -> Value {
-    let bytes = include_bytes!("fixtures/phi_model/reference.json");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let (bytes, digest) = (
+        include_bytes!("fixtures/phi_model/reference-linux-aarch64.json").as_slice(),
+        "fbd68a15501e88a8129d8260765759871e4518f4f82c809e15e84b2f881443cb",
+    );
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     let manifest: Value =
         serde_json::from_str(include_str!("fixtures/phi_model/manifest.json")).unwrap();
-    assert_eq!(
-        format!("{:x}", Sha256::digest(bytes)),
-        manifest["reference.json"].as_str().unwrap()
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    let (bytes, digest) = (
+        include_bytes!("fixtures/phi_model/reference.json").as_slice(),
+        manifest["reference.json"].as_str().unwrap(),
     );
+    assert_eq!(format!("{:x}", Sha256::digest(bytes)), digest);
     serde_json::from_slice(bytes).unwrap()
 }
 fn numbers(v: &Value) -> Vec<f64> {

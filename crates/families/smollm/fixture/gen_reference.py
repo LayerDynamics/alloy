@@ -248,7 +248,13 @@ def main():
     if not np.isfinite(logits).all():
         raise ValueError("Reference logits contain NaN or infinity")
 
-    out = Path(__file__).with_name("reference_logits.json")
+    import platform
+    import importlib.metadata
+    versions = {p: importlib.metadata.version(p) for p in ("mlx", "mlx-lm", "numpy")}
+    assert versions == {"mlx": "0.32.4", "mlx-lm": "0.31.2", "numpy": "2.4.2"}, versions
+    linux_arm = platform.system() == "Linux" and platform.machine() == "aarch64"
+    filename = "reference_logits-linux-aarch64.json" if linux_arm else "reference_logits.json"
+    out = Path(__file__).with_name(filename)
     import json
     # Capture the specified eager float32 reference as well as the independent
     # float64 mathematical oracle. Near-zero logits cannot be compared across
@@ -277,7 +283,10 @@ def main():
         mx.eval(eager)
     eager = np.array(eager[0])
     print("independent_f64_vs_eager_f32_max_abs", np.max(np.abs(eager - logits)), flush=True)
-    out.write_text(json.dumps({"numpy_float64": logits.tolist(), "mlx_eager_float32": eager.tolist()}, allow_nan=False) + "\n")
+    reference = ({"versions": versions, "tokens": TOKENS} if linux_arm
+                 else {"numpy_float64": logits.tolist()})
+    reference["mlx_eager_float32"] = eager.tolist()
+    out.write_text(json.dumps(reference, allow_nan=False) + "\n")
 
     print(f"wrote {out}: {logits.shape[0]} tokens x {logits.shape[1]} vocab")
     print(f"first row head: {logits[0, :4]}")
