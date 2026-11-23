@@ -171,7 +171,18 @@ fn model(stream: &Stream) -> MlxQwen35Model {
     MlxQwen35Model::from_weights(c, w, 8 << 20, stream).unwrap()
 }
 fn reference() -> Value {
-    serde_json::from_str(include_str!("fixtures/qwen35_model/reference.json")).unwrap()
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let bytes = {
+        let bytes = include_bytes!("fixtures/qwen35_model/reference-linux-aarch64.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            "ceca68a0fa7952ffe169206a4e7ff84164adea992c7504fc84139969fc3c2461"
+        );
+        bytes.as_slice()
+    };
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    let bytes = include_bytes!("fixtures/qwen35_model/reference.json").as_slice();
+    serde_json::from_slice(bytes).unwrap()
 }
 fn device_reference<'a>(reference: &'a Value, stream: &Stream) -> &'a Value {
     if stream.device().unwrap().kind().unwrap() == DeviceType::Cpu {

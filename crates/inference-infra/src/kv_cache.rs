@@ -1363,21 +1363,31 @@ mod tests {
         let stream = stream(DeviceType::Cpu);
         let owner = MlxModelId::new();
         let spec = KvCacheSpec {
-            capacity_tokens: 2048,
+            capacity_tokens: 16384,
             ..spec()
         };
         let mode = KvUpdateMode::Layerwise;
         let plan = spec.payload_plan_for(mode).unwrap();
-        let limit = plan.update_overlap_bytes;
-        assert_eq!(limit, plan.resident_bytes + plan.resident_bytes / 2);
-        assert!(limit < spec.payload_plan().unwrap().update_overlap_bytes);
+        let minimum = plan.update_overlap_bytes;
+        assert_eq!(minimum, plan.resident_bytes + plan.resident_bytes / 2);
+        // MLX may reuse a padded allocation. Exercise a real buffer budget
+        // that still rules out keeping two complete cache versions.
+        let limit = spec.payload_plan().unwrap().update_overlap_bytes - 1;
+        assert!(minimum < limit);
         assert!(
-            matches!(MlxKvCache::new_with_mode(&owner, spec, limit - 1, mode, &stream),
-            Err(KvCacheError::PayloadLimit {required_bytes, ..}) if required_bytes == limit)
+            matches!(MlxKvCache::new_with_mode(&owner, spec, minimum - 1, mode, &stream),
+            Err(KvCacheError::PayloadLimit {required_bytes, ..}) if required_bytes == minimum)
         );
+        assert!(matches!(
+            MlxKvCache::new(&owner, spec, limit, &stream),
+            Err(KvCacheError::PayloadLimit { .. })
+        ));
         let mut cache = MlxKvCache::new_with_mode(&owner, spec, limit, mode, &stream).unwrap();
         seed(&mut cache, &owner, &stream);
-        assert!(cache.buffer_bytes().unwrap() <= plan.resident_bytes);
+        assert!(
+            (plan.resident_bytes..=limit - plan.resident_bytes / 2)
+                .contains(&cache.buffer_bytes().unwrap())
+        );
         let original = cache.export_block(&owner, 0, 1, &stream).unwrap();
         let stale = chunk(&[90.0, 91.0, 92.0, 93.0], 1);
         let mut partial = cache.begin_append(&owner, 1, &stream).unwrap();
@@ -1402,7 +1412,10 @@ mod tests {
         assert_eq!(cache.restore_block(&owner, &retry, &stream).unwrap(), 2);
         assert_eq!(cache.export_block(&owner, 0, 1, &stream).unwrap(), original);
         assert_eq!(cache.export_block(&owner, 1, 2, &stream).unwrap(), retry);
-        assert!(cache.buffer_bytes().unwrap() <= plan.resident_bytes);
+        assert!(
+            (plan.resident_bytes..=limit - plan.resident_bytes / 2)
+                .contains(&cache.buffer_bytes().unwrap())
+        );
     }
 
     fn run_append_suite(kind: DeviceType) {

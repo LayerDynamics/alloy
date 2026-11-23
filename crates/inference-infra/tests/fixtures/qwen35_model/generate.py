@@ -3,18 +3,14 @@
 import hashlib
 import importlib.metadata
 import json
+import platform
 from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten
 from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
-def tiny_reference():
-    for package, version in [("mlx", "0.32.4"), ("mlx-lm", "0.31.2"), ("numpy", "2.4.2")]:
-        assert importlib.metadata.version(package) == version
-    mx.disable_compile()
-    mx.set_default_device(mx.gpu)
-    root = Path(__file__).parent
+def generate_checkpoint(root):
     text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=128,
                 num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
                 head_dim=16, rms_norm_eps=1e-6, vocab_size=256,
@@ -42,7 +38,11 @@ def tiny_reference():
     mx.eval(model.parameters())
     (root / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     mx.save_safetensors(str(root / "model.safetensors"), {"language_model." + n: w for n, w in weights})
-    tokens = [3, 41, 7, 200, 128, 95, 12, 250]
+    return model
+
+
+def capture_device(model, tokens, device):
+    mx.set_default_device(device)
     full = model(mx.array([tokens]))
     mx.eval(full)
     cache = model.make_cache()
@@ -53,39 +53,53 @@ def tiny_reference():
         output = model(mx.array([[token]]), cache=cache)
         mx.eval(output)
         continuation.append(output.flatten().tolist())
+
+    # Matrix and attention reductions can change with the chunk geometry.
+    splits = []
+    for split in range(1, len(tokens)):
+        cache = model.make_cache()
+        prefix = model(mx.array([tokens[:split]]), cache=cache)
+        mx.eval(prefix)
+        suffix = model(mx.array([tokens[split:]]), cache=cache)
+        mx.eval(suffix)
+        splits.append(suffix.flatten().tolist())
+    return dict(full=full.flatten().tolist(), prefill=prefill.flatten().tolist(),
+                continuation=continuation, splits=splits)
+
+
+def tiny_reference():
+    for package, version in [("mlx", "0.32.4"), ("mlx-lm", "0.31.2"), ("numpy", "2.4.2")]:
+        assert importlib.metadata.version(package) == version
+    mx.disable_compile()
+    root = Path(__file__).parent
+    tokens = [3, 41, 7, 200, 128, 95, 12, 250]
+    linux_arm = platform.system() == "Linux" and platform.machine() == "aarch64"
     reference = dict(mlx="0.32.4", mlx_lm="0.31.2", numpy="2.4.2", compile=False,
-                     device="gpu", tokens=tokens, full=full.flatten().tolist(),
-                     prefill=prefill.flatten().tolist(), continuation=continuation)
-    # Preserve the GPU capture and capture the identical equations/weights on CPU.
-    # Device-specific reduction kernels can differ near zero; both remain subject
-    # to the same strict thresholds against their corresponding upstream device.
-    mx.set_default_device(mx.cpu)
-    cpu_full = model(mx.array([tokens]))
-    mx.eval(cpu_full)
-    cpu_cache = model.make_cache()
-    cpu_prefill = model(mx.array([tokens[:4]]), cache=cpu_cache)
-    mx.eval(cpu_prefill)
-    cpu_continuation = []
-    for token in tokens[4:]:
-        output = model(mx.array([[token]]), cache=cpu_cache)
-        mx.eval(output)
-        cpu_continuation.append(output.flatten().tolist())
-    reference["cpu"] = dict(full=cpu_full.flatten().tolist(),
-                            prefill=cpu_prefill.flatten().tolist(),
-                            continuation=cpu_continuation)
-    # Record each chunk geometry independently: matrix and attention reductions
-    # change with chunk shape even in upstream MLX. FR8 compares the same workload;
-    # cached-versus-full equivalence is a separate cache correctness assertion.
-    for device, target in [(mx.gpu, reference), (mx.cpu, reference["cpu"])]:
-        mx.set_default_device(device)
-        target["splits"] = []
-        for split in range(1, len(tokens)):
-            split_cache = model.make_cache()
-            prefix = model(mx.array([tokens[:split]]), cache=split_cache)
-            mx.eval(prefix)
-            suffix = model(mx.array([tokens[split:]]), cache=split_cache)
-            mx.eval(suffix)
-            target["splits"].append(suffix.flatten().tolist())
+                     device="cpu" if linux_arm else "gpu", tokens=tokens)
+    if linux_arm:
+        mx.set_default_device(mx.cpu)
+        manifest = json.loads((root / "manifest.json").read_text())
+        for name in ["config.json", "model.safetensors"]:
+            assert hashlib.sha256((root / name).read_bytes()).hexdigest() == manifest[name], name
+        config = json.loads((root / "config.json").read_text())
+        model = TextModel(TextModelArgs.from_dict(config["text_config"]))
+        weights = mx.load(str(root / "model.safetensors"))
+        model.load_weights([(name.removeprefix("language_model."), value)
+                            for name, value in weights.items()])
+        model.eval()
+        reference["cpu"] = capture_device(model, tokens, mx.cpu)
+        (root / "reference-linux-aarch64.json").write_text(
+            json.dumps(reference, separators=(",", ":"), allow_nan=False) + "\n")
+        return
+
+    mx.set_default_device(mx.gpu)
+    model = generate_checkpoint(root)
+    gpu = capture_device(model, tokens, mx.gpu)
+    # Preserve the original field order so identical macOS captures hash identically.
+    splits = gpu.pop("splits")
+    reference.update(gpu)
+    reference["cpu"] = capture_device(model, tokens, mx.cpu)
+    reference["splits"] = splits
     if (root / "reference.json").exists():
         previous = json.loads((root / "reference.json").read_text())
         for key in ["full", "prefill", "continuation"]:
