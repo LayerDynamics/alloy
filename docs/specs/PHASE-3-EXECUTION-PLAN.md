@@ -2741,3 +2741,14 @@ measured resident bounds, prefix preservation and incomplete/retried append.
 Exercise the test alongside other allocator users on Linux and macOS.
 Run all Linux engine job commands on the committed revision. Dependencies
 and production cache admission stay fixed.
+
+### Ministral 3 3B 4-bit compaction follow-up
+
+The pinned upstream model at a962dcb09eee4169c890e544c9eb938f1113fdee
+returned the literal `**COBALT**` on the same 1,279-token follow-up as the
+resumed and cold Alloy runs. In `crates/alloyd/tests/compaction_real_model.rs`,
+extend the final exact-text check for `ministral-3-3b-instruct-2512-4bit`
+to accept that spelling alongside `COBALT`. Keep the first post-compaction
+answer, checkpoint, cache, token-count and resumed/cold equality checks.
+Run the numerical and behavior suites and issue a fresh qualification
+verdict for this profile on the same committed candidate. No dependency changes.
