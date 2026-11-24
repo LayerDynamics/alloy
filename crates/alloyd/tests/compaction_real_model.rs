@@ -816,7 +816,14 @@ fn real_model_compaction_preserves_history_and_continues() {
         after_restore.restore_count,
         cold.assistant_text,
     );
-    assert_eq!(followup.assistant_text, "COBALT");
+    // Pinned Ministral 3 3B 4-bit also renders the name in Markdown bold.
+    assert!(
+        followup.assistant_text == "COBALT"
+            || (real_profile() == "ministral-3-3b-instruct-2512-4bit"
+                && followup.assistant_text == "**COBALT**"),
+        "unexpected project-name follow-up: {:?}",
+        followup.assistant_text
+    );
 }
 
 #[test]
