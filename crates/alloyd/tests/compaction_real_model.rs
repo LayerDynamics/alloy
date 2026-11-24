@@ -816,11 +816,14 @@ fn real_model_compaction_preserves_history_and_continues() {
         after_restore.restore_count,
         cold.assistant_text,
     );
-    // Pinned Ministral 3 3B 4-bit also renders the name in Markdown bold.
+    // The pinned upstream models also produce these exact follow-up spellings.
     assert!(
-        followup.assistant_text == "COBALT"
-            || (real_profile() == "ministral-3-3b-instruct-2512-4bit"
-                && followup.assistant_text == "**COBALT**"),
+        matches!(
+            (real_profile().as_str(), followup.assistant_text.as_str()),
+            (_, "COBALT")
+                | ("ministral-3-3b-instruct-2512-4bit", "**COBALT**")
+                | ("qwen3-coder-30b-a3b-instruct-4bit", "COBALT\n")
+        ),
         "unexpected project-name follow-up: {:?}",
         followup.assistant_text
     );
