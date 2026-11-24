@@ -2752,3 +2752,14 @@ to accept that spelling alongside `COBALT`. Keep the first post-compaction
 answer, checkpoint, cache, token-count and resumed/cold equality checks.
 Run the numerical and behavior suites and issue a fresh qualification
 verdict for this profile on the same committed candidate. No dependency changes.
+
+### Qwen3 Coder 30B 4-bit compaction follow-up
+
+A replay of the 642-token reopened-session prompt on the pinned
+Qwen3 Coder 30B A3B 4-bit checkpoint (6e302ea604ad9ab206367e2c501d1571023e7b6d)
+produced the seven bytes `434f42414c540a` on both native paths and upstream
+MLX-LM. In `crates/alloyd/tests/compaction_real_model.rs`, accept the exact
+single-LF form alongside plain `COBALT` for this profile's final follow-up.
+Retain exact resumed/cold equality, the initial answer and the existing
+Ministral exception. Rerun the optimized real compaction test on Metal with
+the same pinned model and verify the output bytes from the recorded run.
