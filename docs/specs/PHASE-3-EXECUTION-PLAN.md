@@ -2859,3 +2859,19 @@ compare every position's selected token, and apply the original strict
 absolute and pointwise relative thresholds to the full next-token distribution
 after every append. Keep all pinned reference comparisons and retained-window
 checks. Run the full `gemma3_model` suite on CPU and Metal.
+
+Replay of captured native requests with pinned weights and decoders isolated
+three additional failures. In `crates/harness-core/src/supervisor/compaction.rs`
+ask the Qwen3 14B summarizer to copy proper names verbatim and its verifier
+to check their spelling. The upstream verifier accepted the correct and
+misspelled names under the old request and distinguished them under the new
+request. In `crates/harness-core/src/context/builder.rs` use the same labeled
+checkpoint fields for SmolLM3 as for Qwen3.5 0.8B. In
+`crates/harness-core/src/context/skills.rs` include literal-only formatting
+for Phi when the user asks for only a value. Pass the selected profile
+through the text and tool context builders and use the shared validation
+path in `crates/harness-core/src/store/session_store.rs` for skill writes.
+Keep durable user messages, skills, checkpoints, answer assertions and
+cache comparisons. Run `compaction_runtime`, `canonical_tool_context`,
+both real skill fixtures on Phi, and the real compaction fixture on Qwen3
+14B and SmolLM3. No new dependencies.
