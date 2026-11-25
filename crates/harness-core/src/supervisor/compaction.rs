@@ -55,7 +55,7 @@ fn generate_checked<E: Engine>(
     check: &impl Fn() -> HarnessResult<()>,
     on_started: &mut impl FnMut(&RequestId) -> HarnessResult<()>,
     on_finished: &mut impl FnMut(&RequestId) -> HarnessResult<()>,
-) -> HarnessResult<String> {
+) -> HarnessResult<Option<String>> {
     let render = wait_checked(engine.render_and_count(snapshot.clone()), deadline, check)?
         .map_err(HarnessError::from)?;
     if budget.headroom(render.token_count(), 0).is_none() {
@@ -95,8 +95,12 @@ fn generate_checked<E: Engine>(
                     }
                     text.push_str(&chunk);
                 }
-                Some(GenerationEvent::GenerationCompleted { .. }) => return Ok(text),
+                Some(GenerationEvent::GenerationCompleted { .. }) => return Ok(Some(text)),
                 Some(GenerationEvent::RuntimeWarning { .. }) => {}
+                Some(GenerationEvent::RequestFailed {
+                    error: engine::error::EngineError::IncompleteStructuredOutput,
+                    ..
+                }) => return Ok(None),
                 Some(GenerationEvent::RequestFailed { error, .. }) => return Err(error.into()),
                 Some(_) => {
                     return Err(HarnessError::Engine(
@@ -241,7 +245,7 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
         }
         let id = RequestId::new(format!("{}:compact:{attempt}", request_id.as_str()))
             .map_err(HarnessError::from)?;
-        let output = generate_checked(
+        let Some(output) = generate_checked(
             engine,
             summary,
             id,
@@ -251,7 +255,10 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             check,
             on_started,
             on_finished,
-        )?;
+        )?
+        else {
+            continue;
+        };
         let Ok(parsed) = Checkpoint::parse_json(&output) else {
             continue;
         };
@@ -279,7 +286,7 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
         .map_err(HarnessError::from)?;
         let verify_id = RequestId::new(format!("{}:verify:{attempt}", request_id.as_str()))
             .map_err(HarnessError::from)?;
-        let verdict = generate_checked(
+        let Some(verdict) = generate_checked(
             engine,
             verification_snapshot,
             verify_id,
@@ -293,7 +300,10 @@ pub(super) fn compact<E: Engine, F: FnMut(&RequestId) -> HarnessResult<()>>(
             check,
             on_started,
             on_finished,
-        )?;
+        )?
+        else {
+            continue;
+        };
         if serde_json::from_str::<Verification>(&verdict).is_ok_and(|verdict| verdict.valid) {
             checkpoint = Some(parsed);
             break;

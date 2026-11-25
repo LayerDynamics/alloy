@@ -529,7 +529,7 @@ impl JsonConstraint {
         if self.state.accepting() {
             Ok(())
         } else {
-            Err(failed("generation ended with incomplete structured output"))
+            Err(EngineError::IncompleteStructuredOutput)
         }
     }
 }
@@ -702,7 +702,10 @@ mod tests {
         };
         for (boolean, token) in [(true, 3), (false, 4)] {
             let mut constraint = make();
-            assert!(constraint.finish().is_err());
+            assert!(matches!(
+                constraint.finish(),
+                Err(EngineError::IncompleteStructuredOutput)
+            ));
             assert!(constraint.consume(0).is_err());
             let mut logits = [0.; 8];
             logits[0] = 100.;

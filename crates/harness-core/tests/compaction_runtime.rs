@@ -240,6 +240,173 @@ fn two_invalid_outputs_reject_without_checkpoint() {
     );
 }
 
+fn failed_response(error: engine::error::EngineError) -> Vec<GenerationEvent> {
+    vec![GenerationEvent::RequestFailed {
+        error,
+        partial_usage: engine::types::Usage {
+            input_tokens: 1,
+            output_tokens: 20,
+        },
+    }]
+}
+
+#[test]
+fn incomplete_structured_summary_retries_and_continues() {
+    let (_dir, store, supervisor) = setup(vec![
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+        response(CHECKPOINT),
+        response("continued"),
+    ]);
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let requests = supervisor.engine().requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        2
+    );
+    assert!(requests.iter().any(|r| {
+        r.context()
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("Strict retry"))
+    }));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn incomplete_structured_verification_retries_before_publication() {
+    let (_dir, store, supervisor) = setup(vec![
+        response(CHECKPOINT),
+        response(CHECKPOINT),
+        response("continued"),
+    ]);
+    supervisor
+        .engine()
+        .verification_batches
+        .lock()
+        .unwrap()
+        .push_back(failed_response(
+            engine::error::EngineError::IncompleteStructuredOutput,
+        ));
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let requests = supervisor.engine().requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":verify:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn two_incomplete_summaries_preserve_the_committed_checkpoint() {
+    let (_dir, store, supervisor) = setup(vec![
+        response(CHECKPOINT),
+        response("first answer"),
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+    ]);
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let before = store.lock().unwrap().list_events("s").unwrap();
+    let error = supervisor
+        .run_turn(&store, "s", &"another ".repeat(200), 20)
+        .unwrap_err();
+    assert!(error.to_string().contains("failed twice"), "{error}");
+    let after = store.lock().unwrap().list_events("s").unwrap();
+    assert_eq!(&after[..before.len()], before.as_slice());
+    assert_eq!(
+        after
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        supervisor
+            .engine()
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn nonretryable_engine_failures_abort_compaction() {
+    for cause in [
+        engine::error::EngineError::ExecutionFailed {
+            stage: "decode",
+            message: "native failure".into(),
+        },
+        engine::error::EngineError::Cancelled {
+            request_id: "checkpoint".into(),
+        },
+        engine::error::EngineError::MemoryLimitExceeded {
+            reason: engine::error::MemoryLimitReason::BufferLimit,
+            operation: "checkpoint",
+            required_bytes: 2,
+            available_bytes: 1,
+        },
+    ] {
+        let original_message = cause.to_string();
+        let (_dir, store, supervisor) = setup(vec![failed_response(cause)]);
+        let error = supervisor
+            .run_turn(&store, "s", &"new ".repeat(200), 20)
+            .unwrap_err();
+        assert!(error.to_string().contains(&original_message), "{error}");
+        assert_eq!(supervisor.engine().requests.lock().unwrap().len(), 1);
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .list_events("s")
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == EventKind::ContextCompacted)
+        );
+    }
+}
+
 #[test]
 fn rejected_source_verification_retries_then_preserves_history() {
     let (_dir, store, supervisor) = setup(vec![response(CHECKPOINT), response(CHECKPOINT)]);

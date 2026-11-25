@@ -26,6 +26,7 @@ pub struct ScriptedEngine {
     pub fail_summary_render: std::sync::atomic::AtomicBool,
     pub summary_limit_failures: std::sync::atomic::AtomicUsize,
     pub verification_results: Mutex<VecDeque<bool>>,
+    pub verification_batches: Mutex<VecDeque<Vec<GenerationEvent>>>,
 }
 impl ScriptedEngine {
     pub fn new(batches: Vec<Vec<GenerationEvent>>) -> Self {
@@ -52,6 +53,7 @@ impl ScriptedEngine {
             fail_summary_render: std::sync::atomic::AtomicBool::new(false),
             summary_limit_failures: std::sync::atomic::AtomicUsize::new(0),
             verification_results: Mutex::new(VecDeque::new()),
+            verification_batches: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -186,6 +188,14 @@ impl Engine for ScriptedEngine {
     fn generate(&self, request: GenerationRequest) -> EngineFuture<'_, Generation> {
         self.requests.lock().unwrap().push(request.clone());
         let events = if request.request_id().as_str().contains(":verify:") {
+            if let Some(events) = self.verification_batches.lock().unwrap().pop_front() {
+                return Box::pin(async move {
+                    Ok(Generation::from_stream(
+                        request.request_id().clone(),
+                        Box::pin(Events(events.into())),
+                    ))
+                });
+            }
             let valid = self
                 .verification_results
                 .lock()

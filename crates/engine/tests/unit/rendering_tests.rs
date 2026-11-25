@@ -5,6 +5,25 @@ use crate::{
 };
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::WhitespaceSplit};
 
+#[test]
+fn coder_nested_nul_matches_python_repr() {
+    // Python str() uses repr() for strings nested in containers. NUL must be
+    // spelled as \\x00 there, while a top-level string remains unchanged.
+    for (input, expected) in [
+        (serde_json::json!(["\0"]), "['\\x00']"),
+        (
+            serde_json::json!({"\0": ["a\0b"]}),
+            "{'\\x00': ['a\\x00b']}",
+        ),
+        (serde_json::json!("a\0b"), "a\0b"),
+    ] {
+        assert_eq!(
+            hf_python_string(minijinja::Value::from_serialize(input)).unwrap(),
+            expected
+        );
+    }
+}
+
 fn limits() -> RenderingLimits {
     RenderingLimits::new(16, 4096, 4096, 4096, 128).expect("limits")
 }

@@ -549,6 +549,7 @@ fn hf_python_string(value: minijinja::Value) -> Result<String, TemplateError> {
                 let mut out = String::from(quote);
                 for c in s.chars() {
                     match c {
+                        '\0' => out.push_str("\\x00"),
                         '\n' => out.push_str("\\n"),
                         '\t' => out.push_str("\\t"),
                         '\r' => out.push_str("\\r"),
