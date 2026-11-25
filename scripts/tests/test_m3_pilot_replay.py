@@ -23,6 +23,34 @@ def failure(defect):
 
 
 class ArchiveReplayTests(unittest.TestCase):
+    def test_one_rejection_can_still_miss_a_failing_fixture(self):
+        from m3_native_pilot import FIXED
+        a, b, c, d = [case._asdict() for case in FIXED]
+        selection = {"base": "b", "merge_base": "b", "candidate": "h", "rule_version": 1,
+                     "path_counts": {"mapped": 1, "total": 2}, "complete": False,
+                     "fixed_comparator": [a, b, c, d], "selected": [a, c]}
+        archived = {"candidate": "h", "observations": [
+            {**a, "outcome": "product_assertion", "matches_expected_defect": False},
+            {**b, "outcome": "product_assertion", "matches_expected_defect": True},
+            {**c, "outcome": "inconclusive", "matches_expected_defect": False}]}
+        report = replay.compare(selection, archived)
+        mapped = report["strategies"]["change_based"]
+        self.assertEqual(mapped["archive_advice"], "reject")
+        self.assertEqual(mapped["known_failing_fixture_denominator"], 2)
+        self.assertEqual(mapped["detected_failing_fixtures"], [a])
+        self.assertEqual(mapped["missed_known_failing_fixtures"], [b])
+        self.assertEqual(mapped["expected_defect_matches"], 0)
+        self.assertEqual(mapped["unknown_native_cases"], [c])
+        fixed = report["strategies"]["fixed"]
+        self.assertEqual(fixed["expected_defect_matches"], 1)
+        self.assertCountEqual(fixed["unknown_native_cases"], [c, d])
+        archived["observations"] = [{**row, "outcome": "passed"} for row in (a, b, c, d)]
+        self.assertEqual(replay.compare(selection, archived)["strategies"]["fixed"]["archive_advice"],
+                         "inconclusive")
+        archived["candidate"] = "other"
+        with self.assertRaisesRegex(ValueError, "candidates differ"):
+            replay.compare(selection, archived)
+
     def test_exact_product_signatures_and_unknown_outputs(self):
         for defect in MARKERS:
             self.assertEqual(replay.classify(NAME, 101, failure(defect), "", MARKERS),

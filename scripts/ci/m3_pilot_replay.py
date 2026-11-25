@@ -12,10 +12,12 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
 from m3_native_behavior import inventory
 from m3_native_numerical import SUITES, sha256
 from m3_native_qualification import check_execution, checked_json
+from m3_native_pilot import Case, plan
 
 
 def classify(name, code, stdout, stderr, markers):
@@ -131,14 +133,48 @@ def replay(root, manifest_bytes):
             "approval_credit": False, "observations": observations}
 
 
+def compare(selection, replayed):
+    """Measure both selectors against the very same archived observations."""
+    if selection["candidate"] != replayed["candidate"]:
+        raise ValueError("planner and archive candidates differ")
+
+    def key(row):
+        return Case(*(row[field] for field in Case._fields))
+
+    observations = {key(row): row for row in replayed["observations"]}
+    failures = {case for case, row in observations.items() if row["outcome"] == "product_assertion"}
+    strategies = {}
+    for strategy, field in (("fixed", "fixed_comparator"), ("change_based", "selected")):
+        selected = {key(row) for row in selection[field]}
+        detected = selected & failures
+        unknown = [case for case in sorted(selected) if case not in observations
+                   or observations[case]["outcome"] == "inconclusive"]
+        strategies[strategy] = {
+            "selected_native_cases": len(selected),
+            "unknown_native_cases": [case._asdict() for case in unknown],
+            "detected_failing_fixtures": [case._asdict() for case in sorted(detected)],
+            "missed_known_failing_fixtures": [case._asdict() for case in sorted(failures - selected)],
+            "expected_defect_matches": sum(observations[case]["matches_expected_defect"] for case in detected),
+            "known_failing_fixture_denominator": len(failures),
+            "archive_advice": "reject" if detected else "inconclusive",
+        }
+    return {"base": selection["base"], "merge_base": selection["merge_base"],
+            "rule_version": selection["rule_version"], "fully_mapped_request": selection["complete"],
+            "path_counts": selection["path_counts"], "synthetic_controls": "unobserved",
+            "strategies": strategies}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--matrix", required=True, type=Path)
     parser.add_argument("--claim-manifest", required=True, type=Path)
+    parser.add_argument("--compare-base", help="compare both strategies using the full PR diff from this base")
     args = parser.parse_args()
     try:
         result = replay(args.matrix.resolve(strict=True), args.claim_manifest.read_bytes())
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        if args.compare_base:
+            result["comparison"] = compare(plan(args.compare_base, result["candidate"]), result)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"invalid archive or claim: {error}\n")
     print(json.dumps(result, indent=2))
 
