@@ -1120,7 +1120,7 @@ impl RuntimeBackend for Qwen3Backend {
                 &data.tokenizer,
                 rendered,
                 projection.result_count,
-                projection.additional_rendered_bytes,
+                additional_bytes,
             );
         }
         rendering::qwen3_projected_tool_token_upper_bound(
