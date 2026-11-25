@@ -262,6 +262,37 @@ fn gemma3_sliding_full_attention() {
     }
 }
 #[test]
+fn gemma3_paged_cache_matches_cold() {
+    let tokens: Vec<u32> = (0..321).map(|i| (i * 37 + 11) % 128).collect();
+    for (_, stream) in streams() {
+        let (mut config, weights) = weights();
+        config.context = tokens.len();
+        config.window = 150;
+        let model = MlxGemma3Model::from_weights(config, weights, LIMIT, &stream).unwrap();
+        let cold = model
+            .forward(&tokens, LIMIT, LIMIT, LIMIT, &stream)
+            .unwrap();
+        let mut cache = model.new_cache(tokens.len(), LIMIT).unwrap();
+        for chunk in tokens.chunks(63) {
+            let logits = model
+                .forward_cached(chunk, &mut cache, false, LIMIT, LIMIT, &stream, &mut || {
+                    false
+                })
+                .unwrap();
+            let vocab = model.config().vocabulary;
+            let end = cache.len();
+            let expected = &cold.values()[(end - chunk.len()) * vocab..end * vocab];
+            strict(logits.values(), &serde_json::json!(expected));
+            assert_eq!(
+                cache.retained_tokens(0),
+                Some(end.min(model.config().window))
+            );
+            assert_eq!(cache.retained_tokens(2), Some(end));
+        }
+    }
+}
+
+#[test]
 fn gemma3_cancel_and_foreign_cache_are_atomic() {
     for (_, stream) in streams() {
         let m = model(&stream);

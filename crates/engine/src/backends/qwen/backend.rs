@@ -1604,7 +1604,7 @@ fn registration_for(
                 qwen3::register::IMPL_VERSION
             },
             5,
-            0,
+            u32::from(gemma || llama), // Paged Gemma KV and layerwise long Llama KV.
         ),
         (if coder {
             &["Qwen3MoeForCausalLM"][..]
