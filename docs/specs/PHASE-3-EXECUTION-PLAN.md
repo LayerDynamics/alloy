@@ -2763,3 +2763,13 @@ single-LF form alongside plain `COBALT` for this profile's final follow-up.
 Retain exact resumed/cold equality, the initial answer and the existing
 Ministral exception. Rerun the optimized real compaction test on Metal with
 the same pinned model and verify the output bytes from the recorded run.
+
+### Qwen3 Coder post-tool acknowledgement
+
+For the 966-token request after a successful write, pinned upstream
+Qwen3 Coder 30B A3B 4-bit emitted `DONE` followed by a single LF and EOS.
+Update the success-reply assertion in `crates/alloyd/tests/llama_real_model.rs`
+to accept that additional exact spelling for this profile. Preserve the
+tool arguments, invocation count, event order, stop reason and rejection
+checks. Run the entire optimized `llama3_tool_stop_context_cache` test on
+Metal with the pinned artifact and record its terminal result.
