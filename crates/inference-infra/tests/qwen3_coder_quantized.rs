@@ -156,14 +156,21 @@ fn qwen3_coder_native_memory_tiers() {
                     &tier.stream,
                 );
                 if tier.budget < PAYLOAD {
-                    assert!(matches!(result,
-                    Err(MlxDecoderError::Model(ModelError::MemoryLimit{required,limit})) if required==PAYLOAD && limit==tier.budget));
+                    let Err(MlxDecoderError::Model(ModelError::MemoryLimit { required, limit })) =
+                        result
+                    else {
+                        panic!("expected pre-upload weight refusal, got {:?}", result.err());
+                    };
+                    // Inventory stops at the first tensor that crosses the limit.
+                    // verified_geometry separately checks the exact full payload.
+                    assert_eq!(limit, tier.budget);
+                    assert!(required > limit && required <= PAYLOAD);
                     let after = mlx_ffi::memory::active_memory_bytes().unwrap();
                     assert_eq!(before, after);
                     println!(
                         "native_cache_memory={}",
                         serde_json::json!({
-                    "profile":profile["id"], "budget_bytes":tier.budget, "refused_weight_bytes":PAYLOAD,
+                    "profile":profile["id"], "budget_bytes":tier.budget, "refused_weight_bytes":required,
                     "active_before":before, "active_after":after})
                     );
                     return Ok::<_, MlxDecoderError>(());
@@ -189,7 +196,8 @@ fn qwen3_coder_native_memory_tiers() {
                             .prefill(
                                 tokens,
                                 cache,
-                                (tokens.len() * vocabulary * 4) as u64,
+                                // Projection, contiguous output and F32 readback.
+                                (tokens.len() * vocabulary * 3 * size_of::<f32>()) as u64,
                                 &tier.stream,
                             )
                             .unwrap()

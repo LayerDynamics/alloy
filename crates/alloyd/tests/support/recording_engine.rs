@@ -74,7 +74,19 @@ impl Engine for RecordingEngine {
         &'a self,
         projection: ProjectedToolRender<'a>,
     ) -> EngineFuture<'a, ()> {
-        self.inner.check_projected_tool_render(projection)
+        Box::pin(async move {
+            let trace = std::env::var_os("ALLOY_TEST_TRACE_REQUESTS").is_some();
+            let base_tokens = projection.rendered.token_ids().len();
+            let growth_bytes = projection.additional_rendered_bytes;
+            let input_bytes = projection.input_bytes;
+            let result = self.inner.check_projected_tool_render(projection).await;
+            if trace {
+                eprintln!(
+                    "native_tool_projection base_tokens={base_tokens} growth_bytes={growth_bytes} input_bytes={input_bytes} result={result:?}"
+                );
+            }
+            result
+        })
     }
     fn check_projected_context(
         &self,

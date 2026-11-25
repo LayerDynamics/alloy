@@ -89,7 +89,8 @@ pub fn run<E: std::fmt::Debug>(profile: &Value, parse: fn(&Value) -> Result<Deco
                     .prefill(
                         tokens,
                         cache,
-                        (config.vocab_size * tokens.len() * 4) as u64,
+                        // Projection, contiguous output and F32 readback.
+                        (config.vocab_size * tokens.len() * 3 * size_of::<f32>()) as u64,
                         &tier.stream,
                     )
                     .unwrap()
