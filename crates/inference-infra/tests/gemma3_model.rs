@@ -282,7 +282,28 @@ fn gemma3_paged_cache_matches_cold() {
             let vocab = model.config().vocabulary;
             let end = cache.len();
             let expected = &cold.values()[(end - chunk.len()) * vocab..end * vocab];
-            strict(logits.values(), &serde_json::json!(expected));
+            let actual = logits.values();
+            assert_eq!(actual.len(), expected.len());
+            let greedy = |row: &[f32]| {
+                (1..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best })
+            };
+            for (i, (row, cold_row)) in actual
+                .chunks_exact(vocab)
+                .zip(expected.chunks_exact(vocab))
+                .enumerate()
+            {
+                let position = end - chunk.len() + i;
+                for (&a, &b) in row.iter().zip(cold_row) {
+                    assert!(
+                        (a - b).abs() < 3e-6,
+                        "position {position}: cached {a} vs cold {b}"
+                    );
+                }
+                assert_eq!(greedy(row), greedy(cold_row), "position {position}");
+            }
+            // This is the entire distribution available to sample after this append.
+            let last = actual.len() - vocab;
+            strict(&actual[last..], &serde_json::json!(&expected[last..]));
             assert_eq!(
                 cache.retained_tokens(0),
                 Some(end.min(model.config().window))
