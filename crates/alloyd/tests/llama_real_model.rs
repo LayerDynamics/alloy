@@ -122,9 +122,23 @@ fn llama3_tool_stop_context_cache() {
     };
     let create = rpc("session.create", json!({"profile":profile}));
     let session = create[0]["result"]["session_id"].as_str().unwrap();
-    let events = rpc(
-        "session.send",
-        json!({"session_id":session,"content":"Use fs.write exactly once to write marker.txt with exactly the content COBALT. After the tool succeeds, reply with exactly the four uppercase letters DONE, without punctuation, whitespace, or any other text. Do not use any other tool."}),
+    if profile == "qwen3-coder-30b-a3b-instruct-4bit" {
+        let invalid = rpc(
+            "session.send",
+            json!({"session_id":session,"content":"invalid mode","tool_call_mode":"unknown"}),
+        );
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0]["error"]["code"], -32602);
+    }
+    let send = |content: &str| {
+        let mut params = json!({"session_id":session, "content":content});
+        if profile == "qwen3-coder-30b-a3b-instruct-4bit" {
+            params["tool_call_mode"] = json!("single");
+        }
+        rpc("session.send", params)
+    };
+    let events = send(
+        "Use fs.write exactly once to write marker.txt with exactly the content COBALT. After the tool succeeds, reply with exactly the four uppercase letters DONE, without punctuation, whitespace, or any other text. Do not use any other tool.",
     );
     eprintln!(
         "tool_generation={}",
@@ -257,13 +271,19 @@ fn llama3_tool_stop_context_cache() {
         assert_eq!(caps[0]["result"]["cache_modes"][0]["kind"], "mixed");
         assert_eq!(caps[0]["result"]["supports_prefix_reuse"], false);
     }
-    let denied = rpc(
-        "session.send",
-        json!({"session_id":session,"content":"Now use fs.write to write forbidden.txt with content BLOCKED."}),
-    );
+    let denied = send("Now use fs.write to write forbidden.txt with content BLOCKED.");
     eprintln!("denied_events={}", serde_json::to_string(&denied).unwrap());
     assert!(!root.path().join("forbidden.txt").exists());
     assert_eq!(matching(&denied, "tool_requested"), 1);
+    let denied_call = denied
+        .iter()
+        .find(|event| event["params"]["event"] == "tool_requested")
+        .unwrap();
+    assert_eq!(denied_call["params"]["body"]["tool_id"], "fs.write");
+    assert_eq!(
+        denied_call["params"]["body"]["arguments"],
+        json!({"path":"forbidden.txt", "content":"BLOCKED"})
+    );
     assert_eq!(matching(&denied, "tool_call_started"), 0);
     assert!(denied.iter().any(|e| e["params"]["event"] == "tool_result"
         && e["params"]["body"]["state"] == "Rejected"
@@ -273,6 +293,26 @@ fn llama3_tool_stop_context_cache() {
             .iter()
             .any(|e| e["params"]["event"] == "generation_completed")
     );
+    if profile == "qwen3-coder-30b-a3b-instruct-4bit" {
+        let result = denied
+            .iter()
+            .position(|e| e["params"]["event"] == "tool_result")
+            .unwrap();
+        assert!(denied[..result].iter().all(|e| {
+            e["params"]["event"] != "text_delta"
+                || e["params"]["body"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+        }));
+        assert!(
+            denied[result + 1..]
+                .iter()
+                .any(|e| e["params"]["event"] == "generation_completed"
+                    && e["params"]["body"]["finish_reason"] == "end_of_sequence")
+        );
+    }
     let rejected_answer = denied.last().unwrap()["result"]["assistant_text"]
         .as_str()
         .unwrap();

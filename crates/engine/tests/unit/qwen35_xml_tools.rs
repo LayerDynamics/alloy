@@ -249,6 +249,39 @@ fn xml_conversion_success_allocates_no_heap() {
 const XML_CALL: &str = "<tool_call>\n<function=fs.test>\n<parameter=s>\nrésumé\n</parameter>\n</function>\n</tool_call>";
 
 #[test]
+fn xml_single_call_stops_at_validated_boundary() {
+    use crate::{slab_parser::XmlToolParser, types::ToolCallMode};
+    for split in (0..=XML_CALL.len()).filter(|i| XML_CALL.is_char_boundary(*i)) {
+        let (_admission, allocation) = storage(limits());
+        let mut parser = XmlToolParser::new(allocation, Schema, 8192)
+            .unwrap()
+            .with_tool_call_mode(ToolCallMode::Single);
+        parser
+            .push(&XML_CALL[..split], |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert_eq!(parser.is_sequence_complete(), split == XML_CALL.len());
+        parser
+            .push(&XML_CALL[split..], |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert!(parser.is_sequence_complete());
+        assert_eq!(parser.finish().unwrap().proposal_count(), 1);
+    }
+    for suffix in ["text", "<", XML_CALL] {
+        let (_admission, allocation) = storage(limits());
+        let mut parser = XmlToolParser::new(allocation, Schema, 8192)
+            .unwrap()
+            .with_tool_call_mode(ToolCallMode::Single);
+        assert!(
+            parser
+                .push(&format!("{XML_CALL}{suffix}"), |_| Ok(()), |_| Ok(()))
+                .is_err()
+        );
+        assert!(!parser.is_sequence_complete());
+        assert!(parser.finish().is_err());
+    }
+}
+
+#[test]
 fn xml_stream_all_chunk_boundaries_separate_reasoning() {
     use crate::slab_parser::XmlToolParser;
     let reasoning = format!("Maybe {XML_CALL} is useful, 2 < 3.");

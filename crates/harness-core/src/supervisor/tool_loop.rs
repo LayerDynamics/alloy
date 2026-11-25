@@ -7,6 +7,7 @@ use crate::{
     store::IntentAdmission,
     tool_execution::ReceiptExecutor,
 };
+use engine::types::ToolCallMode;
 use serde_json::{Value, json};
 use tool_registry::{
     call::{ToolCall, ToolCallContext, ToolInvocation},
@@ -84,6 +85,40 @@ impl<E: Engine> Supervisor<E> {
         user: &str,
         config: ToolLoopConfig,
         cancel: &CancellationToken,
+        started: S,
+        finished: D,
+        emit: F,
+    ) -> HarnessResult<TurnOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(ToolLoopEvent) -> HarnessResult<()>,
+    {
+        self.run_tool_turn_in_mode(
+            store,
+            runtime,
+            session,
+            user,
+            config,
+            ToolCallMode::Batch,
+            cancel,
+            started,
+            finished,
+            emit,
+        )
+    }
+
+    /// Run a turn with caller-selected tool generation boundaries and the same execution policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tool_turn_in_mode<S, D, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        runtime: &ToolRuntime,
+        session: &str,
+        user: &str,
+        config: ToolLoopConfig,
+        tool_call_mode: ToolCallMode,
+        cancel: &CancellationToken,
         mut started: S,
         mut finished: D,
         mut emit: F,
@@ -111,7 +146,10 @@ impl<E: Engine> Supervisor<E> {
                 .append_event(
                     session,
                     EventKind::RunStarted,
-                    json!({"mode":"tools"}),
+                    match tool_call_mode {
+                        ToolCallMode::Batch => json!({"mode":"tools"}),
+                        ToolCallMode::Single => json!({"mode":"tools","tool_call_mode":"single"}),
+                    },
                     json!([]),
                 )?
                 .seq
@@ -133,6 +171,7 @@ impl<E: Engine> Supervisor<E> {
                         round,
                     },
                     config.round,
+                    tool_call_mode,
                     Some(cancel),
                     |id| {
                         live(store, session, cancel, config.round.deadline)?;

@@ -49,6 +49,7 @@ pub struct XmlToolParser<S> {
     received: usize,
     max_output: usize,
     after_call: bool,
+    tool_call_mode: crate::types::ToolCallMode,
     failed: bool,
 }
 
@@ -78,8 +79,20 @@ impl<S: XmlToolSchema> XmlToolParser<S> {
             received: 0,
             max_output,
             after_call: false,
+            tool_call_mode: crate::types::ToolCallMode::Batch,
             failed: false,
         })
+    }
+
+    /// Select the tool-call boundary before decoding any input.
+    pub(crate) fn with_tool_call_mode(mut self, mode: crate::types::ToolCallMode) -> Self {
+        self.tool_call_mode = mode;
+        self
+    }
+
+    /// True only after a complete schema-validated call ends this generation.
+    pub(crate) fn is_sequence_complete(&self) -> bool {
+        self.tool_call_mode == crate::types::ToolCallMode::Single && self.after_call && !self.failed
     }
 
     /// Consume a valid UTF-8 fragment. Both callbacks may fail; either failure
@@ -116,6 +129,17 @@ impl<S: XmlToolSchema> XmlToolParser<S> {
         let input = text.as_bytes();
         let mut i = 0;
         while i < input.len() {
+            if self.is_sequence_complete() {
+                // A sampled token is indivisible. Permit trailing XML whitespace,
+                // but never discard a second call, partial marker or other data.
+                if input[i..]
+                    .iter()
+                    .all(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+                {
+                    break;
+                }
+                return Err(bad("unexpected data after the single tool call"));
+            }
             if self.mode == Mode::Call {
                 if self.carry == 0 {
                     if input[i] == b'<' {

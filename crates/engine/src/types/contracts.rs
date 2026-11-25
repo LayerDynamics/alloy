@@ -385,6 +385,18 @@ pub struct GenerationOptions {
     decoding: DecodingMode,
     seed: Option<u64>,
     json_schema: Option<crate::structured_output::JsonOutputSchema>,
+    tool_call_mode: ToolCallMode,
+}
+
+/// Boundary at which a tool generation returns its proposals to the caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallMode {
+    /// Collect a complete generation according to the ordinary profile protocol.
+    #[default]
+    Batch,
+    /// Stop decoding at the first validated tool call and return its result before continuing.
+    Single,
 }
 
 impl GenerationOptions {
@@ -437,6 +449,7 @@ impl GenerationOptions {
             decoding,
             seed,
             json_schema: None,
+            tool_call_mode: ToolCallMode::Batch,
         })
     }
 
@@ -458,6 +471,17 @@ impl GenerationOptions {
     /// Return the optional sampling seed.
     pub fn seed(&self) -> Option<u64> {
         self.seed
+    }
+
+    /// Select a tool boundary for this generation only.
+    pub fn with_tool_call_mode(mut self, mode: ToolCallMode) -> Self {
+        self.tool_call_mode = mode;
+        self
+    }
+
+    /// Requested boundary for a tool proposal generation.
+    pub fn tool_call_mode(&self) -> ToolCallMode {
+        self.tool_call_mode
     }
 
     /// Require native token selection to satisfy this validated JSON schema.
@@ -497,6 +521,12 @@ impl GenerationRequest {
             ));
         }
 
+        if options.tool_call_mode() == ToolCallMode::Single && context.tool_context().is_none() {
+            return Err(EngineError::invalid_request(
+                "tool_call_mode",
+                "single requires a tool context",
+            ));
+        }
         if options.json_schema().is_some() && context.tool_context().is_some() {
             return Err(EngineError::invalid_request(
                 "structured output",

@@ -300,6 +300,24 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         self.decoder_with_parser_allocation(registry, profile, allocation)
     }
 
+    /// Choose an explicit tool boundary without changing the default backend protocol.
+    fn decoder_with_tool_mode(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+        mode: crate::types::ToolCallMode,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if mode == crate::types::ToolCallMode::Single {
+            return Err(EngineError::unsupported(
+                "tool_call_mode",
+                "single-call decoding is unavailable for this backend",
+            ));
+        }
+        self.decoder_with_tool_context(registry, profile, allocation, tools)
+    }
+
     /// Conservative incremental MLX allocation forecast for this plan.
     ///
     /// Runs on the native worker. Exclude reused active buffers and host
@@ -4077,11 +4095,12 @@ impl NativeState {
                 .backend
                 .json_decoder(&setup.registry, &setup.profile)?
         } else {
-            setup.backend.decoder_with_tool_context(
+            setup.backend.decoder_with_tool_mode(
                 &setup.registry,
                 &setup.profile,
                 parser,
                 setup.tool_context.clone(),
+                setup.options.tool_call_mode(),
             )?
         };
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;

@@ -1376,6 +1376,33 @@ impl RuntimeBackend for Qwen3Backend {
         allocation: Option<ParserAllocation>,
         tools: Option<Arc<crate::types::ToolContext>>,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        self.decoder_with_tool_mode(
+            registry,
+            profile,
+            allocation,
+            tools,
+            crate::types::ToolCallMode::Batch,
+        )
+    }
+
+    fn decoder_with_tool_mode(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+        mode: crate::types::ToolCallMode,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if mode == crate::types::ToolCallMode::Single
+            && (self.family != BackendFamily::Qwen3Coder
+                || !self.tool_call_parsing
+                || tools.is_none())
+        {
+            return Err(EngineError::unsupported(
+                "tool_call_mode",
+                "single-call decoding requires Qwen3 Coder with tools",
+            ));
+        }
         if !self.family.xml_tools() || !self.tool_call_parsing {
             return self.decoder_with_parser_allocation(registry, profile, allocation);
         }
@@ -1401,7 +1428,8 @@ impl RuntimeBackend for Qwen3Backend {
             allocation,
             output::HybridToolSchema(tools),
             self.tool_parser_limits().max_output_bytes,
-        )?;
+        )?
+        .with_tool_call_mode(mode);
         output::box_slab_decoder(Qwen3TextDecoder {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
@@ -1604,7 +1632,7 @@ fn registration_for(
                 qwen3::register::IMPL_VERSION
             },
             5,
-            u32::from(gemma || llama), // Paged Gemma KV and layerwise long Llama KV.
+            u32::from(gemma || llama || coder), // Revised KV layouts or single-call tool protocol.
         ),
         (if coder {
             &["Qwen3MoeForCausalLM"][..]

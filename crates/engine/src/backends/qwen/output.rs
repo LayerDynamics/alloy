@@ -224,9 +224,13 @@ fn output_blocks(parsed: Vec<ParsedBlock>) -> Result<Vec<GenerationOutputBlock>,
 
 impl TextDecoder for Qwen3TextDecoder {
     fn is_sequence_complete(&self) -> bool {
-        self.phi
+        self.xml
             .as_ref()
-            .is_some_and(|parser| parser.is_sequence_complete())
+            .is_some_and(XmlToolParser::is_sequence_complete)
+            || self
+                .phi
+                .as_ref()
+                .is_some_and(|parser| parser.is_sequence_complete())
             || self
                 .slab
                 .as_ref()
