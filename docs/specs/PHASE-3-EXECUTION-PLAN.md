@@ -2803,3 +2803,12 @@ to concatenate all page handles for one layer's attention. Exercise the
 existing `gemma3_sliding_full_attention`, `gemma3_cancel_and_foreign_cache_are_atomic`,
 pinned numerical comparisons and `gemma3_native_memory_tiers` for both sizes.
 Keep position, eviction, numerical and allocator checks. No new dependencies.
+
+Both Llama 3.1 8B quantizations exceeded the startup reservation at their
+advertised context boundary. In `crates/inference-infra/src/decoder/config.rs`
+select the existing layerwise KV update for long Llama contexts. Allocation,
+load/cache overlap planning and measured buffer checks already consult that
+same selector. Verify `layerwise_append_preserves_prefix_and_bounds`,
+`native_boundary_memory_estimate`, `native_validated_context_boundary`,
+and `dense_native_memory_tiers` on both quantizations with the frozen
+context length, output reserve and margin. No new dependencies.
