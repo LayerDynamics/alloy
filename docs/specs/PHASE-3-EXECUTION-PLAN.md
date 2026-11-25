@@ -2836,3 +2836,14 @@ writes and a projected input byte ceiling below the old reservation. Require
 both requests and terminal rejections to be recorded, no tool starts, no
 file effects, no checkpoint and a completed follow-up. Run `tool_loop` and
 `canonical_tool_context` with the existing dependencies.
+
+Pinned Qwen3.5 0.8B answered the compacted follow-up with the pull request
+identifier when given the JSON checkpoint. An added instruction alone gave
+the same result. Separate labeled fields with the same values yielded the
+correct project name at EOS. Project that profile's committed checkpoint
+as labeled history in `crates/harness-core/src/context/builder.rs` and
+`crates/harness-core/src/context/tool_history.rs`. Preserve every field,
+JSON string escaping, the untrusted-data designation, the durable schema,
+and other profile inputs. In `crates/harness-core/tests/compaction_runtime.rs`
+check both projections and unchanged history. Run the original real overflow,
+reopen and cold comparison for this profile. No new dependencies.
