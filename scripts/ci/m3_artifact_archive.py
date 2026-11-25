@@ -6,6 +6,8 @@ the payloads before rechecking or packaging a historical matrix.
 """
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -57,20 +59,61 @@ def checked_members(archive, files):
                 raise ValueError(f"archive bytes differ: {member.name}")
 
 
+@contextmanager
+def matrix_lock(root):
+    # Lock the directory inode so aliases of the same matrix share a lock.
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("an archive or restore already holds the matrix lock") from error
+        yield
+    finally:
+        os.close(fd)
+
+
 def archive(root):
+    with matrix_lock(root):
+        return archive_locked(root)
+
+
+def archive_locked(root):
     index = root / "index.json"
     if not index.is_file() or json.loads(index.read_bytes()).get("status") not in ("passed", "failed"):
         raise ValueError("matrix has no terminal index")
-    if any(root.glob("*.pending")):
-        raise ValueError("matrix has pending output")
     output = root / ARCHIVE
     manifest = root / MANIFEST
-    if output.exists() or manifest.exists():
-        raise ValueError("matrix already has an archive or manifest")
+    pending = root / (MANIFEST + ".pending")
+    leftovers = set(root.glob("*.pending"))
+    resume = (output.is_file() and not output.is_symlink() and not os.path.lexists(manifest)
+              and leftovers == {pending} and pending.is_file() and not pending.is_symlink())
+    if not resume:
+        if leftovers:
+            raise ValueError("matrix has pending output")
+        if os.path.lexists(output) or os.path.lexists(manifest):
+            raise ValueError("matrix already has an archive or manifest")
     files = {str(path.relative_to(root)): {"bytes": path.stat().st_size, "sha256": sha256(path)}
              for path in candidates(root)}
     if not files:
         raise ValueError("no large numerical JSON payloads")
+    if resume:
+        record = json.loads(pending.read_bytes())
+        if record != {"version": 1, "archive": ARCHIVE, "archive_sha256": sha256(output), "files": files}:
+            raise ValueError("pending manifest differs from archive or source payloads")
+        checked_members(output, files)
+    else:
+        write_archive(root, output, pending, files)
+    pending.rename(manifest)
+    for name, expected in files.items():
+        path = root / name
+        if path.stat().st_size != expected["bytes"] or sha256(path) != expected["sha256"]:
+            raise ValueError(f"source changed during archiving: {path}")
+        path.unlink()
+    return len(files)
+
+
+def write_archive(root, output, pending, files):
     temporary = root / (ARCHIVE + ".pending")
     try:
         with tarfile.open(temporary, "w:gz", compresslevel=6) as target:
@@ -78,25 +121,22 @@ def archive(root):
                 target.add(root / name, arcname=name, recursive=False)
         checked_members(temporary, files)
         record = {"version": 1, "archive": ARCHIVE, "archive_sha256": sha256(temporary), "files": files}
-        pending = root / (MANIFEST + ".pending")
         with pending.open("x") as stream:
             json.dump(record, stream, sort_keys=True, indent=2)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
         temporary.rename(output)
-        pending.rename(manifest)
-        for name, expected in files.items():
-            path = root / name
-            if path.stat().st_size != expected["bytes"] or sha256(path) != expected["sha256"]:
-                raise ValueError(f"source changed during archiving: {path}")
-            path.unlink()
     finally:
         temporary.unlink(missing_ok=True)
-    return len(files)
 
 
 def restore(root):
+    with matrix_lock(root):
+        return restore_locked(root)
+
+
+def restore_locked(root):
     record = json.loads((root / MANIFEST).read_bytes())
     if record.get("version") != 1 or record.get("archive") != ARCHIVE:
         raise ValueError("unknown archive manifest")
