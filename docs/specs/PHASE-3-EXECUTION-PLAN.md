@@ -2875,3 +2875,29 @@ Keep durable user messages, skills, checkpoints, answer assertions and
 cache comparisons. Run `compaction_runtime`, `canonical_tool_context`,
 both real skill fixtures on Phi, and the real compaction fixture on Qwen3
 14B and SmolLM3. No new dependencies.
+
+### Explicit single-call tool generations for Coder
+
+The pinned Coder proposes a second call on the denied write under both user
+prompt variants. Given the first real denial by itself, it explains the
+policy outcome. Add the requested per-send `tool_call_mode` option with
+`batch` (default) and `single` on Coder tool sessions. In
+`crates/engine/src/types/contracts.rs` and `crates/engine/src/runtime.rs`
+carry the mode as a generation option and select the admitted decoder. In
+`crates/engine/src/backends/qwen/{backend,output}.rs` and
+`crates/engine/src/slab_parser/xml_stream.rs`, use the first fully validated
+closing tag as the single-mode generation boundary. Preserve atomic rejection
+of malformed input, cancellation, accurate sampled-token usage and the normal
+batch path. Version the affected backend. Preserve final assistant EOS.
+
+In `crates/harness-core/src/supervisor/{tool_loop,tool_round}.rs` return the
+actual policy or execution result before the next generation. Preserve the
+original proposal/approval/admission limits and existing public entry points.
+In `crates/alloyd/src/service.rs` validate the option before starting the turn.
+Document it in the Phase 3 plan. Cover split tags, invalid same-token suffixes
+and batch compatibility in `crates/engine/tests/unit/qwen35_xml_tools.rs`.
+Exercise the RPC in `crates/alloyd/tests/llama_real_model.rs` on both original
+Coder turns, checking the allowed effect, exact final bytes, one actual denied
+write, zero starts and a real rejection explanation. Run the XML parser and
+harness suites, then numerical, behavioral and complete Coder qualification
+on the frozen revision. No new dependencies.
