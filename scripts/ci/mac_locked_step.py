@@ -74,6 +74,9 @@ def main():
     # A runner may inherit SIGCHLD=SIG_IGN. This wrapper must own its child.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     try:
+        requested_ns = time.time_ns()
+        wait_start = time.monotonic_ns()
+        contended = False
         while True:
             if interrupted is not None:
                 return 128 + interrupted
@@ -81,7 +84,13 @@ def main():
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                contended = True
                 time.sleep(0.1)
+        elapsed_ns = time.monotonic_ns() - wait_start
+        acquired_ns = time.time_ns()
+        print(f"alloy-ci-lease pid={os.getpid()} requested_ns={requested_ns} "
+              f"acquired_ns={acquired_ns} wait_ns={elapsed_ns} contended={int(contended)}",
+              flush=True)
         state = os.pread(fd, 32, 0)
         if state != b"clean\n" and not cleanup_only:
             raise SystemExit("previous CI host lease ended unexpectedly; inspect host processes before resetting the lock")

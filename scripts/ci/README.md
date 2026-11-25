@@ -66,3 +66,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test
 ```
 
 The Rust workspace test command is `cargo test`. Real-model qualification has its own entry point and requires pinned model and reference inputs on the Mac. [m3_native_matrix.py:main](./m3_native_matrix.py)
+
+## Reserved-window scheduling trial
+
+Use a clean checkout of the native build's candidate and a trusted local behavior build receipt. The operator reserves the Mac outside PR service. The trial runs one profile and one test binary under the same host lease as CI. It writes fresh fixture logs and timing receipts in a new external directory.
+
+    python3 -B scripts/ci/m3_reserved_window.py --claim /absolute/path/claim.json --output /absolute/new/attempt
+
+The version 1 JSON claim records `candidate`, `profile`, `package`, `target`, the ordered `fixtures` array, and `behavior_receipt` with its `behavior_receipt_sha256`. On PR arrival, create `STOP` in the attempt directory. The running fixture finishes and later fixtures are recorded as unstarted. Follow `events.jsonl` for fixture progress. Capture the arrival and stop times separately. A successful launcher binds the terminal receipt digest in `finished.json`. The scheduling result grants no qualification credit.
+
+Each instrumented Mac step logs `alloy-ci-lease` with its request and acquisition wall times in nanoseconds, monotonic wait duration, and whether another owner held the lock. Use the first contended PR step to measure lease wait. Workflow queue time and total time to the final required result have different endpoints.
