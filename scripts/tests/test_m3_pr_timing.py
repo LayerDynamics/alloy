@@ -112,6 +112,26 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(evaluate(s)["deadline"], "miss")
         self.assertEqual(evaluate(s)["verdict"], "unknown")
 
+    def test_github_retry_check_created_after_original_execution(self):
+        s = example()
+        ci = s["attempts"][0]
+        ci["jobs"][0]["id"] = 101
+        copied = {**ci["jobs"][0], "id": 202, "created_at": at(26),
+                  "published_at": None, "checkout_sha": None}
+        retry = {**ci, "attempt": 2, "created_at": at(26), "updated_at": at(28),
+                 "jobs": [copied, job("approval-storage-macos-arm64", 28, "c" * 40)]}
+        retry["jobs"][1].update(created_at=at(26), started_at=at(27))
+        s["attempts"].append(retry)
+        result = evaluate(s)
+        first = next(row for row in result["required_checks"] if row["name"] == "mac-metal")
+        self.assertEqual((first["id"], first["attempt"], first["checkout_sha"]), (101, 1, "a" * 40))
+        self.assertEqual(result["deadline"], "miss")
+        for field, value in (("started_at", at(3)), ("checkout_sha", "b" * 40), ("id", 101)):
+            bad = deepcopy(s)
+            bad["attempts"][-1]["jobs"][0][field] = value
+            with self.assertRaisesRegex(ValueError, "unverified carried-forward"):
+                evaluate(bad)
+
     def test_bad_or_missing_publication(self):
         s = example()
         s["attempts"][0]["jobs"][0]["published_at"] = None

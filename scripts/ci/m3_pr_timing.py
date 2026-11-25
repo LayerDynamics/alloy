@@ -103,6 +103,27 @@ def evaluate(snapshot):
                 continue
             timeline = [instant(job.get(k)) for k in
                         ("created_at", "started_at", "completed_at", "published_at")]
+            created, started, finished, published = timeline
+            # GitHub materializes a new check ID for successful jobs on a
+            # failed-jobs-only rerun. Its check creation can be later than
+            # the original execution's finish. Retain the original job ID,
+            # attempt and checkout when the preceding success corroborates it.
+            if created and finished and created > finished:
+                prior = checks[workflow].get(name)
+                if (not previous or previous["attempt"] + 1 != attempt["attempt"] or not prior
+                        or not started or started > finished or created > now
+                        or job.get("id") == prior.get("id") or not job.get("id") or not prior.get("id")
+                        or job.get("status") != "completed" or job.get("conclusion") != "success"
+                        or any(job.get(k) != prior.get(k) for k in
+                               ("status", "conclusion", "started_at", "completed_at"))
+                        or (job.get("checkout_sha") and job["checkout_sha"] != prior.get("checkout_sha"))):
+                    raise ValueError("unverified carried-forward check")
+                if published:
+                    if published < created or published > now:
+                        raise ValueError("invalid carried-forward publication")
+                    if name in jobs:
+                        jobs[name] = {**jobs[name], "published_at": job["published_at"]}
+                continue
             times = [t for t in timeline if t is not None]
             if times != sorted(times) or any(t > now for t in times):
                 raise ValueError("invalid job timeline")
