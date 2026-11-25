@@ -20,7 +20,7 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
-    const SHORT_QWEN_CACHE_LIMIT: usize = 1024;
+    const SHORT_CACHE_LIMIT: usize = 1024;
 
     /// Large routed requests share one attention tile limit between the
     /// execution graph and its memory reservation.
@@ -40,14 +40,17 @@ impl DecoderConfig {
     /// requests can keep the lazy graph, avoiding a device wait per layer.
     /// The engine uses this same decision to reserve temporary storage.
     pub fn evaluates_each_layer(&self, cache_capacity: usize) -> bool {
-        self.family != DecoderFamily::Qwen3 || cache_capacity > Self::SHORT_QWEN_CACHE_LIMIT
+        self.family != DecoderFamily::Qwen3 || cache_capacity > Self::SHORT_CACHE_LIMIT
     }
 
-    /// Long dense and routed Qwen3 decodes materialize each layer and retain
+    /// Long Qwen3 and Llama 3 decodes materialize each layer and retain
     /// only the committed prefix plus the active layer's functional update.
     pub fn kv_update_mode(&self, capacity: usize) -> crate::kv_cache::KvUpdateMode {
-        if capacity > Self::SHORT_QWEN_CACHE_LIMIT
-            && matches!(self.family, DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe)
+        if capacity > Self::SHORT_CACHE_LIMIT
+            && matches!(
+                self.family,
+                DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe | DecoderFamily::Llama3
+            )
         {
             crate::kv_cache::KvUpdateMode::Layerwise
         } else {

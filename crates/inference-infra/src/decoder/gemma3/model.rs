@@ -99,7 +99,56 @@ pub struct Gemma3Cache {
     owner: MlxModelId,
     capacity: usize,
     offset: usize,
-    layers: Vec<Option<(Array, Array)>>,
+    layers: Vec<Vec<KvPage>>,
+}
+
+#[derive(Clone)]
+struct KvPage {
+    start: usize,
+    end: usize,
+    keys: Array,
+    values: Array,
+}
+
+// Align pages to absolute positions so advancing the sliding window shares
+// every unchanged interior page. The old version remains valid until commit.
+fn stage_pages(
+    old: &[KvPage],
+    keys: &Array,
+    values: &Array,
+    source_start: usize,
+    mut start: usize,
+    end: usize,
+    stream: &Stream,
+) -> MlxDecoderResult<Vec<KvPage>> {
+    const PAGE_TOKENS: usize = 128;
+    let mut pages = Vec::new();
+    while start < end {
+        let stop = start
+            .saturating_add(PAGE_TOKENS - start % PAGE_TOKENS)
+            .min(end);
+        if let Ok(i) = old.binary_search_by_key(&start, |p| p.start)
+            && old[i].end == stop
+        {
+            pages.push(old[i].clone());
+        } else {
+            let keep = |array: &Array| -> MlxDecoderResult<Array> {
+                let view =
+                    ops::cache_slice(array, start - source_start, stop - source_start, stream)?;
+                let page = ops::contiguous(&view, stream)?;
+                page.eval()?;
+                Ok(page)
+            };
+            pages.push(KvPage {
+                start,
+                end: stop,
+                keys: keep(keys)?,
+                values: keep(values)?,
+            });
+        }
+        start = stop;
+    }
+    Ok(pages)
 }
 impl Gemma3Cache {
     pub fn capacity(&self) -> usize {
@@ -114,14 +163,14 @@ impl Gemma3Cache {
     pub fn retained_tokens(&self, layer: usize) -> Option<usize> {
         self.layers
             .get(layer)
-            .map(|pair| pair.as_ref().map_or(0, |(k, _)| k.shape()[2]))
+            .map(|pages| pages.first().map_or(0, |p| self.offset - p.start))
     }
     pub fn buffer_bytes(&self) -> MlxDecoderResult<u64> {
         let arrays: Vec<&Array> = self
             .layers
             .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(|(k, v)| [k, v])
+            .flatten()
+            .flat_map(|page| [&page.keys, &page.values])
             .collect();
         Ok(memory::array_buffer_bytes(&arrays)? as u64)
     }
@@ -130,7 +179,7 @@ impl Gemma3Cache {
             return Err(invalid("foreign Gemma 3 cache owner").into());
         }
         for layer in &mut self.layers {
-            *layer = None;
+            layer.clear();
         }
         self.offset = 0;
         Ok(())
@@ -336,7 +385,7 @@ impl MlxGemma3Model {
         layers
             .try_reserve_exact(self.config.layers)
             .map_err(|_| MlxDecoderError::AllocationFailed("Gemma 3 cache metadata"))?;
-        layers.resize_with(self.config.layers, || None);
+        layers.resize_with(self.config.layers, Vec::new);
         Ok(Gemma3Cache {
             owner: self.owner.clone(),
             capacity,
@@ -448,14 +497,15 @@ impl MlxGemma3Model {
             };
             let q = rope(&q)?;
             let k = rope(&k)?;
-            let (k, v, prefix) = match &cache.layers[i] {
-                None => (k, v, 0),
-                Some((old_k, old_v)) => (
-                    ops::concatenate_axis(old_k, &k, 2, stream)?,
-                    ops::concatenate_axis(old_v, &v, 2, stream)?,
-                    old_k.shape()[2],
-                ),
+            let pages = &cache.layers[i];
+            let source_start = pages.first().map_or(cache.offset, |p| p.start);
+            let prefix = cache.offset - source_start;
+            let join = |select: fn(&KvPage) -> &Array, suffix: Array| {
+                let inputs: Vec<_> = pages.iter().map(select).cloned().chain([suffix]).collect();
+                ops::concatenate_arrays(&inputs, 2, stream)
             };
+            let k = join(|page| &page.keys, k)?;
+            let v = join(|page| &page.values, v)?;
             let mask = if c.sliding[i] {
                 AttentionMask::SlidingCausalSuffix {
                     prefix_tokens: prefix,
@@ -493,18 +543,15 @@ impl MlxGemma3Model {
             } else {
                 prefix + t
             };
-            let keep = |x: &Array| -> MlxDecoderResult<Array> {
-                let a = ops::slice(
-                    x,
-                    &[0, 0, prefix + t - retain, 0],
-                    &[1, c.kv_heads, prefix + t, c.head_dim],
-                    stream,
-                )?;
-                let a = ops::contiguous(&a, stream)?;
-                a.eval()?;
-                Ok(a)
-            };
-            staged.push(Some((keep(&k)?, keep(&v)?)));
+            staged.push(stage_pages(
+                pages,
+                &k,
+                &v,
+                source_start,
+                end - retain,
+                end,
+                stream,
+            )?);
             cancelled(check)?;
         }
         let normalized = ops::rms_norm(&hidden, &self.norm, c.epsilon, stream)?;

@@ -51,29 +51,49 @@ pub fn concatenate_axis(
     axis: usize,
     stream: &Stream,
 ) -> OperationResult<Array> {
-    require_f32(left)?;
-    require_f32(right)?;
-    let a = left.shape();
-    let b = right.shape();
-    require_positive_shape(&a)?;
-    require_positive_shape(&b)?;
-    if axis >= a.len()
-        || a.len() != b.len()
-        || a.iter()
-            .zip(&b)
-            .enumerate()
-            .any(|(i, (x, y))| i != axis && x != y)
-        || a[axis]
-            .checked_add(b[axis])
-            .is_none_or(|n| native_dimension(n).is_err())
-    {
-        return Err(OperationError::InvalidInput(
-            "incompatible concatenation dimensions",
-        ));
+    concatenate_arrays(&[left.clone(), right.clone()], axis, stream)
+}
+
+/// Join compatible F32 arrays in order without materializing intermediate joins.
+pub fn concatenate_arrays(
+    inputs: &[Array],
+    axis: usize,
+    stream: &Stream,
+) -> OperationResult<Array> {
+    let first = inputs
+        .first()
+        .ok_or(OperationError::InvalidInput("empty concatenation"))?;
+    let shape = first.shape();
+    let mut length = 0usize;
+    for input in inputs {
+        require_f32(input)?;
+        let part = input.shape();
+        require_positive_shape(&part)?;
+        if axis >= part.len()
+            || part.len() != shape.len()
+            || part
+                .iter()
+                .zip(&shape)
+                .enumerate()
+                .any(|(i, (a, b))| i != axis && a != b)
+        {
+            return Err(OperationError::InvalidInput(
+                "incompatible concatenation dimensions",
+            ));
+        }
+        length = length
+            .checked_add(part[axis])
+            .ok_or(OperationError::InvalidInput(
+                "concatenation length overflow",
+            ))?;
     }
-    let arrays = VectorArray::from_arrays(&[left.clone(), right.clone()])?;
+    native_dimension(length)?;
+    if inputs.len() == 1 {
+        return Ok(first.clone());
+    }
+    let arrays = VectorArray::from_arrays(inputs)?;
     let mut output = PendingArray::new();
-    // SAFETY: owned vector keeps both valid inputs alive; axis is in range.
+    // SAFETY: the owned vector retains all validated arrays and the axis is in range.
     let status = unsafe {
         sys::mlx_concatenate_axis(
             &mut output.raw,
