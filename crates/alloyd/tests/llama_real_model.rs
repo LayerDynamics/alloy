@@ -187,10 +187,17 @@ fn llama3_tool_stop_context_cache() {
             .any(|e| e["params"]["event"] == "generation_completed"
                 && e["params"]["body"]["finish_reason"] == "end_of_sequence")
     );
-    assert_eq!(events.last().unwrap()["result"]["assistant_text"], "DONE");
+    let coder = profile == "qwen3-coder-30b-a3b-instruct-4bit";
+    let reply = events.last().unwrap()["result"]["assistant_text"]
+        .as_str()
+        .unwrap();
+    // Pinned Qwen3 Coder also emits a single LF before EOS on this request.
+    assert!(
+        reply == "DONE" || (coder && reply == "DONE\n"),
+        "unexpected post-tool reply for {profile}: {reply:?}"
+    );
     let caps = rpc("models.capabilities", json!({"artifact_id":profile}));
     let dense_qwen = matches!(profile.as_str(), "qwen3-4b-4bit" | "qwen3-14b-4bit");
-    let coder = profile == "qwen3-coder-30b-a3b-instruct-4bit";
     assert_eq!(
         caps[0]["result"]["family"],
         if profile.starts_with("ornith") || profile.starts_with("qwen3.5") {
