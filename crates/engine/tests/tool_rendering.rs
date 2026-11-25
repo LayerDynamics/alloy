@@ -201,6 +201,52 @@ fn render(
 }
 
 #[test]
+fn llama_error_guidance_follows_typed_results_in_the_pending_batch() {
+    let header = |blocks| {
+        let tools = ToolContext::new(vec![definition(schema("string"))], blocks, tool_limits())
+            .expect("tool context");
+        let rendered = render(
+            &snapshot().with_tool_context(tools),
+            llama3::template::TOOL_CHAT_TEMPLATE,
+            limits(),
+        );
+        rendered
+            .text()
+            .split_once("<|eot_id|>")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+    let ordinary = header(Vec::new());
+    let mut blocks = history();
+    let ToolHistoryBlock::ToolResult {
+        content, is_error, ..
+    } = &mut blocks[1]
+    else {
+        unreachable!();
+    };
+    *content = r#"{"is_error":true}"#.into();
+    *is_error = false;
+    assert_eq!(header(blocks.clone()), ordinary);
+    if let ToolHistoryBlock::ToolResult { is_error, .. } = &mut blocks[1] {
+        *is_error = true;
+    }
+    assert_eq!(
+        header(blocks.clone()),
+        format!(
+            "{} {}\n",
+            ordinary.trim_end_matches('\n'),
+            llama3::template::TOOL_ERROR_GUIDANCE.trim()
+        ),
+    );
+    blocks.push(ToolHistoryBlock::Text(Message {
+        role: MessageRole::User,
+        content: "The last tool result is an error.".into(),
+    }));
+    assert_eq!(header(blocks), ordinary);
+}
+
+#[test]
 fn tool_context_exact_count_and_identity() {
     let input = context("string");
     let rendered = render(&input, qwen3::template::TOOL_CHAT_TEMPLATE, limits());

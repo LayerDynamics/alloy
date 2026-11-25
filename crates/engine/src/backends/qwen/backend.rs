@@ -1034,11 +1034,11 @@ impl RuntimeBackend for Qwen3Backend {
             ));
         }
         // Preflight renders empty successful results. A later failure can
-        // activate Phi's error guidance once, regardless of the batch size.
-        let header_growth = if self.family == BackendFamily::Phi {
-            PHI_TOOL_ERROR_MAX_BYTES
-        } else {
-            0
+        // activate one model-specific error instruction in the header.
+        let header_growth = match self.family {
+            BackendFamily::Phi => PHI_TOOL_ERROR_MAX_BYTES,
+            BackendFamily::Llama3 => 1 + llama3::template::TOOL_ERROR_GUIDANCE.len(),
+            _ => 0,
         };
         let additional_bytes = projection
             .additional_rendered_bytes
