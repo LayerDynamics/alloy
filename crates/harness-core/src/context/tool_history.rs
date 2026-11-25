@@ -104,7 +104,7 @@ impl ContextBuilder {
             })
             .collect::<HarnessResult<Vec<_>>>()?;
         let (checkpoint, boundary) = super::checkpoint_projection(history)?;
-        let skills = crate::context::project_skills(history)?;
+        let skills = crate::context::project_skills(history, Some(profile_id.as_ref()))?;
         let mut base = Vec::new();
         if let Some(checkpoint) = checkpoint {
             base.push(super::checkpoint_message(
