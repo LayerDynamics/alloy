@@ -637,6 +637,60 @@ fn tool_result_structural_spellings_remain_data_across_next_generation() {
 }
 
 #[test]
+fn denied_batch_fits_without_compaction_or_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = SessionStore::open(dir.path().join("db")).unwrap();
+    db.create_session("s", "p").unwrap();
+    let runtime = setup(dir.path(), &mut db, false);
+    let store = Mutex::new(db);
+    let paths = ["first.txt", "second.txt"];
+    let mut batch: Vec<_> = paths
+        .iter()
+        .map(|path| proposal("fs.write", json!({"path":path,"content":"blocked"})))
+        .collect();
+    batch.push(done());
+    let mut engine = ScriptedEngine::new(vec![
+        batch,
+        vec![
+            GenerationEvent::TextDelta {
+                text: "denied".into(),
+            },
+            done(),
+        ],
+    ]);
+    // The two bounded rejections fit. Reserving full generic error results
+    // for both proposals would charge over 12 KiB before counting history.
+    engine.projected_byte_limit = 9_000;
+    let outcome = Supervisor::new(engine, telemetry())
+        .run_tool_turn(
+            &store,
+            &runtime,
+            "s",
+            "write both files",
+            config(),
+            &CancellationToken::default(),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(outcome.assistant_text, "denied");
+    let events = store.lock().unwrap().list_events("s").unwrap();
+    let count = |kind| events.iter().filter(|e| e.kind == kind).count();
+    assert_eq!(count(EventKind::ToolRequested), paths.len());
+    assert_eq!(count(EventKind::ToolCompleted), paths.len());
+    for event in events.iter().filter(|e| e.kind == EventKind::ToolCompleted) {
+        assert_eq!(event.payload["state"], "Rejected");
+        assert_eq!(event.payload["reason"], "policy:ArgumentsNotAllowed");
+    }
+    assert_eq!(count(EventKind::ToolStarted), 0);
+    assert_eq!(count(EventKind::ContextCompacted), 0);
+    assert_eq!(count(EventKind::RunCompleted), 1);
+    for path in paths {
+        assert!(!dir.path().join(path).exists());
+    }
+}
+
+#[test]
 fn projected_budget_reduces_inline_output_without_losing_artifact_bytes() {
     use std::io::Read;
     let dir = tempfile::tempdir().unwrap();
