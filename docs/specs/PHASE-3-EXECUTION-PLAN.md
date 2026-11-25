@@ -2828,3 +2828,11 @@ preserving the skill digest, trust label, user questions and expected
 bytes. Run `real_rpc_skill_load_changes_next_generation` and
 `real_skill_change_invalidates_stale_cache_and_matches_cold` on the
 affected profiles and include them in final qualification.
+
+Cover the Coder denial admission repair on the ordinary supervisor path in
+`crates/harness-core/tests/tool_loop.rs`. The regression
+`denied_batch_fits_without_compaction_or_execution` uses two disallowed
+writes and a projected input byte ceiling below the old reservation. Require
+both requests and terminal rejections to be recorded, no tool starts, no
+file effects, no checkpoint and a completed follow-up. Run `tool_loop` and
+`canonical_tool_context` with the existing dependencies.
