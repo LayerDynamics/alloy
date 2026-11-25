@@ -39,6 +39,40 @@ class M3ArtifactArchiveTests(unittest.TestCase):
         for path, expected in before.items():
             self.assertEqual(path.read_bytes(), expected)
 
+    def test_archive_and_restore_require_exclusive_access(self):
+        before = sorted(self.root.iterdir())
+        with archive_tool.matrix_lock(self.root):
+            for operation in (archive_tool.archive, archive_tool.restore):
+                with self.assertRaisesRegex(ValueError, "matrix lock"):
+                    operation(self.root)
+        self.assertEqual(sorted(self.root.iterdir()), before)
+
+    def test_retry_interrupted_manifest_publication(self):
+        manifest = self.root / archive_tool.MANIFEST
+        rename = Path.rename
+        before = self.payload.read_bytes()
+
+        def interrupt(path, target):
+            if target == manifest:
+                raise InterruptedError("before manifest publication")
+            return rename(path, target)
+
+        with patch.object(archive_tool, "MIN_BYTES", 1):
+            with patch.object(Path, "rename", interrupt), self.assertRaises(InterruptedError):
+                archive_tool.archive(self.root)
+            self.assertFalse(manifest.exists())
+            self.assertEqual(self.payload.read_bytes(), before)
+            self.payload.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "pending manifest differs"):
+                archive_tool.archive(self.root)
+            self.assertTrue(self.raw.exists())
+            self.assertFalse(manifest.exists())
+            self.payload.write_bytes(before)
+            self.assertEqual(archive_tool.archive(self.root), 2)
+            self.assertFalse(self.payload.exists())
+            self.assertEqual(archive_tool.restore(self.root), 2)
+            self.assertEqual(self.payload.read_bytes(), before)
+
     def test_tampered_archive_does_not_restore(self):
         with patch.object(archive_tool, "MIN_BYTES", 1):
             archive_tool.archive(self.root)
