@@ -187,8 +187,8 @@ pub fn softplus(input: &Array, stream: &Stream) -> OperationResult<Array> {
     output.finish(status)
 }
 
-/// Valid depthwise convolution: input [B,T,C], weight [C,K,1], output
-/// [B,T-K+1,C]. Caller prepends its K-1 convolution-state samples, so no implicit
+/// Valid depthwise convolution: input `[B,T,C]`, weight `[C,K,1]`, output
+/// `[B,T-K+1,C]`. Caller prepends its K-1 convolution-state samples, so no implicit
 /// padding or hidden mutable history is introduced here.
 pub fn depthwise_conv1d(input: &Array, weight: &Array, stream: &Stream) -> OperationResult<Array> {
     require_f32(input)?;
@@ -226,9 +226,9 @@ pub fn depthwise_conv1d(input: &Array, weight: &Array, stream: &Stream) -> Opera
     output.finish(status)
 }
 
-/// Gated delta recurrence on float32 tensors. Q/K [B,T,Hk,Dk], V [B,T,Hv,Dv],
-/// decay and beta [B,T,Hv], initial/final state [B,Hv,Dv,Dk]. Hv must be a
-/// multiple of Hk. Returns (output [B,T,Hv,Dv], final state). Inputs remain
+/// Gated delta recurrence on float32 tensors. Q/K `[B,T,Hk,Dk]`, V `[B,T,Hv,Dv]`,
+/// decay and beta `[B,T,Hv]`, initial/final state `[B,Hv,Dv,Dk]`. Hv must be a
+/// multiple of Hk. Returns (output `[B,T,Hv,Dv]`, final state). Inputs remain
 /// immutable; a rejected/cancelled caller can discard the new state atomically.
 /// Decay and beta are already transformed gates, not projection logits.
 pub fn gated_delta_update(

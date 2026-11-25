@@ -214,11 +214,11 @@ impl LinearAttentionState {
     pub fn is_empty(&self) -> bool {
         self.tokens == 0
     }
-    /// Borrow convolution history [1,K-1,C].
+    /// Borrow convolution history `[1,K-1,C]`.
     pub fn convolution(&self) -> &Array {
         &self.convolution
     }
-    /// Borrow recurrent state [1,Hv,Dv,Dk].
+    /// Borrow recurrent state `[1,Hv,Dv,Dk]`.
     pub fn recurrent(&self) -> &Array {
         &self.recurrent
     }
@@ -313,7 +313,7 @@ impl MlxLinearAttention {
         self.config.state_payload_bytes()
     }
 
-    /// Step with [1,T,hidden] float32 input, returning evaluated output and new
+    /// Step with `[1,T,hidden]` float32 input, returning evaluated output and new
     /// state. `capacity` bounds total sequence length. `payload_limit` covers
     /// named intermediate/output/state tensors, not native kernel workspaces or
     /// allocator caches. Engine admission must account for those separately.
