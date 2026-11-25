@@ -2819,3 +2819,12 @@ runtime identities cannot match them. In `crates/inference-infra/tests/gemma3_mo
 compare cold and chunked native logits across page boundaries and sliding
 window eviction in `gemma3_paged_cache_matches_cold`. This supplements the
 short frozen-reference cases with a direct multi-page regression.
+
+Ministral 3 8-bit returned `Cobalt` on the exact 641-token skill request
+both natively and on pinned upstream. Upstream returned `COBALT` when
+the skill projection told it to copy literal values' spelling and case.
+Apply that instruction in `crates/harness-core/src/context/skills.rs`,
+preserving the skill digest, trust label, user questions and expected
+bytes. Run `real_rpc_skill_load_changes_next_generation` and
+`real_skill_change_invalidates_stale_cache_and_matches_cold` on the
+affected profiles and include them in final qualification.
