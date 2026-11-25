@@ -27,7 +27,7 @@ repository = "https://github.com/LayerDynamics/alloy"
 
 [workspace.dependencies]
 # Exact renderer pin for Qwen3 template identity.
-minijinja = "=2.12.0"
+minijinja = "=3.1.0"
 # Session event log (B.4). Bundled SQLite keeps Linux CI self-contained.
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 serde = { version = "=1.0.228", features = ["derive"] }
