@@ -2773,3 +2773,16 @@ to accept that additional exact spelling for this profile. Preserve the
 tool arguments, invocation count, event order, stop reason and rejection
 checks. Run the entire optimized `llama3_tool_stop_context_cache` test on
 Metal with the pinned artifact and record its terminal result.
+
+### Remaining trained-profile qualification
+
+Measure the projected context and the native weight-limit refusal for the
+two outstanding Qwen3 Coder fixtures. Compare the projection with the
+actual persisted rejection and the loader's admission contract. Repair
+the responsible paths and rerun both fixtures before qualifying Coder.
+For each outstanding family, reproduce its failing cases against the
+pinned weights and validate any shared correction across affected profiles.
+Run numerical and behavior qualification on a single reviewed revision for
+all fourteen profiles, including Ornith. Verify long-session event retention,
+cache properties and Phase 1/2 CI on that revision, then reconcile the
+linked issues and publish the qualifying commit and model identities.
