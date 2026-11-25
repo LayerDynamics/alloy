@@ -1,0 +1,104 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"function": {"description": "Test \"quotes\", commas: and 雪.", "name": "fs.test", "parameters": {"additionalProperties": false, "properties": {"a": {"type": "array"}, "b": {"type": "boolean"}, "i": {"type": "integer"}, "n": {"type": "number"}, "o": {"type": "object"}, "s": {"type": "string"}, "z": {"type": "null"}}, "required": ["s"], "type": "object"}, "version": "1.0.0"}, "type": "function"}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+Be precise.<|im_end|>
+<|im_start|>user
+Previous request.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Prior answer.<|im_end|>
+<|im_start|>user
+Run the tools.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=fs.test>
+<parameter=a>
+[1, "é", 1e-07, 1e-05, 0.0001, 1e+16, 1.0, -0.0]
+</parameter>
+<parameter=b>
+True
+</parameter>
+<parameter=i>
+7
+</parameter>
+<parameter=n>
+0.5
+</parameter>
+<parameter=o>
+{"punctuation": "a,b:c"}
+</parameter>
+<parameter=s>
+ line one
+雪, résumé \"quoted\" 
+</parameter>
+<parameter=z>
+None
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=fs.test>
+<parameter=s>
+second
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"call_id":"c1","content":"雪 result","is_error":false}
+</tool_response>
+<tool_response>
+{"call_id":"c2","content":"second result","is_error":true}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Summary.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

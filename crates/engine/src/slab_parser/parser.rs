@@ -20,6 +20,15 @@ use crate::{
 use std::{ops::Range, str};
 const OPEN: &[u8] = b"<tool_call>";
 const CLOSE: &[u8] = b"</tool_call>";
+const GEMMA_FENCE: &[u8] = b"```xml\n";
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    Start(usize),
+    Bare,
+    Fenced,
+    ClosingFence(usize),
+    Complete,
+}
 const FORBIDDEN: &[&[u8]] = &[
     b"<|",
     b"<think>",
@@ -41,6 +50,8 @@ pub(crate) struct SlabParser {
     failed: bool,
     received: usize,
     max_output: usize,
+    handoff: Option<Handoff>,
+    text_before_call: bool,
 }
 impl SlabParser {
     pub(crate) fn new(
@@ -67,7 +78,19 @@ impl SlabParser {
             failed: false,
             received: 0,
             max_output,
+            handoff: None,
+            text_before_call: false,
         })
+    }
+    /// Gemma's one-call turn ends at the validated envelope, or at the closing
+    /// fence for its explicit standalone XML-fence alternative. Other profiles
+    /// retain the existing text/multiple-envelope behavior.
+    pub(crate) fn with_terminal_call(mut self) -> Self {
+        self.handoff = Some(Handoff::Start(0));
+        self
+    }
+    pub(crate) fn is_sequence_complete(&self) -> bool {
+        !self.failed && self.handoff == Some(Handoff::Complete)
     }
     pub(crate) fn push(
         &mut self,
@@ -98,6 +121,49 @@ impl SlabParser {
         let input = text.as_bytes();
         let mut i = 0;
         while i < input.len() {
+            match self.handoff {
+                Some(Handoff::Start(n)) => {
+                    if input[i] == GEMMA_FENCE[n] {
+                        i += 1;
+                        self.handoff = Some(if n + 1 == GEMMA_FENCE.len() {
+                            Handoff::Fenced
+                        } else {
+                            Handoff::Start(n + 1)
+                        });
+                    } else {
+                        if n != 0 {
+                            self.text_before_call = true;
+                            emit(str::from_utf8(&GEMMA_FENCE[..n]).unwrap())?;
+                        }
+                        self.handoff = Some(Handoff::Bare);
+                    }
+                    continue;
+                }
+                Some(Handoff::ClosingFence(n)) => {
+                    if n == 0 && matches!(input[i], b' ' | b'\t' | b'\r' | b'\n') {
+                        i += 1;
+                        continue;
+                    }
+                    if input[i] != b'`' {
+                        return Err(bad("expected closing Gemma tool fence"));
+                    }
+                    self.handoff = Some(if n == 2 {
+                        Handoff::Complete
+                    } else {
+                        Handoff::ClosingFence(n + 1)
+                    });
+                    i += 1;
+                    continue;
+                }
+                Some(Handoff::Complete) => {
+                    if !matches!(input[i], b' ' | b'\t' | b'\r' | b'\n') {
+                        return Err(bad("non-whitespace after terminal Gemma tool call"));
+                    }
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
             if self.inside {
                 if self.carry == 0 {
                     if input[i] == b'<' {
@@ -119,6 +185,11 @@ impl SlabParser {
                             self.carry = 0;
                             self.call = 0;
                             self.inside = false;
+                            self.handoff = match self.handoff {
+                                Some(Handoff::Fenced) => Some(Handoff::ClosingFence(0)),
+                                Some(Handoff::Bare) => Some(Handoff::Complete),
+                                other => other,
+                            };
                         }
                     } else {
                         for k in 0..self.carry {
@@ -140,6 +211,8 @@ impl SlabParser {
                     while i < input.len() && input[i] != b'<' {
                         i += 1;
                     }
+                    self.text_before_call |=
+                        text[start..i].bytes().any(|b| !b.is_ascii_whitespace());
                     emit(&text[start..i])?;
                 }
                 continue;
@@ -169,6 +242,11 @@ impl SlabParser {
                 return Err(bad("malformed or unmatched tool delimiter"));
             }
             if opening {
+                if self.handoff.is_some() && self.text_before_call {
+                    return Err(bad(
+                        "text before Gemma tool call is not a standalone call turn",
+                    ));
+                }
                 self.carry = 0;
                 self.inside = true;
                 i += 1;
@@ -179,6 +257,7 @@ impl SlabParser {
                 let w = self.allocation.workspaces();
                 let text = str::from_utf8(&w.carry[..self.carry])
                     .map_err(|_| internal("non-ASCII delimiter carry"))?;
+                self.text_before_call |= text.bytes().any(|b| !b.is_ascii_whitespace());
                 emit(text)?;
                 self.carry = 0;
             }
@@ -195,45 +274,17 @@ impl SlabParser {
         Ok(())
     }
     fn complete_call(&mut self) -> Result<(), EngineError> {
-        let (decoded, name, args) = {
-            let w = self.allocation.workspaces();
-            let body = &w.call[..self.call];
-            str::from_utf8(body).map_err(|_| bad("invalid UTF-8 in tool envelope"))?;
-            if body.windows(OPEN.len()).any(|x| x == OPEN) {
-                return Err(bad("nested tool delimiter"));
-            }
-            let mut json = JsonCheck {
-                input: body,
-                pos: 0,
-                decoded: w.decoded,
-                used: 0,
-                stack: w.stack,
-                keys: w.keys,
-                key_count: 0,
-                nodes: w.nodes,
-                node_count: 0,
-                name: None,
-                args: None,
-            };
-            json.value(0, usize::MAX, true)?;
-            json.ws();
-            if json.pos != body.len() {
-                return Err(bad("trailing tool-envelope data"));
-            }
-            (
-                json.used,
-                json.name.ok_or_else(|| bad("missing tool name"))?,
-                json.args.ok_or_else(|| bad("missing object arguments"))?,
-            )
-        };
-        self.allocation
-            .commit_validated_call(decoded, name, self.call, args)
-            .map_err(|e| execution_error("commit slab proposal", e.to_string()))?;
-        Ok(())
+        commit_json_call(&mut self.allocation, self.call)
     }
     pub(crate) fn finish(self) -> Result<FrozenParserAllocation, EngineError> {
         if self.failed {
             return Err(bad("parser is poisoned"));
+        }
+        if matches!(
+            self.handoff,
+            Some(Handoff::Fenced | Handoff::ClosingFence(_) | Handoff::Start(1..))
+        ) {
+            return Err(bad("incomplete Gemma tool fence"));
         }
         if self.inside {
             return Err(bad("incomplete tool envelope"));
@@ -243,6 +294,95 @@ impl SlabParser {
         }
         Ok(self.allocation.freeze())
     }
+}
+
+pub(super) fn commit_json_call(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+) -> Result<(), EngineError> {
+    commit_json_call_with_alias(allocation, call_bytes, false)
+}
+
+pub(super) fn commit_phi_json_call(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+) -> Result<(), EngineError> {
+    commit_json_call_with_alias(allocation, call_bytes, true)
+}
+
+fn commit_json_call_with_alias(
+    allocation: &mut ParserAllocation,
+    call_bytes: usize,
+    allow_parameters: bool,
+) -> Result<(), EngineError> {
+    let (decoded, name, args) = {
+        let w = allocation.workspaces();
+        let body = &w.call[..call_bytes];
+        str::from_utf8(body).map_err(|_| bad("invalid UTF-8 in tool envelope"))?;
+        if body.windows(OPEN.len()).any(|x| x == OPEN) {
+            return Err(bad("nested tool delimiter"));
+        }
+        let mut json = JsonCheck {
+            input: body,
+            pos: 0,
+            decoded: w.decoded,
+            used: 0,
+            stack: w.stack,
+            keys: w.keys,
+            key_count: 0,
+            nodes: w.nodes,
+            node_count: 0,
+            name: None,
+            args: None,
+            allow_parameters,
+        };
+        json.value(0, usize::MAX, true)?;
+        json.ws();
+        if json.pos != body.len() {
+            return Err(bad("trailing tool-envelope data"));
+        }
+        (
+            json.used,
+            json.name.ok_or_else(|| bad("missing tool name"))?,
+            json.args.ok_or_else(|| bad("missing object arguments"))?,
+        )
+    };
+    allocation
+        .commit_validated_call(decoded, name, call_bytes, args)
+        .map_err(|e| execution_error("commit slab proposal", e.to_string()))?;
+    Ok(())
+}
+
+pub(super) fn validate_json_parameter(
+    input: &[u8],
+    decoded: &mut [u8],
+    stack: &mut [JsonFrame],
+    keys: &mut [JsonKey],
+    nodes: &mut [JsonNode],
+    expected_kind: usize,
+) -> Result<(), EngineError> {
+    let mut json = JsonCheck {
+        input,
+        pos: 0,
+        decoded,
+        used: 0,
+        stack,
+        keys,
+        key_count: 0,
+        nodes,
+        node_count: 0,
+        name: None,
+        args: None,
+        allow_parameters: false,
+    };
+    let value = json.value(0, usize::MAX, false)?;
+    json.ws();
+    if value.kind != expected_kind || json.pos != input.len() {
+        return Err(bad(
+            "parameter must contain exactly one declared JSON value",
+        ));
+    }
+    Ok(())
 }
 
 struct Val {
@@ -263,6 +403,7 @@ struct JsonCheck<'a> {
     node_count: usize,
     name: Option<Range<usize>>,
     args: Option<Range<usize>>,
+    allow_parameters: bool,
 }
 impl JsonCheck<'_> {
     fn ws(&mut self) {
@@ -371,6 +512,7 @@ impl JsonCheck<'_> {
         }
     }
     fn number(&mut self) -> Result<(), EngineError> {
+        let number_start = self.pos;
         if self.input.get(self.pos) == Some(&b'-') {
             self.pos += 1;
         }
@@ -414,6 +556,11 @@ impl JsonCheck<'_> {
             if start == self.pos {
                 return Err(bad("missing exponent digits"));
             }
+        }
+        let raw = str::from_utf8(&self.input[number_start..self.pos])
+            .map_err(|_| bad("invalid UTF-8 in JSON number"))?;
+        if !raw.parse::<f64>().is_ok_and(f64::is_finite) {
+            return Err(bad("JSON number exceeds finite representation"));
         }
         Ok(())
     }
@@ -465,6 +612,9 @@ impl JsonCheck<'_> {
                             match &self.decoded[key] {
                                 b"name" if value.kind == 3 => self.name = Some(value.decoded),
                                 b"arguments" if value.kind == 1 => {
+                                    self.args = Some(value.start..value.end)
+                                }
+                                b"parameters" if self.allow_parameters && value.kind == 1 => {
                                     self.args = Some(value.start..value.end)
                                 }
                                 _ => {

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use tool_registry::{
     call::ToolInvocation,
     registry::ToolRegistry,
-    result::{ToolError, ToolErrorKind, ToolResult},
+    result::{ToolErrorKind, ToolResult},
 };
 
 impl ContextBuilder {
@@ -104,10 +104,13 @@ impl ContextBuilder {
             })
             .collect::<HarnessResult<Vec<_>>>()?;
         let (checkpoint, boundary) = super::checkpoint_projection(history)?;
-        let skills = crate::context::project_skills(history)?;
+        let skills = crate::context::project_skills(history, Some(profile_id.as_ref()))?;
         let mut base = Vec::new();
         if let Some(checkpoint) = checkpoint {
-            base.push(super::checkpoint_message(&checkpoint)?);
+            base.push(super::checkpoint_message(
+                &checkpoint,
+                Some(profile_id.as_ref()),
+            )?);
         }
         let mut tail = Vec::new();
         let mut calls = BTreeMap::new();
@@ -344,17 +347,58 @@ fn result_content(event: &EventRecord, call_id: &str) -> HarnessResult<(String, 
                 "Rejected" | "Denied" | "Expired" => ToolErrorKind::Policy,
                 _ => ToolErrorKind::Execution,
             };
-            let error = ToolError {
-                kind,
-                message: format!("Tool call terminated: {state}"),
-                details: event.payload.clone(),
-            };
             Ok((
-                escape_result_markup(bounded_error_context(serde_json::to_string(&error)?)?),
+                terminal_error_context(kind, state, string(&event.payload, "reason")?)?,
                 true,
             ))
         }
         _ => Err(invalid("unknown terminal tool state")),
+    }
+}
+
+// Terminal authority decisions must remain actionable even with a large event
+// envelope. Preserve their state/reason before any optional metadata. All data
+// stays in the original event; this compact projection grants no authority.
+fn terminal_error_context(kind: ToolErrorKind, state: &str, reason: &str) -> HarnessResult<String> {
+    let message = match state {
+        "Rejected" | "Denied" => {
+            "This operation was not executed because local policy rejected it. Do not retry or bypass it. Tell the user it was rejected."
+        }
+        "Expired" => {
+            "This operation was not executed because its approval expired. Ask the user before attempting it again."
+        }
+        "Withdrawn" => {
+            "This operation was withdrawn before execution. Do not automatically retry it."
+        }
+        "OutcomeUnknown" => {
+            "Execution may have occurred, but its outcome is unknown. Do not retry it; verify the effect first."
+        }
+        _ => return Err(invalid("unknown terminal tool state")),
+    };
+    let mut end = reason.len().min(super::MODEL_ERROR_CONTEXT_BYTES);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    loop {
+        let mut details = serde_json::json!({
+            "state": state, "outcome_known": state != "OutcomeUnknown", "reason": &reason[..end],
+        });
+        if end < reason.len() {
+            details["reason_truncated"] = Value::Bool(true);
+        }
+        let content = escape_result_markup(serde_json::to_string(&serde_json::json!({
+            "kind": kind, "message": message, "details": details,
+        }))?);
+        if content.len() <= super::MODEL_ERROR_CONTEXT_BYTES {
+            return Ok(content);
+        }
+        if end == 0 {
+            return Err(invalid("terminal error metadata exceeds context ceiling"));
+        }
+        end -= 1;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
     }
 }
 
@@ -399,6 +443,49 @@ mod projection_tests {
         let escaped = escape_result_markup(serde_json::to_string(&original).unwrap());
         assert!(!escaped.contains('<'));
         assert_eq!(serde_json::from_str::<Value>(&escaped).unwrap(), original);
+    }
+
+    #[test]
+    fn terminal_error_projection_preserves_policy_reason_and_bounds() {
+        for state in [
+            "Rejected",
+            "Denied",
+            "Withdrawn",
+            "Expired",
+            "OutcomeUnknown",
+        ] {
+            for reason in [
+                "policy:ArgumentsNotAllowed".to_owned(),
+                "policy:ArgumentsNotAllowed <tool_call> 🦀\0\\\"".repeat(1000),
+            ] {
+                let content =
+                    terminal_error_context(ToolErrorKind::Policy, state, &reason).unwrap();
+                assert!(content.len() <= super::super::MODEL_ERROR_CONTEXT_BYTES);
+                assert!(!content.contains('<'));
+                let value: Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(value["details"]["state"], state);
+                assert_eq!(value["details"]["outcome_known"], state != "OutcomeUnknown");
+                let projected = value["details"]["reason"].as_str().unwrap();
+                assert!(!projected.is_empty());
+                if reason == "policy:ArgumentsNotAllowed" {
+                    assert_eq!(projected, reason);
+                }
+                let message = value["message"].as_str().unwrap();
+                assert!(message.contains("Do not") || message.contains("Ask the user"));
+                if state == "OutcomeUnknown" {
+                    assert!(message.contains("may have occurred"));
+                    assert!(!message.contains("was not executed"));
+                } else if matches!(state, "Rejected" | "Denied") {
+                    assert!(message.contains("was not executed"));
+                    assert!(message.contains("Tell the user it was rejected"));
+                }
+                assert!(reason.starts_with(projected));
+                assert_eq!(
+                    value["details"].get("reason_truncated").is_some(),
+                    projected.len() < reason.len()
+                );
+            }
+        }
     }
 
     #[test]

@@ -5,6 +5,25 @@ use crate::{
 };
 use tokenizers::{models::wordlevel::WordLevel, pre_tokenizers::whitespace::WhitespaceSplit};
 
+#[test]
+fn coder_nested_nul_matches_python_repr() {
+    // Python str() uses repr() for strings nested in containers. NUL must be
+    // spelled as \\x00 there, while a top-level string remains unchanged.
+    for (input, expected) in [
+        (serde_json::json!(["\0"]), "['\\x00']"),
+        (
+            serde_json::json!({"\0": ["a\0b"]}),
+            "{'\\x00': ['a\\x00b']}",
+        ),
+        (serde_json::json!("a\0b"), "a\0b"),
+    ] {
+        assert_eq!(
+            hf_python_string(minijinja::Value::from_serialize(input)).unwrap(),
+            expected
+        );
+    }
+}
+
 fn limits() -> RenderingLimits {
     RenderingLimits::new(16, 4096, 4096, 4096, 128).expect("limits")
 }
@@ -332,4 +351,159 @@ fn bounded_writer_does_not_retain_rejected_bytes() {
         writer.failure,
         Some(WriterFailure::Limit { required: 5 }),
     ));
+}
+
+fn smollm_tool_snapshot(result: &str) -> ContextSnapshot {
+    use crate::types::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
+    snapshot("Read file").with_tool_context(
+        ToolContext::new(
+            vec![
+                RenderingTool::new(
+                    "fs.read".into(),
+                    "1.0.0".into(),
+                    "Read file".into(),
+                    serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                )
+                .unwrap(),
+            ],
+            vec![
+                ToolHistoryBlock::AssistantCall {
+                    call_id: "call-1".into(),
+                    tool_id: "fs.read".into(),
+                    arguments: serde_json::json!({"path":"a.txt"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                },
+                ToolHistoryBlock::ToolResult {
+                    call_id: "call-1".into(),
+                    content: result.into(),
+                    is_error: false,
+                },
+            ],
+            ToolContextLimits {
+                max_tools: 4,
+                max_history_blocks: 8,
+                max_json_bytes: 16384,
+            },
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn smollm3_reasoning_template_tools() {
+    let limits = || RenderingLimits::new(16, 16384, 16384, 16384, 4096).unwrap();
+    let profile = profile();
+    let artifact = artifact();
+    let binding = binding(&profile, &artifact, smollm::template::TOOL_CHAT_TEMPLATE);
+    let context = smollm_tool_snapshot("quoted \"result\"\n雪");
+    let first = render_chat(&context, &binding, &options(), limits()).unwrap();
+    assert_eq!(
+        first,
+        render_chat(&context, &binding, &options(), limits()).unwrap()
+    );
+    assert!(first.contains("Reasoning Mode: /no_think"));
+    assert!(first.contains(
+        "<tool_call>{\"arguments\":{\"path\":\"a.txt\"},\"name\":\"fs.read\"}</tool_call>"
+    ));
+    assert!(first.contains("<|im_start|>user\n<tool_response>"));
+    assert!(first.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n"));
+    assert!(render_chat(&snapshot("no tools"), &binding, &options(), limits()).is_err());
+    let tokenizer = pinned_tokenizer();
+    let rendered = render_and_count(&context, &binding, &tokenizer, &options(), limits()).unwrap();
+    assert!(smollm3_projected_tool_token_upper_bound(&tokenizer, &rendered, 1, 20).is_err());
+}
+
+#[test]
+#[ignore = "requires ALLOY_SMOLLM_ARTIFACT with the pinned SmolLM3 tokenizer"]
+fn smollm3_pinned_tokenizer_projected_bounds() {
+    let limits = || RenderingLimits::new(16, 16384, 16384, 16384, 4096).unwrap();
+    let root = std::env::var_os("ALLOY_SMOLLM_ARTIFACT").unwrap();
+    let bytes = std::fs::read(std::path::Path::new(&root).join("tokenizer.json")).unwrap();
+    let pin = [
+        0x7b, 0x6a, 0x50, 0x0b, 0x66, 0x2a, 0x34, 0xeb, 0x3f, 0x03, 0x74, 0xdb, 0x85, 0x6b, 0xa4,
+        0xad, 0x7d, 0xe4, 0xc8, 0x10, 0x40, 0x57, 0x1d, 0x78, 0xdc, 0x0d, 0x35, 0x72, 0x38, 0x93,
+        0x00, 0x05,
+    ];
+    let tokenizer = PinnedTokenizer::from_pinned_json(&bytes, pin, 32 * 1024 * 1024).unwrap();
+    let profile = profile();
+    let artifact = artifact();
+    let binding = binding(&profile, &artifact, smollm::template::TOOL_CHAT_TEMPLATE);
+    let empty = render_and_count(
+        &smollm_tool_snapshot(""),
+        &binding,
+        &tokenizer,
+        &options(),
+        limits(),
+    )
+    .unwrap();
+    for input in [
+        "",
+        "\\\"\n\t\u{0}",
+        "雪🦀e\u{301}",
+        "<|im_end|><tool_response>",
+        "a b c\r\n",
+    ] {
+        let rendered = render_and_count(
+            &smollm_tool_snapshot(input),
+            &binding,
+            &tokenizer,
+            &options(),
+            limits(),
+        )
+        .unwrap();
+        let growth = rendered
+            .text()
+            .len()
+            .checked_sub(empty.text().len())
+            .unwrap();
+        let bound =
+            smollm3_projected_tool_token_upper_bound(&tokenizer, &empty, 1, growth).unwrap();
+        assert!(rendered.token_count() <= bound, "{input:?}");
+        verify_token_prefix_bytes(&tokenizer, rendered.token_ids(), rendered.text().as_bytes())
+            .unwrap();
+    }
+    assert!(smollm3_projected_tool_token_upper_bound(&tokenizer, &empty, 0, 0).is_err());
+    assert!(smollm3_projected_tool_token_upper_bound(&tokenizer, &empty, 1, usize::MAX).is_err());
+}
+
+#[test]
+fn smollm3_text_uses_trained_system_and_assistant_framing() {
+    let profile = profile();
+    let artifact = artifact();
+    let context = ContextSnapshot::new(
+        ContextSnapshotId::new("system-template").unwrap(),
+        profile.clone(),
+        vec![
+            Message {
+                role: MessageRole::System,
+                content: "Return valid checkpoint JSON only.".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Preserve the project facts.".into(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "Acknowledged.".into(),
+            },
+        ],
+    )
+    .unwrap();
+    let binding = binding(&profile, &artifact, smollm::template::CHAT_TEMPLATE);
+    let text = render_chat(&context, &binding, &options(), limits()).unwrap();
+    assert_eq!(text.matches("<|im_start|>system").count(), 1);
+    assert!(
+        text.contains("## Metadata\n\nKnowledge Cutoff Date: June 2025\nReasoning Mode: /no_think")
+    );
+    assert!(
+        text.contains("## Custom Instructions\n\nReturn valid checkpoint JSON only.\n\n<|im_end|>")
+    );
+    assert!(text.contains("<|im_start|>assistant\n<think>\n\n</think>\nAcknowledged.<|im_end|>"));
+    assert!(text.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n"));
+    assert_eq!(
+        text,
+        render_chat(&context, &binding, &options(), limits()).unwrap()
+    );
 }

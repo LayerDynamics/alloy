@@ -9,6 +9,19 @@ impl ModelFamily for Qwen3Backend {
         let control = request.control();
         control.check_cancelled()?;
         let data = self.data(request.artifact())?;
+        if let BackendConfig::Gemma4(_) = &data.config {
+            return self.load_gemma4(request, data);
+        }
+        if let BackendConfig::Gemma3(config) = &data.config {
+            return self.load_gemma3(request, data, config);
+        }
+        if let BackendConfig::Phi(config) = &data.config {
+            return self.load_phi(request, data, config);
+        }
+        if let BackendConfig::Hybrid(config) = &data.config {
+            return self.load_hybrid(request, data, config);
+        }
+        let BackendConfig::Transformer(config) = &data.config else { unreachable!("hybrid dispatched above") };
         let decoded_bound = data.decoded_bound;
         // Headroom covers group-size variance (planning assumes 64; some
         // fixtures/checkpoints use smaller groups with larger scale tables).
@@ -75,40 +88,67 @@ impl ModelFamily for Qwen3Backend {
             sha256: &data.checksums,
             cancelled: &cancelled,
         };
-        let result = load_weights_verified(
-            &data.config,
-            &data.specification.directory,
-            LoadOptions {
-                // Enforce the source limit used by the workspace plan even
-                // when a caller offers a larger grant. Mutated files must
-                // not expand metadata beyond that bound before hash failure.
-                max_file_bytes: as_usize(data.source_bytes)?,
-                max_weight_bytes: as_usize(weight_charge_limit)?,
-            },
-            &verification,
-        );
-        control.check_cancelled()?;
-        let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
-        let packed_bits = weights.embed_tokens.bits();
-        if !data.config.has_qk_norm() {
-            validate_llama_weight_layout(&weights)?;
-        }
-        let decoded = weight_memory(&weights)?;
-        if decoded.allocated_bytes() > weight_charge_limit {
-            return Err(EngineError::MemoryLimitExceeded {
-                operation: "decoded MLX Qwen weight buffers",
-                required_bytes: decoded.allocated_bytes(),
-                available_bytes: weight_charge_limit,
-                reason: MemoryLimitReason::BufferLimit,
-            });
-        }
-        let model = MlxQwen3Model::from_weights(
-            data.config.clone(),
-            weights,
-            request.limits().max_resident_bytes(),
-            execution_stream.as_ref(),
-        )
-        .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
+        let options = LoadOptions {
+            max_file_bytes: as_usize(data.source_bytes)?,
+            max_weight_bytes: as_usize(weight_charge_limit)?,
+        };
+        let (model, packed_bits) = if self.family == BackendFamily::Qwen3Coder {
+            let model = MlxQwen3Model::load_qwen3_coder_verified(
+                &data.specification.directory,
+                LoadOptions {
+                    max_weight_bytes: options.max_weight_bytes.min(as_usize(request.limits().max_resident_bytes())?),
+                    ..options
+                },
+                &verification,
+                &execution_stream,
+            )
+            .map_err(|e| mlx_model_error(e, control, "load routed Qwen3-Coder model"))?;
+            if model.config() != config {
+                return Err(internal("Qwen3-Coder geometry changed after admission"));
+            }
+            (model, Some(4))
+        } else {
+            let result = if self.family == BackendFamily::Ministral3 {
+                inference_infra::decoder::ministral3::weights::load_verified(
+                    &data.specification.directory,
+                    options,
+                    &verification,
+                )
+                .and_then(|(loaded, weights)| {
+                    if loaded.decoder_config()? != *config {
+                        return Err(inference_infra::decoder::model::ModelError::InvalidConfig(
+                            "Ministral verified geometry changed",
+                        ));
+                    }
+                    Ok(weights)
+                })
+            } else {
+                load_weights_verified(config, &data.specification.directory, options, &verification)
+            };
+            control.check_cancelled()?;
+            let weights = result.map_err(|e| model_error(e, "load MLX Qwen weights"))?;
+            let packed_bits = weights.embed_tokens.bits();
+            if !config.has_qk_norm() {
+                validate_llama_weight_layout(&weights)?;
+            }
+            let decoded = weight_memory(&weights)?;
+            if decoded.allocated_bytes() > weight_charge_limit {
+                return Err(EngineError::MemoryLimitExceeded {
+                    operation: "decoded MLX Qwen weight buffers",
+                    required_bytes: decoded.allocated_bytes(),
+                    available_bytes: weight_charge_limit,
+                    reason: MemoryLimitReason::BufferLimit,
+                });
+            }
+            let model = MlxQwen3Model::from_weights(
+                config.clone(),
+                weights,
+                request.limits().max_resident_bytes(),
+                execution_stream.as_ref(),
+            )
+            .map_err(|e| mlx_model_error(e, control, "construct MLX Qwen model"))?;
+            (model, packed_bits)
+        };
         control.check_cancelled()?;
         let payload = model.weight_payload_bytes();
         let measured = model
@@ -123,7 +163,7 @@ impl ModelFamily for Qwen3Backend {
             });
         }
         let mut capabilities = self.registration.capabilities().clone();
-        if !data.config.has_qk_norm() {
+        if !config.has_qk_norm() {
             capabilities.weight_representations = vec![match packed_bits {
                 Some(8) => WeightRepresentation::Affine8 { group_size: NonZeroUsize::new(64).unwrap() },
                 Some(4) => WeightRepresentation::Affine4 { group_size: NonZeroUsize::new(64).unwrap() },
@@ -132,7 +172,7 @@ impl ModelFamily for Qwen3Backend {
         }
         capabilities.context_limit_tokens = capabilities
             .context_limit_tokens
-            .min(data.config.max_context);
+            .min(config.max_context);
         Ok(Box::new(Qwen3Loaded {
             model,
             stream: execution_stream,
@@ -141,9 +181,9 @@ impl ModelFamily for Qwen3Backend {
             registration: self.registration.clone(),
             capabilities,
             memory: BufferMemoryUsage::new(measured, payload)?,
-            vocabulary: data.config.vocab_size,
+            vocabulary: config.vocab_size,
             max_prefill_tokens: self.limits.prefill_chunk_tokens.get(),
-            logits_payload_bytes: product(logits_payload_bound(&data.config)?, if data.config.has_qk_norm() { 1 } else { as_u64(self.limits.prefill_chunk_tokens.get())? })?,
+            logits_payload_bytes: product(logits_payload_bound(config)?, as_u64(self.limits.prefill_chunk_tokens.get())?)?,
         }))
     }
 }
@@ -196,7 +236,7 @@ impl Qwen3Loaded {
         &self,
         cache: &'a mut dyn FamilyCache,
     ) -> Result<&'a mut Qwen3NativeCache, EngineError> {
-        if cache.owner() != &self.instance || cache.mode() != &family_cache_mode(self.model.config().family)? {
+        if cache.owner() != &self.instance || cache.mode() != &dense_cache_mode(self.model.config().family)? {
             return Err(EngineError::invalid_request(
                 "cache",
                 "cache belongs to another model or representation",
@@ -230,7 +270,7 @@ impl AutoregressiveModel for Qwen3Loaded {
         control: &ExecutionControl,
     ) -> Result<Box<dyn FamilyCache>, EngineError> {
         control.check_cancelled()?;
-        if request.mode() != &family_cache_mode(self.model.config().family)? {
+        if request.mode() != &dense_cache_mode(self.model.config().family)? {
             return Err(EngineError::unsupported(
                 "cache mode",
                 "only full MLX float32 KV is implemented",

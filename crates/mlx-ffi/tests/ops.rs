@@ -133,3 +133,99 @@ fn quantized_matmul_smoke() {
         );
     }
 }
+
+#[test]
+fn routed_swiglu_matches_selected_experts() {
+    for tokens in [2, 31, 32, 55] {
+        check_selected_experts(DeviceType::Cpu, tokens);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn routed_swiglu_matches_selected_experts_metal() {
+    for tokens in [2, 31, 32, 55] {
+        check_selected_experts(DeviceType::Gpu, tokens);
+    }
+}
+
+fn check_selected_experts(kind: DeviceType, tokens: usize) {
+    use mlx_ffi::ops::{AffineExperts, SwitchGluExperts, routed_swiglu, to_vec_f32};
+    let device = Device::new(kind, 0).unwrap();
+    let stream = Stream::get_default(&device).unwrap();
+    const EXPERTS: usize = 3;
+    const WIDTH: usize = 64;
+    let diagonal = |offset: usize| {
+        let mut packed = vec![0u32; EXPERTS * WIDTH * (WIDTH / 8)];
+        for e in 0..EXPERTS {
+            for i in 0..WIDTH {
+                packed[(e * WIDTH + i) * (WIDTH / 8) + i / 8] =
+                    ((e + offset) as u32) << (4 * (i % 8));
+            }
+        }
+        Array::from_u32_slice(&packed, &[3, 64, 8]).unwrap()
+    };
+    let gate = diagonal(1);
+    let up = diagonal(2);
+    let down = diagonal(3);
+    let scales = Array::from_f32_slice(&[1.; EXPERTS * WIDTH], &[3, 64, 1]).unwrap();
+    let bias = Array::from_f32_slice(&[0.; EXPERTS * WIDTH], &[3, 64, 1]).unwrap();
+    let bank = |packed| AffineExperts {
+        packed,
+        scales: &scales,
+        biases: &bias,
+        group_size: 64,
+        bits: 4,
+    };
+    let mut banks = SwitchGluExperts {
+        gate: bank(&gate),
+        up: bank(&up),
+        down: bank(&down),
+    };
+    let inputs: Vec<f32> = (0..tokens * WIDTH)
+        .map(|i| ((i % 127) as f32 - 62.) / 64.)
+        .collect();
+    let x = Array::from_f32_slice(&inputs, &[tokens as i32, 64]).unwrap();
+    let patterns = [[2.0f32, -1., 1.], [-2., 3., 1.], [1., 2., -1.]];
+    let choices = [[0, 2], [1, 2], [1, 0]];
+    let logits = (0..tokens)
+        .map(|i| patterns[i % patterns.len()])
+        .collect::<Vec<_>>();
+    let router = Array::from_f32_slice(logits.as_flattened(), &[tokens as i32, 3]).unwrap();
+    for normalize in [true, false] {
+        let out = routed_swiglu(&x, &router, &banks, 2, normalize, &stream).unwrap();
+        assert_eq!(out.shape(), [tokens, WIDTH]);
+        let values = to_vec_f32(&out, &stream).unwrap();
+        for (row, logit) in logits.iter().enumerate() {
+            let selected = choices[row % choices.len()];
+            let probs = logit.map(f32::exp);
+            let sum: f32 = if normalize {
+                selected.iter().map(|&e| probs[e]).sum()
+            } else {
+                probs.iter().sum()
+            };
+            for column in 0..WIDTH {
+                let x = inputs[row * WIDTH + column];
+                let expected: f32 = selected
+                    .iter()
+                    .map(|&e| {
+                        let g = x * (e + 1) as f32;
+                        probs[e] / sum
+                            * (g / (1. + (-g).exp()))
+                            * (x * (e + 2) as f32)
+                            * (e + 3) as f32
+                    })
+                    .sum();
+                assert!(
+                    (values[row * WIDTH + column] - expected).abs() < 2e-5,
+                    "row={row}, column={column}"
+                );
+            }
+        }
+    }
+    for invalid in [0, 4] {
+        assert!(routed_swiglu(&x, &router, &banks, invalid, true, &stream).is_err());
+    }
+    banks.gate.packed = &scales;
+    assert!(routed_swiglu(&x, &router, &banks, 1, true, &stream).is_err());
+}

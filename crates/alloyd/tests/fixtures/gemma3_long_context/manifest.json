@@ -1,0 +1,11 @@
+{
+  "source": "bench/corpus/fixtures/documents/document-32k.txt",
+  "source_sha256": "393bc22d01056d7e6f5fbba865071725867679aa00521f84780802c660cb0c75",
+  "tokenizer_sha256": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+  "fixture_sha256": "9c249b067cf7600cdbabda90f5231b2a3ad2058835872026a1f83e32f008c8dd",
+  "fixture_bytes": 126723,
+  "prompt_tokens": 32095,
+  "context_limit": 32768,
+  "output_reserve": 512,
+  "safety_margin": 64
+}

@@ -23,6 +23,8 @@
 //! Affine4 residency and greedy decoding are advertised. Rotating caches,
 //! stochastic sampling and thinking mode are not.
 
+#[path = "constraints.rs"]
+mod constraints;
 #[path = "output.rs"]
 mod output;
 use self::output::Qwen3TextDecoder;
@@ -107,6 +109,7 @@ impl Qwen3Execution {
     }
 }
 
+include!("architecture.rs");
 include!("artifact.rs");
 
 /// Explicit bounds; no model, output, or memory policy is silently selected.
@@ -171,7 +174,7 @@ impl Qwen3BackendLimits {
 /// Real Qwen3 backend. Normal metadata/factories may cross threads;
 /// actual model and cache instances are created by ModelFamily::load.
 pub struct Qwen3Backend {
-    family: inference_infra::decoder::config::DecoderFamily,
+    family: BackendFamily,
     registration: FamilyRegistration,
     artifacts: BTreeMap<ArtifactId, ArtifactData>,
     limits: Qwen3BackendLimits,
@@ -182,6 +185,77 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// Native routed Qwen3-Coder backend.
+    pub fn new_qwen3_coder(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen3Coder)
+    }
+
+    /// Construct the native Ministral 3 text backend for qualification runs.
+    pub fn new_ministral3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Ministral3)
+    }
+
+    /// Native Gemma 3 text adapter with mixed local/full attention.
+    /// Construction does not qualify tools or production agent behavior.
+    pub fn new_gemma3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Gemma3)
+    }
+    /// Gemma 4 E4B text decoder with per-layer embeddings and shared KV.
+    pub fn new_gemma4(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Gemma4)
+    }
+
+    /// Native Phi fused decoder with immutable long-factor SuScaledRoPE.
+    /// Construction is not a production qualification.
+    pub fn new_phi(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Phi)
+    }
+    /// Native hybrid decoder with the upstream trained non-thinking text template.
+    /// Construction alone does not qualify a production agent profile.
+    pub fn new_qwen35(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen35)
+    }
+    /// Native hybrid decoder with Ornith's distinct assistant-history framing.
+    pub fn new_ornith(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::Ornith)
+    }
+
+    /// Construct the native SmolLM3 adapter with validated NoPE layer semantics.
+    pub fn new_smollm3(
+        specifications: Vec<Qwen3Artifact>,
+        limits: Qwen3BackendLimits,
+        execution: Qwen3Execution,
+    ) -> Result<Self, EngineError> {
+        Self::new_family(specifications, limits, execution, BackendFamily::SmolLm3)
+    }
     /// Validate pinned metadata and tokenizer configuration without loading
     /// model weights. This synchronous constructor can perform substantial
     /// tokenizer parsing; call it during setup, not on a cancellation loop.
@@ -200,12 +274,7 @@ impl Qwen3Backend {
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
-        Self::new_family(
-            specifications,
-            limits,
-            execution,
-            inference_infra::decoder::config::DecoderFamily::Qwen3,
-        )
+        Self::new_family(specifications, limits, execution, BackendFamily::Qwen3)
     }
 
     /// Explicit native Llama factory. Configs never fall back to Qwen.
@@ -214,19 +283,14 @@ impl Qwen3Backend {
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
     ) -> Result<Self, EngineError> {
-        Self::new_family(
-            specifications,
-            limits,
-            execution,
-            inference_infra::decoder::config::DecoderFamily::Llama3,
-        )
+        Self::new_family(specifications, limits, execution, BackendFamily::Llama3)
     }
 
     fn new_family(
         specifications: Vec<Qwen3Artifact>,
         limits: Qwen3BackendLimits,
         execution: Qwen3Execution,
-        family: inference_infra::decoder::config::DecoderFamily,
+        family: BackendFamily,
     ) -> Result<Self, EngineError> {
         limits.validate()?;
         if specifications.is_empty() {
@@ -292,26 +356,91 @@ impl Qwen3Backend {
             let config_value =
                 parse_json(&specification.directory.join("config.json"), &config_bytes)?;
             let config = match family {
-                inference_infra::decoder::config::DecoderFamily::Qwen3 => {
-                    parse_config(&config_value)?
-                }
-                inference_infra::decoder::config::DecoderFamily::Llama3 => {
+                BackendFamily::Ministral3 => BackendConfig::Transformer(
+                    inference_infra::decoder::ministral3::MinistralConfig::from_json(&config_value)
+                        .and_then(|config| config.decoder_config())
+                        .map_err(|e| model_error(e, "validate Ministral architecture"))?,
+                ),
+                BackendFamily::Gemma4 => BackendConfig::Gemma4(
+                    inference_infra::decoder::gemma4::Gemma4TextConfig::from_affine4_json(
+                        &config_value,
+                    )
+                    .map_err(|e| model_error(e, "validate Gemma 4 config"))?,
+                ),
+                BackendFamily::Gemma3 => BackendConfig::Gemma3(
+                    inference_infra::decoder::gemma3::Gemma3Config::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Gemma3 config"))?,
+                ),
+                BackendFamily::Phi => BackendConfig::Phi(
+                    inference_infra::decoder::phi::PhiConfig::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Phi config"))?,
+                ),
+                BackendFamily::Qwen3Coder => BackendConfig::Transformer(
+                    inference_infra::decoder::qwen3_coder::CoderConfig::from_json(&config_value)
+                        .map_err(|e| model_error(e, "validate Qwen3-Coder architecture"))?
+                        .decoder,
+                ),
+                BackendFamily::Qwen3 => BackendConfig::Transformer(parse_config(&config_value)?),
+                BackendFamily::Llama3 => BackendConfig::Transformer(
                     llama3::config::parse_config(&config_value)
-                        .map_err(|e| model_error(e, "validate Llama config"))?
-                }
+                        .map_err(|e| model_error(e, "validate Llama config"))?,
+                ),
+                BackendFamily::SmolLm3 => BackendConfig::Transformer(
+                    smollm::config::parse_config(&config_value)
+                        .map_err(|e| model_error(e, "validate SmolLM3 config"))?,
+                ),
+                BackendFamily::Qwen35 | BackendFamily::Ornith => BackendConfig::Hybrid(
+                    inference_infra::decoder::qwen35::config::Qwen35Config::from_json(
+                        &config_value,
+                    )
+                    .map_err(|e| model_error(e, "validate native hybrid config"))?,
+                ),
             };
             // Undeclared representation uses the conservative dense path.
             // Quantized declarations retain the existing packed estimates.
             let declares_quantization = ["quantization", "quantization_config"]
                 .iter()
                 .any(|key| config_value.get(*key).is_some_and(|value| !value.is_null()));
-            let (decoded_bound, resident_payload_bound) = if declares_quantization {
-                (decoded_weight_bound(&config)?, resident_bound(&config)?)
-            } else {
-                (
-                    dense_decoded_weight_bound(&config)?,
-                    dense_weight_payload_bound(&config)?,
-                )
+            let (decoded_bound, resident_payload_bound) = match &config {
+                BackendConfig::Gemma4(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| model_error(e, "plan Gemma 4 weights"))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Gemma3(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan Gemma3 weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Phi(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan Phi weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Hybrid(c) => {
+                    let p = c
+                        .weight_payload_plan()
+                        .map_err(|e| execution_error("plan hybrid weights", e.to_string()))?;
+                    (p.payload_bytes, p.payload_bytes)
+                }
+                BackendConfig::Transformer(_) if family == BackendFamily::Qwen3Coder => {
+                    let bytes =
+                        inference_infra::decoder::qwen3_coder::CoderConfig::weight_payload_bytes(
+                            &config_value,
+                        )
+                        .map_err(|e| model_error(e, "plan mixed expert weights"))?;
+                    (bytes, bytes)
+                }
+                BackendConfig::Transformer(c) if declares_quantization => {
+                    (decoded_weight_bound(c)?, resident_bound(c)?)
+                }
+                BackendConfig::Transformer(c) => (
+                    dense_decoded_weight_bound(c)?,
+                    dense_weight_payload_bound(c)?,
+                ),
             };
             let resident_bound = sum(&[resident_payload_bound, limits.loader_headroom_bytes])?;
             let tokenizer_bytes =
@@ -320,20 +449,8 @@ impl Qwen3Backend {
                 &specification.directory.join("tokenizer.json"),
                 &tokenizer_bytes,
             )?;
-            if tokenizer_value
-                .pointer("/model/type")
-                .and_then(Value::as_str)
-                != Some("BPE")
-                || tokenizer_value
-                    .pointer("/decoder/type")
-                    .and_then(Value::as_str)
-                    != Some("ByteLevel")
-            {
-                return Err(EngineError::unsupported(
-                    "tokenizer",
-                    "this adapter supports the actual BPE/ByteLevel Qwen3 tokenizer contract only",
-                ));
-            }
+            let gemma_decoder = matches!(family, BackendFamily::Gemma3 | BackendFamily::Gemma4);
+            output::validate_tokenizer_decoder(&tokenizer_value, gemma_decoder)?;
             let tokenizer_pin = specification.files.get("tokenizer.json").ok_or_else(|| {
                 validation(
                     Some(&specification.id),
@@ -369,8 +486,10 @@ impl Qwen3Backend {
                     }
                 }
             }
+            let mut max_token_spelling_bytes = 0;
             for (spelling, id) in tokenizer.tokenizer().get_vocab(true) {
-                if u64::from(id) >= as_u64(config.vocab_size)?
+                max_token_spelling_bytes = max_token_spelling_bytes.max(spelling.len());
+                if u64::from(id) >= as_u64(config.vocabulary())?
                     || spelling.len() > limits.max_token_bytes
                 {
                     return Err(validation(
@@ -378,7 +497,9 @@ impl Qwen3Backend {
                         "tokenizer vocabulary exceeds the configured token/model bounds",
                     ));
                 }
-                if !specials.contains(&id) && !spelling.chars().all(|ch| inverse.contains_key(&ch))
+                if !gemma_decoder
+                    && !specials.contains(&id)
+                    && !spelling.chars().all(|ch| inverse.contains_key(&ch))
                 {
                     return Err(EngineError::unsupported(
                         "ByteLevel token",
@@ -403,9 +524,128 @@ impl Qwen3Backend {
             } else {
                 config_value.get("eos_token_id").cloned()
             };
-            let eos = parse_eos(eos_value.as_ref())?;
+            let mut eos = if family.hybrid() || gemma_decoder {
+                parse_eos(
+                    eos_value
+                        .as_ref()
+                        .or_else(|| config_value.pointer("/text_config/eos_token_id")),
+                )?
+            } else {
+                parse_eos(eos_value.as_ref())?
+            };
+            if family.hybrid() || family == BackendFamily::Phi || gemma_decoder {
+                let bytes = read_metadata(
+                    &specification,
+                    "tokenizer_config.json",
+                    limits.max_config_bytes,
+                )?;
+                let metadata: Value = parse_json(
+                    &specification.directory.join("tokenizer_config.json"),
+                    &bytes,
+                )?;
+                let spelling = metadata["eos_token"]
+                    .as_str()
+                    .or_else(|| metadata["eos_token"]["content"].as_str())
+                    .ok_or_else(|| {
+                        validation(Some(&specification.id), "missing pinned tokenizer EOS")
+                    })?;
+                let token = tokenizer.tokenizer().token_to_id(spelling).ok_or_else(|| {
+                    validation(Some(&specification.id), "tokenizer EOS spelling is absent")
+                })?;
+                if !eos.contains(&token) {
+                    eos.push(token);
+                }
+            }
+            if family == BackendFamily::Ministral3 {
+                if eos != [2]
+                    || [
+                        ("<s>", 1),
+                        ("</s>", 2),
+                        ("[INST]", 3),
+                        ("[/INST]", 4),
+                        ("[AVAILABLE_TOOLS]", 5),
+                        ("[/AVAILABLE_TOOLS]", 6),
+                        ("[TOOL_RESULTS]", 7),
+                        ("[/TOOL_RESULTS]", 8),
+                        ("[TOOL_CALLS]", crate::slab_parser::ministral3::CALL),
+                        ("[ARGS]", crate::slab_parser::ministral3::ARGS),
+                        ("[SYSTEM_PROMPT]", 17),
+                        ("[/SYSTEM_PROMPT]", 18),
+                    ]
+                    .into_iter()
+                    .any(|(name, id)| {
+                        tokenizer.tokenizer().token_to_id(name) != Some(id)
+                            || !specials.contains(&id)
+                    })
+                {
+                    return Err(validation(
+                        Some(&specification.id),
+                        "unexpected Ministral control tokens",
+                    ));
+                }
+                let reserved = family_rendering_options(family).reserved_spellings;
+                for id in &specials {
+                    let spelling = tokenizer.tokenizer().id_to_token(*id).ok_or_else(|| {
+                        validation(
+                            Some(&specification.id),
+                            "missing Ministral control spelling",
+                        )
+                    })?;
+                    if !reserved.iter().any(|pattern| spelling.contains(pattern)) {
+                        return Err(validation(
+                            Some(&specification.id),
+                            "unprotected Ministral control token",
+                        ));
+                    }
+                }
+            }
+            if family == BackendFamily::Gemma4 {
+                let reserved = family_rendering_options(family).reserved_spellings;
+                if eos != [1, 106, 50]
+                    || [
+                        ("<bos>", 2),
+                        ("<eos>", 1),
+                        ("<|turn>", 105),
+                        ("<turn|>", 106),
+                        ("<|tool_response>", 50),
+                        ("<|tool_call>", 48),
+                        ("<tool_call|>", 49),
+                        (r#"<|"|>"#, 52),
+                    ]
+                    .into_iter()
+                    .any(|(name, id)| {
+                        tokenizer.tokenizer().token_to_id(name) != Some(id)
+                            || !specials.contains(&id)
+                    })
+                    || specials.iter().any(|id| {
+                        tokenizer
+                            .tokenizer()
+                            .id_to_token(*id)
+                            .is_none_or(|s| !reserved.iter().any(|marker| s.contains(marker)))
+                    })
+                {
+                    return Err(validation(
+                        Some(&specification.id),
+                        "unexpected Gemma 4 control tokens",
+                    ));
+                }
+            }
+            if family == BackendFamily::Gemma3 {
+                for spelling in ["<bos>", "<eos>", "<start_of_turn>", "<end_of_turn>"] {
+                    let id = tokenizer
+                        .tokenizer()
+                        .token_to_id(spelling)
+                        .filter(|id| specials.contains(id))
+                        .ok_or_else(|| {
+                            validation(Some(&specification.id), "missing Gemma3 special token")
+                        })?;
+                    if matches!(spelling, "<eos>" | "<end_of_turn>") && !eos.contains(&id) {
+                        eos.push(id);
+                    }
+                }
+            }
             for &token in &eos {
-                if u64::from(token) >= as_u64(config.vocab_size)?
+                if u64::from(token) >= as_u64(config.vocabulary())?
                     || tokenizer.tokenizer().id_to_token(token).is_none()
                     || !specials.contains(&token)
                 {
@@ -422,6 +662,8 @@ impl Qwen3Backend {
                 tokenizer,
                 special_tokens: Arc::new(specials),
                 byte_decoder: Arc::clone(&inverse),
+                gemma_decoder,
+                max_token_spelling_bytes,
                 manifest_sha256,
                 eos,
                 source_bytes,
@@ -526,6 +768,65 @@ impl Qwen3Backend {
         }
     }
 
+    /// Derive identity from this adapter's checked metadata and registered profile.
+    /// The caller supplies independently verified build and environment identities.
+    pub fn qualification_identity(
+        &self,
+        profile: &ModelProfile,
+        candidate: &str,
+        dependencies_sha256: &str,
+    ) -> Result<crate::conformance::QualificationIdentity, EngineError> {
+        if !matches!(candidate.len(), 40 | 64)
+            || !candidate.bytes().all(|b| b.is_ascii_hexdigit())
+            || dependencies_sha256.len() != 64
+            || !dependencies_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(EngineError::invalid_request(
+                "qualification",
+                "invalid build identity",
+            ));
+        }
+        let registry = self.registry(vec![profile.clone()])?;
+        let resolved = registry.resolve_profile(profile.id())?;
+        let data = self.data(resolved.artifact())?;
+        let hex = |bytes: [u8; 32]| format!("{:x}", sha2::digest::Output::<Sha256>::from(bytes));
+        let allocation = self.parser_capacities.map(|p| {
+            [
+                p.carry_bytes,
+                p.call_bytes,
+                p.decoded_bytes,
+                p.depth,
+                p.keys,
+                p.nodes,
+                p.proposal_bytes,
+                p.calls,
+            ]
+        });
+        let limits = self.tool_parser_limits();
+        // The reviewed revision binds parser code as well as protocol-specific
+        // decoders. Also bind their runtime selection and actual capacity settings.
+        let protocol = serde_json::json!({
+            "contract": 1, "source": candidate, "family": resolved.family().family(),
+            "device": match self.execution { Qwen3Execution::MlxCpu => "mlx_cpu", Qwen3Execution::MlxMetal => "mlx_metal" },
+            "parsing": self.tool_call_parsing,
+            "template_sha256": hex(digest(family_template(self.family, true).as_bytes())),
+            "eos": data.eos, "allocation": allocation,
+            "limits": [limits.max_output_bytes, limits.max_call_bytes, limits.max_calls],
+        });
+        Ok(crate::conformance::QualificationIdentity {
+            candidate_revision: candidate.into(),
+            dependencies_sha256: dependencies_sha256.into(),
+            artifact_manifest_sha256: hex(data.manifest_sha256),
+            family: resolved.family().family().into(),
+            family_version: resolved.family().implementation_version().to_string(),
+            engine_api_version: crate::api::ENGINE_API_VERSION,
+            tokenizer_sha256: hex(*data.tokenizer.source_sha256()),
+            template_sha256: hex(data.specification.template_sha256),
+            tool_protocol_sha256: hex(digest(protocol.to_string().as_bytes())),
+            profile_sha256: resolved.profile().qualification_sha256(),
+        })
+    }
+
     /// Construct a registry whose family metadata matches this executable
     /// adapter, register its actual local artifacts, and add caller profiles.
     pub fn registry(&self, profiles: Vec<ModelProfile>) -> Result<Registry, EngineError> {
@@ -620,13 +921,21 @@ impl Qwen3Backend {
     /// Like [`Self::into_engine`], attaching a live memory enforcer for
     /// prefill admit-line / adaptive chunk shrink (M5–M6).
     pub fn into_engine_with_memory_enforcer(
-        self,
+        mut self,
         profiles: Vec<ModelProfile>,
         admission: AdmissionController,
         scheduler: Scheduler,
         retention: RetentionPolicy,
         memory_enforcer: Option<crate::memory_enforcer::MemoryEnforcer>,
     ) -> Result<EngineCore<FamilyRuntime>, EngineError> {
+        if self.family == BackendFamily::Gemma4 && admission.snapshot()?.budget_bytes() <= 8 << 30 {
+            // E4B projects all prompt rows into its 262,144-token vocabulary.
+            // Four rows bound this workspace during cold startup on the small tier.
+            self.limits.prefill_chunk_tokens = self
+                .limits
+                .prefill_chunk_tokens
+                .min(NonZeroUsize::new(4).unwrap());
+        }
         let registry = self.registry(profiles)?;
         let generation_limits = self.limits.generation;
         let backend: Arc<dyn RuntimeBackend> = Arc::new(self);
@@ -649,7 +958,7 @@ impl Qwen3Backend {
             })?;
         if artifact.directory() != data.specification.directory.as_path()
             || artifact.family() != self.registration.family()
-            || artifact.declared_context_limit_tokens() != data.config.max_context
+            || artifact.declared_context_limit_tokens() != data.config.context()
         {
             return Err(validation(
                 Some(artifact.id()),
@@ -661,8 +970,34 @@ impl Qwen3Backend {
 }
 
 include!("loading.rs");
+include!("hybrid_loading.rs");
+include!("phi_loading.rs");
+include!("gemma3_loading.rs");
+include!("gemma4_loading.rs");
 
 impl RuntimeBackend for Qwen3Backend {
+    fn supports_json_output(&self) -> bool {
+        true
+    }
+
+    fn json_constraint(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        schema: crate::structured_output::JsonOutputSchema,
+        control: &ExecutionControl,
+    ) -> Result<crate::structured_output::JsonConstraint, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
+        if data.max_token_spelling_bytes > 64 << 10 {
+            return Err(EngineError::unsupported(
+                "structured output",
+                "tokenizer spelling scratch exceeds 64 KiB",
+            ));
+        }
+        constraints::build(data, schema, control)
+    }
+
     fn verify_retained_prefix_bytes(
         &self,
         registry: &Registry,
@@ -698,10 +1033,23 @@ impl RuntimeBackend for Qwen3Backend {
                 "rendered tool context identity does not match the selected Qwen profile",
             ));
         }
+        // Preflight renders empty successful results. A later failure can
+        // activate one model-specific error instruction in the header.
+        let header_growth = match self.family {
+            BackendFamily::Phi => PHI_TOOL_ERROR_MAX_BYTES,
+            BackendFamily::Llama3 => 1 + llama3::template::TOOL_ERROR_GUIDANCE.len(),
+            _ => 0,
+        };
+        let additional_bytes = projection
+            .additional_rendered_bytes
+            .checked_add(header_growth)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "rendered byte bound overflow")
+            })?;
         let rendered_bytes = rendered
             .text()
             .len()
-            .checked_add(projection.additional_rendered_bytes)
+            .checked_add(additional_bytes)
             .ok_or_else(|| {
                 EngineError::invalid_request("projection", "rendered byte bound overflow")
             })?;
@@ -718,12 +1066,61 @@ impl RuntimeBackend for Qwen3Backend {
                 reason: MemoryLimitReason::BufferLimit,
             });
         }
-        if self.family == inference_infra::decoder::config::DecoderFamily::Llama3 {
-            return rendering::llama3_projected_tool_token_upper_bound(
+        if self.family == BackendFamily::Gemma4 {
+            return rendering::gemma4_projected_tool_token_upper_bound(
                 &data.tokenizer,
                 rendered,
                 projection.result_count,
                 projection.additional_rendered_bytes,
+            );
+        }
+        if self.family == BackendFamily::Ministral3 {
+            return rendering::ministral3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
+        if self.family == BackendFamily::Gemma3 {
+            return rendering::gemma3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
+        if self.family == BackendFamily::Phi {
+            return rendering::phi_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                additional_bytes,
+            );
+        }
+        if self.family.xml_tools() {
+            return rendering::qwen35_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+                projection.additional_ascii_escape_bytes,
+            );
+        }
+        if self.family == BackendFamily::SmolLm3 {
+            return rendering::smollm3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                projection.additional_rendered_bytes,
+            );
+        }
+        if self.family == BackendFamily::Llama3 {
+            return rendering::llama3_projected_tool_token_upper_bound(
+                &data.tokenizer,
+                rendered,
+                projection.result_count,
+                additional_bytes,
             );
         }
         rendering::qwen3_projected_tool_token_upper_bound(
@@ -780,7 +1177,7 @@ impl RuntimeBackend for Qwen3Backend {
                 &context,
                 &binding,
                 data.tokenizer.as_ref(),
-                &qwen3_rendering_options(),
+                &family_rendering_options(self.family),
                 limits,
             )
             .map_err(|error| match error {
@@ -796,7 +1193,7 @@ impl RuntimeBackend for Qwen3Backend {
                 other => other,
             })?;
             // Count overflow here; generation admission enforces profile limits.
-            let vocabulary = as_u64(data.config.vocab_size)?;
+            let vocabulary = as_u64(data.config.vocabulary())?;
             if rendered
                 .token_ids()
                 .iter()
@@ -828,31 +1225,31 @@ impl RuntimeBackend for Qwen3Backend {
             let load_peak = loading_peak_bound(data, &self.limits)?;
             // Full f32 KV overlap dominates long Llama requests. Bound the
             // per-layer attention workspace further once capacity exceeds 16k.
-            let chunk_tokens = if !data.config.has_qk_norm() && capacity > 16_384 {
-                self.limits.prefill_chunk_tokens.get().min(32)
-            } else {
-                self.limits.prefill_chunk_tokens.get()
-            };
+            let chunk_tokens = data
+                .config
+                .chunk_limit(self.limits.prefill_chunk_tokens.get(), capacity);
             let prefill_chunk_tokens =
                 NonZeroUsize::new(chunk_tokens).expect("nonzero configured chunk");
+            let mut load_limits =
+                ModelLoadLimits::new(data.source_bytes, data.resident_bound, load_peak)?;
+            if matches!(&data.config, BackendConfig::Transformer(config)
+                if config.kv_update_mode(capacity) == inference_infra::kv_cache::KvUpdateMode::Layerwise)
+            {
+                load_limits = load_limits.with_scratch_released_before_cache();
+            }
             Ok(RuntimePlan {
-                load_limits: ModelLoadLimits::new(
-                    data.source_bytes,
-                    data.resident_bound,
-                    load_peak,
-                )?,
+                load_limits,
                 cache: CacheAllocationRequest::new(
                     family_cache_mode(self.family)?,
                     capacity,
                     sum(&[
-                        cache_bound(&data.config, capacity)?,
+                        data.config.cache_bound(capacity, chunk_tokens)?,
                         product(self.limits.execution_headroom_bytes, 2)?,
                     ])?,
                 )?,
                 // Prefill cannot process more tokens than this request
                 // supplies. Keep a one-token allowance for decode work.
-                temporary_bytes: workspace_bound(
-                    &data.config,
+                temporary_bytes: data.config.workspace_bound(
                     capacity,
                     chunk_tokens.min(input_tokens.max(1)),
                     self.limits.max_token_bytes,
@@ -929,31 +1326,35 @@ impl RuntimeBackend for Qwen3Backend {
         registry: &Registry,
         profile: &ModelProfileId,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
-        let resolved = registry.resolve_profile(profile)?;
-        let data = self.data(resolved.artifact())?;
         if self.tool_call_parsing {
             return Err(EngineError::unsupported(
                 "admitted parser storage",
                 "tool generation requires the storage-backed decoder construction hook",
             ));
         }
-        let parser = if self.tool_call_parsing {
-            Some(
-                qwen3::tool_calls::ToolCallParser::new(self.tool_parser_limits())
-                    .map_err(|error| execution_error("tool call parser", error.to_string()))?,
-            )
-        } else {
-            None
-        };
+        self.json_decoder(registry, profile)
+    }
+
+    fn json_decoder(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
         Ok(Box::new(Qwen3TextDecoder {
             tokenizer: Arc::clone(&data.tokenizer),
             special_tokens: Arc::clone(&data.special_tokens),
             byte_decoder: Arc::clone(&data.byte_decoder),
+            gemma_decoder: data.gemma_decoder,
             pending: Vec::new(),
             max_token_bytes: self.limits.max_token_bytes,
             finished: false,
-            parser,
+            parser: None,
             slab: None,
+            xml: None,
+            token_protocol: None,
+            phi: None,
             completed_slab: None,
         }))
     }
@@ -968,12 +1369,96 @@ impl RuntimeBackend for Qwen3Backend {
         self.selected_parser_capacities()
     }
 
+    fn decoder_with_tool_context(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        self.decoder_with_tool_mode(
+            registry,
+            profile,
+            allocation,
+            tools,
+            crate::types::ToolCallMode::Batch,
+        )
+    }
+
+    fn decoder_with_tool_mode(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+        mode: crate::types::ToolCallMode,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if mode == crate::types::ToolCallMode::Single
+            && (self.family != BackendFamily::Qwen3Coder
+                || !self.tool_call_parsing
+                || tools.is_none())
+        {
+            return Err(EngineError::unsupported(
+                "tool_call_mode",
+                "single-call decoding requires Qwen3 Coder with tools",
+            ));
+        }
+        if !self.family.xml_tools() || !self.tool_call_parsing {
+            return self.decoder_with_parser_allocation(registry, profile, allocation);
+        }
+        let resolved = registry.resolve_profile(profile)?;
+        let data = self.data(resolved.artifact())?;
+        let limits = self
+            .selected_parser_capacities()?
+            .ok_or_else(|| internal("missing hybrid parser capacities"))?;
+        let expected = ParserAllocation::required_bytes(limits)
+            .map_err(|e| EngineError::invalid_request("parser capacities", e.to_string()))?;
+        let allocation = allocation.ok_or_else(|| {
+            EngineError::invalid_request(
+                "parser allocation",
+                "hybrid tools require the admitted slab",
+            )
+        })?;
+        if allocation.reserved_bytes() != expected {
+            return Err(internal(
+                "hybrid parser allocation differs from planned size",
+            ));
+        }
+        let xml = crate::slab_parser::XmlToolParser::new(
+            allocation,
+            output::HybridToolSchema(tools),
+            self.tool_parser_limits().max_output_bytes,
+        )?
+        .with_tool_call_mode(mode);
+        output::box_slab_decoder(Qwen3TextDecoder {
+            tokenizer: Arc::clone(&data.tokenizer),
+            special_tokens: Arc::clone(&data.special_tokens),
+            byte_decoder: Arc::clone(&data.byte_decoder),
+            gemma_decoder: data.gemma_decoder,
+            pending: Vec::new(),
+            max_token_bytes: self.limits.max_token_bytes,
+            finished: false,
+            parser: None,
+            slab: None,
+            xml: Some(xml),
+            token_protocol: None,
+            phi: None,
+            completed_slab: None,
+        })
+    }
+
     fn decoder_with_parser_allocation(
         &self,
         registry: &Registry,
         profile: &ModelProfileId,
         allocation: Option<ParserAllocation>,
     ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if self.family.xml_tools() && self.tool_call_parsing {
+            return Err(EngineError::invalid_request(
+                "tool schemas",
+                "use the generation-bound decoder hook",
+            ));
+        }
         let resolved = registry.resolve_profile(profile)?;
         self.data(resolved.artifact())?;
         match (self.selected_parser_capacities()?, allocation) {
@@ -988,19 +1473,58 @@ impl RuntimeBackend for Qwen3Backend {
                     ));
                 }
                 let data = self.data(resolved.artifact())?;
-                let slab = crate::slab_parser::SlabParser::new(
-                    allocation,
-                    self.tool_parser_limits().max_output_bytes,
-                )?;
+                let max_output = self.tool_parser_limits().max_output_bytes;
+                let (slab, phi, token_protocol) = match self.family {
+                    BackendFamily::Gemma4 => (
+                        None,
+                        None,
+                        Some(output::TokenProtocol::Gemma4 {
+                            parser: crate::slab_parser::gemma4::Gemma4ToolParser::new(
+                                allocation, max_output,
+                            ),
+                            eos: None,
+                        }),
+                    ),
+                    BackendFamily::Ministral3 => (
+                        None,
+                        None,
+                        Some(output::TokenProtocol::Ministral(
+                            crate::slab_parser::ministral3::MinistralToolParser::new(
+                                allocation, max_output,
+                            ),
+                        )),
+                    ),
+                    BackendFamily::Phi => (
+                        None,
+                        Some(
+                            crate::slab_parser::PhiToolParser::new(allocation, max_output)?
+                                .with_terminal_list(),
+                        ),
+                        None,
+                    ),
+                    _ => {
+                        let parser = crate::slab_parser::SlabParser::new(allocation, max_output)?;
+                        let parser = if self.family == BackendFamily::Gemma3 {
+                            parser.with_terminal_call()
+                        } else {
+                            parser
+                        };
+                        (Some(parser), None, None)
+                    }
+                };
                 output::box_slab_decoder(Qwen3TextDecoder {
                     tokenizer: Arc::clone(&data.tokenizer),
                     special_tokens: Arc::clone(&data.special_tokens),
                     byte_decoder: Arc::clone(&data.byte_decoder),
+                    gemma_decoder: data.gemma_decoder,
                     pending: Vec::new(),
                     max_token_bytes: self.limits.max_token_bytes,
                     finished: false,
                     parser: None,
-                    slab: Some(slab),
+                    slab,
+                    xml: None,
+                    phi,
+                    token_protocol,
                     completed_slab: None,
                 })
             }
@@ -1063,35 +1587,68 @@ impl RuntimeBackend for Qwen3Backend {
 include!("cache.rs");
 
 fn registration_for(
-    family: inference_infra::decoder::config::DecoderFamily,
+    family: BackendFamily,
     context_limit: usize,
     execution: Qwen3Execution,
 ) -> Result<FamilyRegistration, EngineError> {
-    let llama = family == inference_infra::decoder::config::DecoderFamily::Llama3;
+    let hybrid = family.hybrid();
+    let coder = family == BackendFamily::Qwen3Coder;
+    let llama = family == BackendFamily::Llama3;
+    let smollm = family == BackendFamily::SmolLm3;
+    let ministral = family == BackendFamily::Ministral3;
+    let phi = family == BackendFamily::Phi;
+    let gemma = family == BackendFamily::Gemma3;
     let mut representations = vec![
         WeightRepresentation::F32,
         WeightRepresentation::Affine4 {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
     ];
-    if llama {
+    if llama || smollm || hybrid || phi || gemma || ministral || coder {
         representations.push(WeightRepresentation::Affine8 {
             group_size: NonZeroUsize::new(64).unwrap(),
         });
+    }
+    if coder {
+        representations.retain(|r| *r != WeightRepresentation::F32);
+    }
+    let gemma4 = family == BackendFamily::Gemma4;
+    if gemma4 {
+        representations = vec![WeightRepresentation::Affine4 {
+            group_size: NonZeroUsize::new(64).unwrap(),
+        }];
     }
     FamilyRegistration::new(
         // Packed vocabulary lookup and quantized output projection change
         // numerical execution. Old native/disk state must miss this version.
         FamilyVersion::new(
-            if llama {
+            if hybrid || phi || gemma || gemma4 || ministral || coder {
+                1
+            } else if smollm {
+                smollm::register::IMPL_VERSION
+            } else if llama {
                 llama3::register::IMPL_VERSION
             } else {
                 qwen3::register::IMPL_VERSION
             },
             5,
-            0,
+            u32::from(gemma || llama || coder), // Revised KV layouts or single-call tool protocol.
         ),
-        (if llama {
+        (if coder {
+            &["Qwen3MoeForCausalLM"][..]
+        } else if ministral {
+            &["Mistral3ForConditionalGeneration"][..]
+        } else if gemma4 {
+            &["Gemma4ForConditionalGeneration"][..]
+        } else if gemma {
+            &["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"][..]
+        } else if phi {
+            &["Phi3ForCausalLM"][..]
+        } else if hybrid {
+            &["Qwen3_5ForConditionalGeneration"][..]
+        } else if smollm {
+            smollm::register::ARCHITECTURES
+        } else if llama {
             llama3::register::ARCHITECTURES
         } else {
             qwen3::register::ARCHITECTURES
@@ -1101,14 +1658,33 @@ fn registration_for(
         .collect(),
         Capabilities {
             task: "text-generation".to_owned(),
-            family: if llama { "llama3" } else { "qwen3" }.to_owned(),
+            family: if coder {
+                "qwen3-coder"
+            } else if ministral {
+                "ministral3"
+            } else if gemma4 {
+                "gemma4"
+            } else if gemma {
+                "gemma3"
+            } else if phi {
+                "phi"
+            } else if hybrid {
+                "qwen35"
+            } else if smollm {
+                "smollm3"
+            } else if llama {
+                "llama3"
+            } else {
+                "qwen3"
+            }
+            .to_owned(),
             backend: execution.backend(),
             weight_representations: representations,
             cache_modes: vec![family_cache_mode(family)?],
             context_limit_tokens: context_limit,
             supports_streaming: true,
             supports_incremental_kv: true,
-            supports_prefix_reuse: true,
+            supports_prefix_reuse: !gemma && !gemma4,
             decoding_modes: vec![DecodingCapability::Greedy],
         },
     )
@@ -1125,6 +1701,123 @@ fn qwen3_rendering_options() -> RenderingOptions<'static> {
         lstrip_blocks: false,
         reserved_spellings: QWEN3_RESERVED_SPELLINGS,
     }
+}
+
+fn family_rendering_options(family: BackendFamily) -> RenderingOptions<'static> {
+    let mut options = qwen3_rendering_options();
+    if family == BackendFamily::Qwen3Coder {
+        options.trim_blocks = true;
+        options.lstrip_blocks = true;
+        options.reserved_spellings = &[
+            "<|",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<function",
+            "</function>",
+            "<parameter",
+            "</parameter",
+            "<tools>",
+            "</tools>",
+            "<name>",
+            "</name>",
+            "<description>",
+            "</description>",
+            "<IMPORTANT>",
+            "</IMPORTANT>",
+            "<required>",
+            "</required>",
+            "<enum>",
+            "</enum>",
+            "<type>",
+            "</type>",
+            "<return>",
+            "</return>",
+        ];
+    }
+    if family == BackendFamily::Ministral3 {
+        options.reserved_spellings = &[
+            "<s>",
+            "</s>",
+            "<unk>",
+            "<pad>",
+            "<SPECIAL_",
+            "[INST]",
+            "[/INST]",
+            "[AVAILABLE_TOOLS]",
+            "[/AVAILABLE_TOOLS]",
+            "[TOOL_RESULTS]",
+            "[/TOOL_RESULTS]",
+            "[TOOL_CALLS]",
+            "[IMG]",
+            "[IMG_BREAK]",
+            "[IMG_END]",
+            "[PREFIX]",
+            "[MIDDLE]",
+            "[SUFFIX]",
+            "[SYSTEM_PROMPT]",
+            "[/SYSTEM_PROMPT]",
+            "[TOOL_CONTENT]",
+            "[AUDIO]",
+            "[BEGIN_AUDIO]",
+            "[ARGS]",
+            "[CALL_ID]",
+            "[THINK]",
+            "[/THINK]",
+        ];
+    }
+    if family == BackendFamily::Gemma4 {
+        options.reserved_spellings = &[
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<unk>",
+            "<mask>",
+            "<|tool>",
+            "<tool|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|\"|>",
+            "<|think|>",
+            "<|channel>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
+            "<|image>",
+            "<|audio>",
+            "<|image|>",
+            "<|audio|>",
+            "<image|>",
+            "<audio|>",
+            "<|video|>",
+        ];
+    }
+    if family == BackendFamily::Gemma3 {
+        // These are tokenizer control delimiters, never user text boundaries.
+        options.reserved_spellings = &[
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<unk>",
+            "<start_of_",
+            "<end_of_",
+            "<image>",
+            "<image_soft_token>",
+            "<unused",
+            "<mask>",
+            "<0x",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+        ];
+    }
+    options
 }
 
 fn byte_decoder_map() -> BTreeMap<char, u8> {
@@ -1300,27 +1993,76 @@ mod shared_rendering_wiring_tests;
 #[path = "../../../tests/unit/backends_qwen_dense_weight_planning_regressions.rs"]
 mod dense_weight_planning_regressions;
 
-fn family_template(
-    family: inference_infra::decoder::config::DecoderFamily,
-    tools: bool,
-) -> &'static str {
+fn family_template(family: BackendFamily, tools: bool) -> &'static str {
     match (family, tools) {
-        (inference_infra::decoder::config::DecoderFamily::Qwen3, false) => CHAT_TEMPLATE,
-        (inference_infra::decoder::config::DecoderFamily::Qwen3, true) => {
-            qwen3::template::TOOL_CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::Llama3, false) => {
-            llama3::template::CHAT_TEMPLATE
-        }
-        (inference_infra::decoder::config::DecoderFamily::Llama3, true) => {
-            llama3::template::TOOL_CHAT_TEMPLATE
-        }
+        (BackendFamily::Qwen3Coder, false) => QWEN3_CODER_TEXT_TEMPLATE,
+        (BackendFamily::Qwen3Coder, true) => QWEN3_CODER_TOOL_TEMPLATE,
+        (BackendFamily::Ministral3, false) => MINISTRAL3_TEXT_TEMPLATE,
+        (BackendFamily::Ministral3, true) => MINISTRAL3_TOOL_TEMPLATE,
+        (BackendFamily::Gemma4, false) => GEMMA4_TEXT_TEMPLATE,
+        (BackendFamily::Gemma4, true) => GEMMA4_TOOL_TEMPLATE,
+        (BackendFamily::Gemma3, false) => GEMMA3_TEXT_TEMPLATE,
+        (BackendFamily::Gemma3, true) => GEMMA3_TOOL_TEMPLATE,
+        (BackendFamily::Phi, false) => PHI_TEXT_TEMPLATE,
+        (BackendFamily::Phi, true) => PHI_TOOL_TEMPLATE,
+        (BackendFamily::Ornith, false) => ORNITH_TEXT_TEMPLATE,
+        (BackendFamily::Ornith, true) => ORNITH_TOOL_TEMPLATE,
+        (BackendFamily::Qwen35, false) => QWEN35_TEXT_TEMPLATE,
+        (BackendFamily::Qwen35, true) => QWEN35_TOOL_TEMPLATE,
+        (BackendFamily::Qwen3, false) => CHAT_TEMPLATE,
+        (BackendFamily::Qwen3, true) => qwen3::template::TOOL_CHAT_TEMPLATE,
+        (BackendFamily::Llama3, false) => llama3::template::CHAT_TEMPLATE,
+        (BackendFamily::Llama3, true) => llama3::template::TOOL_CHAT_TEMPLATE,
+        (BackendFamily::SmolLm3, false) => smollm::template::CHAT_TEMPLATE,
+        (BackendFamily::SmolLm3, true) => smollm::template::TOOL_CHAT_TEMPLATE,
     }
 }
-fn family_cache_mode(
-    family: inference_infra::decoder::config::DecoderFamily,
-) -> Result<CacheMode, EngineError> {
-    if family == inference_infra::decoder::config::DecoderFamily::Llama3 {
+fn family_cache_mode(family: BackendFamily) -> Result<CacheMode, EngineError> {
+    if family == BackendFamily::Qwen3Coder {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new("qwen3-coder.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::Ministral3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new("ministral3.mlx-f32.full.bhtd.v1")?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::Gemma4 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(
+                "gemma4.mlx-f32.shared-full-and-sliding.v1",
+            )?,
+            kind: CacheKind::Mixed,
+        });
+    }
+    if family == BackendFamily::Gemma3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(GEMMA3_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Mixed,
+        });
+    }
+    if family == BackendFamily::Phi {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(PHI_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family.hybrid() {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(QWEN35_CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::SmolLm3 {
+        return Ok(CacheMode {
+            representation: CacheRepresentationId::new(smollm::register::CACHE_REPRESENTATION)?,
+            kind: CacheKind::Full,
+        });
+    }
+    if family == BackendFamily::Llama3 {
         Ok(CacheMode {
             representation: CacheRepresentationId::new(llama3::register::CACHE_REPRESENTATION)?,
             kind: CacheKind::Full,

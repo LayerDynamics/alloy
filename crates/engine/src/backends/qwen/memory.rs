@@ -94,7 +94,7 @@ fn loading_peak_bound(
     let decode_peak = sum(&[host_limit, as_u64(workspace)?])?;
     let upload_peak = sum(&[
         host_limit.max(data.resident_bound),
-        largest_upload_buffer_bound(&data.config)?,
+        data.config.largest_upload()?,
     ])?;
     sum(&[decode_peak.max(upload_peak), limits.loader_headroom_bytes])
 }
@@ -253,24 +253,44 @@ fn workspace_bound(
     token_bytes: usize,
 ) -> Result<u64, EngineError> {
     let layers = as_u64(config.num_layers)?;
-    let t = as_u64(chunk_tokens.min(capacity).max(1))?;
+    let batch = chunk_tokens.min(capacity).max(1);
+    let t = as_u64(batch)?;
+    let attention_rows = as_u64(config.attention_tile_tokens(capacity, batch))?;
     let s = as_u64(capacity)?;
     let h = as_u64(config.hidden_size)?;
     let q = product(as_u64(config.q_heads)?, as_u64(config.head_dim)?)?;
     let kv = product(as_u64(config.kv_heads)?, as_u64(config.head_dim)?)?;
     let i = as_u64(config.intermediate_size)?;
+    let coder = config.family == inference_infra::decoder::config::DecoderFamily::Qwen3Moe;
+    let live_layers = if config.evaluates_each_layer(capacity) { 1 } else { layers };
+    // Eight selected expert activations, output projections, and router
+    // probabilities/indices for the pinned 128-expert model.
+    let routed_work = if coder {
+        let expert_elements = sum(&[product(6, i)?, product(4, h)?])?;
+        // Large gathers hold one reordered input and one restored projection
+        // plus the flat expert IDs, permutations and token indices.
+        let ordering = if t >= 8 { product(8, sum(&[product(2, h)?, 6])?)? } else { 0 };
+        let router_and_experts = sum(&[product(8, expert_elements)?, 6 * 128, ordering])?;
+        product(t, router_and_experts)?
+    } else {
+        0
+    };
     let per_layer_elements = sum(&[
+        routed_work,
         product(12, product(t, h)?)?,
         product(12, product(t, q)?)?,
         product(12, product(t, kv)?)?,
         product(10, product(t, i)?)?,
-        product(8, product(product(as_u64(config.q_heads)?, t)?, s)?)?,
+        product(8, product(product(as_u64(config.q_heads)?, attention_rows)?, s)?)?,
+        // Tiled execution can overlap a previous prefix, its next tile and
+        // their concatenation. The two inputs together fit one batch.
+        if attention_rows < t { product(2, product(t, q)?)? } else { 0 },
         product(4, product(s, kv)?)?,
     ])?;
     sum(&[
-        product(product(if config.has_qk_norm() { layers } else { 1 }, per_layer_elements)?, 4)?,
+        product(product(live_layers, per_layer_elements)?, 4)?,
         product(product(t, h)?, 16)?,
-        product(logits_payload_bound(config)?, if config.has_qk_norm() { 1 } else { t })?,
+        product(logits_payload_bound(config)?, t)?,
         product(as_u64(token_bytes)?, 8)?,
         product(sum(&[layers, 64])?, 256)?,
         32,

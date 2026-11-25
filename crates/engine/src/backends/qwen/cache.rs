@@ -114,7 +114,7 @@ fn cache_spec(config: &Qwen3Config, capacity: usize) -> KvCacheSpec {
 
 fn cache_bound(config: &Qwen3Config, capacity: usize) -> Result<u64, EngineError> {
     cache_spec(config, capacity)
-        .payload_plan()
+        .payload_plan_for(config.kv_update_mode(capacity))
         .map(|plan| plan.update_overlap_bytes)
         .map_err(|e| cache_error(e, "plan MLX Qwen KV overlap"))
 }

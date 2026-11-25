@@ -1,0 +1,123 @@
+{
+  "id": "gemma-4-e4b-it-4bit",
+  "source": {
+    "repository": "google/gemma-4-E4B-it",
+    "revision": "4ecc2ba63bcac23ba4a767fc87025b1450f84c9c",
+    "declared_license": "Apache-2.0",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 27956,
+        "sha256": "b21e4f69614ccd77baa2f3797d05311040dee07b989cb9f0d25111aa4b605b2c"
+      },
+      {
+        "path": "config.json",
+        "bytes": 5145,
+        "sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4"
+      }
+    ]
+  },
+  "artifact": {
+    "repository": "mlx-community/gemma-4-e4b-it-4bit",
+    "revision": "475b9088d29754a3379866cf5aeb6b41acd313c2",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 593,
+        "sha256": "8e9717df49219943b8992eeccecd8050535318d34fffbbaeaac924ed01f27155"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 17336,
+        "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+      },
+      {
+        "path": "config.json",
+        "bytes": 6628,
+        "sha256": "780ccb3a514a5f1ced161d383f948fc22eca9b84b752ca19494f625bd9bad7a6"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 208,
+        "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 5146800534,
+        "sha256": "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 240961,
+        "sha256": "f8accac59ee7efe87e0c298c854610b262c3cadd477407503147c71209ff0093"
+      },
+      {
+        "path": "processor_config.json",
+        "bytes": 1316,
+        "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 32169626,
+        "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 2740,
+        "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"
+      }
+    ]
+  },
+  "quantization": {
+    "mode": "affine",
+    "group_size": 64,
+    "bits": 4
+  },
+  "modalities": [
+    "text"
+  ],
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "prompt_tokens": [
+    [
+      50702,
+      236743,
+      236778,
+      900,
+      236743,
+      236778,
+      236761,
+      25685,
+      21485,
+      236761
+    ],
+    [
+      155122,
+      3217,
+      506,
+      7217,
+      563,
+      3730,
+      236761
+    ]
+  ],
+  "decode_tokens": [
+    3730,
+    236761
+  ],
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "source_sha256": {
+      "gemma4.py": "4671e4a63cb9849582abac566599a0a85370a46d410f4ad69d81a88788d00fd8",
+      "gemma4_text.py": "db56d5451f348decdae4058322c1447b8a4af67e81be41ad5f3ad8c4c2ecf3bb",
+      "rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a"
+    },
+    "sha256": "c228714b8d3ae93ba57d9f4fdaccf1407d440342b7fdf5b0063872403a9073cd"
+  }
+}

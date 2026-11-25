@@ -184,6 +184,13 @@ fn build_and_link(mlx_c: &Path, vendor: &Path, target_os: &str) {
             .define("CMAKE_OSX_DEPLOYMENT_TARGET", "14.0");
     } else if on_linux {
         cfg.define("MLX_BUILD_METAL", "OFF");
+        if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+            && env::var("OPT_LEVEL").as_deref() == Ok("0")
+        {
+            // GCC needs optimization to contract the packed CPU quantized
+            // matmul's multiply-adds as in the upstream ARM64 kernel.
+            cfg.cxxflag("-O2");
+        }
     }
 
     if env::var_os("MLX_FFI_ASAN").is_some() {

@@ -7,6 +7,7 @@ use crate::{
     store::IntentAdmission,
     tool_execution::ReceiptExecutor,
 };
+use engine::types::ToolCallMode;
 use serde_json::{Value, json};
 use tool_registry::{
     call::{ToolCall, ToolCallContext, ToolInvocation},
@@ -84,6 +85,40 @@ impl<E: Engine> Supervisor<E> {
         user: &str,
         config: ToolLoopConfig,
         cancel: &CancellationToken,
+        started: S,
+        finished: D,
+        emit: F,
+    ) -> HarnessResult<TurnOutcome>
+    where
+        S: FnMut(&RequestId) -> HarnessResult<()>,
+        D: FnMut(&RequestId) -> HarnessResult<()>,
+        F: FnMut(ToolLoopEvent) -> HarnessResult<()>,
+    {
+        self.run_tool_turn_in_mode(
+            store,
+            runtime,
+            session,
+            user,
+            config,
+            ToolCallMode::Batch,
+            cancel,
+            started,
+            finished,
+            emit,
+        )
+    }
+
+    /// Run a turn with caller-selected tool generation boundaries and the same execution policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tool_turn_in_mode<S, D, F>(
+        &self,
+        store: &Mutex<SessionStore>,
+        runtime: &ToolRuntime,
+        session: &str,
+        user: &str,
+        config: ToolLoopConfig,
+        tool_call_mode: ToolCallMode,
+        cancel: &CancellationToken,
         mut started: S,
         mut finished: D,
         mut emit: F,
@@ -111,7 +146,10 @@ impl<E: Engine> Supervisor<E> {
                 .append_event(
                     session,
                     EventKind::RunStarted,
-                    json!({"mode":"tools"}),
+                    match tool_call_mode {
+                        ToolCallMode::Batch => json!({"mode":"tools"}),
+                        ToolCallMode::Single => json!({"mode":"tools","tool_call_mode":"single"}),
+                    },
                     json!([]),
                 )?
                 .seq
@@ -133,6 +171,7 @@ impl<E: Engine> Supervisor<E> {
                         round,
                     },
                     config.round,
+                    tool_call_mode,
                     Some(cancel),
                     |id| {
                         live(store, session, cancel, config.round.deadline)?;
@@ -546,6 +585,7 @@ impl<E: Engine> Supervisor<E> {
         };
         let mut blocks = Vec::with_capacity(proposed.len().saturating_mul(2));
         let mut result_limits = Vec::with_capacity(proposed.len());
+        let mut denied_result_bytes = 0usize;
         for (index, (name, arguments)) in proposed.iter().enumerate() {
             let number = prior_calls
                 .checked_add(index)
@@ -566,6 +606,16 @@ impl<E: Engine> Supervisor<E> {
             // Error and artifact representations need space even for a denied
             // call or a small policy output cap. Accepted inline JSON is bounded
             // by the immutable policy binding's effective output limit.
+            blocks.push(ToolHistoryBlock::AssistantCall {
+                call_id: call_id.clone(),
+                tool_id: name.clone(),
+                arguments: arguments.clone(),
+            });
+            blocks.push(ToolHistoryBlock::ToolResult {
+                call_id,
+                content: String::new(),
+                is_error: false,
+            });
             let output_limit =
                 match runtime
                     .policy
@@ -579,7 +629,19 @@ impl<E: Engine> Supervisor<E> {
                         .ok_or_else(|| {
                             HarnessError::Invalid("missing projected output limit".into())
                         })?,
-                    _ => 0,
+                    Ok(PolicyDecision::Deny(_)) => {
+                        // Immutable policy persists a Rejected terminal marker. Its
+                        // model-visible bound already includes markup escaping in
+                        // terminal_error_context. Reserve enclosing string escaping
+                        // once, without charging the markup expansion again.
+                        denied_result_bytes = denied_result_bytes
+                            .checked_add(2 * crate::context::MODEL_ERROR_CONTEXT_BYTES)
+                            .ok_or_else(|| {
+                                HarnessError::Engine("projected denial overflow".into())
+                            })?;
+                        continue;
+                    }
+                    Err(_) => 0,
                 };
             let output_limit = usize::try_from(output_limit).map_err(|_| {
                 HarnessError::Engine("projected tool output limit is too large".into())
@@ -609,16 +671,6 @@ impl<E: Engine> Supervisor<E> {
             // bytes while retaining the full result in the durable event.
             let error_limit = crate::context::MODEL_ERROR_CONTEXT_BYTES;
             result_limits.push((streaming, inline_limit, error_limit));
-            blocks.push(ToolHistoryBlock::AssistantCall {
-                call_id: call_id.clone(),
-                tool_id: name.clone(),
-                arguments: arguments.clone(),
-            });
-            blocks.push(ToolHistoryBlock::ToolResult {
-                call_id,
-                content: String::new(),
-                is_error: false,
-            });
         }
         let snapshot = ContextBuilder::build_projected_tool_snapshot(
             request_id.as_str(),
@@ -665,6 +717,7 @@ impl<E: Engine> Supervisor<E> {
                 .ok_or_else(|| HarnessError::Engine("projected escape overflow".into()))?;
             let extra = base
                 .checked_add(ascii_escape)
+                .and_then(|n| n.checked_add(denied_result_bytes))
                 .ok_or_else(|| HarnessError::Engine("projected result overflow".into()))?;
             let json_bytes = extra
                 .checked_mul(2)

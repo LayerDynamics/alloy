@@ -13,6 +13,86 @@ use tokenizers::{
     Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::WhitespaceSplit,
 };
 
+#[test]
+fn xml_tool_context_resolves_declared_types_and_rejects_ambiguity() {
+    use engine::slab_parser::{XmlParameterType as Kind, XmlToolSchema};
+    fn tools(property: Value) -> ToolContext {
+        ToolContext::new(
+            vec![definition(
+                json!({"type":"object", "properties":{"path":property}}),
+            )],
+            vec![],
+            tool_limits(),
+        )
+        .unwrap()
+    }
+    for (declared, expected) in [
+        ("string", Kind::String),
+        ("integer", Kind::Integer),
+        ("number", Kind::Number),
+        ("boolean", Kind::Boolean),
+        ("object", Kind::Object),
+        ("array", Kind::Array),
+        ("null", Kind::Null),
+    ] {
+        let tools = tools(json!({"type":declared}));
+        tools.validate_tool("fs.read").unwrap();
+        assert_eq!(
+            tools.parameter_type("fs.read", "path", "null").unwrap(),
+            expected
+        );
+        assert!(tools.validate_tool("unknown").is_err());
+        assert!(tools.parameter_type("fs.read", "unknown", "value").is_err());
+    }
+    let nullable = tools(json!({"type":["null","string"]}));
+    assert_eq!(
+        nullable.parameter_type("fs.read", "path", "NULL").unwrap(),
+        Kind::Null
+    );
+    assert_eq!(
+        nullable.parameter_type("fs.read", "path", "00123").unwrap(),
+        Kind::String
+    );
+    let shared = std::sync::Arc::new(nullable);
+    assert_eq!(
+        shared.parameter_type("fs.read", "path", "true").unwrap(),
+        Kind::String
+    );
+    for property in [
+        json!({}),
+        json!(true),
+        json!({"type":"unknown"}),
+        json!({"type":["integer","string"]}),
+        json!({"type":["string","null","integer"]}),
+        json!({"type":["unknown","null"]}),
+        json!({"type":[null,"null"]}),
+        json!({"type":["null","null"]}),
+        json!({"type":42}),
+        json!({"type":"string","$ref":"#/$defs/path"}),
+        json!({"type":"string","anyOf":[{"type":"string"}]}),
+    ] {
+        assert!(
+            tools(property)
+                .parameter_type("fs.read", "path", "null")
+                .is_err()
+        );
+    }
+    for root in [
+        json!(true),
+        json!({"type":"array"}),
+        json!({"type":"object","allOf":[]}),
+    ] {
+        let tools = ToolContext::new(vec![definition(root)], vec![], tool_limits()).unwrap();
+        assert!(tools.validate_tool("fs.read").is_err());
+    }
+    let original = snapshot().with_tool_context(tools(json!({"type":"string"})));
+    let cloned = original.clone();
+    assert!(std::ptr::eq(
+        original.tool_context().unwrap(),
+        cloned.tool_context().unwrap()
+    ));
+}
+
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -118,6 +198,52 @@ fn render(
     };
     rendering::render_and_count(context, &binding, &tokenizer, &options(), limits)
         .expect("render/count")
+}
+
+#[test]
+fn llama_error_guidance_follows_typed_results_in_the_pending_batch() {
+    let header = |blocks| {
+        let tools = ToolContext::new(vec![definition(schema("string"))], blocks, tool_limits())
+            .expect("tool context");
+        let rendered = render(
+            &snapshot().with_tool_context(tools),
+            llama3::template::TOOL_CHAT_TEMPLATE,
+            limits(),
+        );
+        rendered
+            .text()
+            .split_once("<|eot_id|>")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+    let ordinary = header(Vec::new());
+    let mut blocks = history();
+    let ToolHistoryBlock::ToolResult {
+        content, is_error, ..
+    } = &mut blocks[1]
+    else {
+        unreachable!();
+    };
+    *content = r#"{"is_error":true}"#.into();
+    *is_error = false;
+    assert_eq!(header(blocks.clone()), ordinary);
+    if let ToolHistoryBlock::ToolResult { is_error, .. } = &mut blocks[1] {
+        *is_error = true;
+    }
+    assert_eq!(
+        header(blocks.clone()),
+        format!(
+            "{} {}\n",
+            ordinary.trim_end_matches('\n'),
+            llama3::template::TOOL_ERROR_GUIDANCE.trim()
+        ),
+    );
+    blocks.push(ToolHistoryBlock::Text(Message {
+        role: MessageRole::User,
+        content: "The last tool result is an error.".into(),
+    }));
+    assert_eq!(header(blocks), ordinary);
 }
 
 #[test]

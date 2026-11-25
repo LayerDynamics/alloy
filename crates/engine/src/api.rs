@@ -345,6 +345,28 @@ impl<R: EngineRuntime> EngineCore<R> {
         }
     }
 
+    /// Install and evaluate a trusted profile suite before publishing this engine to any callers.
+    pub fn with_qualification(
+        mut self,
+        spec: crate::conformance::QualificationSpec,
+        report: &crate::conformance::QualificationReport,
+    ) -> Result<Self, EngineError> {
+        let registry = Arc::get_mut(&mut self.registry).ok_or_else(|| {
+            EngineError::invalid_request("qualification", "engine registry is already shared")
+        })?;
+        let id = ModelProfileId::new(&spec.profile_id)?;
+        registry.require_qualification(spec)?;
+        let verdict = registry.record_qualification(&id, report)?;
+        if !verdict.usable {
+            return Err(EngineError::unsupported(
+                "qualification",
+                verdict.failures.join("; "),
+            ));
+        }
+        registry.resolve_profile(&id)?;
+        Ok(self)
+    }
+
     /// Borrow the registry snapshot used by this engine.
     ///
     /// Inspection does not load models or acquire reservations.

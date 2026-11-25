@@ -123,6 +123,7 @@ pub fn parse_config(value: &Value) -> Result<DecoderConfig, ModelError> {
         family: DecoderFamily::Llama3,
         rms_eps: positive("rms_norm_eps")?,
         rope_scaling,
+        rope_layers: None,
         quantization_bits: bits,
         hidden_size,
         q_heads,

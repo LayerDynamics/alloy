@@ -7,9 +7,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+smollm = { path = "../families/smollm" }
 llama3 = { path = "../families/llama3" }
 serde = { workspace = true }
-serde_json = "=1.0.145"
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 safetensors = "=0.8.0"
 qwen3 = { path = "../families/qwen3" }
 minijinja = { workspace = true }

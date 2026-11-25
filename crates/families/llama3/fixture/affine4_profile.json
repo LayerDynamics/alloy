@@ -1,0 +1,117 @@
+{
+  "id": "llama-3.1-8b-4bit",
+  "artifact": {
+    "repository": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+    "revision": "241a666dad6cb93c8ff213d39a7f34a36bf26db4",
+    "format": "mlx-safetensors",
+    "sha256": "a820507ffdc50b15ccac9be35886d8047a8676f593c17016e1f06f86aa8b486c",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "sha256": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+        "bytes": 1519
+      },
+      {
+        "path": "README.md",
+        "sha256": "a3b7619f21fd22c67f21c6bf6a37485e9856e65a1686f4a834d79e9a195887d6",
+        "bytes": 14433
+      },
+      {
+        "path": "config.json",
+        "sha256": "e809729d4bc2d0fa9a920c91165dfbf79875821c1b357df2aaf51bff07df382e",
+        "bytes": 1017
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "08eff50fa4eb1fe499ead69eaeb4c5177ae82f218da0b55e0e31d7a989debb92",
+        "bytes": 4517488999
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "sha256": "9a76e05055778bb04cacb7aff616b378da0e57c87a181c932037a943efba5997",
+        "bytes": 52381
+      },
+      {
+        "path": "special_tokens_map.json",
+        "sha256": "6f38c73729248f6c127296386e3cdde96e254636cc58b4169d3fd32328d9a8ec",
+        "bytes": 296
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "bbc1904d35169c542dffbe1f7589a5994ec7426d9e5b609d07bab876f32e97ab",
+        "bytes": 9084449
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "0514fcf4017bff6ac7bba1cd68247b841060f3d942c2d428d929d5a932477085",
+        "bytes": 55350
+      }
+    ]
+  },
+  "reference": {
+    "sha256": "df5031505b23fb67fb4299efa42fc25c6eae104b9da67539bf253bda91df90a7",
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2",
+      "tokenizers": "0.23.3"
+    },
+    "recipe": "capture_real_reference.py"
+  },
+  "prompt_tokens": [
+    [
+      128000,
+      128006,
+      882,
+      128007,
+      271,
+      3923,
+      374,
+      220,
+      17,
+      489,
+      220,
+      17,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271
+    ],
+    [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      16533,
+      3613,
+      285,
+      989,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      849,
+      21435,
+      3249,
+      279,
+      13180,
+      374,
+      6437,
+      13,
+      128009,
+      128006,
+      78191,
+      128007,
+      271
+    ]
+  ],
+  "decode_tokens": [
+    19,
+    13
+  ]
+}

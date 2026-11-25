@@ -404,7 +404,7 @@ impl SessionStore {
                 payload: payload.clone(),
                 artifact_refs: artifact_refs.clone(),
             });
-            crate::context::project_skills(&history)?;
+            crate::context::project_skills(&history, None)?;
         }
         let record = append_event_in_tx(&tx, session_id, ts, kind, payload, artifact_refs)?;
         tx.execute(

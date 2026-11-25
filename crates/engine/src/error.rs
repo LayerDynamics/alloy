@@ -312,6 +312,11 @@ pub enum EngineError {
         message: String,
     },
 
+    /// Generation ended before a constrained JSON object was complete.
+    /// Callers may retry this bounded output failure without retrying native,
+    /// allocation, cancellation, or other execution failures.
+    IncompleteStructuredOutput,
+
     /// An engine invariant or checked calculation failed.
     Internal {
         /// Failure explanation.
@@ -336,6 +341,7 @@ impl EngineError {
             Self::CheckpointFormat { .. } => ErrorKind::CheckpointFormat,
             Self::Cancelled { .. } => ErrorKind::Cancelled,
             Self::ExecutionFailed { .. } => ErrorKind::ExecutionFailed,
+            Self::IncompleteStructuredOutput => ErrorKind::ExecutionFailed,
             Self::Internal { .. } => ErrorKind::Internal,
         }
     }
@@ -350,6 +356,9 @@ impl EngineError {
         use serde_json::json;
         let mut report = json!({"kind": self.kind().as_str(), "message": self.to_string()});
         match self {
+            Self::IncompleteStructuredOutput => {
+                report["reason"] = json!("incomplete_structured_output");
+            }
             Self::Busy {
                 active_request_id, ..
             } => {
@@ -640,6 +649,10 @@ impl fmt::Display for EngineError {
 
             Self::ExecutionFailed { stage, message } => {
                 write!(f, "model execution failed during {stage}: {message}")
+            }
+
+            Self::IncompleteStructuredOutput => {
+                write!(f, "generation ended with incomplete structured output")
             }
 
             Self::Internal { message } => {

@@ -52,10 +52,12 @@ impl Qwen3Artifact {
 
 struct ArtifactData {
     specification: Qwen3Artifact,
-    config: Qwen3Config,
+    config: BackendConfig,
     tokenizer: Arc<PinnedTokenizer>,
     special_tokens: Arc<BTreeSet<u32>>,
     byte_decoder: Arc<BTreeMap<char, u8>>,
+    gemma_decoder: bool,
+    max_token_spelling_bytes: usize,
     manifest_sha256: [u8; 32],
     eos: Vec<u32>,
     source_bytes: u64,
@@ -140,7 +142,8 @@ fn parse_json(path: &Path, bytes: &[u8]) -> Result<Value, EngineError> {
         .map_err(|e| EngineError::checkpoint_format("json", Some(path.to_owned()), e))
 }
 
-fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
+/// Validate the dense Qwen3 architecture and dimensions used by the native engine.
+pub fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
     if value.get("model_type").and_then(Value::as_str) != Some("qwen3") {
         return Err(EngineError::unsupported(
             "architecture",
@@ -214,6 +217,7 @@ fn parse_config(value: &Value) -> Result<Qwen3Config, EngineError> {
         family: inference_infra::decoder::config::DecoderFamily::Qwen3,
         rms_eps: 1e-6,
         rope_scaling: None,
+        rope_layers: None,
         quantization_bits: 4,
         hidden_size: dimension("hidden_size")?,
         num_layers: dimension("num_hidden_layers")?,

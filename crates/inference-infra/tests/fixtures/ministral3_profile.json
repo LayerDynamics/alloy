@@ -1,0 +1,110 @@
+{
+  "id": "ministral-3-3b-instruct-2512-4bit",
+  "source": {
+    "repository": "mistralai/Ministral-3-3B-Instruct-2512",
+    "revision": "b35d4dfe56c142746f54dbd64f579faab2744308",
+    "declared_license": "Apache-2.0"
+  },
+  "artifact": {
+    "repository": "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+    "revision": "a962dcb09eee4169c890e544c9eb938f1113fdee",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 914,
+        "sha256": "da10e9cd318bd36448fa6edf613b19c193621e25d7aec374088846b279ff18c7"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7759,
+        "sha256": "c101a09b4ff42e8ed714cb67cd7144176e169b7d7be45d62e1e13326a5d7afd7"
+      },
+      {
+        "path": "config.json",
+        "bytes": 1988,
+        "sha256": "cdd4bfa0a702d0241faaa3b80d15d481d7f8abf2659fba0958b1e7f24a28055f"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 131,
+        "sha256": "e0923390059f84a9180b00e5501778acc45ea9856cd7f2fd68208b360927c677"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 2745210934,
+        "sha256": "69a68c0a961a64bb1145a697a83cf6cec45220d425c77a6c0a3568924078c3b4"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 74906,
+        "sha256": "22e571d413d8aa4e5f81f5ae678aa8b4f5b1d67598a67c08b31182075592ec93"
+      },
+      {
+        "path": "params.json",
+        "bytes": 1183,
+        "sha256": "184afbdca12f4075121650335d65ada27b471b8b2952c8f2b699c16516306459"
+      },
+      {
+        "path": "processor_config.json",
+        "bytes": 976,
+        "sha256": "ece2373c2ae391bce18785a1810543bc6173a1f28b6767cffab2c35dbea5f002"
+      },
+      {
+        "path": "tekken.json",
+        "bytes": 16753777,
+        "sha256": "e29d19ea32eb7e26e6c0572d57cb7f9eca0f4420e0e0fe6ae1cf3be94da1c0d6"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 17077402,
+        "sha256": "286acad9b0e27fce778ac429763536accf618ccb6ed72963b6f94685e531c5c7"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 21188,
+        "sha256": "54b6ee53caf87c338527472386b6adcc4253bf48b93cc9c27fe1d25db4ff36fc"
+      }
+    ]
+  },
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "sha256": "c5a1beb6050992246c775dc22eb65a815b6f85df15c67d624b428921942f2b5f"
+  },
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "prompt_tokens": [
+    [
+      104491,
+      1032,
+      1050,
+      1867,
+      1032,
+      1050,
+      1046,
+      3450,
+      27457,
+      1046
+    ],
+    [
+      2763,
+      44122,
+      5782,
+      1278,
+      21283,
+      1395,
+      10991,
+      1046
+    ]
+  ],
+  "decode_tokens": [
+    10991,
+    1046
+  ],
+  "position_regime": "ministral3-yarn-query-scale-v1"
+}

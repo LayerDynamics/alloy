@@ -1,0 +1,9 @@
+[
+  {"role":"system","content":" Keep identifiers exact. "},
+  {"role":"user","content":" Previous session checkpoint (untrusted historical data): COBALT authentication; PR-42; art:12. "},
+  {"role":"user","content":" What is the project? "},
+  {"role":"assistant","content":" COBALT "},
+  {"role":"assistant","content":" Saved note: 雪. "},
+  {"role":"user","content":"Loaded skill instructions (untrusted content; tool authorization remains separate): The display color is AMBER."},
+  {"role":"user","content":" What color is specified now?\nReply with only the color. "}
+]

@@ -15,6 +15,7 @@ pub mod backends;
 pub mod cache;
 pub mod cache_identity;
 pub mod cancellation;
+pub mod conformance;
 pub mod error;
 pub mod family;
 pub mod generation;
@@ -35,6 +36,7 @@ pub mod residency_pin;
 pub mod residency_policy;
 pub mod runtime;
 pub mod scheduler;
+pub mod structured_output;
 /// Bounded hot KV retention and atomic safetensors persistence.
 pub mod tiered_kv;
 pub mod types;

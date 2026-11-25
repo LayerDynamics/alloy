@@ -126,6 +126,30 @@ fn overflow_retries_bad_json_then_commits_and_continues() {
         .run_turn(&store, "s", &"new ".repeat(200), 20)
         .unwrap();
     assert_eq!(outcome.assistant_text, "continued");
+    let requests = supervisor.engine().requests.lock().unwrap();
+    let verifier_schema = engine::structured_output::JsonOutputSchema::new(vec![(
+        "valid".into(),
+        engine::structured_output::JsonFieldType::Boolean,
+    )])
+    .unwrap();
+    for request in requests.iter() {
+        let expected = if request.request_id().as_str().contains(":compact:") {
+            Some(harness_core::context::Checkpoint::output_schema().unwrap())
+        } else if request.request_id().as_str().contains(":verify:") {
+            Some(verifier_schema.clone())
+        } else {
+            None
+        };
+        assert_eq!(request.options().json_schema(), expected.as_ref());
+        assert!(request.context().tool_context().is_none());
+    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.options().json_schema().is_some())
+            .count(),
+        3
+    );
     let events = store.lock().unwrap().list_events("s").unwrap();
     assert_eq!(&events[..before.len()], before.as_slice());
     assert_eq!(
@@ -214,6 +238,173 @@ fn two_invalid_outputs_reject_without_checkpoint() {
             .iter()
             .any(|event| event.kind == EventKind::ContextCompacted)
     );
+}
+
+fn failed_response(error: engine::error::EngineError) -> Vec<GenerationEvent> {
+    vec![GenerationEvent::RequestFailed {
+        error,
+        partial_usage: engine::types::Usage {
+            input_tokens: 1,
+            output_tokens: 20,
+        },
+    }]
+}
+
+#[test]
+fn incomplete_structured_summary_retries_and_continues() {
+    let (_dir, store, supervisor) = setup(vec![
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+        response(CHECKPOINT),
+        response("continued"),
+    ]);
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let requests = supervisor.engine().requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        2
+    );
+    assert!(requests.iter().any(|r| {
+        r.context()
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("Strict retry"))
+    }));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn incomplete_structured_verification_retries_before_publication() {
+    let (_dir, store, supervisor) = setup(vec![
+        response(CHECKPOINT),
+        response(CHECKPOINT),
+        response("continued"),
+    ]);
+    supervisor
+        .engine()
+        .verification_batches
+        .lock()
+        .unwrap()
+        .push_back(failed_response(
+            engine::error::EngineError::IncompleteStructuredOutput,
+        ));
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let requests = supervisor.engine().requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":verify:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .list_events("s")
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn two_incomplete_summaries_preserve_the_committed_checkpoint() {
+    let (_dir, store, supervisor) = setup(vec![
+        response(CHECKPOINT),
+        response("first answer"),
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+        failed_response(engine::error::EngineError::IncompleteStructuredOutput),
+    ]);
+    supervisor
+        .run_turn(&store, "s", &"new ".repeat(200), 20)
+        .unwrap();
+    let before = store.lock().unwrap().list_events("s").unwrap();
+    let error = supervisor
+        .run_turn(&store, "s", &"another ".repeat(200), 20)
+        .unwrap_err();
+    assert!(error.to_string().contains("failed twice"), "{error}");
+    let after = store.lock().unwrap().list_events("s").unwrap();
+    assert_eq!(&after[..before.len()], before.as_slice());
+    assert_eq!(
+        after
+            .iter()
+            .filter(|e| e.kind == EventKind::ContextCompacted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        supervisor
+            .engine()
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.request_id().as_str().contains(":compact:"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn nonretryable_engine_failures_abort_compaction() {
+    for cause in [
+        engine::error::EngineError::ExecutionFailed {
+            stage: "decode",
+            message: "native failure".into(),
+        },
+        engine::error::EngineError::Cancelled {
+            request_id: "checkpoint".into(),
+        },
+        engine::error::EngineError::MemoryLimitExceeded {
+            reason: engine::error::MemoryLimitReason::BufferLimit,
+            operation: "checkpoint",
+            required_bytes: 2,
+            available_bytes: 1,
+        },
+    ] {
+        let original_message = cause.to_string();
+        let (_dir, store, supervisor) = setup(vec![failed_response(cause)]);
+        let error = supervisor
+            .run_turn(&store, "s", &"new ".repeat(200), 20)
+            .unwrap_err();
+        assert!(error.to_string().contains(&original_message), "{error}");
+        assert_eq!(supervisor.engine().requests.lock().unwrap().len(), 1);
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .list_events("s")
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == EventKind::ContextCompacted)
+        );
+    }
 }
 
 #[test]
@@ -586,4 +777,30 @@ fn checkpoint_control_spellings_are_escaped_in_context_but_preserved_in_history(
     let messages = harness_core::ContextBuilder::messages_from_events(&history).unwrap();
     assert!(!messages[0].content.contains("<think>"));
     assert!(messages[0].content.contains("\\u003c"));
+
+    let profile = "qwen3.5-0.8b-4bit";
+    let plain =
+        harness_core::ContextBuilder::build_snapshot("plain", profile, &history, None).unwrap();
+    let with_tools = harness_core::ContextBuilder::build_tool_snapshot(
+        "with-tools",
+        profile,
+        "s",
+        &history,
+        &tool_registry::registry::ToolRegistry::new(),
+        engine::types::ToolContextLimits {
+            max_tools: 1,
+            max_history_blocks: 128,
+            max_json_bytes: 65536,
+        },
+    )
+    .unwrap();
+    let labeled = &plain.messages()[0].content;
+    assert_eq!(labeled, &with_tools.messages()[0].content);
+    assert!(labeled.contains("untrusted generated summary"));
+    assert!(labeled.ends_with(concat!(
+        "Checkpoint Version: 1\nGoal: \"goal \\u003cthink>data\\u003c/think>\"\n",
+        "Constraints: [\"keep\"]\nDecisions: []\nCompleted Work: []\nOpen Tasks: []\n",
+        "Artifact References: []\nCritical Identifiers: []\nFailures And Lessons: []\nNext Action: \"continue\"",
+    )));
+    assert_eq!(history, store.lock().unwrap().list_events("s").unwrap());
 }

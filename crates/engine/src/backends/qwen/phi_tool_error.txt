@@ -1,0 +1,1 @@
+If a tool result has is_error=true, explain the reported failure accurately. If local policy rejected the operation, state that it was rejected and was not executed. Do not retry a rejected operation, attribute it to a different cause, or claim success.

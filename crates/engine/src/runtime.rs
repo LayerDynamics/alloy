@@ -132,6 +132,18 @@ pub struct RuntimeResidency {
 /// Output is untrusted: decoding cannot assign invocation identities or
 /// authorize effects. The runtime separately enforces delivery budgets.
 pub trait TextDecoder {
+    /// Observe a profile-defined structural end after a successfully decoded
+    /// token. The default waits for the configured EOS token or output limit.
+    /// This must neither execute model work nor publish tentative proposals.
+    fn is_sequence_complete(&self) -> bool {
+        false
+    }
+
+    /// Notify a protocol decoder of an actual sampled EOS before finishing.
+    fn observe_eos(&mut self, _token: u32) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     /// Decode one generated token without corrupting incremental state.
     fn push(&mut self, token: u32) -> Result<String, EngineError>;
 
@@ -274,6 +286,38 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         legacy_decoder_with_parser(allocation, || self.decoder(registry, profile))
     }
 
+    /// Construct the decoder using the exact immutable schemas bound to the
+    /// counted render. The context is shared with the input, never reconstructed
+    /// from model output or copied into unadmitted parser scratch. Existing
+    /// protocols retain their admitted-parser constructor by default.
+    fn decoder_with_tool_context(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        _tools: Option<Arc<crate::types::ToolContext>>,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        self.decoder_with_parser_allocation(registry, profile, allocation)
+    }
+
+    /// Choose an explicit tool boundary without changing the default backend protocol.
+    fn decoder_with_tool_mode(
+        &self,
+        registry: &Registry,
+        profile: &ModelProfileId,
+        allocation: Option<ParserAllocation>,
+        tools: Option<Arc<crate::types::ToolContext>>,
+        mode: crate::types::ToolCallMode,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        if mode == crate::types::ToolCallMode::Single {
+            return Err(EngineError::unsupported(
+                "tool_call_mode",
+                "single-call decoding is unavailable for this backend",
+            ));
+        }
+        self.decoder_with_tool_context(registry, profile, allocation, tools)
+    }
+
     /// Conservative incremental MLX allocation forecast for this plan.
     ///
     /// Runs on the native worker. Exclude reused active buffers and host
@@ -288,6 +332,37 @@ pub trait RuntimeBackend: ModelFamily + 'static {
         _residency: RuntimeResidency,
     ) -> Result<Option<u64>, EngineError> {
         Ok(None)
+    }
+
+    /// Whether this backend implements the bounded JSON constraint constructor.
+    fn supports_json_output(&self) -> bool {
+        false
+    }
+
+    /// Decode constrained JSON as data, without interpreting tool syntax in strings.
+    fn json_decoder(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+    ) -> Result<Box<dyn TextDecoder>, EngineError> {
+        Err(EngineError::unsupported(
+            "structured output",
+            "backend has no JSON text decoder",
+        ))
+    }
+
+    /// Construct request-owned JSON constraints only after workspace admission.
+    fn json_constraint(
+        &self,
+        _registry: &Registry,
+        _profile: &ModelProfileId,
+        _schema: crate::structured_output::JsonOutputSchema,
+        _control: &ExecutionControl,
+    ) -> Result<crate::structured_output::JsonConstraint, EngineError> {
+        Err(EngineError::unsupported(
+            "structured output",
+            "backend does not implement JSON constraints",
+        ))
     }
 
     /// Return the actual profile EOS token IDs.
@@ -1058,7 +1133,7 @@ impl EngineRuntime for FamilyRuntime {
                 0
             } else {
                 plan.load_limits
-                    .max_load_peak_bytes()
+                    .cold_load_charge(plan.cache.max_cache_bytes())
                     .checked_sub(plan.load_limits.max_resident_bytes())
                     .ok_or_else(|| internal("invalid loader overlap bounds"))?
             };
@@ -1109,6 +1184,11 @@ impl EngineRuntime for FamilyRuntime {
             if execution.request_id() != request.request_id()
                 || rendered.profile_id() != request.profile_id()
                 || rendered.snapshot_id() != request.context().snapshot_id()
+                || rendered.tool_schema_hash()
+                    != request
+                        .context()
+                        .tool_context()
+                        .map(crate::types::ToolContext::schema_hash)
             {
                 return Err(internal("generation startup identities disagree"));
             }
@@ -1140,6 +1220,18 @@ impl EngineRuntime for FamilyRuntime {
                 plan.prefill_chunk_tokens = decision.chunk_tokens;
                 plan.temporary_bytes = decision.workspace_bytes;
             }
+            if request.options().json_schema().is_some() {
+                if !backend.supports_json_output() {
+                    return Err(EngineError::unsupported(
+                        "structured output",
+                        "backend does not implement JSON constraints",
+                    ));
+                }
+                plan.temporary_bytes = plan
+                    .temporary_bytes
+                    .checked_add(crate::structured_output::JSON_WORKSPACE_BYTES)
+                    .ok_or_else(|| internal("structured-output workspace overflow"))?;
+            }
             validate_plan(
                 &registry,
                 request.profile_id(),
@@ -1149,8 +1241,11 @@ impl EngineRuntime for FamilyRuntime {
             )?;
             execution.check_cancelled()?;
 
-            let parser_limits =
-                backend.parser_allocation_limits(&registry, request.profile_id())?;
+            let parser_limits = if request.options().json_schema().is_some() {
+                None
+            } else {
+                backend.parser_allocation_limits(&registry, request.profile_id())?
+            };
             validate_parser_output_budget(plan.output_bytes, self.limits, parser_limits)?;
 
             let setup = Setup {
@@ -1158,6 +1253,7 @@ impl EngineRuntime for FamilyRuntime {
                 backend,
                 plan,
                 parser_limits,
+                tool_context: request.context().shared_tool_context(),
                 profile: request.profile_id().clone(),
                 options: request.options().clone(),
                 pressure_policy: self.pressure_policy,
@@ -1238,6 +1334,7 @@ struct Setup {
     // W2_RUNTIME_PARSER_ALLOCATION_V1
     // Immutable metadata snapshot; allocation remains native-worker owned.
     parser_limits: Option<ParserAllocationLimits>,
+    tool_context: Option<Arc<crate::types::ToolContext>>,
     profile: ModelProfileId,
     options: GenerationOptions,
     pressure_policy: Option<crate::pressure::PressurePolicy>,
@@ -1898,6 +1995,8 @@ struct Resident {
     model: Box<dyn LoadedModel>,
     weights: MemoryReservation,
     capabilities: Capabilities,
+    // Derived from the actual cache, retained even after hot eviction.
+    supports_disk_cache: bool,
     candidate: Option<StateCandidate>,
 }
 
@@ -2093,6 +2192,7 @@ impl StateEntry {
 
 struct Active {
     decoder: Box<dyn TextDecoder>,
+    constraint: Option<crate::structured_output::JsonConstraint>,
     logits: Option<TokenLogits>,
     eos: Vec<u32>,
     control: ExecutionControl,
@@ -2501,7 +2601,7 @@ impl NativeState {
             0
         } else {
             plan.load_limits
-                .max_load_peak_bytes()
+                .cold_load_charge(plan.cache.max_cache_bytes())
                 .checked_sub(plan.load_limits.max_resident_bytes())
                 .ok_or_else(|| internal("invalid loader overlap bounds"))?
         };
@@ -2760,18 +2860,19 @@ impl NativeState {
                         .chain(self.pool.iter())
                         .chain(self.states.values().map(|entry| &entry.resident))
                         .find(|resident| resident.model.artifact_id() == &artifact)
-                        .map(|resident| resident.capabilities.clone())
+                        .map(|resident| {
+                            (resident.capabilities.clone(), resident.supports_disk_cache)
+                        })
                         .ok_or_else(|| EngineError::NotFound {
                             resource: "verified loaded artifact",
                             id: artifact.into_string(),
                         })
-                        .and_then(|mut capabilities| {
-                            if let Some(store) = &self.tiered
-                                && !store.metrics.disk_enabled
-                            {
+                        .and_then(|(mut capabilities, supports_disk_cache)| {
+                            if let Some(store) = &self.tiered {
                                 let budget = self.admission.snapshot()?.budget_bytes();
                                 capabilities.supports_prefix_reuse &=
-                                    store.config.hot_limit.bytes(budget) > 0;
+                                    store.config.hot_limit.bytes(budget) > 0
+                                        || (store.metrics.disk_enabled && supports_disk_cache);
                             }
                             Ok(capabilities)
                         });
@@ -3149,30 +3250,9 @@ impl NativeState {
             && resident
                 .and_then(|resident| resident.cache.as_ref())
                 .is_some_and(|cache| cache_matches(cache, &setup.plan));
-        let weights = if residency.reusable_model {
-            0
-        } else {
-            setup.plan.load_limits.max_load_peak_bytes()
-        };
-        let cache = if same_cache {
-            0
-        } else {
-            setup.plan.cache.max_cache_bytes()
-        };
-        let history = if retains_contents(self.retention) {
-            token_storage_bytes(setup.plan.cache.capacity_tokens())?
-        } else {
-            0
-        };
-        // Same conservative full-startup ledger forecast as the existing
-        // estimate, without crediting reservations before their guards die.
-        let ledger = add(
-            add(add(weights, cache)?, history)?,
-            add(
-                add(setup.plan.temporary_bytes, setup.plan.headroom_bytes)?,
-                setup.plan.output_bytes,
-            )?,
-        )?;
+        let components =
+            incremental_startup_components(&setup.plan, self.retention, &residency, same_cache)?;
+        let ledger = components.into_iter().try_fold(0, add)?;
         let policy = setup
             .pressure_policy
             .ok_or_else(|| internal("pressure policy missing"))?;
@@ -3787,15 +3867,21 @@ impl NativeState {
         };
 
         if self.resident.is_none() {
-            let peak = setup.plan.load_limits.max_load_peak_bytes();
+            let limits = setup.plan.load_limits;
             let mut weights = {
                 let grant = &mut self
                     .pending
                     .as_mut()
                     .ok_or_else(|| internal("admitted startup grant disappeared"))?
                     .grant;
+                // No KV allocation exists on a cold load. Its unpartitioned
+                // grant remains exclusively owned until load() returns.
+                if grant.remaining_bytes() < limits.max_load_peak_bytes() {
+                    return Err(internal("startup grant does not cover the loader peak"));
+                }
+                let charge = limits.cold_load_charge(setup.plan.cache.max_cache_bytes());
                 grant
-                    .take("model loading peak", peak)?
+                    .take("model loading peak", charge)?
                     .ok_or_else(|| internal("startup grant missing model loading peak"))?
             };
             let model = setup.backend.load(ModelLoadRequest::new(
@@ -3854,6 +3940,7 @@ impl NativeState {
                 model,
                 weights,
                 capabilities,
+                supports_disk_cache: false,
                 candidate: None,
             });
         }
@@ -3895,6 +3982,7 @@ impl NativeState {
                 return Err(internal("family allocated an incompatible cache"));
             }
             check_cache_bytes(cache.as_ref(), reservation.bytes())?;
+            resident.supports_disk_cache = cache.kv_block_spec().is_some();
             resident.cache = Some(ResidentCache { cache, reservation });
         }
 
@@ -3999,12 +4087,35 @@ impl NativeState {
             .as_mut()
             .ok_or_else(|| internal("decoder construction lost its admitted startup"))?
             .take_parser(setup.parser_limits)?;
-        let decoder = setup.backend.decoder_with_parser_allocation(
-            &setup.registry,
-            &setup.profile,
-            parser,
-        )?;
+        let decoder = if setup.options.json_schema().is_some() {
+            if parser.is_some() || setup.tool_context.is_some() {
+                return Err(internal("JSON generation cannot own a tool parser"));
+            }
+            setup
+                .backend
+                .json_decoder(&setup.registry, &setup.profile)?
+        } else {
+            setup.backend.decoder_with_tool_mode(
+                &setup.registry,
+                &setup.profile,
+                parser,
+                setup.tool_context.clone(),
+                setup.options.tool_call_mode(),
+            )?
+        };
         let eos = setup.backend.eos_tokens(&setup.registry, &setup.profile)?;
+        let constraint = setup
+            .options
+            .json_schema()
+            .map(|schema| {
+                setup.backend.json_constraint(
+                    &setup.registry,
+                    &setup.profile,
+                    schema.clone(),
+                    &control,
+                )
+            })
+            .transpose()?;
 
         let compatibility =
             Compatibility::new(resident.model.as_ref(), cache.cache.as_ref(), context);
@@ -4079,6 +4190,7 @@ impl NativeState {
         }
         self.active = Some(Active {
             decoder,
+            constraint,
             logits: initial_logits,
             eos,
             control,
@@ -4165,14 +4277,17 @@ impl NativeState {
             .logits
             .as_ref()
             .ok_or_else(|| internal("decode has no preceding logits"))?;
-        let mut best = 0;
-        for index in 1..logits.values().len() {
-            if logits.values()[index] > logits.values()[best] {
-                best = index;
+        let token = if let Some(constraint) = &active.constraint {
+            constraint.select(logits.values(), &active.control)?
+        } else {
+            let mut best = 0;
+            for index in 1..logits.values().len() {
+                if logits.values()[index] > logits.values()[best] {
+                    best = index;
+                }
             }
-        }
-        let token =
-            u32::try_from(best).map_err(|_| internal("selected token exceeds u32 range"))?;
+            u32::try_from(best).map_err(|_| internal("selected token exceeds u32 range"))?
+        };
 
         let resident = self
             .resident
@@ -4212,12 +4327,21 @@ impl NativeState {
         }
         active.logits = Some(next);
 
+        if let Some(constraint) = &mut active.constraint {
+            constraint.consume(token)?;
+        }
+
         let end_of_sequence = active.eos.contains(&token);
         let blocks = if end_of_sequence {
+            active.decoder.observe_eos(token)?;
             Vec::new()
         } else {
             active.decoder.push_blocks(token)?
         };
+        // A structural protocol boundary is a profile EOS condition. The
+        // selected closing token has already executed and is counted above;
+        // do not generate a speculative answer or invent an extra EOS token.
+        let end_of_sequence = end_of_sequence || active.decoder.is_sequence_complete();
 
         Ok(BlockStep {
             token_id: token,
@@ -4238,6 +4362,9 @@ impl NativeState {
             return Err(internal("text completion requested twice"));
         }
 
+        if let Some(constraint) = &active.constraint {
+            constraint.finish()?;
+        }
         let blocks = active.decoder.finish_blocks()?;
         active.control.check_cancelled()?;
         active.text_finished = true;
@@ -4882,7 +5009,8 @@ fn incremental_startup_components(
     let weights = if residency.reusable_model {
         0
     } else {
-        plan.load_limits.max_load_peak_bytes()
+        plan.load_limits
+            .cold_load_charge(plan.cache.max_cache_bytes())
     };
     let cache = if same_cache {
         0

@@ -225,8 +225,43 @@ impl ToolContext {
             self.tools.iter().map(RenderingTool::value).collect(),
         )))
     }
+    pub(crate) fn tool_values(&self) -> Value {
+        Value::Array(self.tools.iter().map(RenderingTool::value).collect())
+    }
     /// Reject reserved control syntax in all model-facing data before rendering.
     pub(crate) fn validate_spellings(&self, reserved: &[&str]) -> Result<(), EngineError> {
+        // Serialized JSON escapes quotes inside strings. Check original keys
+        // and values too, including protocols whose delimiters contain quotes.
+        fn has_marker(value: &Value, reserved: &[&str]) -> bool {
+            let marked = |text: &str| reserved.iter().any(|marker| text.contains(marker));
+            match value {
+                Value::String(s) => marked(s),
+                Value::Object(o) => o.iter().any(|(k, v)| marked(k) || has_marker(v, reserved)),
+                Value::Array(a) => a.iter().any(|v| has_marker(v, reserved)),
+                _ => false,
+            }
+        }
+        for block in &self.history {
+            let invalid_data = match block {
+                ToolHistoryBlock::AssistantCall { arguments, .. } => {
+                    arguments.iter().any(|(k, v)| {
+                        reserved.iter().any(|m| k.contains(m)) || has_marker(v, reserved)
+                    })
+                }
+                ToolHistoryBlock::ToolResult { content, .. } => {
+                    reserved.iter().any(|m| content.contains(m))
+                }
+                ToolHistoryBlock::Text(message) => {
+                    reserved.iter().any(|m| message.content.contains(m))
+                }
+            };
+            if invalid_data {
+                return Err(invalid(
+                    "tool_context",
+                    "data contains reserved structural syntax",
+                ));
+            }
+        }
         for value in self
             .tools
             .iter()
@@ -234,7 +269,7 @@ impl ToolContext {
             .chain(self.history.iter().map(history_value))
         {
             let text = serialize(&value)?;
-            if reserved.iter().any(|token| text.contains(token)) {
+            if has_marker(&value, reserved) || reserved.iter().any(|token| text.contains(token)) {
                 return Err(invalid(
                     "tool_context",
                     "data contains reserved structural syntax",
@@ -245,7 +280,147 @@ impl ToolContext {
     }
     /// Values are separate role-bearing messages, never injected into system content.
     pub(crate) fn messages(&self) -> Vec<Value> {
-        self.history.iter().map(history_value).collect()
+        let mut names = BTreeMap::new();
+        self.history
+            .iter()
+            .map(|block| {
+                let mut value = history_value(block);
+                if let ToolHistoryBlock::AssistantCall {
+                    call_id,
+                    tool_id,
+                    arguments,
+                } = block
+                {
+                    names.insert(call_id.as_str(), tool_id.as_str());
+                    value["call"] = canonical(json!({"name":tool_id, "arguments":arguments}));
+                } else if let ToolHistoryBlock::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } = block
+                    && let Some(name) = names.get(call_id.as_str())
+                {
+                    value["tool_name"] = json!(name);
+                    value["result"] =
+                        json!({"call_id":call_id,"content":content,"is_error":is_error});
+                }
+                value
+            })
+            .collect()
+    }
+}
+
+impl crate::slab_parser::XmlToolSchema for ToolContext {
+    fn validate_tool(&self, name: &str) -> Result<(), EngineError> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.id == name)
+            .ok_or_else(|| invalid("XML tool schema", "tool was not advertised"))?;
+        reject_xml_composition(&tool.input_schema)?;
+        if tool.input_schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(invalid(
+                "XML tool schema",
+                "explicit object parameter schema required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn parameter_type(
+        &self,
+        name: &str,
+        parameter: &str,
+        raw: &str,
+    ) -> Result<crate::slab_parser::XmlParameterType, EngineError> {
+        use crate::slab_parser::XmlParameterType as Kind;
+        self.validate_tool(name)?;
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.id == name)
+            .ok_or_else(|| invalid("XML tool schema", "tool was not advertised"))?;
+        let definition = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(parameter))
+            .ok_or_else(|| invalid("XML parameter schema", "parameter was not advertised"))?;
+        reject_xml_composition(definition)?;
+        let declared = definition
+            .get("type")
+            .ok_or_else(|| invalid("XML parameter schema", "explicit type required"))?;
+        let kind = if let Some(kind) = declared.as_str() {
+            kind
+        } else if let Some(types) = declared.as_array() {
+            if types.len() != 2
+                || types
+                    .iter()
+                    .filter(|kind| kind.as_str() == Some("null"))
+                    .count()
+                    != 1
+            {
+                return Err(invalid(
+                    "XML parameter schema",
+                    "only single-type nullable unions are supported",
+                ));
+            }
+            let non_null = types
+                .iter()
+                .find(|kind| kind.as_str() != Some("null"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("XML parameter schema", "invalid nullable type"))?;
+            // Validate the alternative even when this value happens to be null.
+            xml_kind(non_null)?;
+            if raw.eq_ignore_ascii_case("null") {
+                return Ok(Kind::Null);
+            }
+            non_null
+        } else {
+            return Err(invalid("XML parameter schema", "invalid type declaration"));
+        };
+        xml_kind(kind)
+    }
+}
+
+fn reject_xml_composition(schema: &Value) -> Result<(), EngineError> {
+    if !schema.is_object()
+        || [
+            "$ref",
+            "$dynamicRef",
+            "oneOf",
+            "anyOf",
+            "allOf",
+            "if",
+            "then",
+            "else",
+            "not",
+            "dependentSchemas",
+        ]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return Err(invalid(
+            "XML tool schema",
+            "unsupported schema reference or composition",
+        ));
+    }
+    Ok(())
+}
+fn xml_kind(kind: &str) -> Result<crate::slab_parser::XmlParameterType, EngineError> {
+    use crate::slab_parser::XmlParameterType as Kind;
+    match kind {
+        "string" => Ok(Kind::String),
+        "integer" => Ok(Kind::Integer),
+        "number" => Ok(Kind::Number),
+        "boolean" => Ok(Kind::Boolean),
+        "object" => Ok(Kind::Object),
+        "array" => Ok(Kind::Array),
+        "null" => Ok(Kind::Null),
+        _ => Err(invalid(
+            "XML parameter schema",
+            "unsupported declared JSON type",
+        )),
     }
 }
 fn history_value(block: &ToolHistoryBlock) -> Value {

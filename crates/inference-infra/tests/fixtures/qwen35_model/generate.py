@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Offline fixed mixed-layer Qwen3.5 reference; never invoked in inference."""
+import hashlib
+import importlib.metadata
+import json
+import platform
+from pathlib import Path
+import mlx.core as mx
+import numpy as np
+from mlx.utils import tree_flatten
+from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+def generate_checkpoint(root):
+    text = dict(model_type="qwen3_5_text", hidden_size=64, intermediate_size=128,
+                num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+                head_dim=16, rms_norm_eps=1e-6, vocab_size=256,
+                max_position_embeddings=128, linear_num_value_heads=2,
+                linear_num_key_heads=1, linear_key_head_dim=128,
+                linear_value_head_dim=128, linear_conv_kernel_dim=4,
+                tie_word_embeddings=False, attention_bias=False,
+                attn_output_gate=True, hidden_act="silu", full_attention_interval=2,
+                layer_types=["linear_attention", "full_attention"] * 2,
+                partial_rotary_factor=0.25,
+                rope_parameters=dict(type="default", rope_theta=10000000,
+                                     partial_rotary_factor=0.25))
+    config = dict(model_type="qwen3_5", architectures=["Qwen3_5ForConditionalGeneration"],
+                  tie_word_embeddings=False, text_config=text)
+    model = TextModel(TextModelArgs.from_dict(text))
+    rng = np.random.default_rng(20261114)
+    weights = []
+    for name, array in sorted(tree_flatten(model.parameters())):
+        data = rng.integers(-64, 65, size=array.shape).astype(np.float32) / np.float32(256)
+        if "norm.weight" in name or "layernorm.weight" in name:
+            data = np.float32(1) + data
+        weights.append((name, mx.array(data, dtype=mx.float32)))
+    model.load_weights(weights)
+    model.eval()
+    mx.eval(model.parameters())
+    (root / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    mx.save_safetensors(str(root / "model.safetensors"), {"language_model." + n: w for n, w in weights})
+    return model
+
+
+def capture_device(model, tokens, device):
+    mx.set_default_device(device)
+    full = model(mx.array([tokens]))
+    mx.eval(full)
+    cache = model.make_cache()
+    prefill = model(mx.array([tokens[:4]]), cache=cache)
+    mx.eval(prefill)
+    continuation = []
+    for token in tokens[4:]:
+        output = model(mx.array([[token]]), cache=cache)
+        mx.eval(output)
+        continuation.append(output.flatten().tolist())
+
+    # Matrix and attention reductions can change with the chunk geometry.
+    splits = []
+    for split in range(1, len(tokens)):
+        cache = model.make_cache()
+        prefix = model(mx.array([tokens[:split]]), cache=cache)
+        mx.eval(prefix)
+        suffix = model(mx.array([tokens[split:]]), cache=cache)
+        mx.eval(suffix)
+        splits.append(suffix.flatten().tolist())
+    return dict(full=full.flatten().tolist(), prefill=prefill.flatten().tolist(),
+                continuation=continuation, splits=splits)
+
+
+def tiny_reference():
+    for package, version in [("mlx", "0.32.4"), ("mlx-lm", "0.31.2"), ("numpy", "2.4.2")]:
+        assert importlib.metadata.version(package) == version
+    mx.disable_compile()
+    root = Path(__file__).parent
+    tokens = [3, 41, 7, 200, 128, 95, 12, 250]
+    linux_arm = platform.system() == "Linux" and platform.machine() == "aarch64"
+    reference = dict(mlx="0.32.4", mlx_lm="0.31.2", numpy="2.4.2", compile=False,
+                     device="cpu" if linux_arm else "gpu", tokens=tokens)
+    if linux_arm:
+        mx.set_default_device(mx.cpu)
+        manifest = json.loads((root / "manifest.json").read_text())
+        for name in ["config.json", "model.safetensors"]:
+            assert hashlib.sha256((root / name).read_bytes()).hexdigest() == manifest[name], name
+        config = json.loads((root / "config.json").read_text())
+        model = TextModel(TextModelArgs.from_dict(config["text_config"]))
+        weights = mx.load(str(root / "model.safetensors"))
+        model.load_weights([(name.removeprefix("language_model."), value)
+                            for name, value in weights.items()])
+        model.eval()
+        reference["cpu"] = capture_device(model, tokens, mx.cpu)
+        (root / "reference-linux-aarch64.json").write_text(
+            json.dumps(reference, separators=(",", ":"), allow_nan=False) + "\n")
+        return
+
+    mx.set_default_device(mx.gpu)
+    model = generate_checkpoint(root)
+    gpu = capture_device(model, tokens, mx.gpu)
+    # Preserve the original field order so identical macOS captures hash identically.
+    splits = gpu.pop("splits")
+    reference.update(gpu)
+    reference["cpu"] = capture_device(model, tokens, mx.cpu)
+    reference["splits"] = splits
+    if (root / "reference.json").exists():
+        previous = json.loads((root / "reference.json").read_text())
+        for key in ["full", "prefill", "continuation"]:
+            assert previous[key] == reference[key], "fixed GPU reference changed"
+    (root / "reference.json").write_text(json.dumps(reference, separators=(",", ":"), allow_nan=False) + "\n")
+    manifest = {name: hashlib.sha256((root/name).read_bytes()).hexdigest()
+                for name in ["config.json", "model.safetensors", "reference.json"]}
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest))
+
+
+def capture_artifact(artifact, output, profile_path):
+    # Reference generation only: production inference remains entirely native.
+    from mlx_lm.utils import load_model
+    from mlx_lm.models.cache import make_prompt_cache
+    from tokenizers import Tokenizer
+    profile = json.loads(profile_path.read_text())
+    versions = {p: importlib.metadata.version(p) for p in ["mlx", "mlx-lm", "numpy"]}
+    assert versions == profile["reference"]["versions"], versions
+    for file in profile["artifact"]["files"]:
+        with (artifact / file["path"]).open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
+        assert digest == file["sha256"], file["path"]
+    mx.disable_compile()
+    mx.set_default_device(mx.gpu)
+    model, config = load_model(artifact, lazy=False)
+    model.apply(lambda a: a.astype(mx.float32) if mx.issubdtype(a.dtype, mx.floating) else a)
+    mx.eval(model.parameters())
+    tokenizer = Tokenizer.from_file(str(artifact / "tokenizer.json"))
+    cases = []
+    for prompt in profile["prompts"]:
+        tokens = tokenizer.encode(prompt, add_special_tokens=False).ids
+        cache = make_prompt_cache(model)
+        logits = model(mx.array([tokens]), cache=cache)[:, -1, :]
+        mx.eval(logits)
+        rows = [logits[0].tolist()]
+        for token in profile["decode_tokens"]:
+            logits = model(mx.array([[token]]), cache=cache)[:, -1, :]
+            mx.eval(logits)
+            rows.append(logits[0].tolist())
+        cases.append(dict(tokens=tokens, decode_tokens=profile["decode_tokens"], logits=rows))
+        print("captured prompt", tokens, flush=True)
+    result = dict(profile=profile["id"], artifact_revision=profile["artifact"]["revision"],
+                  versions=versions, compile_enabled=False, device="gpu", cases=cases)
+    output.write_text(json.dumps(result, separators=(",", ":"), allow_nan=False) + "\n")
+    print("reference_sha256", hashlib.sha256(output.read_bytes()).hexdigest(), flush=True)
+    print("memory", mx.get_active_memory(), mx.get_peak_memory(), flush=True)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--profile", type=Path, default=Path(__file__).parent.parent / "ornith_1_5_9b_profile.json")
+    args = parser.parse_args()
+    if args.artifact is None:
+        if args.output is not None:
+            parser.error("--output requires --artifact")
+        tiny_reference()
+    else:
+        if args.output is None:
+            parser.error("--artifact requires --output")
+        capture_artifact(args.artifact, args.output, args.profile)

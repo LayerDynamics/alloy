@@ -154,9 +154,9 @@ pub type MlxDecoderResult<T> = Result<T, MlxDecoderError>;
 /// Intermediate transformer tensors remain in MLX.
 #[derive(Debug)]
 pub struct MlxLogits {
-    values: Vec<f32>,
-    rows: usize,
-    vocabulary: usize,
+    pub(crate) values: Vec<f32>,
+    pub(crate) rows: usize,
+    pub(crate) vocabulary: usize,
 }
 
 impl MlxLogits {
@@ -197,7 +197,7 @@ impl MlxLogits {
 }
 
 /// Dense float32 or resident Affine4 projection.
-enum MlxLinear {
+pub(crate) enum MlxLinear {
     Dense(Array),
     Affine4 {
         bits: i32,
@@ -209,7 +209,7 @@ enum MlxLinear {
 }
 
 impl MlxLinear {
-    fn upload(matrix: MatrixWeight, rows: usize, cols: usize) -> MlxDecoderResult<Self> {
+    pub(crate) fn upload(matrix: MatrixWeight, rows: usize, cols: usize) -> MlxDecoderResult<Self> {
         let bits = i32::from(matrix.bits().unwrap_or(4));
         let pack = 32 / bits as usize;
         match matrix {
@@ -262,7 +262,11 @@ impl MlxLinear {
         }
     }
 
-    fn embedding_lookup(&self, tokens: &[u32], stream: &Stream) -> MlxDecoderResult<Array> {
+    pub(crate) fn embedding_lookup(
+        &self,
+        tokens: &[u32],
+        stream: &Stream,
+    ) -> MlxDecoderResult<Array> {
         match self {
             Self::Dense(weight) => Ok(ops::embedding_lookup(weight, tokens, stream)?),
             Self::Affine4 {
@@ -283,7 +287,7 @@ impl MlxLinear {
         }
     }
 
-    fn apply(&self, input: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
+    pub(crate) fn apply(&self, input: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
         match self {
             Self::Dense(weight) => Ok(ops::linear(input, weight, stream)?),
             Self::Affine4 {
@@ -305,7 +309,7 @@ impl MlxLinear {
         }
     }
 
-    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+    pub(crate) fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
         match self {
             Self::Dense(weight) => visitor(weight),
             Self::Affine4 {
@@ -322,6 +326,41 @@ impl MlxLinear {
     }
 }
 
+mod qwen3_coder;
+
+enum FeedForward {
+    Dense {
+        gate: MlxLinear,
+        up: MlxLinear,
+        down: MlxLinear,
+    },
+    Routed(Box<qwen3_coder::RoutedLayer>),
+}
+
+impl FeedForward {
+    fn apply(&self, x: &Array, stream: &Stream) -> MlxDecoderResult<Array> {
+        match self {
+            Self::Dense { gate, up, down } => {
+                let activated =
+                    ops::swiglu(&gate.apply(x, stream)?, &up.apply(x, stream)?, stream)?;
+                down.apply(&activated, stream)
+            }
+            Self::Routed(layer) => layer.apply(x, stream),
+        }
+    }
+
+    fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a Array)) {
+        match self {
+            Self::Dense { gate, up, down } => {
+                gate.visit(visitor);
+                up.visit(visitor);
+                down.visit(visitor);
+            }
+            Self::Routed(layer) => layer.visit(visitor),
+        }
+    }
+}
+
 struct MlxLayer {
     input_layernorm: Array,
     q_proj: MlxLinear,
@@ -331,9 +370,7 @@ struct MlxLayer {
     k_norm: Option<Array>,
     o_proj: MlxLinear,
     post_attention_layernorm: Array,
-    gate_proj: MlxLinear,
-    up_proj: MlxLinear,
-    down_proj: MlxLinear,
+    mlp: FeedForward,
 }
 
 impl MlxLayer {
@@ -358,21 +395,23 @@ impl MlxLayer {
                 weights.post_attention_layernorm,
                 &[config.hidden_size],
             )?,
-            gate_proj: MlxLinear::upload(
-                weights.gate_proj,
-                config.intermediate_size,
-                config.hidden_size,
-            )?,
-            up_proj: MlxLinear::upload(
-                weights.up_proj,
-                config.intermediate_size,
-                config.hidden_size,
-            )?,
-            down_proj: MlxLinear::upload(
-                weights.down_proj,
-                config.hidden_size,
-                config.intermediate_size,
-            )?,
+            mlp: FeedForward::Dense {
+                gate: MlxLinear::upload(
+                    weights.gate_proj,
+                    config.intermediate_size,
+                    config.hidden_size,
+                )?,
+                up: MlxLinear::upload(
+                    weights.up_proj,
+                    config.intermediate_size,
+                    config.hidden_size,
+                )?,
+                down: MlxLinear::upload(
+                    weights.down_proj,
+                    config.hidden_size,
+                    config.intermediate_size,
+                )?,
+            },
         })
     }
 
@@ -389,9 +428,7 @@ impl MlxLayer {
         }
         self.o_proj.visit(visitor);
         visitor(&self.post_attention_layernorm);
-        self.gate_proj.visit(visitor);
-        self.up_proj.visit(visitor);
-        self.down_proj.visit(visitor);
+        self.mlp.visit(visitor);
     }
 }
 
@@ -499,38 +536,47 @@ impl MlxDecoderModel {
                 lm_head,
             };
 
-            let mut failure = None;
-            native.visit(|array| {
-                if let Err(error) = array.eval()
-                    && failure.is_none()
-                {
-                    failure = Some(error);
-                }
-            });
-
-            if let Some(error) = failure {
-                return Err(MlxDecoderError::Mlx(error));
-            }
-
-            let model = Self {
-                config,
-                weights: native,
-                owner: MlxModelId::new(),
-                weight_payload_bytes: payload,
-                healthy: Cell::new(true),
-            };
-            let measured = model.weight_buffer_bytes()?;
-            if measured > max_weight_payload_bytes {
-                return Err(MlxDecoderError::PayloadLimit {
-                    operation: "MLX resident weight backing buffers",
-                    required_bytes: measured,
-                    limit_bytes: max_weight_payload_bytes,
-                });
-            }
-            Ok(model)
+            Self::from_uploaded(config, native, payload, max_weight_payload_bytes)
         })();
 
         complete_stream(result, stream)
+    }
+
+    fn from_uploaded(
+        config: DecoderConfig,
+        native: MlxWeights,
+        payload: u64,
+        max_weight_payload_bytes: u64,
+    ) -> MlxDecoderResult<Self> {
+        let mut failure = None;
+        native.visit(|array| {
+            if let Err(error) = array.eval()
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        });
+
+        if let Some(error) = failure {
+            return Err(MlxDecoderError::Mlx(error));
+        }
+
+        let model = Self {
+            config,
+            weights: native,
+            owner: MlxModelId::new(),
+            weight_payload_bytes: payload,
+            healthy: Cell::new(true),
+        };
+        let measured = model.weight_buffer_bytes()?;
+        if measured > max_weight_payload_bytes {
+            return Err(MlxDecoderError::PayloadLimit {
+                operation: "MLX resident weight backing buffers",
+                required_bytes: measured,
+                limit_bytes: max_weight_payload_bytes,
+            });
+        }
+        Ok(model)
     }
 
     /// Exact architecture configuration.
@@ -607,7 +653,7 @@ impl MlxDecoderModel {
                 .into());
             }
 
-            Ok(MlxKvCache::new(
+            Ok(MlxKvCache::new_with_mode(
                 &self.owner,
                 KvCacheSpec {
                     layers: self.config.num_layers,
@@ -617,6 +663,7 @@ impl MlxDecoderModel {
                     head_dim: self.config.head_dim,
                 },
                 max_cache_payload_bytes,
+                self.config.kv_update_mode(capacity_tokens),
                 stream,
             )?)
         })();
@@ -765,22 +812,14 @@ impl MlxDecoderModel {
             OutputSelection::Last => 1,
         };
         let output_elements = checked_product(output_rows, c.vocab_size, "MLX output elements")?;
-        let output_bytes = byte_count(output_elements)?;
-
-        // Account conservatively for projected output, a possible
-        // contiguous output, and the final host output payload.
-        // Llama's eager reference projects every prefill row before selecting
-        // the final logits. A single-row GEMV rounds differently from GEMM near
-        // zero; preserve the qualified graph and account for the full projection.
-        let projection_bytes = if !c.has_qk_norm() {
-            byte_count(checked_product(
-                tokens.len(),
-                c.vocab_size,
-                "Llama projection",
-            )?)?
-        } else {
-            output_bytes
-        };
+        // Eager inference projects the prompt before selecting its final row.
+        // Selecting first changes quantized GEMM into GEMV and can change
+        // near-zero logits even for the same normalized hidden state.
+        let projection_bytes = byte_count(checked_product(
+            tokens.len(),
+            c.vocab_size,
+            "MLX output projection",
+        )?)?;
         let required_output = projection_bytes
             .checked_mul(3)
             .ok_or(ModelError::DimensionOverflow("MLX output payload overlap"))?;
@@ -828,24 +867,28 @@ impl MlxDecoderModel {
             let key = ops::transpose(&key, &[0, 2, 1, 3], stream)?;
             let value = ops::transpose(&value, &[0, 2, 1, 3], stream)?;
 
-            let query = apply_rope(&query, c, position, stream)?;
-            let key = apply_rope(&key, c, position, stream)?;
+            let (query, key) = match c.family {
+                super::config::DecoderFamily::Ministral3 { yarn, query_beta } => {
+                    super::ministral3::position::rotate_query_key(
+                        &query, &key, &yarn, query_beta, position, stream,
+                    )?
+                }
+                _ if c.uses_rope(index) => (
+                    apply_rope(&query, c, position, stream)?,
+                    apply_rope(&key, c, position, stream)?,
+                ),
+                _ => (query, key),
+            };
 
             let prefix = append.stage_layer(index, &key, &value)?;
 
-            let mask = if token_count == 1 {
-                AttentionMask::Full
-            } else {
-                AttentionMask::CausalSuffix {
-                    prefix_tokens: position,
-                }
-            };
-
-            let attended = attention::grouped_query_attention(
+            let attended = causal_prefill_attention(
                 &query,
                 prefix.keys(),
                 prefix.values(),
-                mask,
+                position,
+                token_count,
+                c.attention_tile_tokens(cache_spec.capacity_tokens, token_count),
                 stream,
             )?;
 
@@ -856,13 +899,10 @@ impl MlxDecoderModel {
 
             let normalized =
                 ops::rms_norm(&hidden, &layer.post_attention_layernorm, c.rms_eps, stream)?;
-            let gate = layer.gate_proj.apply(&normalized, stream)?;
-            let up = layer.up_proj.apply(&normalized, stream)?;
-            let activated = ops::swiglu(&gate, &up, stream)?;
-            let mlp_output = layer.down_proj.apply(&activated, stream)?;
+            let mlp_output = layer.mlp.apply(&normalized, stream)?;
             hidden = ops::residual_add(&hidden, &mlp_output, stream)?;
-            if !c.has_qk_norm() {
-                // Bound Llama's live activation graph to one layer. Evaluating
+            if c.evaluates_each_layer(cache_spec.capacity_tokens) {
+                // Bound the decoder's live activation graph to one layer. Evaluating
                 // native arrays does not publish the staged KV transaction.
                 // The hidden output depends on both staged K/V arrays, so their
                 // upstream graphs are also evaluated before the next layer.
@@ -873,19 +913,8 @@ impl MlxDecoderModel {
 
         let normalized = ops::rms_norm(&hidden, &self.weights.final_layernorm, c.rms_eps, stream)?;
 
-        let selected = match selection {
-            OutputSelection::All => normalized,
-            OutputSelection::Last if !c.has_qk_norm() => normalized,
-            OutputSelection::Last => ops::slice(
-                &normalized,
-                &[token_count - 1, 0],
-                &[token_count, c.hidden_size],
-                stream,
-            )?,
-        };
-
-        let logits = self.weights.output_head().apply(&selected, stream)?;
-        let logits = if !c.has_qk_norm() && matches!(selection, OutputSelection::Last) {
+        let logits = self.weights.output_head().apply(&normalized, stream)?;
+        let logits = if matches!(selection, OutputSelection::Last) {
             ops::slice(
                 &logits,
                 &[token_count - 1, 0],
@@ -915,7 +944,7 @@ impl MlxDecoderModel {
         }
 
         // Check actual host-vector capacity as well as requested length.
-        let actual_overlap = output_bytes
+        let actual_overlap = projection_bytes
             .checked_mul(2)
             .and_then(|bytes| {
                 byte_count(values.capacity())
@@ -1008,7 +1037,7 @@ fn shape_i32(shape: &[usize]) -> MlxDecoderResult<(usize, Vec<i32>)> {
     Ok((expected, dimensions))
 }
 
-fn upload_f32(values: Vec<f32>, shape: &[usize]) -> MlxDecoderResult<Array> {
+pub(crate) fn upload_f32(values: Vec<f32>, shape: &[usize]) -> MlxDecoderResult<Array> {
     let (expected, dimensions) = shape_i32(shape)?;
     if expected != values.len() {
         return Err(ModelError::ShapeMismatch {
@@ -1038,7 +1067,7 @@ fn upload_u32(values: Vec<u32>, shape: &[usize]) -> MlxDecoderResult<Array> {
     Ok(array)
 }
 
-fn check_weight(
+pub(crate) fn check_weight(
     name: &'static str,
     expected: usize,
     values: &[f32],
@@ -1064,7 +1093,7 @@ fn check_weight(
     Ok(())
 }
 
-fn check_matrix(
+pub(crate) fn check_matrix(
     name: &'static str,
     expected_elements: usize,
     matrix: &MatrixWeight,
@@ -1129,6 +1158,38 @@ fn check_matrix(
 }
 
 fn validate_weights(c: &DecoderConfig, weights: &DecoderWeights) -> Result<u64, ModelError> {
+    use super::config::DecoderFamily;
+    if c.family == DecoderFamily::Qwen3Moe {
+        return Err(ModelError::InvalidConfig(
+            "expected routed Qwen3-Coder weights",
+        ));
+    }
+    if let DecoderFamily::Ministral3 { yarn, query_beta } = c.family {
+        yarn.validate()
+            .map_err(|_| ModelError::InvalidConfig("invalid Ministral YaRN parameters"))?;
+        if c.head_dim != yarn.dimensions
+            || c.rope_theta != yarn.theta
+            || c.rope_scaling.is_some()
+            || c.max_context > 1 << 24
+            || c.max_context < yarn.original_context
+            || !query_beta.is_finite()
+            || query_beta < 0.0
+        {
+            return Err(ModelError::InvalidConfig(
+                "inconsistent Ministral position contract",
+            ));
+        }
+    }
+    if match (&c.family, &c.rope_layers) {
+        (DecoderFamily::SmolLm3, Some(layers)) => layers.len() != c.num_layers,
+        (DecoderFamily::SmolLm3, None) => true,
+        (_, Some(_)) => true,
+        (_, None) => false,
+    } {
+        return Err(ModelError::InvalidConfig(
+            "invalid family-specific RoPE layer schedule",
+        ));
+    }
     if !c.rms_eps.is_finite() || c.rms_eps <= 0.0 || c.rope_scaling.is_some_and(|s| !s.validate()) {
         return Err(ModelError::InvalidConfig(
             "invalid normalization or RoPE scaling",
@@ -1344,6 +1405,53 @@ mod tests {
         }
     }
 
+    fn check_tiled_causal_prefill(kind: DeviceType) {
+        let stream = stream(kind);
+        let tensor = |heads: i32, tokens: i32, seed: i32| {
+            let values = (0..heads * tokens * 64)
+                .map(|i| (((i * 37 + seed) % 101) - 50) as f32 / 33.0)
+                .collect::<Vec<_>>();
+            Array::from_f32_slice(&values, &[1, heads, tokens, 64]).unwrap()
+        };
+        for (prefix, tokens) in [(0, 33), (19, 37)] {
+            let query = tensor(4, tokens, 3);
+            let keys = tensor(2, prefix + tokens, 17);
+            let values = tensor(2, prefix + tokens, 59);
+            let mask = AttentionMask::CausalSuffix {
+                prefix_tokens: prefix as usize,
+            };
+            let full =
+                attention::grouped_query_attention(&query, &keys, &values, mask, &stream).unwrap();
+            let tiled = causal_prefill_attention(
+                &query,
+                &keys,
+                &values,
+                prefix as usize,
+                tokens as usize,
+                16,
+                &stream,
+            )
+            .unwrap();
+            assert_eq!(tiled.shape(), full.shape());
+            let expected = ops::to_vec_f32(&full, &stream).unwrap();
+            let actual = ops::to_vec_f32(&tiled, &stream).unwrap();
+            for (i, (a, b)) in actual.into_iter().zip(expected).enumerate() {
+                assert!((a - b).abs() < 1e-4, "element {i}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_causal_prefill_cpu() {
+        check_tiled_causal_prefill(DeviceType::Cpu);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn tiled_causal_prefill_metal() {
+        check_tiled_causal_prefill(DeviceType::Gpu);
+    }
+
     fn reference_last(model: &DecoderModel, tokens: &[u32]) -> Vec<f32> {
         model
             .forward(tokens)
@@ -1543,6 +1651,35 @@ mod tests {
     }
 
     #[test]
+    fn long_dense_cache_matches_short_cache_after_cancel() {
+        let stream = stream(DeviceType::Cpu);
+        let mut config = DecoderConfig::tiny_fixture();
+        config.max_context = 2048;
+        assert!(!config.evaluates_each_layer(16));
+        assert!(config.evaluates_each_layer(2048));
+        let (model, reference) = models(config, &stream);
+        let mut short = model.new_cache(16, CACHE, &stream).unwrap();
+        let mut long = model.new_cache(2048, CACHE, &stream).unwrap();
+        let prompt = [3, 41, 7];
+        let short_row = model.prefill(&prompt, &mut short, LOGITS, &stream).unwrap();
+        let mut checks = 0;
+        let cancelled = model.prefill_cancellable(&prompt, &mut long, LOGITS, &stream, || {
+            checks += 1;
+            checks == 3 // after evaluating the first layer, before publishing the append
+        });
+        assert!(matches!(cancelled, Err(MlxDecoderError::Cancelled)));
+        assert_eq!(long.len(), 0);
+        assert!(long.is_healthy());
+        let long_row = model.prefill(&prompt, &mut long, LOGITS, &stream).unwrap();
+        assert_close(long_row.last_row(), short_row.last_row());
+        assert_close(long_row.last_row(), &reference_last(&reference, &prompt));
+        let long_decode = model.decode(12, &mut long, LOGITS, &stream).unwrap();
+        let short_decode = model.decode(12, &mut short, LOGITS, &stream).unwrap();
+        assert_close(long_decode.last_row(), short_decode.last_row());
+        assert_eq!(long.len(), 4);
+    }
+
+    #[test]
     fn cancellation_abandons_staged_layers_without_advancing_cache() {
         let stream = stream(DeviceType::Cpu);
         let (model, _) = models(DecoderConfig::tiny_fixture(), &stream);
@@ -1609,6 +1746,19 @@ mod tests {
             Err(MlxDecoderError::PayloadLimit { .. }),
         ));
         assert_eq!(cache.len(), before);
+
+        let prompt = [7, 12, 5];
+        let required = (prompt.len() * model.config().vocab_size * size_of::<f32>() * 3) as u64;
+        assert!(matches!(
+            model.prefill(&prompt, &mut cache, required - 1, &stream),
+            Err(MlxDecoderError::PayloadLimit { required_bytes, .. }) if required_bytes == required
+        ));
+        assert_eq!(cache.len(), before);
+        let logits = model
+            .prefill(&prompt, &mut cache, required, &stream)
+            .unwrap();
+        assert_eq!(logits.rows(), 1);
+        assert_eq!(cache.len(), before + prompt.len());
     }
 
     #[test]
@@ -1758,6 +1908,53 @@ mod measured_weight_buffer_tests {
 }
 
 // ALLOY_MEASURED_BUFFERS_V1
+
+/// Evaluate each tile before advancing, so score tensors for distinct
+/// query ranges cannot coexist in the lazy graph.
+fn causal_prefill_attention(
+    query: &Array,
+    keys: &Array,
+    values: &Array,
+    position: usize,
+    tokens: usize,
+    tile: usize,
+    stream: &Stream,
+) -> MlxDecoderResult<Array> {
+    if tokens <= tile {
+        let mask = if tokens == 1 {
+            AttentionMask::Full
+        } else {
+            AttentionMask::CausalSuffix {
+                prefix_tokens: position,
+            }
+        };
+        return Ok(attention::grouped_query_attention(
+            query, keys, values, mask, stream,
+        )?);
+    }
+
+    let q = query.shape();
+    let k = keys.shape();
+    let mut output = None;
+    for start in (0..tokens).step_by(tile) {
+        let end = (start + tile).min(tokens);
+        let queries = ops::slice(query, &[0, 0, start, 0], &[1, q[1], end, q[3]], stream)?;
+        let kv_end = [1, k[1], position + end, k[3]];
+        let keys = ops::slice(keys, &[0; 4], &kv_end, stream)?;
+        let values = ops::slice(values, &[0; 4], &kv_end, stream)?;
+        let mask = AttentionMask::CausalSuffix {
+            prefix_tokens: position + start,
+        };
+        let result = attention::grouped_query_attention(&queries, &keys, &values, mask, stream)?;
+        let joined = match output {
+            Some(previous) => ops::concatenate_axis(&previous, &result, 2, stream)?,
+            None => result,
+        };
+        joined.eval()?;
+        output = Some(joined);
+    }
+    output.ok_or_else(|| ModelError::InvalidConfig("empty attention batch").into())
+}
 
 fn apply_rope(
     input: &Array,

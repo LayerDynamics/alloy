@@ -1,0 +1,13 @@
+{
+  "files": {
+    "config.json": "cdd4bfa0a702d0241faaa3b80d15d481d7f8abf2659fba0958b1e7f24a28055f",
+    "generate.py": "1c3aa715c8aeffc8642ca8083880bc4deff71a074dbce3712e4f01a6db2ee17d",
+    "reference-linux-aarch64.json": "471791928d0712c0e49814635fe048c55c06be84d4d571086f6a36147932da79"
+  },
+  "upstream": {
+    "ministral3.py": "658de236349540794672fa5526049222d0877edffc43783a9208f483f4fa5dca",
+    "rope_utils.py": "9f68c938c040fa111d13f2ed95c70e8261515fb3b54f8a0a474c096baf4e087a"
+  },
+  "artifact_revision": "a962dcb09eee4169c890e544c9eb938f1113fdee",
+  "scope": "Position operations only, not complete model numerical qualification"
+}

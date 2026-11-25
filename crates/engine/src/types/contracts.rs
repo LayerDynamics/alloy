@@ -11,6 +11,7 @@ use std::{
     fmt,
     num::NonZeroUsize,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 pub use tool_context::{RenderingTool, ToolContext, ToolContextLimits, ToolHistoryBlock};
@@ -208,7 +209,7 @@ pub struct ContextSnapshot {
     snapshot_id: ContextSnapshotId,
     profile_id: ModelProfileId,
     messages: Vec<Message>,
-    tool_context: Option<ToolContext>,
+    tool_context: Option<Arc<ToolContext>>,
 }
 
 impl ContextSnapshot {
@@ -252,13 +253,17 @@ impl ContextSnapshot {
     /// Callers source metadata from validated registrations and bind historical
     /// IDs before construction. This does not authorize new effects.
     pub fn with_tool_context(mut self, context: ToolContext) -> Self {
-        self.tool_context = Some(context);
+        self.tool_context = Some(Arc::new(context));
         self
     }
 
     /// Borrow optional model-facing tool schemas and linked history.
     pub fn tool_context(&self) -> Option<&ToolContext> {
-        self.tool_context.as_ref()
+        self.tool_context.as_deref()
+    }
+
+    pub(crate) fn shared_tool_context(&self) -> Option<Arc<ToolContext>> {
+        self.tool_context.clone()
     }
 }
 
@@ -379,6 +384,19 @@ pub struct GenerationOptions {
     max_output_tokens: NonZeroUsize,
     decoding: DecodingMode,
     seed: Option<u64>,
+    json_schema: Option<crate::structured_output::JsonOutputSchema>,
+    tool_call_mode: ToolCallMode,
+}
+
+/// Boundary at which a tool generation returns its proposals to the caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallMode {
+    /// Collect a complete generation according to the ordinary profile protocol.
+    #[default]
+    Batch,
+    /// Stop decoding at the first validated tool call and return its result before continuing.
+    Single,
 }
 
 impl GenerationOptions {
@@ -430,6 +448,8 @@ impl GenerationOptions {
             max_output_tokens,
             decoding,
             seed,
+            json_schema: None,
+            tool_call_mode: ToolCallMode::Batch,
         })
     }
 
@@ -451,6 +471,28 @@ impl GenerationOptions {
     /// Return the optional sampling seed.
     pub fn seed(&self) -> Option<u64> {
         self.seed
+    }
+
+    /// Select a tool boundary for this generation only.
+    pub fn with_tool_call_mode(mut self, mode: ToolCallMode) -> Self {
+        self.tool_call_mode = mode;
+        self
+    }
+
+    /// Requested boundary for a tool proposal generation.
+    pub fn tool_call_mode(&self) -> ToolCallMode {
+        self.tool_call_mode
+    }
+
+    /// Require native token selection to satisfy this validated JSON schema.
+    pub fn with_json_schema(mut self, schema: crate::structured_output::JsonOutputSchema) -> Self {
+        self.json_schema = Some(schema);
+        self
+    }
+
+    /// Optional closed-object constraint; absent for ordinary text generation.
+    pub fn json_schema(&self) -> Option<&crate::structured_output::JsonOutputSchema> {
+        self.json_schema.as_ref()
     }
 }
 
@@ -476,6 +518,19 @@ impl GenerationRequest {
             return Err(EngineError::invalid_request(
                 "profile_id",
                 "request profile does not match the context snapshot",
+            ));
+        }
+
+        if options.tool_call_mode() == ToolCallMode::Single && context.tool_context().is_none() {
+            return Err(EngineError::invalid_request(
+                "tool_call_mode",
+                "single requires a tool context",
+            ));
+        }
+        if options.json_schema().is_some() && context.tool_context().is_some() {
+            return Err(EngineError::invalid_request(
+                "structured output",
+                "JSON constraints cannot be combined with a tool context",
             ));
         }
 
@@ -864,6 +919,9 @@ pub enum WeightRepresentation {
 /// KV retention behavior supported by an implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheKind {
+    /// Per-layer full history and sliding windows. The representation identifies
+    /// the family layout; this does not imply full-prefix export or truncation.
+    Mixed,
     /// Retain the full admitted prefix.
     Full,
     /// Retain a bounded rolling window.

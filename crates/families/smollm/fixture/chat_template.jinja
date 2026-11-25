@@ -1,0 +1,15 @@
+{{- '<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nReasoning Mode: /no_think\n\n## Custom Instructions\n\n' -}}
+{%- if messages[0].role == 'system' -%}
+{{- messages[0].content ~ '\n\n' -}}
+{%- else -%}
+{{- 'You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n' -}}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- for message in messages -%}
+{%- if not (loop.first and message.role == 'system') -%}
+{{- '<|im_start|>' ~ message.role ~ '\n' -}}
+{%- if message.role == 'assistant' -%}{{- '<think>\n\n</think>\n' -}}{%- endif -%}
+{{- message.content ~ '<|im_end|>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{{- '<|im_start|>assistant\n<think>\n\n</think>\n' -}}

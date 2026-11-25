@@ -4,6 +4,8 @@ pub struct DecoderConfig {
     pub family: DecoderFamily,
     pub rms_eps: f32,
     pub rope_scaling: Option<Llama31Scaling>,
+    /// Explicit per-layer RoPE schedule for SmolLM3. None means every layer.
+    pub rope_layers: Option<Vec<bool>>,
     pub quantization_bits: u8,
     pub hidden_size: usize,
     pub num_layers: usize,
@@ -18,6 +20,44 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
+    const SHORT_CACHE_LIMIT: usize = 1024;
+
+    /// Large routed requests share one attention tile limit between the
+    /// execution graph and its memory reservation.
+    pub fn tiled_routed_prefill(&self, capacity: usize) -> bool {
+        self.family == DecoderFamily::Qwen3Moe && capacity > 32_768
+    }
+
+    pub fn attention_tile_tokens(&self, capacity: usize, tokens: usize) -> usize {
+        if self.tiled_routed_prefill(capacity) {
+            tokens.min(16)
+        } else {
+            tokens
+        }
+    }
+
+    /// Limit live activations to one transformer layer. Short dense Qwen3
+    /// requests can keep the lazy graph, avoiding a device wait per layer.
+    /// The engine uses this same decision to reserve temporary storage.
+    pub fn evaluates_each_layer(&self, cache_capacity: usize) -> bool {
+        self.family != DecoderFamily::Qwen3 || cache_capacity > Self::SHORT_CACHE_LIMIT
+    }
+
+    /// Long Qwen3 and Llama 3 decodes materialize each layer and retain
+    /// only the committed prefix plus the active layer's functional update.
+    pub fn kv_update_mode(&self, capacity: usize) -> crate::kv_cache::KvUpdateMode {
+        if capacity > Self::SHORT_CACHE_LIMIT
+            && matches!(
+                self.family,
+                DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe | DecoderFamily::Llama3
+            )
+        {
+            crate::kv_cache::KvUpdateMode::Layerwise
+        } else {
+            crate::kv_cache::KvUpdateMode::FullVersion
+        }
+    }
+
     /// The tiny synthetic model for `qwen3_forward_cpu`. Small enough that
     /// an independent numpy implementation (fixture/gen_reference.py)
     /// is the source of truth for its reference logits.
@@ -26,6 +66,7 @@ impl DecoderConfig {
             family: DecoderFamily::Qwen3,
             rms_eps: 1e-6,
             rope_scaling: None,
+            rope_layers: None,
             quantization_bits: 4,
             hidden_size: 32,
             num_layers: 2,
@@ -48,6 +89,7 @@ impl DecoderConfig {
             family: DecoderFamily::Qwen3,
             rms_eps: 1e-6,
             rope_scaling: None,
+            rope_layers: None,
             quantization_bits: 4,
             hidden_size: 2560,
             num_layers: 36,
@@ -83,10 +125,56 @@ impl DecoderConfig {
 }
 
 /// Dense architectures with different attention semantics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DecoderFamily {
     Qwen3,
+    /// Qwen3-Coder with a routed expert MLP in each transformer layer.
+    Qwen3Moe,
     Llama3,
+    SmolLm3,
+    /// Nested Ministral 3 text decoder with full-head YaRN and absolute query scaling.
+    Ministral3 {
+        yarn: mlx_ffi::attention::YarnParameters,
+        query_beta: f32,
+    },
+}
+
+/// Parse the publisher's 0=NoPE/1=RoPE schedule, with explicit overrides taking
+/// precedence over the periodic default. Shared by metadata and weight loading.
+pub fn smollm_rope_layers(
+    value: &serde_json::Value,
+    layers: usize,
+) -> Result<Vec<bool>, &'static str> {
+    if layers == 0 || layers > 4096 {
+        return Err("invalid SmolLM3 layer count");
+    }
+    if let Some(explicit) = value.get("no_rope_layers").filter(|v| !v.is_null()) {
+        let entries = explicit
+            .as_array()
+            .ok_or("no_rope_layers must be an array")?;
+        if entries.len() != layers {
+            return Err("no_rope_layers length mismatch");
+        }
+        return entries
+            .iter()
+            .map(|entry| match entry.as_u64() {
+                Some(0) => Ok(false),
+                Some(1) => Ok(true),
+                _ => Err("no_rope_layers entries must be 0 or 1"),
+            })
+            .collect();
+    }
+    let interval = match value.get("no_rope_layer_interval") {
+        None => 4,
+        Some(v) => v
+            .as_u64()
+            .and_then(|x| usize::try_from(x).ok())
+            .filter(|x| *x > 0)
+            .ok_or("invalid no_rope_layer_interval")?,
+    };
+    Ok((0..layers)
+        .map(|i| !(i + 1).is_multiple_of(interval))
+        .collect())
 }
 
 /// Llama 3.1 wavelength scaling, applied to inverse angular frequencies.
@@ -124,8 +212,12 @@ impl Llama31Scaling {
     }
 }
 impl DecoderConfig {
+    /// NoPE layers keep raw Q/K while retaining the same causal KV layout.
+    pub fn uses_rope(&self, layer: usize) -> bool {
+        self.rope_layers.as_ref().is_none_or(|layers| layers[layer])
+    }
     pub fn has_qk_norm(&self) -> bool {
-        self.family == DecoderFamily::Qwen3
+        matches!(self.family, DecoderFamily::Qwen3 | DecoderFamily::Qwen3Moe)
     }
     pub fn norm_width(&self) -> usize {
         if self.has_qk_norm() { self.head_dim } else { 0 }

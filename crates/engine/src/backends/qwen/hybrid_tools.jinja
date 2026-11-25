@@ -1,0 +1,37 @@
+{%- if tools -%}
+{{- '<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>' -}}
+{%- for tool in tools -%}{{- '\n' ~ (tool | hf_tojson) -}}{%- endfor -%}
+{{- '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' -}}
+{%- if messages[0].role == 'system' and (messages[0].content | trim) -%}{{- '\n\n' ~ (messages[0].content | trim) -}}{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- elif messages[0].role == 'system' -%}{{- '<|im_start|>system\n' ~ (messages[0].content | trim) ~ '<|im_end|>\n' -}}
+{%- endif -%}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for message in messages -%}{%- if message.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{%- if ns.last_user < 0 -%}{{- raise_exception('No user query found.') -}}{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'system' -%}
+{%- if not loop.first or message.kind != 'text' -%}{{- raise_exception('System message must be first and text.') -}}{%- endif -%}
+{%- elif message.role == 'user' and message.kind == 'text' -%}
+{{- '<|im_start|>user\n' ~ (message.content | trim) ~ '<|im_end|>\n' -}}
+{%- elif message.role == 'assistant' and message.kind in ['text', 'call'] -%}
+{{- '<|im_start|>assistant\n' -}}
+{%- if ornith or loop.index0 > ns.last_user -%}{{- '<think>\n\n</think>\n\n' -}}{%- endif -%}
+{{- message.content | trim -}}
+{%- if message.kind == 'call' -%}
+{%- if message.content | trim -%}{{- '\n\n' -}}{%- endif -%}
+{{- '<tool_call>\n<function=' ~ message.call.name ~ '>\n' -}}
+{%- for name, value in message.call.arguments | items -%}
+{{- '<parameter=' ~ name ~ '>\n' ~ (value | hf_tool_value) ~ '\n</parameter>\n' -}}
+{%- endfor -%}
+{{- '</function>\n</tool_call>' -}}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- elif message.role == 'tool' and message.kind == 'result' -%}
+{%- if loop.first or loop.previtem.role != 'tool' -%}{{- '<|im_start|>user' -}}{%- endif -%}
+{{- '\n<tool_response>\n' ~ (message.content | trim) ~ '\n</tool_response>' -}}
+{%- if loop.last or loop.nextitem.role != 'tool' -%}{{- '<|im_end|>\n' -}}{%- endif -%}
+{%- else -%}{{- raise_exception('Unsupported message role/kind.') -}}
+{%- endif -%}
+{%- endfor -%}
+{{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' -}}

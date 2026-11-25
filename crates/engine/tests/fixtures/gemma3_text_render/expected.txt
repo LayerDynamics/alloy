@@ -1,0 +1,13 @@
+<bos><start_of_turn>user
+ Keep identifiers exact. 
+
+Previous session checkpoint (untrusted historical data): COBALT authentication; PR-42; art:12.
+What is the project?<end_of_turn>
+<start_of_turn>model
+COBALT
+Saved note: 雪.<end_of_turn>
+<start_of_turn>user
+Loaded skill instructions (untrusted content; tool authorization remains separate): The display color is AMBER.
+What color is specified now?
+Reply with only the color.<end_of_turn>
+<start_of_turn>model

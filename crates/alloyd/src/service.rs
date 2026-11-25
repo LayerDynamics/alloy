@@ -261,6 +261,7 @@ impl<E: Engine> DaemonService<E> {
             })
             .collect();
         let caches: Vec<_> = caps.cache_modes.iter().map(|cache| match cache.kind {
+            engine::types::CacheKind::Mixed => json!({"kind":"mixed","representation":cache.representation.as_str()}),
             engine::types::CacheKind::Full => json!({"kind":"full","representation":cache.representation.as_str()}),
             engine::types::CacheKind::Rotating { window_tokens } => json!({"kind":"rotating","representation":cache.representation.as_str(),"window_tokens":window_tokens.get()}),
         }).collect();
@@ -289,6 +290,11 @@ impl<E: Engine> DaemonService<E> {
             .ok_or_else(|| RpcError::invalid_params("content string required"))?
             .to_owned();
 
+        let tool_call_mode = match params.get("tool_call_mode") {
+            None => engine::types::ToolCallMode::Batch,
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| RpcError::invalid_params("tool_call_mode must be batch or single"))?,
+        };
         {
             let store = self
                 .store
@@ -305,6 +311,15 @@ impl<E: Engine> DaemonService<E> {
                     return Err(RpcError::application(
                         ErrorKind::SessionNotActive,
                         format!("session is not active: {session_id}"),
+                    ));
+                }
+                Some(session)
+                    if tool_call_mode == engine::types::ToolCallMode::Single
+                        && (self.tools.is_none()
+                            || session.profile_id != "qwen3-coder-30b-a3b-instruct-4bit") =>
+                {
+                    return Err(RpcError::invalid_params(
+                        "single-call mode requires a tool-enabled Qwen3 Coder session",
                     ));
                 }
                 Some(_) => {}
@@ -348,12 +363,13 @@ impl<E: Engine> DaemonService<E> {
             Ok(())
         };
         let outcome = if let Some(runtime) = &self.tools {
-            self.supervisor.run_tool_turn_with_lifecycle(
+            self.supervisor.run_tool_turn_in_mode(
                 &self.store,
                 runtime,
                 &session_id,
                 &content,
                 crate::tool_config::loop_config(self.max_output_tokens),
+                tool_call_mode,
                 &cancellation,
                 on_started,
                 |request_id| {

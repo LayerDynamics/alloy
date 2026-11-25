@@ -442,6 +442,180 @@ pub fn qwen3_projected_tool_token_upper_bound(
         .ok_or_else(|| EngineError::invalid_request("projection", "token bound overflow"))
 }
 
+// Explicit opt-in formatting used by the pinned hybrid publisher templates.
+// Ordinary `tojson` and all existing family templates keep their behavior.
+struct HuggingFaceJson;
+impl serde_json::ser::Formatter for HuggingFaceJson {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        if !value.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-finite template number",
+            ));
+        }
+        let magnitude = value.abs();
+        if magnitude != 0.0 && !(1e-4..1e16).contains(&magnitude) {
+            let scientific = format!("{value:e}");
+            let (mantissa, exponent) = scientific.split_once('e').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid scientific number")
+            })?;
+            let exponent: i32 = exponent.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid exponent")
+            })?;
+            write!(writer, "{mantissa}e{exponent:+03}")
+        } else if value.fract() == 0.0 {
+            write!(writer, "{value}.0")
+        } else {
+            write!(writer, "{value}")
+        }
+    }
+}
+fn hf_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
+    let mut output = Vec::new();
+    serde::Serialize::serialize(
+        &value,
+        &mut serde_json::Serializer::with_formatter(&mut output, HuggingFaceJson),
+    )
+    .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    String::from_utf8(output)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
+}
+// Gemma's declared tool protocol uses Python's compact JSON separators while
+// retaining its number spelling. Opt in without changing other templates.
+struct CompactHuggingFaceJson;
+impl serde_json::ser::Formatter for CompactHuggingFaceJson {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        serde_json::ser::Formatter::write_f64(&mut HuggingFaceJson, writer, value)
+    }
+}
+fn hf_compact_tojson(value: minijinja::Value) -> Result<String, TemplateError> {
+    let mut output = Vec::new();
+    serde::Serialize::serialize(
+        &value,
+        &mut serde_json::Serializer::with_formatter(&mut output, CompactHuggingFaceJson),
+    )
+    .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    String::from_utf8(output)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))
+}
+// Coder's publisher template applies Python str() to call arguments. Inside
+// containers Python uses repr(), including quotes and Python boolean literals.
+fn hf_python_string(value: minijinja::Value) -> Result<String, TemplateError> {
+    fn python_repr(value: &Value, nested: bool) -> Result<String, TemplateError> {
+        Ok(match value {
+            Value::String(s) if !nested => s.clone(),
+            Value::String(s) => {
+                let quote = if s.contains('\'') && !s.contains('"') {
+                    '"'
+                } else {
+                    '\''
+                };
+                let mut out = String::from(quote);
+                for c in s.chars() {
+                    match c {
+                        '\0' => out.push_str("\\x00"),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        '\r' => out.push_str("\\r"),
+                        c if c == quote || c == '\\' => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        c if c.escape_debug().to_string().starts_with("\\u{") => {
+                            let n = c as u32;
+                            out.push_str(&if n <= 255 {
+                                format!("\\x{n:02x}")
+                            } else if n <= 65535 {
+                                format!("\\u{n:04x}")
+                            } else {
+                                format!("\\U{n:08x}")
+                            });
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push(quote);
+                out
+            }
+            Value::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|v| python_repr(v, true))
+                    .collect::<Result<Vec<_>, _>>()?;
+                format!("[{}]", items.join(", "))
+            }
+            Value::Object(items) => {
+                let items = items
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok(format!(
+                            "{}: {}",
+                            python_repr(&Value::String(k.clone()), true)?,
+                            python_repr(v, true)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, TemplateError>>()?;
+                format!("{{{}}}", items.join(", "))
+            }
+            Value::Bool(true) => "True".into(),
+            Value::Bool(false) => "False".into(),
+            Value::Null => "None".into(),
+            Value::Number(_) => hf_tojson(minijinja::Value::from_serialize(value))?,
+        })
+    }
+    let json = serde_json::to_value(value)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    python_repr(&json, false)
+}
+
+fn hf_tool_value(value: minijinja::Value) -> Result<String, TemplateError> {
+    let json = serde_json::to_value(&value)
+        .map_err(|e| TemplateError::new(TemplateErrorKind::InvalidOperation, e.to_string()))?;
+    match json {
+        Value::String(s) => Ok(s),
+        Value::Bool(true) => Ok("True".to_owned()),
+        Value::Bool(false) => Ok("False".to_owned()),
+        Value::Null => Ok("None".to_owned()),
+        _ => hf_tojson(value),
+    }
+}
+
 /// Render exact model-visible text from a structured text snapshot.
 ///
 /// Uses the supplied pinned template. No fallback template is selected.
@@ -497,6 +671,7 @@ pub fn render_chat(
     let mut variables = Map::new();
     if let Some(tools) = context.tool_context() {
         variables.insert("tools_json".to_owned(), Value::String(tools.tools_json()?));
+        variables.insert("tools".to_owned(), tools.tool_values());
     }
 
     variables.insert("messages".to_owned(), Value::Array(messages));
@@ -511,6 +686,26 @@ pub fn render_chat(
     }
 
     let mut environment = Environment::new();
+    environment.add_filter("hf_tojson", hf_tojson);
+    environment.add_filter("hf_compact_tojson", hf_compact_tojson);
+    environment.add_filter("hf_tool_value", hf_tool_value);
+    environment.add_filter("hf_python_string", hf_python_string);
+    environment.add_filter(
+        "gemma4_name",
+        |name: String| -> Result<String, TemplateError> {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "._-".contains(c))
+            {
+                return Err(TemplateError::new(
+                    TemplateErrorKind::InvalidOperation,
+                    "invalid bare Gemma tool identifier",
+                ));
+            }
+            Ok(name)
+        },
+    );
 
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
 
@@ -954,4 +1149,317 @@ pub fn llama3_projected_tool_token_upper_bound(
         .len()
         .checked_add(additional_bytes)
         .ok_or_else(|| EngineError::invalid_request("projection", "Llama byte bound overflow"))
+}
+
+/// Conservative bound for the pinned SmolLM3 ByteLevel BPE tokenizer. It has no
+/// normalizer, no prefix-space insertion and no added post-processing tokens.
+/// Regex splitting preserves bytes and BPE only merges; one token per UTF-8
+/// byte bounds the complete rendered prompt plus already-escaped result growth.
+pub fn smollm3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x7b, 0x6a, 0x50, 0x0b, 0x66, 0x2a, 0x34, 0xeb, 0x3f, 0x03, 0x74, 0xdb, 0x85, 0x6b, 0xa4,
+        0xad, 0x7d, 0xe4, 0xc8, 0x10, 0x40, 0x57, 0x1d, 0x78, 0xdc, 0x0d, 0x35, 0x72, 0x38, 0x93,
+        0x00, 0x05,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified SmolLM3 tokenizer or empty result projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "SmolLM3 byte bound overflow"))
+}
+
+/// Bound changed grouped hybrid tool responses using the pinned ByteLevel BPE
+/// tokenizers and the shared NFC eight-byte expansion bound. Each im_start is
+/// a non-normalized, non-stripping added token, isolating each changing user
+/// segment. Charge the exact skeleton plus each complete changing segment
+/// again; never subtract estimated tokens or assume stable merges within it.
+pub fn qwen35_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+    ascii_escape_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PINS: [[u8; 32]; 3] = [
+        [
+            0xae, 0xb1, 0x33, 0x07, 0xa7, 0x1a, 0xcd, 0x8f, 0xe8, 0x18, 0x61, 0xd9, 0x4a, 0xd5,
+            0x4a, 0xb6, 0x89, 0xdf, 0x77, 0x33, 0x18, 0x80, 0x9e, 0xed, 0x3c, 0xbe, 0x79, 0x4b,
+            0x44, 0x92, 0xda, 0xe4,
+        ],
+        [
+            0x06, 0xb9, 0x50, 0x93, 0x52, 0xd2, 0xaf, 0x50, 0x38, 0x1a, 0xb2, 0x24, 0x7e, 0x08,
+            0x3b, 0x80, 0xd3, 0x2d, 0x5c, 0x0a, 0xba, 0x91, 0xc2, 0x72, 0xca, 0x9f, 0xf7, 0x29,
+            0xb6, 0xa0, 0xe5, 0x23,
+        ],
+        [
+            0x87, 0xa7, 0x83, 0x0d, 0x63, 0xfc, 0xf4, 0x3b, 0xf2, 0x41, 0xc3, 0xc5, 0x24, 0x2e,
+            0x96, 0xe6, 0x2d, 0xd3, 0xfd, 0xc2, 0x92, 0x24, 0xca, 0x26, 0xfe, 0xd8, 0xea, 0x33,
+            0x3d, 0xb7, 0x2d, 0xe4,
+        ],
+    ];
+    if !PINS.contains(tokenizer.source_sha256()) || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified hybrid tokenizer or empty result projection",
+        ));
+    }
+    const START: &str = "<|im_start|>";
+    const RESULT: &str = "\n<tool_response>\n";
+    const END: &str = "\n</tool_response>";
+    let text = rendered.text();
+    let mut previous_group = None;
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (at, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let body = &text[at + RESULT.len()..];
+        let end = body.find(END).ok_or_else(|| {
+            EngineError::invalid_request("projection", "incomplete hybrid result placeholder")
+        })?;
+        if !body[..end].contains("\"content\":\"\"") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "hybrid result placeholder is not empty",
+            ));
+        }
+        let start = text[..at].rfind(START).ok_or_else(|| {
+            EngineError::invalid_request("projection", "missing hybrid result role boundary")
+        })?;
+        if !text[start..].starts_with("<|im_start|>user\n<tool_response>\n") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "hybrid result must belong to a grouped user turn",
+            ));
+        }
+        let next = text[at + RESULT.len() + end..]
+            .find(START)
+            .map(|n| at + RESULT.len() + end + n)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "missing next hybrid role boundary")
+            })?;
+        if previous_group != Some(start) {
+            segment_bytes = segment_bytes.checked_add(next - start).ok_or_else(|| {
+                EngineError::invalid_request("projection", "hybrid segment byte overflow")
+            })?;
+            previous_group = Some(start);
+        }
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing hybrid result placeholders",
+        ));
+    }
+    let variable = additional_bytes
+        .checked_sub(ascii_escape_bytes)
+        .and_then(|n| n.checked_add(segment_bytes))
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(ascii_escape_bytes))
+        .ok_or_else(|| {
+            EngineError::invalid_request("projection", "hybrid result bound overflow")
+        })?;
+    rendered
+        .token_count()
+        .checked_add(variable)
+        .ok_or_else(|| EngineError::invalid_request("projection", "hybrid token bound overflow"))
+}
+
+/// Bound the complete Phi prompt plus already-escaped tool-result growth.
+/// The pinned tokenizer has no normalizer/postprocessor, splits existing bytes,
+/// and applies ByteLevel BPE without prefix-space insertion. BPE only merges.
+pub fn phi_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x38, 0x2c, 0xc2, 0x35, 0xb5, 0x6c, 0x72, 0x59, 0x45, 0xe1, 0x49, 0xcc, 0x25, 0xf1, 0x91,
+        0xda, 0x66, 0x7c, 0x83, 0x66, 0x55, 0xef, 0xd0, 0x85, 0x7b, 0x00, 0x43, 0x20, 0xe9, 0x0e,
+        0x91, 0xea,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Phi tokenizer or empty result projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Phi byte bound overflow"))
+}
+
+/// Bound projected Gemma tool results for the frozen 4B/12B tokenizer.
+/// Space-to-metaspace replacement expands bytes by at most three. BPE with
+/// byte fallback cannot produce more tokens than normalized bytes. The pinned
+/// non-normalized, non-stripping added turn token separates unchanged groups.
+/// Charge the exact skeleton plus every entire changing group and its growth;
+/// do not subtract estimates or assume stable merges inside changed text.
+pub fn gemma3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x46, 0x67, 0xf2, 0x08, 0x95, 0x29, 0xe8, 0xe7, 0x65, 0x7c, 0xfb, 0x6d, 0x1c, 0x19, 0x91,
+        0x0a, 0xe7, 0x1f, 0xf5, 0xf2, 0x8a, 0xa7, 0xab, 0x2f, 0xf2, 0x76, 0x33, 0x30, 0xaf, 0xfa,
+        0xd7, 0x95,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Gemma3 tokenizer or empty result projection",
+        ));
+    }
+    const START: &str = "<start_of_turn>";
+    const RESULT: &str = "<tool_response>";
+    const END: &str = "</tool_response>";
+    let text = rendered.text();
+    let mut previous_group = None;
+    let mut segment_bytes = 0usize;
+    let mut count = 0usize;
+    for (at, _) in text.rmatch_indices(RESULT).take(result_count) {
+        let body = &text[at + RESULT.len()..];
+        let end = body.find(END).ok_or_else(|| {
+            EngineError::invalid_request("projection", "incomplete Gemma3 result placeholder")
+        })?;
+        if !body[..end].contains("\"content\":\"\"") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "Gemma3 result placeholder is not empty",
+            ));
+        }
+        let start = text[..at].rfind(START).ok_or_else(|| {
+            EngineError::invalid_request("projection", "missing Gemma3 result role boundary")
+        })?;
+        if !text[start..].starts_with("<start_of_turn>user\n<tool_response>") {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "Gemma3 result must belong to a grouped user turn",
+            ));
+        }
+        let next = text[at + RESULT.len() + end..]
+            .find(START)
+            .map(|n| at + RESULT.len() + end + n)
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "missing next Gemma3 role boundary")
+            })?;
+        if previous_group != Some(start) {
+            segment_bytes = segment_bytes.checked_add(next - start).ok_or_else(|| {
+                EngineError::invalid_request("projection", "Gemma3 segment byte overflow")
+            })?;
+            previous_group = Some(start);
+        }
+        count += 1;
+    }
+    if count != result_count {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing Gemma3 result placeholders",
+        ));
+    }
+    let variable = additional_bytes
+        .checked_add(segment_bytes)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            EngineError::invalid_request("projection", "Gemma3 result bound overflow")
+        })?;
+    rendered
+        .token_count()
+        .checked_add(variable)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Gemma3 token bound overflow"))
+}
+
+/// Bound the complete Ministral prompt plus the escaped growth of result bodies.
+/// The verified Tekken BPE has no normalizer or prefix insertion, and its
+/// ByteLevel postprocessor changes offsets only. Each byte yields at most one ID.
+pub(crate) fn ministral3_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    result_count: usize,
+    additional_bytes: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        0x28, 0x6a, 0xca, 0xd9, 0xb0, 0xe2, 0x7f, 0xce, 0x77, 0x8a, 0xc4, 0x29, 0x76, 0x35, 0x36,
+        0xac, 0xcf, 0x61, 0x8c, 0xcb, 0x6e, 0xd7, 0x29, 0x63, 0xb6, 0xf9, 0x46, 0x85, 0xe5, 0x31,
+        0xc5, 0xc7,
+    ];
+    if tokenizer.source_sha256() != &PIN || result_count == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "unqualified Ministral tokenizer or empty projection",
+        ));
+    }
+    rendered
+        .text()
+        .len()
+        .checked_add(additional_bytes)
+        .ok_or_else(|| EngineError::invalid_request("projection", "Ministral byte bound overflow"))
+}
+
+/// In this pinned BPE the normalizer replaces each ASCII space with a three-byte
+/// marker. The two quote controls isolate the changed span from all other groups.
+pub(crate) fn gemma4_projected_tool_token_upper_bound(
+    tokenizer: &PinnedTokenizer,
+    rendered: &RenderedContext,
+    results: usize,
+    additional: usize,
+) -> Result<usize, EngineError> {
+    const PIN: [u8; 32] = [
+        204, 141, 58, 12, 227, 100, 102, 204, 193, 39, 139, 249, 135, 223, 95, 113, 219, 23, 25,
+        185, 202, 107, 65, 24, 38, 79, 69, 203, 98, 123, 254, 15,
+    ];
+    if tokenizer.source_sha256() != &PIN || results == 0 {
+        return Err(EngineError::unsupported(
+            "projected tokenizer bound",
+            "expected pinned Gemma 4 tokenizer and result placeholders",
+        ));
+    }
+    let mut bytes = additional;
+    let mut count = 0;
+    for (at, _) in rendered
+        .text()
+        .rmatch_indices("<|tool_response>response:")
+        .take(results)
+    {
+        let (body, _) = rendered.text()[at..]
+            .split_once("<tool_response|>")
+            .ok_or_else(|| {
+                EngineError::invalid_request("projection", "incomplete Gemma 4 result")
+            })?;
+        if !body.contains(r#",content:<|"|><|"|>,is_error:"#) {
+            return Err(EngineError::invalid_request(
+                "projection",
+                "expected empty Gemma 4 result",
+            ));
+        }
+        bytes = bytes
+            .checked_add(body.len())
+            .ok_or_else(|| internal("Gemma 4 result size overflow"))?;
+        count += 1;
+    }
+    if count != results {
+        return Err(EngineError::invalid_request(
+            "projection",
+            "missing Gemma 4 result placeholders",
+        ));
+    }
+    bytes
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(rendered.token_count()))
+        .ok_or_else(|| internal("Gemma 4 token bound overflow"))
 }

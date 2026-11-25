@@ -10,7 +10,7 @@ use engine::{
     parser_allocation::FrozenParserAllocation,
     types::{
         FinishReason, GenerationEvent, GenerationOptions, GenerationRequest, GenerationStream,
-        RequestId, ToolCallProposal, ToolContextLimits, Usage,
+        RequestId, ToolCallMode, ToolCallProposal, ToolContextLimits, Usage,
     },
 };
 use std::{
@@ -129,6 +129,7 @@ impl<E: Engine> Supervisor<E> {
             registry,
             request,
             config,
+            ToolCallMode::Batch,
             None,
             on_started,
             |_| Ok(()),
@@ -158,6 +159,7 @@ impl<E: Engine> Supervisor<E> {
             registry,
             request,
             config,
+            ToolCallMode::Batch,
             None,
             on_started,
             on_finished,
@@ -171,7 +173,8 @@ impl<E: Engine> Supervisor<E> {
         store: &Mutex<SessionStore>,
         registry: &ToolRegistry,
         request: ToolRoundRequest<'_>,
-        config: ToolRoundConfig,
+        mut config: ToolRoundConfig,
+        tool_call_mode: ToolCallMode,
         cancellation: Option<&tool_registry::execution::CancellationToken>,
         mut on_started: S,
         mut on_finished: D,
@@ -182,6 +185,9 @@ impl<E: Engine> Supervisor<E> {
         D: FnMut(&RequestId) -> HarnessResult<()>,
         F: FnMut(&GenerationEvent) -> HarnessResult<()>,
     {
+        if tool_call_mode == ToolCallMode::Single {
+            config.max_proposals = config.max_proposals.min(1);
+        }
         validate_config(config, request)?;
         let (profile_id, history) = read_open_turn(store, request)?;
         let request_id = round_request_id(request.session_id, request.turn_seq, request.round)?;
@@ -267,8 +273,9 @@ impl<E: Engine> Supervisor<E> {
             rendered.token_count(),
             additional_output,
         )?;
-        let options =
-            GenerationOptions::greedy(config.max_output_tokens).map_err(HarnessError::from)?;
+        let options = GenerationOptions::greedy(config.max_output_tokens)
+            .map_err(HarnessError::from)?
+            .with_tool_call_mode(tool_call_mode);
         let generation_request = GenerationRequest::new(
             request_id.clone(),
             snapshot.profile_id().clone(),

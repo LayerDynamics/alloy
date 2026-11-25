@@ -95,6 +95,7 @@ fn resident(
         }),
         weights,
         capabilities: capabilities(),
+        supports_disk_cache: false,
         candidate: None,
     }
 }

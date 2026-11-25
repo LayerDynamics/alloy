@@ -1,0 +1,137 @@
+{
+  "id": "qwen3.5-0.8b-4bit",
+  "source": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "declared_card_license": "Apache-2.0",
+    "standalone_license_verified": true,
+    "license_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+  },
+  "artifact": {
+    "repository": "mlx-community/Qwen3.5-0.8B-4bit",
+    "revision": "da28692b5f139cb0ec58a356b437486b7dac7462",
+    "files": [
+      {
+        "path": "README.md",
+        "bytes": 678,
+        "sha256": "5614ff1cdf39fd970ade36d9499d99024c089e7add90931e018b8cd8de6dd265"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7755,
+        "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+      },
+      {
+        "path": "config.json",
+        "bytes": 3112,
+        "sha256": "ba7770da23eae5ebd6827571f086e331956b33f4442a9e876fb4aa10969a6772"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 424027384,
+        "sha256": "34b9f235b12ade78358792a93396b362c9f5fc2dee9a25b246e45bafca8e0766"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 57958,
+        "sha256": "588a906d04097e66c56d3d40ed928bb45d62fd586929673c3234dd373aa31c3d"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 19989343,
+        "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 1139,
+        "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182"
+      }
+    ],
+    "derivation": {
+      "method": "byte-preserving language_model tensor extraction",
+      "recipe": "qwen35_model/extract_text.py",
+      "recipe_sha256": "6f5ecc0c0f693ebc624ad12e2d6801a50ce68fe06643b19441870ce8a8a609d6",
+      "retained_tensors": 694,
+      "omitted_vision_tensors": 153,
+      "original_files": [
+        {
+          "path": "README.md",
+          "bytes": 678,
+          "sha256": "5614ff1cdf39fd970ade36d9499d99024c089e7add90931e018b8cd8de6dd265"
+        },
+        {
+          "path": "chat_template.jinja",
+          "bytes": 7755,
+          "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+        },
+        {
+          "path": "config.json",
+          "bytes": 3112,
+          "sha256": "ba7770da23eae5ebd6827571f086e331956b33f4442a9e876fb4aa10969a6772"
+        },
+        {
+          "path": "model.safetensors",
+          "bytes": 625229487,
+          "sha256": "f5a0d9dd3efa73510542a8023d610ff26be2b4b020d181cfc4bedaa1fcc5dd9e"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "bytes": 71473,
+          "sha256": "6e48f2fa5d6f033a6d77bf833abfa9698ca24d1715ecea4c67447bcfaee44650"
+        },
+        {
+          "path": "tokenizer.json",
+          "bytes": 19989343,
+          "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "bytes": 1139,
+          "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182"
+        }
+      ]
+    }
+  },
+  "reference": {
+    "versions": {
+      "mlx": "0.32.4",
+      "mlx-lm": "0.31.2",
+      "numpy": "2.4.2"
+    },
+    "compile_enabled": false,
+    "sha256": "052a68302b3c1d4dce08b88fc15ac43ac58a5b4770b96c6e077a41dbbee9dd87"
+  },
+  "prompts": [
+    "Calculate 2 + 2. Answer briefly.",
+    "Explain why the sky is blue."
+  ],
+  "decode_tokens": [
+    19,
+    13
+  ],
+  "qualification_status": "unqualified",
+  "prompt_tokens": [
+    [
+      46270,
+      220,
+      17,
+      478,
+      220,
+      17,
+      13,
+      21134,
+      25899,
+      13
+    ],
+    [
+      814,
+      20139,
+      3069,
+      279,
+      12515,
+      369,
+      6105,
+      13
+    ]
+  ]
+}

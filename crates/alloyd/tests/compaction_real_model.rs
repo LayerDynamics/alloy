@@ -4,7 +4,17 @@ mod recording_engine;
 fn real_profile() -> String {
     std::env::var("ALLOY_REAL_PROFILE").unwrap_or_else(|_| "qwen3-4b-4bit".to_owned())
 }
-use alloyd::{BootRequest, boot_qwen3};
+fn rebuild_only_profile() -> bool {
+    matches!(
+        real_profile().as_str(),
+        "ornith-1.5-9b-4bit"
+            | "qwen3.5-0.8b-4bit"
+            | "gemma-3-4b-4bit"
+            | "gemma-3-12b-4bit"
+            | "gemma-4-e4b-it-4bit"
+    )
+}
+use alloyd::BootRequest;
 use engine::{
     api::Engine,
     memory_guard::{MemoryGuardConfig, MemoryGuardTier},
@@ -49,7 +59,7 @@ fn wait_future<F: std::future::Future>(future: F) -> F::Output {
 #[ignore = "requires local pinned model and native MLX"]
 fn real_rpc_skill_load_changes_next_generation() {
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -82,7 +92,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     ));
     let service = alloyd::DaemonService::open(
         root.path().join("sessions.sqlite"),
-        boot.engine,
+        recording_engine::RecordingEngine::new(boot.engine),
         telemetry,
         16,
         1,
@@ -106,8 +116,8 @@ fn real_rpc_skill_load_changes_next_generation() {
     let session = created[0]["result"]["session_id"].as_str().unwrap();
     let mut outputs = Vec::new();
     for (value, word) in [
-        ("The secret color is COBALT.", "COBALT"),
-        ("The secret color is AMBER.", "AMBER"),
+        ("The display color is COBALT.", "COBALT"),
+        ("The display color is AMBER.", "AMBER"),
     ] {
         let loaded = rpc(
             "session.skill.load",
@@ -116,7 +126,7 @@ fn real_rpc_skill_load_changes_next_generation() {
         assert!(loaded[0].get("error").is_none(), "{loaded:?}");
         let sent = rpc(
             "session.send",
-            serde_json::json!({"session_id":session,"content":"What color is specified?"}),
+            serde_json::json!({"session_id":session,"content":"What color is specified? Reply with only the color."}),
         );
         assert_eq!(sent.last().unwrap()["result"]["ok"], true, "{sent:?}");
         let text = sent
@@ -127,7 +137,7 @@ fn real_rpc_skill_load_changes_next_generation() {
         outputs.push((word, text));
     }
     for (word, text) in outputs {
-        assert!(text.to_ascii_uppercase().contains(word), "{word}: {text}");
+        assert_eq!(text, word, "skill must return the current color exactly");
     }
     let caps = rpc(
         "models.capabilities",
@@ -135,7 +145,7 @@ fn real_rpc_skill_load_changes_next_generation() {
     );
     assert_eq!(
         caps[0]["result"]["supports_prefix_reuse"],
-        std::env::var_os("ALLOY_TEST_COLD").is_none(),
+        std::env::var_os("ALLOY_TEST_COLD").is_none() && !rebuild_only_profile(),
         "{caps:?}"
     );
 }
@@ -160,7 +170,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         tools_enabled: true,
         tiered_kv: TieredKvConfig::new(disk, HotCacheLimit::Bytes(0)),
     };
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         make_request(Some(root.path().join("cache"))),
         Some(2048),
     )
@@ -170,7 +180,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     db.append_event(
         "skill",
         EventKind::SkillLoaded,
-        harness_core::context::skill_event_payload("answer", "The secret color is COBALT.")
+        harness_core::context::skill_event_payload("answer", "The display color is COBALT.")
             .unwrap(),
         serde_json::json!([]),
     )
@@ -179,7 +189,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "initial",
         &boot.profile_id,
         &db.list_events("skill").unwrap(),
-        Some("What color is specified?"),
+        Some("What color is specified? Reply with only the color."),
     )
     .unwrap();
     let initial = ContextBuilder::render_and_count(&boot.engine, initial).unwrap();
@@ -189,22 +199,26 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "https://127.0.0.1:1",
         Box::new(Offline),
     ));
-    let supervisor = Supervisor::new(boot.engine, telemetry);
+    let supervisor = Supervisor::new(
+        recording_engine::RecordingEngine::new(boot.engine),
+        telemetry,
+    );
     let store = Mutex::new(db);
     let first = supervisor
-        .run_turn(&store, "skill", "What color is specified?", 16)
+        .run_turn(
+            &store,
+            "skill",
+            "What color is specified? Reply with only the color.",
+            16,
+        )
         .unwrap();
-    assert!(
-        first.assistant_text.to_ascii_uppercase().contains("COBALT"),
-        "{}",
-        first.assistant_text
-    );
+    assert_eq!(first.assistant_text, "COBALT");
     {
         let mut db = store.lock().unwrap();
         db.append_event(
             "skill",
             EventKind::SkillLoaded,
-            harness_core::context::skill_event_payload("answer", "The secret color is AMBER.")
+            harness_core::context::skill_event_payload("answer", "The display color is AMBER.")
                 .unwrap(),
             serde_json::json!([]),
         )
@@ -215,7 +229,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         "changed",
         real_profile().as_str(),
         &db.list_events("skill").unwrap(),
-        Some("What color is specified now?"),
+        Some("What color is specified now? Reply with only the color."),
     )
     .unwrap();
     let changed = ContextBuilder::render_and_count(supervisor.engine(), changed).unwrap();
@@ -236,7 +250,12 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     let warm_store = Mutex::new(SessionStore::open(root.path().join("warm.sqlite")).unwrap());
     let before = supervisor.engine().runtime().tiered_kv_snapshot();
     let warm = supervisor
-        .run_turn(&warm_store, "skill", "What color is specified now?", 16)
+        .run_turn(
+            &warm_store,
+            "skill",
+            "What color is specified now? Reply with only the color.",
+            16,
+        )
         .unwrap();
     let after = supervisor.engine().runtime().tiered_kv_snapshot();
     let restored = after.restored_tokens - before.restored_tokens;
@@ -244,18 +263,14 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
         restored <= common as u64,
         "restored {restored} exceeds unchanged prefix {common}"
     );
-    assert!(
-        warm.assistant_text.to_ascii_uppercase().contains("AMBER"),
-        "{}",
-        warm.assistant_text
-    );
+    assert_eq!(warm.assistant_text, "AMBER");
     let caps = wait_future(
         supervisor
             .engine()
             .capabilities(ArtifactId::new(real_profile().as_str()).unwrap()),
     )
     .unwrap();
-    assert!(caps.supports_prefix_reuse);
+    assert_eq!(caps.supports_prefix_reuse, !rebuild_only_profile());
     let rpc_telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
         HardwareTier::Unknown,
@@ -264,7 +279,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     ));
     let service = alloyd::DaemonService::open(
         root.path().join("rpc.sqlite"),
-        supervisor.engine().clone(),
+        supervisor.engine().inner.clone(),
         rpc_telemetry,
         16,
         1,
@@ -276,23 +291,32 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
     service.handle(request, &mut response).unwrap();
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(
-        response["result"]["supports_prefix_reuse"], true,
+        response["result"]["supports_prefix_reuse"],
+        !rebuild_only_profile(),
         "{response}"
     );
     drop(service);
     drop(supervisor);
     let cold_boot =
-        alloyd::boot::boot_qwen3_with_context_limit(make_request(None), Some(2048)).unwrap();
+        alloyd::boot::boot_native_for_qualification(make_request(None), Some(2048)).unwrap();
     let telemetry = Arc::new(TelemetryClient::with_transport(
         "0.1",
         HardwareTier::Unknown,
         "https://127.0.0.1:1",
         Box::new(Offline),
     ));
-    let cold = Supervisor::new(cold_boot.engine, telemetry);
+    let cold = Supervisor::new(
+        recording_engine::RecordingEngine::new(cold_boot.engine),
+        telemetry,
+    );
     let cold_store = Mutex::new(SessionStore::open(root.path().join("cold.sqlite")).unwrap());
     let baseline = cold
-        .run_turn(&cold_store, "skill", "What color is specified now?", 16)
+        .run_turn(
+            &cold_store,
+            "skill",
+            "What color is specified now? Reply with only the color.",
+            16,
+        )
         .unwrap();
     assert_eq!(warm.input_tokens, baseline.input_tokens);
     assert_eq!(warm.assistant_text, baseline.assistant_text);
@@ -312,7 +336,7 @@ fn real_skill_change_invalidates_stale_cache_and_matches_cold() {
 #[ignore = "requires local pinned model and native MLX"]
 fn real_model_generated_history_has_verified_canonical_bytes() {
     let root = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -352,26 +376,41 @@ fn real_model_generated_history_has_verified_canonical_bytes() {
     assert!(!result.assistant_text.is_empty());
     let base = format!("{}{}", rendered.text(), result.assistant_text);
     let mut published = None;
-    for suffix in [
-        "",
-        "<|im_end|>",
-        "<|endoftext|>",
-        "<|eot_id|>",
-        "<|eom_id|>",
-        "<|end_of_text|>",
-    ] {
+    let mut rejected = Vec::new();
+    let suffixes: &[&str] = if real_profile() == "gemma-4-e4b-it-4bit" {
+        &["<turn|>", "<eos>", "<|tool_response>", ""]
+    } else if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
+        &["</s>"]
+    } else {
+        &[
+            "",
+            "<|end|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|eot_id|>",
+            "<|eom_id|>",
+            "<|end_of_text|>",
+            "<end_of_turn>",
+            "<eos>",
+        ]
+    };
+    for suffix in suffixes {
         let bytes = format!("{base}{suffix}").into_bytes();
-        if let Ok(id) = wait_future(
+        match wait_future(
             supervisor
                 .engine()
                 .runtime()
                 .retain_session_state(result.request_id.clone(), bytes),
         ) {
-            published = Some(id);
-            break;
+            Ok(id) => {
+                published = Some(id);
+                break;
+            }
+            Err(error) => rejected.push((suffix, error.to_string())),
         }
     }
-    let id = published.expect("actual generated history has no verified canonical byte roundtrip");
+    let id = published
+        .unwrap_or_else(|| panic!("generated history failed byte roundtrip: {rejected:?}"));
     let state = wait_future(supervisor.engine().runtime().lookup_session_state(id))
         .unwrap()
         .unwrap();
@@ -389,7 +428,7 @@ fn real_model_ssd_prefix_survives_process_restart() {
     const PHASE: &str = "ALLOY_TEST_REAL_SSD_PHASE";
     if let Ok(phase) = std::env::var(PHASE) {
         let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
-        let boot = alloyd::boot::boot_qwen3_with_context_limit(
+        let boot = alloyd::boot::boot_native_for_qualification(
             BootRequest {
                 artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
                 profile_id: real_profile().as_str().into(),
@@ -427,7 +466,15 @@ fn real_model_ssd_prefix_survives_process_restart() {
             .run_turn(&Mutex::new(db), "real-ssd", &prompt, 16)
             .expect("real Qwen turn");
         let metrics = supervisor.engine().runtime().tiered_kv_snapshot();
-        if phase == "seed" {
+        if rebuild_only_profile() {
+            assert_eq!(metrics.spill_count, 0, "{metrics:?}");
+            assert_eq!(metrics.restore_count, 0, "{metrics:?}");
+            assert_eq!(metrics.restored_tokens, 0, "{metrics:?}");
+            assert!(
+                metrics.hot_evictions > 0,
+                "non-persistent cache must actually discard state: {metrics:?}"
+            );
+        } else if phase == "seed" {
             assert!(metrics.spill_count > 0, "{metrics:?}");
             assert_eq!(metrics.restore_count, 0);
         } else {
@@ -475,16 +522,25 @@ fn real_model_ssd_prefix_survives_process_restart() {
     let restored = read("restore");
     assert_eq!(cold["text"], restored["text"]);
     assert_eq!(cold["input_tokens"], restored["input_tokens"]);
-    assert!(restored["restored_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        restored["restored_tokens"].as_u64().unwrap() > 0,
+        !rebuild_only_profile()
+    );
     println!("real_ssd_restart: cold={cold}, restored={restored}");
 }
 
 #[test]
 #[ignore = "requires local pinned model and native MLX"]
 fn real_model_compaction_preserves_history_and_continues() {
+    // The pinned Ministral default system adds 530 tokens to the same archive.
+    let context_limit = if real_profile().starts_with("ministral-3-3b-instruct-2512-") {
+        2048 + 530
+    } else {
+        2048
+    };
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
     let dir = tempfile::tempdir().unwrap();
-    let boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: artifact,
             profile_id: real_profile().as_str().into(),
@@ -504,7 +560,7 @@ fn real_model_compaction_preserves_history_and_continues() {
                 HotCacheLimit::Bytes(0),
             ),
         },
-        Some(2048),
+        Some(context_limit),
     )
     .expect("boot real Qwen");
     let mut db = SessionStore::open(dir.path().join("sessions.sqlite")).unwrap();
@@ -524,6 +580,22 @@ fn real_model_compaction_preserves_history_and_continues() {
         recording_engine::RecordingEngine::new(boot.engine),
         telemetry,
     );
+    let profile = engine::types::ModelProfileId::new(&boot.profile_id).unwrap();
+    let budget = supervisor
+        .engine()
+        .profile_context_budget(&profile)
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.limit, context_limit);
+    let first =
+        ContextBuilder::build_snapshot("initial", &boot.profile_id, &[], Some(&old)).unwrap();
+    let initial_tokens = ContextBuilder::render_and_count(supervisor.engine(), first)
+        .unwrap()
+        .token_count();
+    assert!(
+        initial_tokens + budget.output_reserve + budget.safety_margin <= budget.limit,
+        "first turn must fit before any history can be compacted: {initial_tokens} input tokens"
+    );
     let initial = supervisor
         .run_turn(&store, "real-compact", &old, 64)
         .expect("initial real-model turn");
@@ -534,9 +606,16 @@ fn real_model_compaction_preserves_history_and_continues() {
             .iter()
             .any(|event| event.kind == EventKind::AssistantMessage)
     );
+    // Ordinary document content exercises the same measured overflow without
+    // a repeated-word flood that trained models may correctly treat as injection.
+    let sample: String = include_str!("../../../bench/corpus/fixtures/documents/document-8k.txt")
+        .chars()
+        .skip(2000)
+        .take(2000)
+        .collect();
+    assert_eq!(sample.chars().count(), 2000);
     let prompt = format!(
-        "{} What is the project codename? Reply with the codename.",
-        "current ".repeat(500)
+        "Here is a sample document for later tests. Keep our earlier refactor notes in context.\n<sample_document>\n{sample}\n</sample_document>\nWhat is the project name from our earlier refactor notes? Reply with only the name."
     );
     let snapshot =
         ContextBuilder::build_snapshot("before", &boot.profile_id, &prior, Some(&prompt)).unwrap();
@@ -544,19 +623,15 @@ fn real_model_compaction_preserves_history_and_continues() {
         .unwrap()
         .token_count();
     assert!(
-        tokens + 512 + 64 > 2048,
+        tokens + budget.output_reserve + budget.safety_margin > budget.limit,
         "fixture must overflow, got {tokens}"
     );
     let result = supervisor
         .run_turn(&store, "real-compact", &prompt, 128)
         .expect("compact and continue");
-    assert!(
-        result
-            .assistant_text
-            .to_ascii_uppercase()
-            .contains("COBALT"),
-        "{}",
-        result.assistant_text
+    assert_eq!(
+        result.assistant_text, "COBALT",
+        "compaction must retrieve the name, not merely mention it in a refusal"
     );
     // The recorder captures the actual request BEFORE generation, including
     // the committed checkpoint and identical decoding options. The cold oracle
@@ -642,25 +717,24 @@ fn real_model_compaction_preserves_history_and_continues() {
         .run_turn(
             &resumed,
             "real-compact",
-            "What is the project codename? Answer briefly.",
+            "What is the project name from our refactor notes? Reply with only the name.",
             32,
         )
         .expect("continue after reopen");
-    assert!(
-        followup
-            .assistant_text
-            .to_ascii_uppercase()
-            .contains("COBALT"),
-        "{}",
-        followup.assistant_text
-    );
     let after_restore = supervisor.engine().runtime().tiered_kv_snapshot();
-    assert!(
-        after_restore.restore_count > before_restore,
-        "compacted session did not restore KV: {after_restore:?}"
-    );
+    if rebuild_only_profile() {
+        assert_eq!(after_restore.restore_count, 0, "{after_restore:?}");
+        assert_eq!(after_restore.spill_count, 0, "{after_restore:?}");
+        assert_eq!(after_restore.restored_tokens, 0, "{after_restore:?}");
+        assert!(after_restore.hot_evictions > 0, "{after_restore:?}");
+    } else {
+        assert!(
+            after_restore.restore_count > before_restore,
+            "compacted session did not restore KV: {after_restore:?}"
+        );
+    }
     drop(supervisor);
-    let cold_boot = alloyd::boot::boot_qwen3_with_context_limit(
+    let cold_boot = alloyd::boot::boot_native_for_qualification(
         BootRequest {
             artifact_dir: PathBuf::from(std::env::var_os("ALLOY_REAL_MODEL").unwrap()),
             profile_id: real_profile().as_str().into(),
@@ -677,7 +751,7 @@ fn real_model_compaction_preserves_history_and_continues() {
             tools_enabled: true,
             tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        Some(2048),
+        Some(context_limit),
     )
     .expect("boot cold baseline");
     let cold_render =
@@ -727,7 +801,7 @@ fn real_model_compaction_preserves_history_and_continues() {
         .run_turn(
             &cold_store,
             "real-compact",
-            "What is the project codename? Answer briefly.",
+            "What is the project name from our refactor notes? Reply with only the name.",
             32,
         )
         .expect("cold compacted continuation");
@@ -742,29 +816,43 @@ fn real_model_compaction_preserves_history_and_continues() {
         after_restore.restore_count,
         cold.assistant_text,
     );
+    // The pinned upstream models also produce these exact follow-up spellings.
+    assert!(
+        matches!(
+            (real_profile().as_str(), followup.assistant_text.as_str()),
+            (_, "COBALT")
+                | ("ministral-3-3b-instruct-2512-4bit", "**COBALT**")
+                | ("qwen3-coder-30b-a3b-instruct-4bit", "COBALT\n")
+        ),
+        "unexpected project-name follow-up: {:?}",
+        followup.assistant_text
+    );
 }
 
 #[test]
 #[ignore = "requires pinned artifact; timing must use an optimized build"]
 fn real_model_render_32k_latency() {
     let artifact = PathBuf::from(std::env::var("ALLOY_REAL_MODEL").expect("set ALLOY_REAL_MODEL"));
-    let boot = boot_qwen3(BootRequest {
-        artifact_dir: artifact,
-        profile_id: real_profile().as_str().into(),
-        corpus_models_json: Some(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
-        ),
-        memory_guard: MemoryGuardConfig {
-            tier: MemoryGuardTier::Balanced,
-            custom_ceiling_bytes: 0,
-            enabled: true,
+    let boot = alloyd::boot::boot_native_for_qualification(
+        BootRequest {
+            artifact_dir: artifact,
+            profile_id: real_profile().as_str().into(),
+            corpus_models_json: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bench/corpus/models.json"),
+            ),
+            memory_guard: MemoryGuardConfig {
+                tier: MemoryGuardTier::Balanced,
+                custom_ceiling_bytes: 0,
+                enabled: true,
+            },
+            admission_budget_override_bytes: None,
+            prefer_metal: true,
+            tools_enabled: false,
+            tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
         },
-        admission_budget_override_bytes: None,
-        prefer_metal: true,
-        tools_enabled: false,
-        tiered_kv: TieredKvConfig::new(None, HotCacheLimit::Bytes(0)),
-    })
-    .expect("boot Qwen renderer");
+        None,
+    )
+    .expect("boot native qualification renderer");
     let doc = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../bench/corpus/fixtures/documents/document-32k.txt"),

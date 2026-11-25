@@ -1,0 +1,26 @@
+{{- '<bos>' -}}
+{%- if messages and messages[0].role == 'system' -%}
+    {%- set first_user_prefix = messages[0].content + '\n\n' -%}
+    {%- set turns = messages[1:] -%}
+{%- else -%}
+    {%- set first_user_prefix = '' -%}
+    {%- set turns = messages -%}
+{%- endif -%}
+{%- if not turns -%}{{ raise_exception('Gemma3 requires a user turn') }}{%- endif -%}
+{%- set ns = namespace(role='') -%}
+{%- for message in turns -%}
+    {%- if message.role not in ['user', 'assistant'] or (loop.first and message.role != 'user') -%}
+        {{- raise_exception('Gemma3 requires user/assistant history beginning with a user turn') -}}
+    {%- endif -%}
+    {%- if message.role == ns.role -%}
+        {{- '\n' -}}
+    {%- else -%}
+        {%- if not loop.first -%}{{ '<end_of_turn>\n' }}{%- endif -%}
+        {{- '<start_of_turn>' + ('model' if message.role == 'assistant' else 'user') + '\n' -}}
+    {%- endif -%}
+    {%- if loop.first -%}{{ first_user_prefix }}{%- endif -%}
+    {{- message.content | trim -}}
+    {%- set ns.role = message.role -%}
+{%- endfor -%}
+{{- '<end_of_turn>\n' -}}
+{%- if add_generation_prompt -%}{{ '<start_of_turn>model\n' }}{%- endif -%}
