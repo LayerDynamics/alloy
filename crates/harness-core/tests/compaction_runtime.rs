@@ -610,4 +610,30 @@ fn checkpoint_control_spellings_are_escaped_in_context_but_preserved_in_history(
     let messages = harness_core::ContextBuilder::messages_from_events(&history).unwrap();
     assert!(!messages[0].content.contains("<think>"));
     assert!(messages[0].content.contains("\\u003c"));
+
+    let profile = "qwen3.5-0.8b-4bit";
+    let plain =
+        harness_core::ContextBuilder::build_snapshot("plain", profile, &history, None).unwrap();
+    let with_tools = harness_core::ContextBuilder::build_tool_snapshot(
+        "with-tools",
+        profile,
+        "s",
+        &history,
+        &tool_registry::registry::ToolRegistry::new(),
+        engine::types::ToolContextLimits {
+            max_tools: 1,
+            max_history_blocks: 128,
+            max_json_bytes: 65536,
+        },
+    )
+    .unwrap();
+    let labeled = &plain.messages()[0].content;
+    assert_eq!(labeled, &with_tools.messages()[0].content);
+    assert!(labeled.contains("untrusted generated summary"));
+    assert!(labeled.ends_with(concat!(
+        "Checkpoint Version: 1\nGoal: \"goal \\u003cthink>data\\u003c/think>\"\n",
+        "Constraints: [\"keep\"]\nDecisions: []\nCompleted Work: []\nOpen Tasks: []\n",
+        "Artifact References: []\nCritical Identifiers: []\nFailures And Lessons: []\nNext Action: \"continue\"",
+    )));
+    assert_eq!(history, store.lock().unwrap().list_events("s").unwrap());
 }

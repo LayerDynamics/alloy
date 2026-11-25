@@ -107,7 +107,10 @@ impl ContextBuilder {
         let skills = crate::context::project_skills(history)?;
         let mut base = Vec::new();
         if let Some(checkpoint) = checkpoint {
-            base.push(super::checkpoint_message(&checkpoint)?);
+            base.push(super::checkpoint_message(
+                &checkpoint,
+                Some(profile_id.as_ref()),
+            )?);
         }
         let mut tail = Vec::new();
         let mut calls = BTreeMap::new();
