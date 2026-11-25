@@ -120,6 +120,22 @@ class DeadlineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluate(s)
 
+    def test_superseded_after_completion_with_unknown_publication_order(self):
+        s = example()
+        s["request"]["superseded_at"] = at(26)
+        s["attempts"][0]["jobs"][0]["published_at"] = None
+        result = evaluate(s)
+        self.assertEqual(result["deadline"], "unscorable")
+        self.assertIn("unknown publication order", result["reason"])
+        s["request"]["superseded_at"] = at(24)
+        self.assertEqual(evaluate(s)["deadline"], "superseded_before_deadline")
+
+    def test_reversed_workflow_times_are_invalid(self):
+        s = example()
+        s["attempts"][0]["updated_at"] = at(0)
+        with self.assertRaisesRegex(ValueError, "update precedes"):
+            evaluate(s)
+
 
 if __name__ == "__main__":
     unittest.main()

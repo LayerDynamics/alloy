@@ -72,6 +72,10 @@ def evaluate(snapshot):
             result["reason"] = "conflicting workflow attempts"
             return result
         records[workflow] = attempt
+        created = instant(attempt.get("created_at"))
+        changed = instant(attempt.get("updated_at"))
+        if created and changed and changed < created:
+            raise ValueError("workflow update precedes creation")
         for field, dest in (("created_at", queued), ("updated_at", updated)):
             t = instant(attempt.get(field))
             if t is not None:
@@ -141,7 +145,15 @@ def evaluate(snapshot):
     elif result["verdict"] == "inconclusive":
         result["deadline"] = "miss"
     elif superseded:
-        result["deadline"] = "superseded_before_deadline" if superseded - start < LIMIT else "miss"
+        # A check that finished before supersession might also have published
+        # before it. Missing publication evidence cannot exclude that request
+        # from the denominator as a known early supersession.
+        observed = publications + [instant(row.get("completed_at")) for row in rows]
+        known_pending = not terminal or any(t > superseded for t in observed if t is not None)
+        if known_pending:
+            result["deadline"] = "superseded_before_deadline" if superseded - start < LIMIT else "miss"
+        else:
+            result["reason"] = "unknown publication order at supersession"
     elif now - start >= LIMIT:
         result["deadline"] = "miss"
     else:
