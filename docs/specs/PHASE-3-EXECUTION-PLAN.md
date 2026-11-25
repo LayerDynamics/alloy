@@ -2847,3 +2847,15 @@ JSON string escaping, the untrusted-data designation, the durable schema,
 and other profile inputs. In `crates/harness-core/tests/compaction_runtime.rs`
 check both projections and unchanged history. Run the original real overflow,
 reopen and cold comparison for this profile. No new dependencies.
+
+On the 321-token synthetic Gemma cache case, running the former dense cache
+and the paged cache with identical chunk sizes produced byte-identical logits
+for every position on CPU and Metal. Changing only the cold prefill shape
+caused different reductions even in the first uncached chunk. Maximum
+absolute differences across the whole sequence were below 1.3e-6, with
+identical greedy decisions. In `crates/inference-infra/tests/gemma3_model.rs`
+check every cold/chunked logit for finiteness and a 3e-6 absolute bound,
+compare every position's selected token, and apply the original strict
+absolute and pointwise relative thresholds to the full next-token distribution
+after every append. Keep all pinned reference comparisons and retained-window
+checks. Run the full `gemma3_model` suite on CPU and Metal.
