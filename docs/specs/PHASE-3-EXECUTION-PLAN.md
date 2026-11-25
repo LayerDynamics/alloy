@@ -2812,3 +2812,10 @@ same selector. Verify `layerwise_append_preserves_prefix_and_bounds`,
 `native_boundary_memory_estimate`, `native_validated_context_boundary`,
 and `dense_native_memory_tiers` on both quantizations with the frozen
 context length, output reserve and margin. No new dependencies.
+
+Version the Gemma 3 and Llama cache implementation changes in
+`crates/engine/src/backends/qwen/backend.rs` so older qualification and
+runtime identities cannot match them. In `crates/inference-infra/tests/gemma3_model.rs`,
+compare cold and chunked native logits across page boundaries and sliding
+window eviction in `gemma3_paged_cache_matches_cold`. This supplements the
+short frozen-reference cases with a direct multi-page regression.
