@@ -2786,3 +2786,20 @@ Run numerical and behavior qualification on a single reviewed revision for
 all fourteen profiles, including Ornith. Verify long-session event retention,
 cache properties and Phase 1/2 CI on that revision, then reconcile the
 linked issues and publish the qualifying commit and model identities.
+
+For Coder, use `crates/alloyd/tests/support/recording_engine.rs` to trace
+the real projected input and `crates/harness-core/src/supervisor/tool_loop.rs`
+to charge the already-escaped policy denial. Exercise `tool_loop` and
+`llama3_tool_stop_context_cache`. In `crates/inference-infra/tests/`,
+check routed early refusal in `qwen3_coder_quantized.rs` and exercise the
+decoder's three-buffer logits allowance there and in `support/dense_memory.rs`.
+Run the isolated routed and dense memory fixtures with their physical limits.
+
+For Gemma 3, the 12B checkpoint crossed the 8 GiB ceiling while retaining
+both versions of all layers' KV. In `crates/inference-infra/src/decoder/gemma3/model.rs`,
+share complete immutable KV pages across appends and stage changed pages
+until the whole step succeeds. Extend `crates/mlx-ffi/src/ops/hybrid.rs`
+to concatenate all page handles for one layer's attention. Exercise the
+existing `gemma3_sliding_full_attention`, `gemma3_cancel_and_foreign_cache_are_atomic`,
+pinned numerical comparisons and `gemma3_native_memory_tiers` for both sizes.
+Keep position, eviction, numerical and allocator checks. No new dependencies.
