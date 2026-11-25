@@ -2901,3 +2901,16 @@ Coder turns, checking the allowed effect, exact final bytes, one actual denied
 write, zero starts and a real rejection explanation. Run the XML parser and
 harness suites, then numerical, behavioral and complete Coder qualification
 on the frozen revision. No new dependencies.
+
+### Llama 3.1 tool rejection continuation
+
+The 4-bit upstream replay echoed the requested file content after a denied
+write. A replay with the same request and a system instruction scoped to the
+pending error produced an explanation of the local policy denial. In
+`crates/families/llama3/{src/template.rs,fixture/tool_chat_template.jinja}`,
+add that instruction for a pending batch containing a typed tool error. Keep
+the instruction in a family fixture shared by the template and the projection
+byte bound in `crates/engine/src/backends/qwen/backend.rs`. Verify successful
+results, user text resembling errors, and subsequent turns through the existing
+shared rendering suite in `crates/engine/tests/tool_rendering.rs`. Run both
+native Llama quantizations with the original tool and denial assertions.
