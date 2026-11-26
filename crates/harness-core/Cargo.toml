@@ -19,6 +19,7 @@ tool-registry = { path = "../tool-registry" }
 ureq = { workspace = true }
 
 [dev-dependencies]
+tool-registry = { path = "../tool-registry", features = ["test-clock"] }
 tempfile = "=3.27.0"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 

@@ -19,13 +19,34 @@ use std::{
 use tool_registry::{
     builtins::shell::{ShellFailure, ShellReport, ShellRunTool, ShellScope},
     call::{ToolCall, ToolCallContext, ToolInvocation},
-    execution::{CancellationToken, ExecutionContext, OutputSink},
+    execution::{CancellationToken, ExecutionContext, ExecutionError, OutputSink},
     registry::ToolImplementation,
     result::ToolResult,
 };
 struct Observed {
     inner: ShellRunTool,
     count: Arc<AtomicUsize>,
+    deadline_marker: Option<PathBuf>,
+}
+
+// Child output wakes the real pipe pump. Advance only this invocation and only
+// after its child has written its PID. Cleanup and receipt persistence stay real.
+struct DeadlineOnReady<'a> {
+    sink: &'a mut dyn OutputSink,
+    context: &'a ExecutionContext,
+    marker: &'a std::path::Path,
+}
+impl OutputSink for DeadlineOnReady<'_> {
+    fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), ExecutionError> {
+        self.sink.write_chunk(bytes)?;
+        if self.marker.exists() {
+            self.context.advance_to_deadline_for_test();
+        }
+        Ok(())
+    }
+    fn abort(&mut self) {
+        self.sink.abort();
+    }
 }
 impl ToolImplementation for Observed {
     fn execute(&self, i: &ToolInvocation) -> ToolResult {
@@ -38,6 +59,17 @@ impl ToolImplementation for Observed {
         o: &mut dyn OutputSink,
     ) -> Result<ShellReport, ShellFailure> {
         self.count.fetch_add(1, Ordering::SeqCst);
+        if let Some(marker) = &self.deadline_marker {
+            return self.inner.execute_shell_run(
+                i,
+                c,
+                &mut DeadlineOnReady {
+                    sink: o,
+                    context: c,
+                    marker,
+                },
+            );
+        }
         self.inner.execute_shell_run(i, c, o)
     }
 }
@@ -53,6 +85,12 @@ fn shell_child_fixture() {
     };
     match mode {
         "marker" => std::fs::write("marker", b"executed").unwrap(),
+        "deadline" => {
+            std::fs::write("marker", std::process::id().to_string()).unwrap();
+            std::io::stdout().write_all(b"ready\n").unwrap();
+            std::io::stdout().flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
         "hang" => {
             std::fs::write("marker", b"started").unwrap();
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -116,7 +154,7 @@ impl Fixture {
         .unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let mut executor = ReceiptExecutor::new();
-        let definition = tool_registry::builtins::definitions(10000, maximum)
+        let definition = tool_registry::builtins::definitions(timeout.max(10000), maximum)
             .unwrap()
             .into_iter()
             .find(|d| d.id == "shell.run")
@@ -127,6 +165,7 @@ impl Fixture {
                 Arc::new(Observed {
                     inner: ShellRunTool::new(scope),
                     count: count.clone(),
+                    deadline_marker: (mode == "deadline").then(|| root.join("cwd/marker")),
                 }),
             )
             .unwrap();
@@ -421,6 +460,14 @@ fn delayed_run_does_not_renew_start_deadline() {
     std::thread::sleep(std::time::Duration::from_millis(40));
     let result = job.run().complete(&mut f.store).unwrap();
     assert!(result.is_error());
+    let ToolResult::Inline(ref inline) = result else {
+        panic!("expected deadline receipt: {result:?}")
+    };
+    assert_eq!(
+        inline.content["details"]["reason"], "deadline_exceeded",
+        "{result:?}"
+    );
+    assert_eq!(error_outcome(&result)["started"], false);
     f.zero();
     f.no_artifact();
 }
@@ -435,9 +482,21 @@ fn output_overflow_preserves_started_and_cleanup_status() {
 }
 #[test]
 fn deadline_after_spawn_records_started_and_cleanup() {
-    let mut f = Fixture::new("hang", 65536, 1000);
+    let mut f = Fixture::new("deadline", 65536, 60_000);
     let result = f.run(65536);
-    assert!(result.is_error());
+    assert!(result.is_error(), "{result:?}");
+    let ToolResult::Inline(ref inline) = result else {
+        panic!("expected deadline receipt: {result:?}")
+    };
+    assert_eq!(
+        inline.content["details"]["reason"], "deadline_exceeded",
+        "{result:?}"
+    );
+    let pid: u32 = std::fs::read_to_string(f.root.join("cwd/marker"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(error_outcome(&result)["pid"], pid);
     assert_eq!(error_outcome(&result)["started"], true);
     assert_eq!(error_outcome(&result)["cleanup_errors"], json!([]));
     f.no_artifact();

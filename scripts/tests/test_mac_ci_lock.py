@@ -17,11 +17,12 @@ class MacCiLockTest(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.env = os.environ.copy()
         self.env.pop("GITHUB_ACTIONS", None)
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
         self.env["ALLOY_CI_LOCK_TEST_PATH"] = str(self.root / "host.lock")
 
-    def launch(self, code):
+    def launch(self, code, *, verify_failure=False):
         return subprocess.Popen(
-            [sys.executable, str(SCRIPT), "--", sys.executable, "-c", code],
+            [sys.executable, str(SCRIPT), *(["--verify-clean-failure"] if verify_failure else []), "--", sys.executable, "-c", code],
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
@@ -157,6 +158,127 @@ class MacCiLockTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("lease ended unexpectedly", err)
 
+    def test_verified_assertion_failure_stays_red_and_next_step_runs(self):
+        failed = self.launch("assert False, 'intentional acceptance failure'", verify_failure=True)
+        out, err = failed.communicate(timeout=10)
+        self.assertEqual(failed.returncode, 1, err)
+        self.assertIn("intentional acceptance failure", err)
+        self.assertIn("exit_code=1 cleanup=verified", out)
+        self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"clean\n")
+        next_step = self.launch("pass")
+        _, err = next_step.communicate(timeout=5)
+        self.assertEqual(next_step.returncode, 0, err)
+
+    def test_verified_failure_keeps_shell_pipefail_and_cargo_status(self):
+        for status in (7, 101):
+            with self.subTest(status=status):
+                script = self.root / "acceptance.sh"
+                script.write_text(f"exit {status} | cat\n")
+                failed = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--verify-clean-failure", str(script)],
+                    env=self.env, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(failed.returncode, status, failed.stderr)
+                self.assertIn("cleanup=verified", failed.stdout)
+                next_step = self.launch("pass")
+                _, err = next_step.communicate(timeout=5)
+                self.assertEqual(next_step.returncode, 0, err)
+
+    def test_verified_failure_refuses_detached_survivor(self):
+        pidfile = self.root / "detached.pid"
+        code = (
+            "import os,pathlib,subprocess\n"
+            "child=subprocess.Popen(['/bin/sleep','30'], start_new_session=True, "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+            "env={}, close_fds=True)\n"
+            f"pathlib.Path({str(pidfile)!r}).write_text(str(child.pid))\n"
+            "os._exit(1)\n"
+        )
+        failed = self.launch(code, verify_failure=True)
+        try:
+            out, err = failed.communicate(timeout=10)
+            self.assertEqual(failed.returncode, 1, err)
+            self.assertIn("cleanup=unverified", out)
+            self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"dirty\n")
+            next_step = self.launch("pass")
+            _, err = next_step.communicate(timeout=5)
+            self.assertNotEqual(next_step.returncode, 0)
+            self.assertIn("lease ended unexpectedly", err)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_verified_mode_retains_signal_and_timeout_dirty_state(self):
+        for code, status in [
+            ("import os,signal; os.kill(os.getpid(),signal.SIGTERM)", 143),
+            ("raise SystemExit(124)", 124),
+            ("raise SystemExit(137)", 137),
+        ]:
+            with self.subTest(status=status):
+                self.env["ALLOY_CI_LOCK_TEST_PATH"] = str(self.root / f"lock-{status}")
+                failed = self.launch(code, verify_failure=True)
+                out, err = failed.communicate(timeout=10)
+                self.assertEqual(failed.returncode, status, err)
+                self.assertNotIn("cleanup=verified", out)
+                self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"dirty\n")
+
+    def test_verified_cleanup_cannot_clear_preexisting_dirty_lease(self):
+        failed = self.launch("raise SystemExit(7)")
+        failed.communicate(timeout=5)
+        cleanup = subprocess.run(
+            [sys.executable, str(SCRIPT), "--cleanup", "--verify-clean-failure", "--",
+             sys.executable, "-c", "raise SystemExit(1)"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(cleanup.returncode, 1, cleanup.stderr)
+        self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"dirty\n")
+
+    def test_verified_mode_interrupted_wrapper_keeps_dirty_after_child_exits_zero(self):
+        ready = self.root / "ready"
+        code = (
+            "import pathlib,signal,sys,time\n"
+            "signal.signal(signal.SIGTERM,lambda *_: sys.exit(0))\n"
+            f"pathlib.Path({str(ready)!r}).touch()\n"
+            "while True: time.sleep(.01)\n"
+        )
+        holder = self.launch(code, verify_failure=True)
+        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(ready.exists())
+        holder.send_signal(signal.SIGTERM)
+        _, err = holder.communicate(timeout=5)
+        self.assertEqual(holder.returncode, 143, err)
+        self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"dirty\n")
+
+    def test_failed_process_inspection_keeps_dirty_lease(self):
+        marker = self.root / "executed"
+        for phase in ("before", "after"):
+            with self.subTest(phase=phase):
+                self.env["ALLOY_CI_LOCK_TEST_PATH"] = str(self.root / f"inspection-{phase}")
+                command = [str(SCRIPT), "--verify-clean-failure", "--", sys.executable, "-c",
+                           f"import pathlib; pathlib.Path({str(marker)!r}).touch(); raise SystemExit(7)"]
+                code = (
+                    "import sys\nfrom unittest.mock import patch\n"
+                    f"sys.path.insert(0,{str(SCRIPT.parent)!r})\n"
+                    "import mac_locked_step as step\n"
+                    f"sys.argv={command!r}\n"
+                    f"with patch.object(step, {'runner_processes' if phase == 'before' else 'check_quiescence'!r}, side_effect=OSError('inspection unavailable')):\n"
+                    " raise SystemExit(step.main())\n"
+                )
+                result = subprocess.run([sys.executable, "-c", code], env=self.env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("inspection unavailable", result.stdout + result.stderr)
+                self.assertEqual(marker.exists(), phase == "after")
+                if phase == "after":
+                    self.assertEqual(result.returncode, 7)
+                self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"dirty\n")
+
     def test_empty_or_interrupted_state_transitions_fail_closed(self):
         for transition in ("empty", "partial_dirty", "before_clean", "partial_clean", "signal_before_clean"):
             with self.subTest(transition=transition):
@@ -194,6 +316,59 @@ class MacCiLockTest(unittest.TestCase):
         _, err = child.communicate(timeout=5)
         self.assertEqual(child.returncode, 143, err)
         self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"clean\n")
+
+
+
+class CollectorVerdictTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "approval_storage_evidence", SCRIPT.parents[1] / "approval_storage_evidence.py")
+        cls.collector = importlib.util.module_from_spec(spec)
+        from unittest.mock import patch
+        with patch.object(sys, "path", [str(SCRIPT.parents[1]), *sys.path]):
+            spec.loader.exec_module(cls.collector)
+        import ci.mac_host_processes
+        cls.inspection = ci.mac_host_processes
+
+    def test_only_completed_failed_test_summary_qualifies(self):
+        summary = ("test result: FAILED. 22 passed; 1 failed; 0 ignored; finished in 1.41s\n\n"
+                   "error: test failed, to rerun pass `-p harness-core --test shell_adapter`\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "cargo.log"
+            for command, status, output, expected in [
+                (["cargo", "test"], 101, summary, True),
+                (["cargo", "test"], -15, summary, False),
+                (["cargo", "check"], 101, summary, False),
+                (["cargo", "test"], 101, summary + "Caused by: signal 9\n", False),
+                (["cargo", "test"], 101, "error: could not compile fixture\n", False),
+            ]:
+                with self.subTest(command=command, status=status, output=output):
+                    log.write_text(output)
+                    self.assertEqual(self.collector.libtest_failed(command, status, log), expected)
+
+    def test_both_snapshots_must_show_no_new_or_reused_pids(self):
+        from unittest.mock import patch
+        before = {1: "original", 2: "exited"}
+        clean = {1: "original"}
+        for final in [{1: "original", 3: "detached"}, {1: "reused"}, OSError("ps failed")]:
+            with self.subTest(final=final), patch.object(
+                self.inspection, "runner_processes", side_effect=[clean, final]
+            ), self.assertRaises((RuntimeError, OSError)):
+                self.collector.check_quiescence(before, settle_seconds=0)
+        with patch.object(self.inspection, "runner_processes", side_effect=[clean, clean]):
+            self.collector.check_quiescence(before)
+
+    def test_transient_process_resets_required_consecutive_clear_snapshots(self):
+        from unittest.mock import patch
+        before = {1: "original"}
+        busy = {1: "original", 2: "finishing"}
+        # A clear sample followed by a transient process cannot count as two
+        # clear samples. Both final samples must independently be clear.
+        with patch.object(self.inspection, "runner_processes", side_effect=[before, busy, before, before]) as inspect:
+            self.collector.check_quiescence(before)
+        self.assertEqual(inspect.call_count, 4)
 
 
 if __name__ == "__main__":

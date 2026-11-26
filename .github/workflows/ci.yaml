@@ -243,7 +243,7 @@ jobs:
     runs-on: [self-hosted, macOS, arm64]
     defaults:
       run:
-        shell: python3 scripts/ci/mac_locked_step.py {0}
+        shell: python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}
     timeout-minutes: 180
     env:
       # A pre-provisioned flat artifact directory; empty uses the documented local default.
@@ -287,6 +287,7 @@ jobs:
       # serial workspace suite, check, Clippy, doctests, strict rustdoc, and
       # parallel harness suite. Share that verification with mac-core.
       - name: Approval/storage and complete native workspace verification
+        id: approval_collector
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CI_CANDIDATE"
@@ -296,7 +297,13 @@ jobs:
             "$CI_CANDIDATE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             > "$evidence/workflow.txt"
           python3 scripts/approval_storage_evidence.py \
-            --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results"
+            --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results" \
+            --github-verdict-output "$GITHUB_OUTPUT" --native-parallel-packages
+
+      - name: Require passing approval/storage tests
+        if: steps.approval_collector.outputs.tests_passed != 'true'
+        shell: bash
+        run: exit 1
 
       - name: Retain approval/storage macOS evidence
         if: ${{ always() }}
@@ -307,13 +314,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Preserve the previous default-parallel schedules in addition to the
-      # collector's serial run. MLX remains serial; harness runs in parallel
-      # in the collector and W5. No package's former schedule is dropped.
-      - name: Native parallel package regression
-        run: cargo test --locked --workspace --exclude mlx-ffi --exclude harness-core --all-targets
-
       - name: W4 scoped named gates and candidate evidence
+        if: ${{ !cancelled() && steps.clean_source.outcome == 'success' }}
         env:
           ALLOY_W4_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
           ALLOY_W4_OUTPUT: ${{ github.workspace }}/target/w4-acceptance/macos
@@ -337,6 +339,7 @@ jobs:
           retention-days: 30
 
       - name: W5 named hooks, owned-process and sandbox gates
+        if: ${{ !cancelled() && steps.clean_source.outcome == 'success' }}
         env:
           ALLOY_W5_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}
           ALLOY_W5_OUTPUT: ${{ github.workspace }}/target/w5-acceptance/macos
@@ -368,7 +371,7 @@ jobs:
     runs-on: [self-hosted, macOS, arm64]
     defaults:
       run:
-        shell: python3 scripts/ci/mac_locked_step.py {0}
+        shell: python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}
     timeout-minutes: 180
     env:
       CI_CANDIDATE: ${{ github.event.pull_request.head.sha || github.sha }}

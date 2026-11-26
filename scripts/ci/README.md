@@ -32,7 +32,7 @@ Manually dispatch **M3 native observations** with `profile_paths` set to the abs
 
 - A successful pinned run starts and ends at the requested clean Git revision. The runner checks untracked files and submodules, validates manifest-listed model files and the reference digest, and uses an external Cargo target keyed by checkout path and candidate. For matrix and single-profile runs, the resolved output directory must be new, outside the checkout, and have an existing parent. [m3_native_numerical.py:verify_candidate](./m3_native_numerical.py) · [m3_native_numerical.py:pinned_run](./m3_native_numerical.py) · [m3_native_numerical.py:cargo_target](./m3_native_numerical.py)
 - A passing native fixture must exit successfully and report exactly one passing test with the requested name. A filtered run that executes zero tests fails this check. Qualification rechecks the recorded command, executable digest and output. [m3_native_numerical.py:require_single_pass](./m3_native_numerical.py) · [m3_native_qualification.py:native_pass](./m3_native_qualification.py)
-- The lease serializes cooperating steps on the same Mac. A failed child leaves the lease dirty, which blocks ordinary steps. A cleanup command can run against a dirty lease and exit successfully while the lease stays dirty. Inspect host processes before attempting recovery. [mac_locked_step.py:main](./mac_locked_step.py)
+- The lease serializes cooperating steps on the same Mac. Mac acceptance workflows use `--verify-clean-failure`. An ordinary failed step keeps its original nonzero exit code and red check while the wrapper releases the host after a bounded three-second settling period and two consecutive process snapshots verify no new surviving runner-account processes. Signals, reserved timeout statuses, failed inspection and surviving processes leave the lease dirty. Direct wrapper callers opt in explicitly. Strict `--cleanup` cannot clear a dirty lease. [mac_locked_step.py:main](./mac_locked_step.py) · [mac_host_processes.py:check_quiescence](./mac_host_processes.py)
 
 ### Reproducing a profile
 
@@ -66,3 +66,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test
 ```
 
 The Rust workspace test command is `cargo test`. Real-model qualification has its own entry point and requires pinned model and reference inputs on the Mac. [m3_native_matrix.py:main](./m3_native_matrix.py)
+
+## Reserved-window scheduling trial
+
+Use a clean checkout of the native build's candidate and a trusted local behavior build receipt. The operator reserves the Mac outside PR service. The trial runs one profile and one test binary under the same host lease as CI. It writes fresh fixture logs and timing receipts in a new external directory.
+
+    python3 -B scripts/ci/m3_reserved_window.py --claim /absolute/path/claim.json --output /absolute/new/attempt
+
+The version 1 JSON claim records `candidate`, `profile`, `package`, `target`, the ordered `fixtures` array, and `behavior_receipt` with its `behavior_receipt_sha256`. On PR arrival, create `STOP` in the attempt directory. The running fixture finishes and later fixtures are recorded as unstarted. Follow `events.jsonl` for fixture progress. Capture the arrival and stop times separately. A successful launcher binds the terminal receipt digest in `finished.json`. The scheduling result grants no qualification credit.
+
+Each instrumented Mac step logs `alloy-ci-lease` with its request and acquisition wall times in nanoseconds, monotonic wait duration, and whether another owner held the lock. Use the first contended PR step to measure lease wait. Workflow queue time and total time to the final required result have different endpoints.

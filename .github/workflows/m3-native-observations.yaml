@@ -23,7 +23,7 @@ jobs:
           submodules: recursive
           clean: false
       - name: Run native numerical and behavioral fixtures
-        shell: python3 scripts/ci/mac_locked_step.py {0}
+        shell: python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}
         env:
           M3_PROFILE_PATHS: ${{ inputs.profile_paths }}
         run: |

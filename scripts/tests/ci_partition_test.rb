@@ -48,7 +48,7 @@ class CiPartitionTest < Minitest::Test
     assert_equal "mac-metal", @jobs.fetch("mac").fetch("name")
     core = commands("mac_core")
     ["python3 scripts/approval_storage_evidence.py", '--repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results"',
-     "cargo test --locked --workspace --exclude mlx-ffi --exclude harness-core --all-targets",
+     "--native-parallel-packages",
      "bash scripts/builtin_acceptance.sh", "bash scripts/plugin_acceptance.sh"].each { |gate| assert_includes core, gate }
     assert_equal 1, core.scan("python3 scripts/approval_storage_evidence.py").length
     refute_includes core, "--capture-only"
@@ -59,6 +59,7 @@ class CiPartitionTest < Minitest::Test
       '["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]',
       '["cargo", "test", "--locked", "--workspace", "--all-targets", "--", "--test-threads=1"]',
       '["cargo", "test", "--locked", "--workspace", "--doc"]',
+      '["cargo", "test", "--locked", "--workspace", "--exclude", "mlx-ffi", "--exclude", "harness-core", "--all-targets"]',
       '["cargo", "test", "--locked", "-p", "harness-core", "--all-targets"]',
       '["cargo", "doc", "--locked", "--workspace", "--no-deps"]',
       'env["RUSTDOCFLAGS"] = "-D warnings"',
@@ -85,6 +86,15 @@ class CiPartitionTest < Minitest::Test
       refute_includes step.fetch("run"), '"$GITHUB_SHA"'
     end
     old_jobs = YAML.load_file(File.expand_path("../../.github/workflows/approval-storage-evidence.yaml", __dir__)).fetch("jobs")
+    [@jobs.fetch("mac_core"), old_jobs.fetch("mac")].each do |job|
+      steps = job.fetch("steps")
+      collect = steps.index { |step| step["id"] == "approval_collector" }
+      assert_includes steps.fetch(collect).fetch("run"), '--github-verdict-output "$GITHUB_OUTPUT"'
+      verdict = steps.fetch(collect + 1)
+      assert_equal "steps.approval_collector.outputs.tests_passed != 'true'", verdict.fetch("if")
+      assert_equal "bash", verdict.fetch("shell")
+      assert_equal "exit 1", verdict.fetch("run")
+    end
     assert_equal "approval-storage-macos-standalone", old_jobs.fetch("mac").fetch("name")
     assert_equal "github.event_name != 'pull_request'", old_jobs.fetch("mac").fetch("if").strip
     assert_equal 1, (@jobs.values + old_jobs.values).count { |job| job["name"] == "approval-storage-macos-arm64" }
@@ -103,8 +113,16 @@ class CiPartitionTest < Minitest::Test
     end
     assert_includes integration, "npm ci"
     %w[mac_core mac_integration].each do |shard|
-      assert_equal "python3 scripts/ci/mac_locked_step.py {0}", @jobs.fetch(shard).dig("defaults", "run", "shell")
+      assert_equal "python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}", @jobs.fetch(shard).dig("defaults", "run", "shell")
     end
+    @jobs.fetch("mac_core").fetch("steps").select { |step| step["name"]&.match?(/^W[45] /) }.each do |step|
+      assert_equal "${{ !cancelled() && steps.clean_source.outcome == 'success' }}", step.fetch("if")
+    end
+    standalone = old_jobs.fetch("mac").fetch("steps").find { |step| step["id"] == "approval_collector" }
+    assert_includes standalone.fetch("run"), "mac_locked_step.py --verify-clean-failure -- bash"
+    observations = YAML.load_file(File.expand_path("../../.github/workflows/m3-native-observations.yaml", __dir__))
+    native = observations.fetch("jobs").fetch("observations").fetch("steps").find { |step| step["name"] == "Run native numerical and behavioral fixtures" }
+    assert_equal "python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}", native.fetch("shell")
     cleanup = @jobs.fetch("mac_integration").fetch("steps").find { |step| step["name"] == "Clean this run's owned Homebrew resources" }
     assert_equal "python3 scripts/ci/mac_locked_step.py --cleanup {0}", cleanup.fetch("shell")
     assert_equal "exec node scripts/homebrew/ci.mjs --cleanup-owned", cleanup.fetch("run")
