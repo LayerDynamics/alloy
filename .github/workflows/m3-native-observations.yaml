@@ -16,7 +16,7 @@ jobs:
     runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -42,7 +42,7 @@ jobs:
           fi
       - name: Archive terminal observations
         if: ${{ always() && env.M3_OUTPUT != '' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: m3-native-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

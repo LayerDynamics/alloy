@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Plugin collector output lifecycle
@@ -32,7 +32,7 @@ jobs:
       - name: Host lock regression
         run: python3 -B -m unittest discover -s scripts/tests -p test_mac_ci_lock.py
       - name: Node runtime
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '26.13.0'
           cache: npm
@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: pins and corpus
@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: build native test image
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: build native test image
@@ -119,7 +119,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -201,7 +201,7 @@ jobs:
 
       - name: Retain W5 Linux evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: w5-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w5-acceptance/linux/
@@ -210,7 +210,7 @@ jobs:
 
       - name: Retain W4 Linux evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: w4-linux-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w4-acceptance/linux/
@@ -253,7 +253,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
@@ -271,7 +271,7 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
 
       - name: Node runtime
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '26.13.0'
           cache: npm
@@ -307,7 +307,7 @@ jobs:
 
       - name: Retain approval/storage macOS evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: approval-storage-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/approval-storage-evidence-${{ github.run_id }}-${{ github.run_attempt }}-macos/
@@ -331,7 +331,7 @@ jobs:
 
       - name: Retain builtin macOS evidence
         if: ${{ always() && steps.clean_source.outcome == 'success' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: w4-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w4-acceptance/macos/
@@ -353,7 +353,7 @@ jobs:
 
       - name: Retain plugin macOS evidence
         if: ${{ always() && steps.clean_source.outcome == 'success' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: w5-macos-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/w5-acceptance/macos/
@@ -379,7 +379,7 @@ jobs:
       ALLOY_ACCEPTANCE_OUTPUT_DIR: ${{ github.workspace }}/target/phase-1-acceptance
     steps:
       - name: checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
@@ -396,7 +396,7 @@ jobs:
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
 
       - name: Node runtime
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: '26.13.0'
           cache: npm
@@ -406,7 +406,7 @@ jobs:
 
       - name: Retain early Homebrew host evidence
         if: ${{ always() && steps.clean_source.outcome == 'success' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: homebrew-host-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/phase-1-acceptance/homebrew-host/
@@ -469,7 +469,7 @@ jobs:
 
       - name: Retain Phase 1 and Homebrew acceptance evidence
         if: ${{ always() && steps.clean_source.outcome == 'success' }}
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: phase-1-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           path: target/phase-1-acceptance/
