@@ -64,7 +64,8 @@ for accepting timing and resource measurements.
 Mac CI uses `mac_locked_step.py --verify-clean-failure` for both PR
 lanes, standalone approval/storage collection and manual native observations.
 When a step exits with an ordinary nonzero status (1 through 123), the wrapper
-takes two runner-account process snapshots. Each must contain no new surviving
+allows up to three seconds for transient processes to settle, and requires two
+consecutive clear runner-account process snapshots. Each must contain no new surviving
 process relative to the snapshot taken under the lease before launch.
 Detached children, reused process IDs and unrelated new account processes
 prevent release. Failed inspection also prevents release.

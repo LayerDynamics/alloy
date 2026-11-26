@@ -29,13 +29,19 @@ def runner_processes():
         return processes
 
 
-def check_quiescence(before):
-    for sample in range(2):
-        if sample:
-            time.sleep(0.2)
+def check_quiescence(before, *, settle_seconds=3):
+    deadline = time.monotonic() + settle_seconds
+    clean_samples = 0
+    while clean_samples < 2:
         after = runner_processes()
         survivors = sorted(pid for pid, start in after.items() if before.get(pid) != start)
         if survivors:
-            raise RuntimeError(f"Runner processes remain after test failure: {survivors}")
+            clean_samples = 0
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Runner processes remain after test failure: {survivors}")
+        else:
+            clean_samples += 1
+        if clean_samples < 2:
+            time.sleep(0.2)
 
 

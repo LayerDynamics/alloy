@@ -356,9 +356,19 @@ class CollectorVerdictTest(unittest.TestCase):
             with self.subTest(final=final), patch.object(
                 self.inspection, "runner_processes", side_effect=[clean, final]
             ), self.assertRaises((RuntimeError, OSError)):
-                self.collector.check_quiescence(before)
+                self.collector.check_quiescence(before, settle_seconds=0)
         with patch.object(self.inspection, "runner_processes", side_effect=[clean, clean]):
             self.collector.check_quiescence(before)
+
+    def test_transient_process_resets_required_consecutive_clear_snapshots(self):
+        from unittest.mock import patch
+        before = {1: "original"}
+        busy = {1: "original", 2: "finishing"}
+        # A clear sample followed by a transient process cannot count as two
+        # clear samples. Both final samples must independently be clear.
+        with patch.object(self.inspection, "runner_processes", side_effect=[before, busy, before, before]) as inspect:
+            self.collector.check_quiescence(before)
+        self.assertEqual(inspect.call_count, 4)
 
 
 if __name__ == "__main__":
