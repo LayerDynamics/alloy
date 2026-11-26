@@ -17,6 +17,7 @@ class MacCiLockTest(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.env = os.environ.copy()
         self.env.pop("GITHUB_ACTIONS", None)
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
         self.env["ALLOY_CI_LOCK_TEST_PATH"] = str(self.root / "host.lock")
 
     def launch(self, code, *, verify_failure=False):
