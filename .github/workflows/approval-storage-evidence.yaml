@@ -129,7 +129,7 @@ jobs:
         run: |
           # Expansion intentionally happens in the locked child shell.
           # shellcheck disable=SC2016
-          python3 scripts/ci/mac_locked_step.py -- bash -euo pipefail -c '
+          python3 scripts/ci/mac_locked_step.py --verify-clean-failure -- bash -euo pipefail -c '
             test "$(git rev-parse HEAD)" = "$APPROVAL_STORAGE_CANDIDATE"
             rustup component add rustfmt clippy
             python3 scripts/approval_storage_evidence.py \

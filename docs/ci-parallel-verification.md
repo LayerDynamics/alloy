@@ -61,19 +61,31 @@ can survive a successful step, and the lock alone cannot detect it. Treat
 physical runner exclusivity and each script's cleanup contract as prerequisites
 for accepting timing and resource measurements.
 
-The Mac approval/storage collector can release the lease after a completed
-libtest failure. It requires Cargo exit 101, the terminal failed-test summary,
-and two runner-account process snapshots with no new surviving process
-relative to collector startup. A surviving detached process or an unrelated
-new process under that account blocks release. The collector writes its red
-verdict and evidence before exiting successfully under the lock. A separate
-workflow step requires an explicit passing verdict. A timeout, signal, missing
-report or failed inspection uses the ordinary failure path.
+Mac CI uses `mac_locked_step.py --verify-clean-failure` for both PR
+lanes, standalone approval/storage collection and manual native observations.
+When a step exits with an ordinary nonzero status (1 through 123), the wrapper
+takes two runner-account process snapshots. Each must contain no new surviving
+process relative to the snapshot taken under the lease before launch.
+Detached children, reused process IDs and unrelated new account processes
+prevent release. Failed inspection also prevents release.
 
-The lock retains an unclean lease marker if a step fails or its wrapper is
-interrupted before the step has been successfully reaped. A signal arriving
-after successful reap, during the final clean-record write, can leave the lease
-clean; the successful-step descendant cleanup contract still applies.
+After verified cleanup the wrapper logs `alloy-ci-result` with the original
+exit code and `cleanup=verified`, writes the clean lease under the lock and
+returns the original nonzero status. GitHub keeps the step and required check
+red. W4 and W5 run after earlier failures when source cleanup succeeded and the
+job has not been cancelled. The installed/model acceptance steps also retain
+their independent failure scheduling. Evidence uploads run after failures.
+
+The approval/storage collector shares the same process inspection helper.
+Its explicit terminal libtest verdict still uses a separate workflow step.
+Direct invocations of the lock wrapper retain strict failure behavior unless
+the caller supplies `--verify-clean-failure`.
+
+A signal, interruption, reserved timeout/launch status (124 or above), a killed
+wrapper or uncertain cleanup leaves the lease dirty. The owned Homebrew cleanup
+step retains its strict `--cleanup` mode, which cannot clear a preexisting dirty
+lease. A signal arriving after reap during the clean-record write can still
+leave a clean marker, as with the prior successful-step path.
 Later locked steps fail rather than assume detached work has stopped. After
 checking that no CI work or descendants remain on that host, an operator must
 reset the marker while holding the same exclusive file lock. Do not delete or

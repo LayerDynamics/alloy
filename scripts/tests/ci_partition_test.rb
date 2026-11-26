@@ -113,8 +113,16 @@ class CiPartitionTest < Minitest::Test
     end
     assert_includes integration, "npm ci"
     %w[mac_core mac_integration].each do |shard|
-      assert_equal "python3 scripts/ci/mac_locked_step.py {0}", @jobs.fetch(shard).dig("defaults", "run", "shell")
+      assert_equal "python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}", @jobs.fetch(shard).dig("defaults", "run", "shell")
     end
+    @jobs.fetch("mac_core").fetch("steps").select { |step| step["name"]&.match?(/^W[45] /) }.each do |step|
+      assert_equal "${{ !cancelled() && steps.clean_source.outcome == 'success' }}", step.fetch("if")
+    end
+    standalone = old_jobs.fetch("mac").fetch("steps").find { |step| step["id"] == "approval_collector" }
+    assert_includes standalone.fetch("run"), "mac_locked_step.py --verify-clean-failure -- bash"
+    observations = YAML.load_file(File.expand_path("../../.github/workflows/m3-native-observations.yaml", __dir__))
+    native = observations.fetch("jobs").fetch("observations").fetch("steps").find { |step| step["name"] == "Run native numerical and behavioral fixtures" }
+    assert_equal "python3 scripts/ci/mac_locked_step.py --verify-clean-failure {0}", native.fetch("shell")
     cleanup = @jobs.fetch("mac_integration").fetch("steps").find { |step| step["name"] == "Clean this run's owned Homebrew resources" }
     assert_equal "python3 scripts/ci/mac_locked_step.py --cleanup {0}", cleanup.fetch("shell")
     assert_equal "exec node scripts/homebrew/ci.mjs --cleanup-owned", cleanup.fetch("run")

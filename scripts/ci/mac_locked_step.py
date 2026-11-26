@@ -13,14 +13,21 @@ import sys
 import tempfile
 import time
 
+sys.dont_write_bytecode = True
+
+from mac_host_processes import check_quiescence, runner_processes
+
 
 def main():
     args = sys.argv[1:]
-    cleanup_only = bool(args and args[0] == "--cleanup")
-    if cleanup_only:
+    cleanup_only = False
+    verify_failure = False
+    while args and args[0] in ("--cleanup", "--verify-clean-failure"):
+        cleanup_only |= args[0] == "--cleanup"
+        verify_failure |= args[0] == "--verify-clean-failure"
         args = args[1:]
     if not args:
-        raise SystemExit("usage: mac_locked_step.py [--cleanup] STEP_SCRIPT | -- COMMAND [ARG ...]")
+        raise SystemExit("usage: mac_locked_step.py [--cleanup] [--verify-clean-failure] STEP_SCRIPT | -- COMMAND [ARG ...]")
     if args[0] == "--":
         if len(args) < 2:
             raise SystemExit("missing command")
@@ -105,6 +112,7 @@ def main():
             return 128 + interrupted
         # The child inherits the lock, so a killed wrapper does not immediately
         # release it while the step shell is still alive.
+        before = runner_processes() if verify_failure else None
         child = subprocess.Popen(command, start_new_session=True, pass_fds=(fd,))
         if interrupted is not None:
             stop(interrupted, None)
@@ -125,10 +133,21 @@ def main():
         status = os.waitstatus_to_exitcode(status)
         if injection == "signal_before_clean":
             os.kill(os.getpid(), signal.SIGTERM)
+        # An ordinary terminal failure remains a failed step. Only the host's
+        # availability changes after positive inspection. Shell signal statuses
+        # and timeout's reserved 124-127 codes retain a dirty lease.
+        clean_failure = False
+        if verify_failure and interrupted is None and 0 < status < 124:
+            try:
+                check_quiescence(before)
+                clean_failure = True
+                print(f"alloy-ci-result exit_code={status} cleanup=verified", flush=True)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                print(f"alloy-ci-result exit_code={status} cleanup=unverified reason={error}", flush=True)
         watched = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
         old = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
         try:
-            if interrupted is None and not (signal.sigpending() & watched) and status == 0 and (not cleanup_only or was_clean):
+            if interrupted is None and not (signal.sigpending() & watched) and (status == 0 or clean_failure) and (not cleanup_only or was_clean):
                 if injection == "before_clean":
                     os._exit(86)
                 if injection == "partial_clean":
