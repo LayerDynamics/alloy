@@ -48,7 +48,7 @@ class CiPartitionTest < Minitest::Test
     assert_equal "mac-metal", @jobs.fetch("mac").fetch("name")
     core = commands("mac_core")
     ["python3 scripts/approval_storage_evidence.py", '--repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results"',
-     "cargo test --locked --workspace --exclude mlx-ffi --exclude harness-core --all-targets",
+     "--native-parallel-packages",
      "bash scripts/builtin_acceptance.sh", "bash scripts/plugin_acceptance.sh"].each { |gate| assert_includes core, gate }
     assert_equal 1, core.scan("python3 scripts/approval_storage_evidence.py").length
     refute_includes core, "--capture-only"
@@ -59,6 +59,7 @@ class CiPartitionTest < Minitest::Test
       '["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]',
       '["cargo", "test", "--locked", "--workspace", "--all-targets", "--", "--test-threads=1"]',
       '["cargo", "test", "--locked", "--workspace", "--doc"]',
+      '["cargo", "test", "--locked", "--workspace", "--exclude", "mlx-ffi", "--exclude", "harness-core", "--all-targets"]',
       '["cargo", "test", "--locked", "-p", "harness-core", "--all-targets"]',
       '["cargo", "doc", "--locked", "--workspace", "--no-deps"]',
       'env["RUSTDOCFLAGS"] = "-D warnings"',

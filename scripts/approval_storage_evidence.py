@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--native-parallel-packages", action="store_true",
+                        help="also run the mac-core default-parallel workspace regression")
     parser.add_argument("--github-verdict-output", type=Path,
                         help="Under the Mac lease, deliver a verified terminal test verdict to a separate workflow step")
     args = parser.parse_args()
@@ -190,6 +192,8 @@ def main():
             run(["cargo", "test", "--locked", "--workspace", "--doc"], env)
             # Also exercise W3 under ordinary parallel test scheduling.
             run(["cargo", "test", "--locked", "-p", "harness-core", "--all-targets"], env)
+            if args.native_parallel_packages:
+                run(["cargo", "test", "--locked", "--workspace", "--exclude", "mlx-ffi", "--exclude", "harness-core", "--all-targets"], env)
             env["RUSTDOCFLAGS"] = "-D warnings"
             run(["cargo", "doc", "--locked", "--workspace", "--no-deps"], env)
         for name, original in snapshots.items():

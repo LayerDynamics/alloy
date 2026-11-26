@@ -11,6 +11,10 @@ use tool_registry::{
     definition::{ApprovalRequirement, ToolEffect, ToolPolicy},
     execution::{BoundedOutput, CancellationToken, ExecutionContext, ExecutionError, OutputSink},
 };
+#[path = "fixtures/deadline.rs"]
+mod deadline;
+use deadline::DeadlineOnChildOutput;
+
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -287,10 +291,17 @@ fn precancelled_invocation_never_spawns() {
 #[test]
 fn deadline_kills_and_reaps_owned_child() {
     let d = Temp::new();
-    let c = context(1000, 65536, CancellationToken::default());
+    let c = context(60_000, 65536, CancellationToken::default());
     let mut out = BoundedOutput::new(&c, 65536).unwrap();
     let e = scope(&d)
-        .run(&request(&d, "hang"), &c, &mut out)
+        .run(
+            &request(&d, "hang"),
+            &c,
+            &mut DeadlineOnChildOutput {
+                context: &c,
+                output: &mut out,
+            },
+        )
         .unwrap_err();
     assert!(e.started);
     assert!(matches!(

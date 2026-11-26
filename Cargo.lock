@@ -1920,6 +1920,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tool-registry",
  "ureq",
  "url",
 ]

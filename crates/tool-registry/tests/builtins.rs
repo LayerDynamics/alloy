@@ -14,6 +14,10 @@ use tool_registry::{
     definition::{ApprovalRequirement, ToolEffect, ToolPolicy},
     execution::{BoundedOutput, CancellationToken, ExecutionContext, ExecutionError},
 };
+#[path = "fixtures/deadline.rs"]
+mod deadline;
+use deadline::DeadlineOnChildOutput;
+
 mod fixture {
     include!("fixtures/http_server.rs");
 }
@@ -187,13 +191,16 @@ fn builtin_scope_and_output_limits() {
         .unwrap_err();
     assert!(!denied.started);
     assert!(!dir.0.join("marker").exists());
-    let timed = context(500, 4096);
+    let timed = context(60_000, 4096);
     let mut out = BoundedOutput::new(&timed, 4096).unwrap();
     let failed = shell
         .run(
             &request(&exe, &dir.0.join("root"), "hang"),
             &timed,
-            &mut out,
+            &mut DeadlineOnChildOutput {
+                context: &timed,
+                output: &mut out,
+            },
         )
         .unwrap_err();
     assert!(failed.started);

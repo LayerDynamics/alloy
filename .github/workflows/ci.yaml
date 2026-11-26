@@ -298,7 +298,7 @@ jobs:
             > "$evidence/workflow.txt"
           python3 scripts/approval_storage_evidence.py \
             --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results" \
-            --github-verdict-output "$GITHUB_OUTPUT"
+            --github-verdict-output "$GITHUB_OUTPUT" --native-parallel-packages
 
       - name: Require passing approval/storage tests
         if: steps.approval_collector.outputs.tests_passed != 'true'
@@ -313,12 +313,6 @@ jobs:
           path: ${{ runner.temp }}/approval-storage-evidence-${{ github.run_id }}-${{ github.run_attempt }}-macos/
           if-no-files-found: error
           retention-days: 30
-
-      # Preserve the previous default-parallel schedules in addition to the
-      # collector's serial run. MLX remains serial; harness runs in parallel
-      # in the collector and W5. No package's former schedule is dropped.
-      - name: Native parallel package regression
-        run: cargo test --locked --workspace --exclude mlx-ffi --exclude harness-core --all-targets
 
       - name: W4 scoped named gates and candidate evidence
         env:

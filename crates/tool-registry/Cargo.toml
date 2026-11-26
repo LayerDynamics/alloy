@@ -20,5 +20,9 @@ serde_json = { workspace = true }
 ureq = { workspace = true }
 url = "=2.5.8"
 
+[dev-dependencies]
+# Integration tests compile the library as a dependency.
+tool-registry = { path = ".", features = ["test-clock"] }
+
 [lints]
 workspace = true
