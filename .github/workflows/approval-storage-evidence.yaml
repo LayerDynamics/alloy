@@ -124,6 +124,7 @@ jobs:
             "$APPROVAL_STORAGE_CANDIDATE" "$SERVER_URL" "$REPOSITORY" "$RUN_ID" "$RUN_ATTEMPT" \
             > "$APPROVAL_STORAGE_EVIDENCE/workflow.txt"
       - name: Collect approval and storage gates and complete source sections
+        id: approval_collector
         shell: bash
         run: |
           # Expansion intentionally happens in the locked child shell.
@@ -134,8 +135,13 @@ jobs:
             python3 scripts/approval_storage_evidence.py \
               --repo "$PWD" --expected-commit "$APPROVAL_STORAGE_CANDIDATE" \
               --output "$APPROVAL_STORAGE_EVIDENCE/results" \
+              --github-verdict-output "$GITHUB_OUTPUT" \
               2>&1 | tee "$APPROVAL_STORAGE_EVIDENCE/collector-driver.log"
           '
+      - name: Require passing approval/storage tests
+        if: steps.approval_collector.outputs.tests_passed != 'true'
+        shell: bash
+        run: exit 1
       - name: Retain approval and storage macOS evidence even after failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v6

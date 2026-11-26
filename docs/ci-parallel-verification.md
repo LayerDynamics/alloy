@@ -61,6 +61,15 @@ can survive a successful step, and the lock alone cannot detect it. Treat
 physical runner exclusivity and each script's cleanup contract as prerequisites
 for accepting timing and resource measurements.
 
+The Mac approval/storage collector can release the lease after a completed
+libtest failure. It requires Cargo exit 101, the terminal failed-test summary,
+and two runner-account process snapshots with no new surviving process
+relative to collector startup. A surviving detached process or an unrelated
+new process under that account blocks release. The collector writes its red
+verdict and evidence before exiting successfully under the lock. A separate
+workflow step requires an explicit passing verdict. A timeout, signal, missing
+report or failed inspection uses the ordinary failure path.
+
 The lock retains an unclean lease marker if a step fails or its wrapper is
 interrupted before the step has been successfully reaped. A signal arriving
 after successful reap, during the final clean-record write, can leave the lease

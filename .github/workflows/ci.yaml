@@ -287,6 +287,7 @@ jobs:
       # serial workspace suite, check, Clippy, doctests, strict rustdoc, and
       # parallel harness suite. Share that verification with mac-core.
       - name: Approval/storage and complete native workspace verification
+        id: approval_collector
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CI_CANDIDATE"
@@ -296,7 +297,13 @@ jobs:
             "$CI_CANDIDATE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             > "$evidence/workflow.txt"
           python3 scripts/approval_storage_evidence.py \
-            --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results"
+            --repo "$PWD" --expected-commit "$CI_CANDIDATE" --output "$evidence/results" \
+            --github-verdict-output "$GITHUB_OUTPUT"
+
+      - name: Require passing approval/storage tests
+        if: steps.approval_collector.outputs.tests_passed != 'true'
+        shell: bash
+        run: exit 1
 
       - name: Retain approval/storage macOS evidence
         if: ${{ always() }}

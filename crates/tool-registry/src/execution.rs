@@ -57,6 +57,8 @@ impl std::error::Error for ExecutionError {}
 pub struct ExecutionContext {
     cancellation: CancellationToken,
     deadline: Instant,
+    #[cfg(feature = "test-clock")]
+    at_deadline: AtomicBool,
     max_output_bytes: u64,
 }
 impl ExecutionContext {
@@ -82,6 +84,8 @@ impl ExecutionContext {
         Ok(Self {
             cancellation,
             deadline,
+            #[cfg(feature = "test-clock")]
+            at_deadline: AtomicBool::new(false),
             max_output_bytes,
         })
     }
@@ -107,6 +111,12 @@ impl ExecutionContext {
         Ok(context)
     }
 
+    /// Advance this operation to its fixed deadline in integration tests.
+    #[cfg(feature = "test-clock")]
+    pub fn advance_to_deadline_for_test(&self) {
+        self.at_deadline.store(true, Ordering::Release);
+    }
+
     /// Check the operation-local cancellation flag and deadline.
     pub fn check(&self) -> Result<(), ExecutionError> {
         self.check_at(Instant::now())
@@ -115,6 +125,12 @@ impl ExecutionContext {
         if self.cancellation.is_cancelled() {
             return Err(ExecutionError::Cancelled);
         }
+        #[cfg(feature = "test-clock")]
+        let now = if self.at_deadline.load(Ordering::Acquire) {
+            now.max(self.deadline)
+        } else {
+            now
+        };
         if now >= self.deadline {
             return Err(ExecutionError::DeadlineExceeded);
         }

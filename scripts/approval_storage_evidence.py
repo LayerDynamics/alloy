@@ -8,6 +8,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 AUDIT_FILES = [
@@ -29,13 +30,68 @@ GATES = [
 ]
 
 
+class CompletedTestFailure(Exception):
+    """Cargo reaped libtest and reported failed tests."""
+
+
+def libtest_failed(argv, code, log):
+    if argv[:2] != ["cargo", "test"] or code != 101:
+        return False
+    # Require the final failed harness summary and Cargo's target diagnostic.
+    # Earlier passing binaries, compiler errors and killed binaries do not qualify.
+    return re.search(
+        r"^test result: FAILED\. \d+ passed; [1-9]\d* failed;[^\n]*\n"
+        r"\s*error: test failed, to rerun pass `[^\n]+`\s*\Z",
+        log.read_text(errors="replace"), re.MULTILINE,
+    ) is not None
+
+
+def runner_processes():
+    # Same real UID includes detached descendants even after reparenting or
+    # environment clearing. Start time distinguishes reused process IDs.
+    with subprocess.Popen(
+        ["/bin/ps", "-U", str(os.getuid()), "-o", "pid=,lstart="],
+        stdout=subprocess.PIPE, text=True, env={**os.environ, "LC_ALL": "C"},
+    ) as probe:
+        try:
+            output, _ = probe.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            probe.kill()
+            probe.communicate()
+            raise
+        if probe.returncode:
+            raise RuntimeError("Could not inspect runner processes")
+        processes = {}
+        for line in output.splitlines():
+            pid, started = line.split(maxsplit=1)
+            if int(pid) != probe.pid:
+                processes[int(pid)] = started
+        if os.getpid() not in processes:
+            raise RuntimeError("Runner process snapshot is incomplete")
+        return processes
+
+
+def check_quiescence(before):
+    for sample in range(2):
+        if sample:
+            time.sleep(0.2)
+        after = runner_processes()
+        survivors = sorted(pid for pid, start in after.items() if before.get(pid) != start)
+        if survivors:
+            raise RuntimeError(f"Runner processes remain after test failure: {survivors}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--github-verdict-output", type=Path,
+                        help="Under the Mac lease, deliver a verified terminal test verdict to a separate workflow step")
     args = parser.parse_args()
+    if args.github_verdict_output and args.capture_only:
+        parser.error("deferred test verdict requires a full run")
     root = args.repo.expanduser().resolve()
     output = args.output.expanduser().resolve()
     if output == root or root in output.parents:
@@ -66,12 +122,16 @@ def main():
                 record["timed_out"] = True
                 raise RuntimeError("Command timeout: " + str(log))
         record["returncode"] = code
+        if args.github_verdict_output and libtest_failed(argv, code, log):
+            raise CompletedTestFailure("Test assertion failed: " + str(log))
         if code:
             raise RuntimeError("Command failed: " + str(log))
         return log.read_text(errors="replace")
     def git(*items):
         return run(["git", *items]).strip()
+    quiescent_failure = False
     try:
+        before = runner_processes() if args.github_verdict_output else None
         if not re.fullmatch(r"[0-9a-f]{40}", args.expected_commit):
             raise RuntimeError("Expected commit must be a full SHA")
         head = git("rev-parse", "HEAD")
@@ -141,6 +201,14 @@ def main():
         report["remaining"] = ["manual full-source audit", "historical dependency audit",
             "exact Step C inventory review", "other-platform evidence",
             "required CLI/native/real-model CI jobs", "scoped acceptance decision"]
+    except CompletedTestFailure as error:
+        report["error"] = str(error)
+        try:
+            check_quiescence(before)
+            quiescent_failure = True
+            report["host_quiescence"] = "verified"
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as inspection:
+            report["host_quiescence_error"] = str(inspection)
     except Exception as error:
         report["error"] = str(error)
     finally:
@@ -151,6 +219,10 @@ def main():
         print("Evidence:", output)
         print("Captured only" if args.capture_only and "error" not in report
               else "Passed collected gates" if report["passed"] else "Failed: " + report.get("error", "unknown"))
+    if args.github_verdict_output and (report["passed"] or quiescent_failure):
+        with args.github_verdict_output.open("a") as stream:
+            print("tests_passed=" + str(report["passed"]).lower(), file=stream)
+        return 0
     return 0 if report["passed"] or (args.capture_only and "error" not in report) else 1
 
 

@@ -85,6 +85,15 @@ class CiPartitionTest < Minitest::Test
       refute_includes step.fetch("run"), '"$GITHUB_SHA"'
     end
     old_jobs = YAML.load_file(File.expand_path("../../.github/workflows/approval-storage-evidence.yaml", __dir__)).fetch("jobs")
+    [@jobs.fetch("mac_core"), old_jobs.fetch("mac")].each do |job|
+      steps = job.fetch("steps")
+      collect = steps.index { |step| step["id"] == "approval_collector" }
+      assert_includes steps.fetch(collect).fetch("run"), '--github-verdict-output "$GITHUB_OUTPUT"'
+      verdict = steps.fetch(collect + 1)
+      assert_equal "steps.approval_collector.outputs.tests_passed != 'true'", verdict.fetch("if")
+      assert_equal "bash", verdict.fetch("shell")
+      assert_equal "exit 1", verdict.fetch("run")
+    end
     assert_equal "approval-storage-macos-standalone", old_jobs.fetch("mac").fetch("name")
     assert_equal "github.event_name != 'pull_request'", old_jobs.fetch("mac").fetch("if").strip
     assert_equal 1, (@jobs.values + old_jobs.values).count { |job| job["name"] == "approval-storage-macos-arm64" }

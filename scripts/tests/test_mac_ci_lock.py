@@ -196,5 +196,44 @@ class MacCiLockTest(unittest.TestCase):
         self.assertEqual(pathlib.Path(self.env["ALLOY_CI_LOCK_TEST_PATH"]).read_bytes(), b"clean\n")
 
 
+
+class CollectorVerdictTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "approval_storage_evidence", SCRIPT.parents[1] / "approval_storage_evidence.py")
+        cls.collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.collector)
+
+    def test_only_completed_failed_test_summary_qualifies(self):
+        summary = ("test result: FAILED. 22 passed; 1 failed; 0 ignored; finished in 1.41s\n\n"
+                   "error: test failed, to rerun pass `-p harness-core --test shell_adapter`\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "cargo.log"
+            for command, status, output, expected in [
+                (["cargo", "test"], 101, summary, True),
+                (["cargo", "test"], -15, summary, False),
+                (["cargo", "check"], 101, summary, False),
+                (["cargo", "test"], 101, summary + "Caused by: signal 9\n", False),
+                (["cargo", "test"], 101, "error: could not compile fixture\n", False),
+            ]:
+                with self.subTest(command=command, status=status, output=output):
+                    log.write_text(output)
+                    self.assertEqual(self.collector.libtest_failed(command, status, log), expected)
+
+    def test_both_snapshots_must_show_no_new_or_reused_pids(self):
+        from unittest.mock import patch
+        before = {1: "original", 2: "exited"}
+        clean = {1: "original"}
+        for final in [{1: "original", 3: "detached"}, {1: "reused"}, OSError("ps failed")]:
+            with self.subTest(final=final), patch.object(
+                self.collector, "runner_processes", side_effect=[clean, final]
+            ), self.assertRaises((RuntimeError, OSError)):
+                self.collector.check_quiescence(before)
+        with patch.object(self.collector, "runner_processes", side_effect=[clean, clean]):
+            self.collector.check_quiescence(before)
+
+
 if __name__ == "__main__":
     unittest.main()
