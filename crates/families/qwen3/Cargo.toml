@@ -10,7 +10,7 @@ serde = { workspace = true }
 minijinja = { workspace = true }
 sha2 = "=0.10.9"
 safetensors = "=0.8.0"
-half = "=2.4.1"
+half = "=2.7.1"
 serde_json = "=1.0.145"
 inference-infra = { path = "../../inference-infra" }
 mlx-ffi = { path = "../../mlx-ffi" }
